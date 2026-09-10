@@ -303,10 +303,15 @@ impl DeviceFootprint {
         if self.weights_host_bytes > 0 {
             // Named, not just totalled: "the rest is on the CPU" invites
             // the question of whether that is a fallback or a bug, and the
-            // answer (routed experts have no GPU path at all) is a
-            // property of the engine rather than of this machine.
+            // answer — these tensors have no GPU path at all — is a property
+            // of the engine rather than of this machine. Named *accurately*,
+            // too: this used to say "routed experts" for every host-resident
+            // byte, and on a model with no experts at all it was describing
+            // its per-layer embedding table. A reader took it at its word,
+            // and went looking for a mixture-of-experts path that a dense
+            // model never takes.
             weights.push_str(&format!(
-                ", {} in host memory (routed experts)",
+                ", {} in host memory (per-layer embeddings, routed experts)",
                 format_bytes(self.weights_host_bytes)
             ));
         }

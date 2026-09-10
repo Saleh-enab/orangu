@@ -726,6 +726,9 @@ async fn send_message(
             sampling: SamplingParams::default(),
             max_tokens: MAX_TOKENS,
             stop_token_ids,
+            // The console is served by this process and has no coordinator
+            // in front of it, so it is this server's own role.
+            role: None,
             cache_prompt: true,
             // The web console keeps one conversation per session but has no
             // notion of a slot; any free one is right.

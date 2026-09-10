@@ -481,6 +481,18 @@ struct PoolInner {
     next_seq: u64,
     /// Pages currently held by at least one holder.
     live: usize,
+    /// Pages promised to sequences that have not taken them yet.
+    ///
+    /// A sequence takes its pages one at a time, as it grows, but it is
+    /// admitted once — so without this the pool can hand the last page to a
+    /// second sequence and leave the first one with nowhere to put its next
+    /// token. That is not a slow path: [`SequencePages::page_for`] has no way
+    /// to answer "no page" and used to assert its way out, taking the process
+    /// with it. Counting a promise against availability is what makes that
+    /// assertion true.
+    ///
+    /// [`SequencePages::page_for`]: crate::engine::kv_cache
+    reserved: usize,
     policy: Policy,
     /// [`Policy::Arc`]'s lists, `None` under [`Policy::Lru`] so the recency
     /// path carries none of its bookkeeping.
@@ -862,6 +874,7 @@ impl KvPool {
                 release_seq: vec![0; num_pages],
                 next_seq: 1,
                 live: 0,
+                reserved: 0,
                 policy,
                 arc: (policy == Policy::Arc).then(|| ArcState::new(num_pages)),
                 tag: vec![0; num_pages],
@@ -1197,11 +1210,36 @@ impl KvPool {
         tokens.div_ceil(self.page_tokens)
     }
 
-    /// The largest number of pages that could be served right now — held pages
-    /// excluded, cached ones included, since those are reclaimable.
+    /// The largest number of pages that could be served right now — held and
+    /// promised pages excluded, cached ones included, since those are
+    /// reclaimable.
     pub fn available(&self) -> usize {
         let inner = self.inner.lock().expect("kv pool poisoned");
-        self.num_pages - inner.live
+        self.num_pages - inner.live - inner.reserved
+    }
+
+    /// Promises `pages` to one sequence, or reports that the pool has no room
+    /// for it. A promise is what makes a sequence's later [`Self::acquire_for`]
+    /// calls unrefusable, so admission happens here, once, and growth never
+    /// has to fail.
+    ///
+    /// Every promise must be given back — by claiming it (`acquire_for`) or by
+    /// returning the remainder ([`Self::release_reserved`]) — or the pool
+    /// shrinks by that much for the life of the process.
+    pub fn try_reserve(&self, pages: usize) -> bool {
+        let mut inner = self.inner.lock().expect("kv pool poisoned");
+        if self.num_pages - inner.live - inner.reserved < pages {
+            return false;
+        }
+        inner.reserved += pages;
+        true
+    }
+
+    /// Gives back `pages` of a promise that were never claimed — what a
+    /// finished sequence owes for the length it did not reach.
+    pub fn release_reserved(&self, pages: usize) {
+        let mut inner = self.inner.lock().expect("kv pool poisoned");
+        inner.reserved = inner.reserved.saturating_sub(pages);
     }
 
     pub fn stats(&self) -> PoolStats {
@@ -1272,7 +1310,35 @@ impl KvPool {
     ///
     /// A tag of `0` is reserved for "unnamed" and always misses.
     pub fn acquire(&self, tags: &[u64]) -> Result<Vec<Acquired>, AllocError> {
+        self.acquire_inner(tags, 0)
+    }
+
+    /// [`Self::acquire`] for a caller that already holds a promise covering
+    /// these `tags` — one page per tag, taken out of the promise rather than
+    /// out of what is left over.
+    ///
+    /// **This cannot fail.** [`Self::try_reserve`] only promises pages that
+    /// availability already covers, and a promise is subtracted from what
+    /// anyone else may take, so the pages are still there when the sequence
+    /// finally asks for them. That is the whole point: a sequence discovers
+    /// how many pages it needs one token at a time, and the only moment at
+    /// which "no" is an answer anyone can act on is admission.
+    ///
+    /// The `Result` stays for one reason — a caller that asks for more pages
+    /// than it promised is a bug in the caller, and this reports it rather
+    /// than dipping into someone else's promise.
+    pub fn acquire_for(&self, tags: &[u64], promised: usize) -> Result<Vec<Acquired>, AllocError> {
+        self.acquire_inner(tags, promised)
+    }
+
+    /// The body of both, with `promised` pages of the request already paid for
+    /// by a [`Self::try_reserve`] this caller made earlier.
+    fn acquire_inner(&self, tags: &[u64], promised: usize) -> Result<Vec<Acquired>, AllocError> {
         let mut inner = self.inner.lock().expect("kv pool poisoned");
+        // Claimed before the check, not after: these pages were taken out of
+        // everyone else's availability when they were promised, so they have to
+        // come back into this caller's before it can see them.
+        inner.reserved = inner.reserved.saturating_sub(promised);
 
         // Price the request before touching anything: only the misses need a
         // page, and only the ones that are not already resident.
@@ -1291,12 +1357,18 @@ impl KvPool {
             }
             needed += 1;
         }
-        let available = self.num_pages - inner.live;
-        if needed > available {
-            return Err(AllocError::Exhausted {
-                wanted: needed,
-                available,
-            });
+        // A hit on a *cached* page makes it live too, so a promised caller is
+        // priced at one page per tag rather than one per miss: its promise
+        // covers every page it will hold, however each one is come by. An
+        // unpromised caller keeps the older, looser accounting.
+        let wanted = if promised > 0 {
+            tags.len().max(needed)
+        } else {
+            needed
+        };
+        let available = self.num_pages - inner.live - inner.reserved;
+        if wanted > available {
+            return Err(AllocError::Exhausted { wanted, available });
         }
 
         let mut out = Vec::with_capacity(tags.len());
@@ -2380,6 +2452,43 @@ mod tests {
 
     /// Attaching is optional, and a host-only pool must stay fully usable —
     /// every CPU-backed path still works with no device in sight.
+    /// The promise is the admission decision, so it has to refuse what the
+    /// pool cannot cover — and cover what it accepts, for as long as the
+    /// sequence holds it.
+    #[test]
+    fn a_promise_is_refused_beyond_the_pool_and_honoured_within_it() {
+        let p = pool(4);
+        assert!(!p.try_reserve(5), "a promise larger than the pool");
+        assert!(p.try_reserve(3));
+        assert_eq!(
+            p.available(),
+            1,
+            "a promise is not available to anyone else"
+        );
+        // A second promise may take only what the first left.
+        assert!(!p.try_reserve(2));
+        assert!(p.try_reserve(1));
+        assert_eq!(p.available(), 0);
+        // And what was promised is still there when it is finally claimed —
+        // one page at a time, which is how a sequence grows.
+        for _ in 0..3 {
+            assert!(p.acquire_for(&[0], 1).is_ok());
+        }
+    }
+
+    /// An unclaimed promise has to come back, or a server that answers a
+    /// thousand short requests ends up with a pool it cannot allocate from —
+    /// every one of them admitted for a length it never reached.
+    #[test]
+    fn an_unclaimed_promise_is_given_back() {
+        let p = pool(4);
+        assert!(p.try_reserve(4));
+        assert_eq!(p.available(), 0);
+        p.release_reserved(4);
+        assert_eq!(p.available(), 4);
+        assert!(p.try_reserve(4), "the pool is whole again");
+    }
+
     #[test]
     fn a_pool_without_a_device_still_works() {
         let p = pool_with(4, Policy::Lru);

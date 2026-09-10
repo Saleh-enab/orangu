@@ -233,12 +233,26 @@ pub fn scope<T>(stage: Stage, f: impl FnOnce() -> T) -> T {
 /// cost** — which is the number a batching change moves and a timing alone
 /// cannot separate from the arithmetic.
 pub fn record_submission() {
+    ALL_SUBMITS.fetch_add(1, Ordering::Relaxed);
     if !enabled() {
         return;
     }
     if let Some(stage) = CURRENT.with(|c| c.get()) {
         SUBMITS[stage.index()].fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Every submission the backends have recorded since the process started,
+/// instrument or no instrument — the prefill chunk sizer reads it before
+/// and after a chunk to learn how many round trips the chunk was, which is
+/// what turns a chunk's wall time into an estimate of its longest single
+/// submission (see `generate::budget_elapsed`). A lower bound: a submit path
+/// that does not call [`record_submission`] is simply not counted, which
+/// errs toward the longer estimate.
+static ALL_SUBMITS: AtomicU64 = AtomicU64::new(0);
+
+pub fn submissions_so_far() -> u64 {
+    ALL_SUBMITS.load(Ordering::Relaxed)
 }
 
 /// Times one whole forward pass, and counts it.

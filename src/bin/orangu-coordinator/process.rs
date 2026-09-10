@@ -36,9 +36,28 @@ use tokio::{
 };
 
 /// A running `orangu-server` process for one configured entry.
+/// The `orangu-server` a coordinator is currently routing to, and how it came
+/// to be there.
+///
+/// Two ways, because starting one is not the only way for one to exist. A
+/// server may already be listening on the profile's address when the
+/// coordinator looks — an operator's own, or one left by an earlier
+/// coordinator — and starting a second is not merely wasteful: it cannot bind,
+/// so it loads a model for nothing and exits, and the coordinator is left
+/// talking to a process it does not think it has. Adopting the one that is
+/// there is both cheaper and more truthful.
+enum ServerHandle {
+    /// Started by this coordinator, and reaped by it.
+    Spawned(tokio::process::Child),
+    /// Already serving this profile when the coordinator looked. Held by pid
+    /// alone: there is no `Child` to wait on for a process this one did not
+    /// fork, so liveness is a signal probe and stopping is a signal.
+    Adopted { pid: u32 },
+}
+
 struct ActiveProcess {
     entry_name: String,
-    child: tokio::process::Child,
+    child: ServerHandle,
     /// The whole entry that was used to start this process, so hot-reload
     /// can detect when a profile's settings changed (any field, not just
     /// its model — a `port`/`backend`/`slots` change matters just as much).
@@ -48,6 +67,79 @@ struct ActiveProcess {
     /// request — can still be reported with its own diagnostic output
     /// attached, the same as a startup failure.
     tail: OutputTail,
+}
+
+/// An `orangu-server` found already listening on a profile's address.
+struct Occupant {
+    pid: u32,
+    /// The model it reports serving (`/props`), compared *exactly* against the
+    /// spec a profile names: a match that has to be guessed at is not a match.
+    model: String,
+    /// The role it came up in (`/props`), which decides whether it can answer
+    /// for a profile at all — an `--embedding` server cannot serve a chat one
+    /// however identical the weights.
+    role: String,
+}
+
+/// Whether `pid` is an `orangu-server` process, as far as the OS is asked.
+///
+/// The pid comes from a `/health` answer, which is a *network* fact, and it is
+/// about to be signalled. A server that reported someone else's pid — broken,
+/// or hostile on a port it should not be on — would otherwise have this
+/// coordinator kill an unrelated process for it. Asking the kernel what the
+/// pid actually is costs one small read and turns that into nothing.
+///
+/// `false` when it cannot be established, which includes every platform
+/// without `/proc`: the takeover it guards is a convenience, and declining to
+/// perform it leaves the operator with a clear message, where performing it on
+/// an unverified pid could leave them with a stopped database.
+#[cfg(target_os = "linux")]
+fn pid_is_orangu_server(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|comm| comm.trim() == "orangu-server")
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pid_is_orangu_server(_pid: u32) -> bool {
+    false
+}
+
+impl Occupant {
+    /// Whether this server is already doing what `entry` asks for, so that
+    /// starting one would produce exactly it.
+    fn serves(&self, entry: &CoordinatorLlmEntry) -> bool {
+        self.model == entry.model && crate::config::roles_share_a_process(&self.role, &entry.role)
+    }
+}
+
+impl ServerHandle {
+    /// Whether the process has gone, in the shape [`tokio::process::Child`]
+    /// answers it — `Ok(None)` while it is still there.
+    ///
+    /// An adopted process cannot be waited on (it is not this process's
+    /// child), so it is asked the only way a stranger can be: signal `0`,
+    /// which delivers nothing and fails exactly when the pid is gone. The
+    /// exit status it reports is therefore a stand-in — nobody reaped it, so
+    /// there is no real one — and it is only ever used to say *that* the
+    /// process ended, never how.
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self {
+            Self::Spawned(child) => child.try_wait(),
+            #[cfg(unix)]
+            Self::Adopted { pid } => {
+                // SAFETY: `kill` with signal 0 sends nothing; it only reports
+                // whether the pid can be signalled.
+                let alive = unsafe { libc::kill(*pid as libc::pid_t, 0) } == 0;
+                Ok((!alive).then(|| {
+                    use std::os::unix::process::ExitStatusExt;
+                    std::process::ExitStatus::from_raw(0)
+                }))
+            }
+            #[cfg(not(unix))]
+            Self::Adopted { .. } => Ok(None),
+        }
+    }
 }
 
 /// Number of most-recent stdout/stderr lines kept per starting/active
@@ -166,6 +258,22 @@ impl Coordinator {
             .into_iter()
             .map(|(r, m)| (r.to_string(), m.to_string()))
             .collect()
+    }
+
+    /// Every role a profile is configured for, deduplicated and sorted —
+    /// what `GET /v1/coordinator` reports as `roles`.
+    ///
+    /// Distinct from [`Self::models_by_role`], which answers "what would this
+    /// role route to" for *every* conventional role because routing always
+    /// falls back to `all`. This answers "is this role configured", which is
+    /// the question a client has when it wants to know whether a capability
+    /// exists rather than where a request would go.
+    pub fn configured_roles(&self) -> Vec<String> {
+        let config = self.config.read().unwrap();
+        let mut roles: Vec<String> = config.llms.values().map(|e| e.role.clone()).collect();
+        roles.sort();
+        roles.dedup();
+        roles
     }
 
     /// Matches `hint` against a real model id, then a role name — see
@@ -305,7 +413,16 @@ impl Coordinator {
         let mut guard = self.active.lock().await;
 
         if let Some(active) = guard.as_mut() {
-            if active.entry_name == entry.name {
+            // The same profile, or a different one this process already
+            // serves: `serves_same_process_as` is true exactly when the only
+            // difference is the role, which travels per request instead
+            // (`proxy::ROLE_HEADER`). Restarting for that would reload the
+            // identical model file and throw away every cached prefix with
+            // the old process.
+            let running = active.entry_name.clone();
+            if active.entry_name == entry.name
+                || active.entry_at_start.serves_same_process_as(entry)
+            {
                 // Already the active model — but confirm the process is
                 // still alive; a crashed backend must be restarted rather
                 // than silently proxied into.
@@ -320,14 +437,13 @@ impl Coordinator {
                         // message `orangu-server` already printed.
                         if is_device_lost_exit(&status) {
                             eprintln!(
-                                "'{}' exited after losing its GPU device (a driver reset); \
-                                 restarting it on a fresh device",
-                                entry.name
+                                "'{running}' exited after losing its GPU device (a driver \
+                                 reset); restarting it on a fresh device"
                             );
                         } else {
                             eprintln!(
-                                "warning: '{}' exited unexpectedly while active (status: {status}){}",
-                                entry.name,
+                                "warning: '{running}' exited unexpectedly while active \
+                                 (status: {status}){}",
                                 format_output_tail(&active.tail).await
                             );
                         }
@@ -342,14 +458,119 @@ impl Coordinator {
             Self::stop(guard.take().expect("checked above")).await;
         }
 
+        // Before starting one, see what is already on the address — starting
+        // a second server there cannot bind, so it would load a model for
+        // nothing and exit, leaving the coordinator talking to a process it
+        // does not think it has.
+        //
+        // An `orangu-server` on this address is under this coordinator's
+        // management whoever started it: the address is the coordinator's by
+        // configuration, and the only question is whether the server there is
+        // already doing the job.
+        if let Some(occupant) = self.occupant(entry).await {
+            if occupant.serves(entry) {
+                if !self.quiet {
+                    println!(
+                        "adopting the orangu-server already serving '{}' at {} (process {})",
+                        entry.name,
+                        entry.origin(),
+                        occupant.pid
+                    );
+                }
+                self.current_pid.store(occupant.pid, Ordering::Relaxed);
+                *guard = Some(ActiveProcess {
+                    entry_name: entry.name.clone(),
+                    entry_at_start: entry.clone(),
+                    child: ServerHandle::Adopted { pid: occupant.pid },
+                    // Nothing was captured from a process this one did not
+                    // start; its output belongs to whoever did.
+                    tail: Arc::new(Mutex::new(VecDeque::new())),
+                });
+                return Ok(entry.origin());
+            }
+            // Serving something else. This is a *swap*, and the fact that
+            // this coordinator did not start the incumbent changes nothing
+            // about it: the same act is already performed on every adopted
+            // server whose profile is swapped away from. Refusing it instead
+            // — which this used to do — left a leftover from an earlier run
+            // able to block every profile indefinitely, with the operator
+            // told to go and find it by hand.
+            //
+            // Only against a pid the kernel agrees is an `orangu-server`.
+            // Everything else falls through to the start below, which reports
+            // the address as taken rather than signalling a stranger.
+            if pid_is_orangu_server(occupant.pid) {
+                if !self.quiet {
+                    println!(
+                        "taking {} for '{}': process {} is serving {} in {} mode, which this profile \
+                     does not ask for",
+                        entry.origin(),
+                        entry.name,
+                        occupant.pid,
+                        occupant.model,
+                        occupant.role,
+                    );
+                }
+                Self::stop(ActiveProcess {
+                    entry_name: format!("(unmanaged, process {})", occupant.pid),
+                    entry_at_start: entry.clone(),
+                    child: ServerHandle::Adopted { pid: occupant.pid },
+                    tail: Arc::new(Mutex::new(VecDeque::new())),
+                })
+                .await;
+            }
+        }
+
         let (child, tail) = self.start(entry).await?;
         *guard = Some(ActiveProcess {
             entry_name: entry.name.clone(),
             entry_at_start: entry.clone(),
-            child,
+            child: ServerHandle::Spawned(child),
             tail,
         });
         Ok(entry.origin())
+    }
+
+    /// What is already listening at `entry`'s address, when it is an
+    /// `orangu-server` that can be identified — `None` for an empty address,
+    /// and for anything that cannot say what it is.
+    ///
+    /// The distinction that matters is *identifiable*, not *ours*. A server
+    /// this coordinator did not start is still an `orangu-server` on an
+    /// address this coordinator is configured to own, and what to do about it
+    /// follows from what it is serving, not from who started it. Something
+    /// that answers neither `/props` nor `/health` — a different program, or
+    /// one whose `api_key` locks this coordinator out — is not identifiable
+    /// and is never touched.
+    async fn occupant(&self, entry: &CoordinatorLlmEntry) -> Option<Occupant> {
+        let origin = entry.origin();
+        let props: serde_json::Value = self
+            .http_client
+            .get(format!("{origin}/props"))
+            .timeout(HEALTH_CHECK_TIMEOUT)
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let pid = self
+            .http_client
+            .get(format!("{origin}/health"))
+            .timeout(HEALTH_CHECK_TIMEOUT)
+            .send()
+            .await
+            .ok()?
+            .json::<serde_json::Value>()
+            .await
+            .ok()?
+            .get("pid")?
+            .as_u64()? as u32;
+        Some(Occupant {
+            pid,
+            model: props.get("model")?.as_str()?.to_string(),
+            role: props.get("role")?.as_str()?.to_string(),
+        })
     }
 
     /// Makes sure `entry`'s `orangu-server` is *answering*, not merely
@@ -409,7 +630,7 @@ impl Coordinator {
         *guard = Some(ActiveProcess {
             entry_name: entry.name.clone(),
             entry_at_start: entry.clone(),
-            child,
+            child: ServerHandle::Spawned(child),
             tail,
         });
         Ok(entry.origin())
@@ -459,25 +680,56 @@ impl Coordinator {
         }
     }
 
-    async fn stop(mut active: ActiveProcess) {
-        #[cfg(unix)]
-        {
-            if let Some(pid) = active.child.id() {
-                kill_pid(pid);
+    async fn stop(active: ActiveProcess) {
+        match active.child {
+            ServerHandle::Spawned(mut child) => {
+                #[cfg(unix)]
+                {
+                    if let Some(pid) = child.id() {
+                        kill_pid(pid);
+                    }
+                    // Wait up to 5 seconds for graceful shutdown
+                    if tokio::time::timeout(Duration::from_secs(5), child.wait())
+                        .await
+                        .is_err()
+                    {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                }
             }
-            // Wait up to 5 seconds for graceful shutdown
-            if tokio::time::timeout(Duration::from_secs(5), active.child.wait())
-                .await
-                .is_err()
-            {
-                let _ = active.child.start_kill();
-                let _ = active.child.wait().await;
+            // Not this process's child, so there is nothing to reap and
+            // nothing to wait on: signal it and watch the pid instead.
+            //
+            // Stopped at all, rather than left alone, because the port is the
+            // coordinator's by configuration and a swap needs it. A profile
+            // whose server must not be touched belongs on its own `port`,
+            // where no swap will ever ask for it.
+            ServerHandle::Adopted { pid } => {
+                #[cfg(unix)]
+                {
+                    kill_pid(pid);
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    // SAFETY: signal 0 delivers nothing and only reports
+                    // whether the pid is still there.
+                    while unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+                        if Instant::now() >= deadline {
+                            // SAFETY: same call, with the signal that cannot
+                            // be caught or ignored.
+                            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+                #[cfg(not(unix))]
+                let _ = pid;
             }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = active.child.start_kill();
-            let _ = active.child.wait().await;
         }
     }
 
@@ -523,7 +775,8 @@ impl Coordinator {
         // the flag is the directory it is started in — the coordinator's own
         // working directory, inherited by the child. The coordinator has no
         // workspace of its own; it is a pass-through.
-        let mut child = Command::new(&program)
+        let mut command = Command::new(&program);
+        command
             .arg("--config")
             .arg(&server_config_path)
             .arg(role_flag)
@@ -531,15 +784,15 @@ impl Coordinator {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to start orangu-server for '{}' ({})",
-                    entry.name,
-                    program.display()
-                )
-            })?;
+            .kill_on_drop(true);
+        die_with_parent(&mut command);
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "failed to start orangu-server for '{}' ({})",
+                entry.name,
+                program.display()
+            )
+        })?;
 
         // Record the PID *before* the (possibly long) health-check wait
         // below, so a concurrent `shutdown` can always kill this process,
@@ -580,7 +833,11 @@ impl Coordinator {
     ) -> Result<()> {
         let startup_timeout = self.config.read().unwrap().startup_timeout_seconds;
         let deadline = Instant::now() + Duration::from_secs(startup_timeout);
-        let probe_url = format!("{}/v1/models", entry.origin());
+        // `/health`, not `/v1/models`: it is open on an authenticated server
+        // (so a `200` needs no key) and it names the process answering, which
+        // is the question this loop is actually asking. See `answering_pid`.
+        let probe_url = format!("{}/health", entry.origin());
+        let spawned_pid = child.id();
 
         loop {
             if let Ok(Some(status)) = child.try_wait() {
@@ -610,11 +867,35 @@ impl Coordinator {
                 .http_client
                 .get(&probe_url)
                 .timeout(HEALTH_CHECK_TIMEOUT);
-            // Any answer means the listener is up and serving, which is what
-            // "ready" means here — a `401` from an authenticated server is a
-            // server that started, not one that failed to.
-            if request.send().await.is_ok() {
-                return Ok(());
+            // An answer means *a* listener is up on that address. Whether it
+            // is the one just spawned is a different question, and it used to
+            // go unasked: a leftover `orangu-server` still holding the port
+            // answers instantly, so the coordinator called the swap done while
+            // its own child was still loading, recorded it as active, and
+            // proxied every request to a process it did not start — serving
+            // whatever model *that* one had. The child then failed to bind and
+            // exited, and the next request found it dead, restarted it, and
+            // did the whole thing again. Nothing in that loop is visible as an
+            // error; the model is simply not the one that was asked for.
+            if let Ok(response) = request.send().await {
+                match (answering_pid(response).await, spawned_pid) {
+                    // Someone else's listener. Retrying cannot help — the port
+                    // is taken by a process this coordinator does not manage —
+                    // so this is reported rather than waited out.
+                    (Some(answering), Some(spawned)) if answering != spawned => {
+                        return Err(anyhow!(
+                            "'{}' cannot serve {}: process {answering} is already listening there, \
+                             and it is not the orangu-server just started (process {spawned}). \
+                             Stop it — an orangu-server or orangu-coordinator left running from \
+                             earlier is the usual cause — or give this profile its own `port`.",
+                            entry.name,
+                            entry.origin(),
+                        ));
+                    }
+                    // Its own child, or a server too old to say (`pid` was
+                    // added alongside this check): ready, as before.
+                    _ => return Ok(()),
+                }
             }
 
             if Instant::now() >= deadline {
@@ -629,6 +910,65 @@ impl Coordinator {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
+}
+
+/// Asks the kernel to signal this child if the coordinator goes away, so an
+/// `orangu-server` can never outlive the process that owns its lifecycle.
+///
+/// `kill_on_drop` and the shutdown path cover every exit the coordinator gets
+/// to *run*. They cover nothing about a `SIGKILL`, and what they leave behind
+/// is the worst kind of leftover: a server still holding the port, still
+/// answering, and belonging to nobody — so the next coordinator's children
+/// cannot bind, exit, and are replaced forever while requests are served by
+/// the ghost with whatever model it happened to have.
+///
+/// `PR_SET_PDEATHSIG` is per-child and set between fork and exec, so it says
+/// nothing about a server started by hand: only one spawned here dies with its
+/// parent. The `getppid` re-check closes the one race in it — a parent that
+/// died in the window before the `prctl` would otherwise never send anything.
+///
+/// A no-op where the kernel has no such facility; there the shutdown path is
+/// all there is, as before.
+#[cfg(target_os = "linux")]
+fn die_with_parent(command: &mut Command) {
+    let parent = std::process::id();
+    // SAFETY: async-signal-safe calls only (`prctl`, `getppid`, `_exit`), as
+    // required between `fork` and `exec`; no allocation, no locks.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                // Not fatal: the server still works, it just outlives a
+                // killed coordinator the way it always did.
+                return Ok(());
+            }
+            // Reparented before the `prctl` landed — the signal it asks for
+            // will never come, so leave now rather than become the ghost.
+            if libc::getppid() as u32 != parent {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn die_with_parent(_command: &mut Command) {}
+
+/// The `pid` a `GET /health` answer names, or `None` when the answer carries
+/// none — an older `orangu-server`, or something else entirely on that port.
+///
+/// `None` is deliberately not a failure. It cannot distinguish "an old build"
+/// from "a stranger", and refusing to start against the first would break an
+/// in-place upgrade for a check that exists to catch the second. The pid is
+/// what makes the strong statement; its absence leaves the old, weaker one.
+async fn answering_pid(response: reqwest::Response) -> Option<u32> {
+    response
+        .json::<serde_json::Value>()
+        .await
+        .ok()?
+        .get("pid")?
+        .as_u64()
+        .map(|pid| pid as u32)
 }
 
 /// Reads `stream` line by line for as long as the process keeps it open,
@@ -1230,6 +1570,222 @@ mod tests {
             "{message}"
         );
         assert!(message.contains("GGML_ASSERT failed"), "{message}");
+        std::fs::remove_file(&fake_bin).ok();
+    }
+
+    /// Answers `GET /health` with a pid that is not the caller's child — a
+    /// leftover `orangu-server` still holding the port, which is what this is
+    /// standing in for.
+    #[cfg(unix)]
+    async fn stranger_on_the_port(listener: tokio::net::TcpListener, pid: u32) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut scratch = [0u8; 1024];
+            let _ = stream.read(&mut scratch).await;
+            let body = format!("{{\"status\":\"ok\",\"pid\":{pid}}}");
+            let _ = stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        }
+    }
+
+    /// A stand-in `orangu-server`: answers `/props` with `model` and `role`,
+    /// and `/health` with `pid`. Everything else gets `404`, which is what a
+    /// coordinator asking anything else would deserve here.
+    #[cfg(unix)]
+    async fn standin_server(
+        listener: tokio::net::TcpListener,
+        model: String,
+        role: String,
+        pid: u32,
+    ) {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut scratch = [0u8; 1024];
+            let read = stream.read(&mut scratch).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&scratch[..read]).to_string();
+            let body = if request.contains("/props") {
+                format!("{{\"model\":\"{model}\",\"role\":\"{role}\"}}")
+            } else if request.contains("/health") {
+                format!("{{\"status\":\"ok\",\"pid\":{pid}}}")
+            } else {
+                "{}".to_string()
+            };
+            let _ = stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        }
+    }
+
+    /// A server already serving what a profile asks for is used, not competed
+    /// with.
+    ///
+    /// Starting a second one on the same address cannot work — it fails to
+    /// bind after loading a whole model — so the only question is whether the
+    /// coordinator finds that out by trying or by looking first. The marker
+    /// file is what makes "did not try" checkable: the stand-in binary writes
+    /// it when invoked, and adoption means it never is.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_server_already_serving_this_profile_is_adopted_rather_than_restarted() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(standin_server(
+            listener,
+            "org/gemma".to_string(),
+            // Not the profile's own role: `all` and `code` are one process,
+            // and adoption has to know that or it restarts for nothing.
+            "all".to_string(),
+            4242,
+        ));
+
+        let marker = std::env::temp_dir().join(format!("orangu-adopt-{}", std::process::id()));
+        std::fs::remove_file(&marker).ok();
+        // Two profiles on one model and one port, which is the shape this is
+        // about: `all` is required as the fallback, and `code` is what the
+        // request resolves to.
+        let config = minimal_config(
+            "startup_timeout = 5",
+            &format!(
+                "[main]\nrole = all\nmodel = org/gemma\nport = {port}\n\
+                 [coder]\nrole = code\nmodel = org/gemma\nport = {port}\n"
+            ),
+        );
+        let fake_bin = fake_server_script(&format!("touch {}; sleep 30", marker.display()));
+        let coordinator = Coordinator::new(config, true, Some(fake_bin.clone())).unwrap();
+        let entry = coordinator.resolve_entry(Some("code"), None).await.clone();
+        assert_eq!(
+            entry.role, "code",
+            "the request resolved to the code profile"
+        );
+
+        let origin = coordinator.ensure_active(&entry).await.unwrap();
+        assert_eq!(origin, entry.origin());
+        assert!(
+            !marker.exists(),
+            "the coordinator started a second orangu-server for a profile already being served"
+        );
+
+        std::fs::remove_file(&fake_bin).ok();
+        std::fs::remove_file(&marker).ok();
+    }
+
+    /// A server on the profile's address that is *not* serving it has the
+    /// address taken from it, rather than being reported as an obstacle.
+    ///
+    /// The same act as swapping away from an adopted server, and refusing it
+    /// on the grounds that this coordinator did not start the incumbent is
+    /// what left a leftover from an earlier run able to block every profile
+    /// indefinitely.
+    ///
+    /// The incumbent here is a real child process whose pid the stand-in
+    /// reports, because the takeover signals that pid — a fabricated one would
+    /// have this test signalling a stranger.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_server_serving_something_else_has_the_address_taken_from_it() {
+        // `pid_is_orangu_server` is what gates the takeover, and it reads
+        // `/proc`; on a platform without one there is nothing to assert.
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        // Named `orangu-server` so the kernel agrees it is one — the guard is
+        // there so a `/health` answer cannot nominate an arbitrary victim.
+        let incumbent_bin = fake_server_script("sleep 30");
+        let renamed = incumbent_bin.with_file_name("orangu-server");
+        std::fs::rename(&incumbent_bin, &renamed).unwrap();
+        let mut incumbent = std::process::Command::new(&renamed).spawn().unwrap();
+        let pid = incumbent.id();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(standin_server(
+            listener,
+            "org/something-else".to_string(),
+            "all".to_string(),
+            pid,
+        ));
+
+        let config = minimal_config(
+            "startup_timeout = 5",
+            &format!("[main]\nrole = all\nmodel = org/gemma\nport = {port}\n"),
+        );
+        let fake_bin = fake_server_script("sleep 30");
+        let coordinator = Coordinator::new(config, true, Some(fake_bin.clone())).unwrap();
+        let entry = coordinator.resolve_entry(None, None).await.clone();
+
+        // Whether the *start* then succeeds is not what this is about — the
+        // stand-in is still holding the socket, which no real incumbent would
+        // be once stopped.
+        let _ = coordinator.ensure_active(&entry).await;
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stopped = loop {
+            match incumbent.try_wait() {
+                Ok(Some(_)) => break true,
+                _ if Instant::now() >= deadline => break false,
+                _ => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        };
+        let _ = incumbent.kill();
+        std::fs::remove_file(&renamed).ok();
+        std::fs::remove_file(&fake_bin).ok();
+        assert!(
+            stopped,
+            "the server holding this profile's address was left running"
+        );
+    }
+
+    /// A port already held by something else must not read as "the child I
+    /// just started is up".
+    ///
+    /// It did, and the consequence was not a failed start but a *silent wrong
+    /// answer*: the health probe was satisfied by the leftover, the swap was
+    /// recorded as done, and every request went to a process the coordinator
+    /// never started — serving whatever model that one had loaded. The child
+    /// meanwhile failed to bind and exited, so the next request found it dead
+    /// and started the whole cycle again, one model load at a time, forever.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_stranger_holding_the_port_is_reported_not_mistaken_for_the_child() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // A pid no child of this test can have.
+        tokio::spawn(stranger_on_the_port(listener, u32::MAX));
+
+        let config = minimal_config(
+            "startup_timeout = 5",
+            &format!("[main]\nrole = all\nmodel = org/gemma\nport = {port}\n"),
+        );
+        // Alive and quiet: it never binds, exactly like a real server whose
+        // own bind failed would be during the window this races.
+        let fake_bin = fake_server_script("sleep 30");
+        let coordinator = Coordinator::new(config, true, Some(fake_bin.clone())).unwrap();
+        let entry = coordinator.resolve_entry(None, None).await.clone();
+
+        let err = coordinator.ensure_active(&entry).await.unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("is already listening there"),
+            "the leftover has to be named as the problem: {message}"
+        );
+        assert!(
+            message.contains(&u32::MAX.to_string()),
+            "and named by pid, so it can be found and stopped: {message}"
+        );
         std::fs::remove_file(&fake_bin).ok();
     }
 

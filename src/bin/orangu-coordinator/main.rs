@@ -342,7 +342,7 @@ async fn run(
     let shutdown_coordinator = coordinator.clone();
     let result = tokio::select! {
         result = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()) => result.context("server error"),
-        _ = tokio::signal::ctrl_c() => {
+        _ = terminated() => {
             if !args.quiet {
                 println!("shutting down...");
             }
@@ -358,6 +358,36 @@ async fn run(
 
     shutdown_coordinator.shutdown().await;
     result
+}
+
+/// Resolves when this process is asked to stop — `Ctrl+C` anywhere, and
+/// `SIGTERM` as well on Unix.
+///
+/// `SIGTERM` is what `kill` sends by default, what a service manager sends,
+/// and what a closing terminal leads to. Waiting only on `Ctrl+C` meant every
+/// one of those killed the coordinator *without* running the shutdown that
+/// stops its `orangu-server` — and a server that outlives its coordinator goes
+/// on holding the port, so the next coordinator's children cannot bind and are
+/// restarted forever while requests are answered by the leftover.
+async fn terminated() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        // A handler that cannot be installed is not a reason to refuse to
+        // run: fall back to `Ctrl+C` alone, which is where this started.
+        let Ok(mut term) = signal(SignalKind::terminate()) else {
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = term.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 #[cfg(test)]

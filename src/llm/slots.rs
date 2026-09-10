@@ -94,6 +94,24 @@ impl SlotRegistry {
         Some(slot)
     }
 
+    /// Forgets what `endpoint` reported, so the next assignment probes it
+    /// again — and hands out slot `0` until it has.
+    ///
+    /// Called when a server rejects a pinned slot as out of range, which is
+    /// the only authoritative statement about a slot count anyone gets:
+    /// `GET /props` carries no model, so behind an `orangu-coordinator` it
+    /// answers for whichever backend was active when it was asked, and a
+    /// count learned from one backend is simply wrong against another. The
+    /// rejection is the correction.
+    pub fn forget(&self, endpoint: &str) {
+        let mut registry = self.inner.lock().expect("slot registry lock poisoned");
+        if let Some(entry) = registry.get_mut(endpoint) {
+            entry.total_slots = None;
+            entry.unsupported = false;
+            entry.next_slot = 0;
+        }
+    }
+
     async fn total_slots(
         &self,
         client: &Client,
@@ -325,6 +343,36 @@ mod tests {
                 .await,
             SaveRestoreOutcome::Ok
         );
+    }
+
+    /// The correction a rejected slot forces. Behind a coordinator the count
+    /// learned from one backend is wrong against the next, and until this
+    /// existed a session that had learned a large one kept asking for slots
+    /// the serving process did not have — one failed request per session,
+    /// forever.
+    #[tokio::test]
+    async fn forgetting_an_endpoint_reprobes_and_restarts_the_rotation() {
+        let registry = SlotRegistry::default();
+        {
+            let mut inner = registry.inner.lock().unwrap();
+            let entry = inner.entry("http://x".to_string()).or_default();
+            entry.total_slots = Some(8);
+            entry.next_slot = 3;
+        }
+        let client = Client::new();
+        assert_eq!(
+            registry.assign_slot(&client, "http://x", None).await,
+            Some(3)
+        );
+
+        registry.forget("http://x");
+        {
+            let inner = registry.inner.lock().unwrap();
+            let entry = inner.get("http://x").expect("entry kept");
+            assert_eq!(entry.total_slots, None, "the count is re-probed");
+            assert_eq!(entry.next_slot, 0, "and the rotation starts over");
+            assert!(!entry.unsupported, "a rejection is not 'no slots at all'");
+        }
     }
 
     #[tokio::test]

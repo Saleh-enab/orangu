@@ -64,13 +64,14 @@ use layouts::{
     argmax_bind_group_layout, argmax_split_bind_group_layout, attn_bind_group_layout,
     attn_paged_bind_group_layout, bind_group_layout, elem2_bind_group_layout,
     elem3_bind_group_layout, elem4_bind_group_layout, elem5_bind_group_layout,
+    kv_epilogue_bind_group_layout, norm_pair_bind_group_layout,
 };
 use pipeline_cache::{pipeline_cache_file_path, save_pipeline_cache};
 // `RopeYarn` and `rope_layout_code` keep their `vulkan::` path: four
 // architectures name them, and a move must not rewrite call sites.
 use meta::{
     ArgmaxSampleResources, ArgmaxSplitMeta, AttnMeta, AttnReduceMeta, AttnSplitMeta, ElemMeta,
-    FusedNormRopeMeta, Meta, PerHeadNormMeta, RopeMeta, SampleMeta,
+    FusedNormRopeMeta, KvEpilogueMeta, Meta, PerHeadNormMeta, RopeMeta, SampleMeta, TopkResources,
 };
 pub use meta::{RopeYarn, rope_layout_code};
 
@@ -461,6 +462,7 @@ impl ScratchArena {
 /// `ScratchArena` chunk (`CachedOpResources::x_src`/`output_src`). The
 /// `From` impl below lets every existing whole-buffer call site keep
 /// passing a bare `&wgpu::Buffer` with no changes.
+#[derive(Clone, Copy)]
 enum BindSrc<'a> {
     Whole(&'a wgpu::Buffer),
     Slice(&'a wgpu::Buffer, u64, u64),
@@ -503,6 +505,8 @@ pub struct VulkanBackend {
     /// best-fit: `map_read` maps the whole buffer, so a larger one would
     /// hand back more bytes than the caller asked for.
     readback_pool: std::sync::Mutex<HashMap<u64, Vec<wgpu::Buffer>>>,
+    /// Chunk-sized K/V readback stages ([`KvReadbackStage`]), at most two.
+    kv_stage_pool: std::sync::Mutex<Vec<wgpu::Buffer>>,
     bind_group_layout: wgpu::BindGroupLayout,
     /// The `IQ*` codebooks (`iq_grid_words`), uploaded once and bound at
     /// `@binding(4)` of every matmul bind group. ~15 KiB, device-resident
@@ -619,6 +623,10 @@ pub struct VulkanBackend {
     /// and bind groups across every decode token instead of allocating a
     /// fresh set each time.
     argmax_sample_cache: Mutex<HashMap<usize, ArgmaxSampleResources>>,
+    /// Per-slot resources of the per-layer-embedding projection
+    /// (`record_ple_projection`) — built on first use, keyed by the same
+    /// `batch_slot` every other per-slot cache here uses.
+    ple_projection_cache: Mutex<HashMap<usize, Arc<PleProjectionResources>>>,
     /// Backing store for every small per-op meta *uniform* buffer — packs
     /// them all offset-wise into one (or a few) large chunks instead of one
     /// BO per meta, so a decode submission's BO list — which the kernel
@@ -665,6 +673,9 @@ pub struct VulkanBackend {
     /// size, so [`Self::ffn_activation_pipeline`] selects between them and
     /// nothing else in a fused chain changes.
     silu_mul_pipeline: wgpu::ComputePipeline,
+    /// `vulkan_shaders::shader_source_sigmoid_gate` — attention's output
+    /// gated in place by the sigmoid of its own projection.
+    sigmoid_gate_pipeline: wgpu::ComputePipeline,
     /// `y[i] += bias[i % row]` — Qwen2's Q/K/V projection biases inside the
     /// fused chain (`shader_source_bias_add`).
     bias_add_pipeline: wgpu::ComputePipeline,
@@ -675,6 +686,15 @@ pub struct VulkanBackend {
     /// prefill chain — see `vulkan_shaders::RMSNORM_ROWS_SHADER_BODY`.
     rmsnorm_rows_pipeline: wgpu::ComputePipeline,
     rmsnorm_add_rows_pipeline: wgpu::ComputePipeline,
+    /// `rmsnorm_add_rows` with the per-layer output scale folded in — see
+    /// `vulkan_shaders::shader_source_rmsnorm_add_scale_rows`.
+    rmsnorm_add_scale_rows_pipeline: wgpu::ComputePipeline,
+    /// The row-strided norms on the wide kernel, taken for a row width that
+    /// is a multiple of four unless `ORANGU_NORM_WIDE=0` — see
+    /// `vulkan_shaders::shader_source_rmsnorm_wide_shaped`.
+    rmsnorm_rows_wide_pipeline: wgpu::ComputePipeline,
+    rmsnorm_add_rows_wide_pipeline: wgpu::ComputePipeline,
+    rmsnorm_add_scale_rows_wide_pipeline: wgpu::ComputePipeline,
     /// Bind group layout for `rmsnorm_add_pipeline` — see
     /// `elem5_bind_group_layout`.
     elem5_bind_group_layout: wgpu::BindGroupLayout,
@@ -691,6 +711,32 @@ pub struct VulkanBackend {
     /// post-projection norm (`build_ple_resources`); gated by
     /// `ORANGU_NO_FUSED_SCALE`.
     rmsnorm_add_scale_pipeline: NormPipelines,
+    /// The wide forms of the three whole-row norms above — `vec4`, straight-
+    /// line loads, one workgroup of `NORM_WIDE_WG` — taken for any row width
+    /// that is a multiple of four unless `ORANGU_NORM_WIDE=0`. See
+    /// `vulkan_shaders::shader_source_rmsnorm_wide_kind`.
+    rmsnorm_wide_pipeline: wgpu::ComputePipeline,
+    rmsnorm_add_wide_pipeline: wgpu::ComputePipeline,
+    rmsnorm_add_scale_wide_pipeline: wgpu::ComputePipeline,
+    /// Whether the wide norms are in use (`ORANGU_NORM_WIDE`, on by default).
+    norm_wide: bool,
+    /// The per-head norm+RoPE with the head loaded straight-line
+    /// (`vulkan_shaders::shader_source_head_norm_rope_wide`), and the
+    /// one-dispatch key/value epilogue that folds K's norm+RoPE, V's norm and
+    /// both mirror writes together (`shader_source_kv_epilogue`; `None` for a
+    /// `q8_0` mirror). Both replace their rolled counterparts on every head
+    /// up to `HEAD_WIDE_MAX_DIM` wide unless `ORANGU_HEAD_WIDE=0`.
+    head_norm_rope_wide_pipeline: wgpu::ComputePipeline,
+    kv_epilogue_pipeline: Option<wgpu::ComputePipeline>,
+    kv_epilogue_bind_group_layout: wgpu::BindGroupLayout,
+    head_wide: bool,
+    /// The attention post-norm+residual and the FFN norm that reads its
+    /// result as one dispatch (`vulkan_shaders::
+    /// shader_source_rmsnorm_add_norm_wide`); taken wherever the wide norms
+    /// are unless `ORANGU_NORM_PAIRS=0`.
+    rmsnorm_add_norm_wide_pipeline: wgpu::ComputePipeline,
+    norm_pair_bind_group_layout: wgpu::BindGroupLayout,
+    norm_pairs: bool,
     /// Every buffer/bind group `fused_post_attention` needs *except* the
     /// three that genuinely change contents every call (`wo`'s own
     /// `x_buffer`, already covered by `op_cache`; the residual snapshot;
@@ -742,19 +788,20 @@ pub struct VulkanBackend {
     /// norms, RoPE, the KV-cache write and attention, with nothing in between
     /// reaching the CPU.
     ///
-    /// **Off by default; opt in with `ORANGU_PREFILL_FUSED_ATTN`.** It was
-    /// briefly defaulted on, on the strength of measurements that turned out to
-    /// have been taken against a prefill that computed only a fraction of its
-    /// output (see `CachedOpResources::n_tokens` for that bug). Re-measured
-    /// against correct output it is a **loss** on a short prompt (~-10% at 158
-    /// tokens) and roughly a wash on a long one (~+4% at 1120, inside the
-    /// spread) — so the transfers it removes do not currently pay for the work
-    /// it adds. Kept because the structure is right and correctness-verified;
-    /// what it needs is a reason to be faster, not another default flip. It
-    /// declines (returns
-    /// `None`, and the caller falls back) under `ORANGU_Q4K_MMVQ` and for a
-    /// non-causal batch that would have to be striped — see its own doc
-    /// comment for why that case is unsafe to stripe.
+    /// **On by default; `ORANGU_PREFILL_FUSED_ATTN=0` turns it off.** It was
+    /// off for a while: first defaulted on from measurements taken against a
+    /// prefill that computed only a fraction of its output (see
+    /// `CachedOpResources::n_tokens` for that bug), then re-measured as a loss
+    /// and parked. Under the paged pool it could not run at all — a layer
+    /// reading a donor's cache asked the pool for pages from the donor's
+    /// already-advanced `len`, outgrew the sequence's block table, and fell
+    /// into the mirror path's assertion (`record_attention_prefill` now asks
+    /// from the batch's own position). Fixed and measured with the per-dispatch
+    /// device stamps: 163/176/182 → 202/222/262 tok/s at 128/512/2048 tokens,
+    /// output byte-identical. It declines (returns `None`, and the caller falls
+    /// back) under `ORANGU_Q4K_MMVQ` and for a non-causal batch that would have
+    /// to be striped — see its own doc comment for why that case is unsafe to
+    /// stripe.
     prefill_fused_attn: bool,
     /// Whether the prefill attention dispatch shares each KV head's reads
     /// across the query heads that use it (`vulkan_shaders::
@@ -899,6 +946,17 @@ pub struct VulkanBackend {
     /// per MMVQ op (quantize activation → q8 in one pass, then dp4a matmul).
     q8_quantize_pipeline: Option<wgpu::ComputePipeline>,
     q4_k_mmvq_fused_pipeline: Option<wgpu::ComputePipeline>,
+    /// The prefill's integer-dot `Q4_K` GEMM and its row quantizer
+    /// (`vulkan_shaders::shader_source_mmq_q4k`, `shader_source_quantize_q8_rows`),
+    /// taken for a `Q4_K` projection of a batch that fits its tile unless
+    /// `ORANGU_PREFILL_MMQ=0`.
+    mmq_q4k_pipeline: Option<wgpu::ComputePipeline>,
+    mmq_q6k_pipeline: Option<wgpu::ComputePipeline>,
+    quantize_q8_rows_pipeline: Option<wgpu::ComputePipeline>,
+    /// Whether the integer-dot GEMM is built on this device: the flag, or
+    /// where it is unset, the driver's own word that the packed dot is a
+    /// native instruction (`vulkan_replay::integer_dot_accelerated`).
+    prefill_mmq: bool,
     /// The reduce
     /// kernel's `f32`-dequant + `f32`-dot inner loop, replaced with a
     /// `Q4_K`-only packed `vec2<f16>` dot —
@@ -979,6 +1037,11 @@ pub struct VulkanBackend {
     /// restores the element-wise `reduce` for these types — the control for
     /// its measurement.
     block_hoisted_pipelines: HashMap<u32, wgpu::ComputePipeline>,
+    /// The `vec4`, loads-in-flight decode matvec for the float weight types
+    /// (`vulkan_shaders::shader_source_reduce_float_wide`), taken ahead of
+    /// the generic `reduce` for `F32`/`F16` at decode. Opt out with
+    /// `ORANGU_NO_FLOAT_WIDE=1`, the control for its measurement.
+    float_wide_pipelines: HashMap<u32, wgpu::ComputePipeline>,
     /// `Q4_K` block-unroll combined with the packed-`f16` dot
     /// (`vulkan_shaders::shader_source_reduce_q4k_wide_unroll_packed_f16`).
     /// `Some` only when `wide_unroll` **and**
@@ -1168,6 +1231,11 @@ pub struct VulkanBackend {
     /// Phase 3 of `Self::record_argmax_sample` — merges the split phase's
     /// partial winners, `vulkan_shaders::ARGMAX_REDUCE_SHADER_BODY`.
     argmax_reduce_pipeline: wgpu::ComputePipeline,
+    /// The two phases of `Self::record_topk_sample` — a sampled decode
+    /// step's device top-k, `vulkan_shaders::TOPK_SPLIT_SHADER` and
+    /// `TOPK_REDUCE_SHADER_BODY`.
+    topk_split_pipeline: wgpu::ComputePipeline,
+    topk_reduce_pipeline: wgpu::ComputePipeline,
     /// GPU-resident greedy sampling. `record_argmax_sample`'s reduction
     /// is now a genuine two-level reduction — `ARGMAX_SPLIT_N` workgroups
     /// finding partial winners in parallel, then one small merge pass —
@@ -1205,12 +1273,19 @@ pub struct VulkanBackend {
     /// K traffic that otherwise dominates attention as the KV range grows —
     /// see `Self::try_init`'s construction-site comment.
     flash_attn: bool,
-    /// Whether `Backend::matmul` routes `Q4_K` through the **MMVQ** integer-dot
-    /// kernel (`shader_source_reduce_q4k_mmvq`) instead of the float dual
-    /// kernel. **Opt-in (`ORANGU_Q4K_MMVQ=1`), off by default.** Currently wired
-    /// only into the standalone (uncached) `matmul` path used by the cross-check
-    /// tests and shaderstats; the fused GPU-resident decode path still uses the
-    /// dual kernel (fused integration + q8-activation reuse is separate work).
+    /// Whether `Q4_K` matmuls route through the **MMVQ** integer-dot kernel
+    /// (`shader_source_reduce_q4k_mmvq`) — a q8 quantize of the activation
+    /// followed by an integer dot — instead of the float light kernel.
+    /// **Opt-in (`ORANGU_Q4K_MMVQ=1`), off by default**, and wired through the
+    /// whole fused decode path (Q/K/V, wo, gate/up/down, PLE), with the
+    /// activation quantized once per layer and shared (`SharedQ8`).
+    ///
+    /// Off because it measured **four times slower** in the fused decode on
+    /// the backend it was tried on — 11.8 against 46 tok/s, alternating arms
+    /// — not because it is unfinished. The quantize passes sit between the
+    /// matmul passes as pipeline barriers, and the kernel's one-workgroup-per-
+    /// row geometry is the shape the light kernel was written to escape.
+    /// Kept as a sweep arm.
     q4_k_mmvq: bool,
     /// Whether `attn_split_pipeline_for` builds the **GQA-grouped** split-k
     /// phase-1 kernel (`shader_source_attention_split_gqa`), and the dispatch
@@ -1287,9 +1362,96 @@ pub struct VulkanBackend {
     /// model, so the layer count this needs to be sized to never changes
     /// after the first call.
     timestamps: Mutex<Option<TimestampQueries>>,
+    /// Per-dispatch device timing of a decode step
+    /// (`ORANGU_GPU_TIMESTAMPS=ops`) — see [`OpTimer`]. `None` unless asked
+    /// for and the adapter can stamp inside a pass.
+    op_timer: Option<Mutex<OpTimer>>,
+}
+
+/// Per-dispatch GPU timestamps for one decode step — the instrument that
+/// separates a matvec kernel from the elementwise dispatches and pass
+/// boundaries around it, which the per-stage brackets (`TimestampQueries`)
+/// cannot: a stage is a sum, and a sum that is twice the kernels it holds
+/// says nothing about where the other half went.
+///
+/// Every recording site that matters calls [`VulkanBackend::op_stamp`] right
+/// after its dispatch, naming it; the delta from the previous stamp is that
+/// dispatch's cost *as paid* — its own execution plus whatever barrier or
+/// pass boundary the driver put in front of it, which is the number a
+/// scheduling decision needs. Aggregated per label over the step and printed
+/// by [`VulkanBackend::report_op_step`]. Opt-in (`ORANGU_GPU_TIMESTAMPS=ops`)
+/// because every stamp is a small command of its own.
+struct OpTimer {
+    query_set: wgpu::QuerySet,
+    resolve_buffer: wgpu::Buffer,
+    readback_buffer: wgpu::Buffer,
+    capacity: u32,
+    /// The label of every stamp written this step, in slot order; slot 0 is
+    /// the step start.
+    labels: Vec<&'static str>,
+    /// Whether a step overflowed `capacity` — reported once, not per stamp.
+    overflowed: bool,
+    /// The last tick of the previous step, so the gap between two steps —
+    /// the device idle between one token's last dispatch and the next
+    /// token's first — is reported too. That gap is where the host's turn
+    /// (readback, sampling, recording, submission) shows on the device.
+    prev_end: Option<u64>,
+}
+
+impl OpTimer {
+    /// Stamps one step can hold — `wgpu`'s ceiling for one query set. A
+    /// layer is a few dozen dispatches, so this covers a hundred-odd layers;
+    /// a step past it reports as overflowed rather than failing.
+    const CAPACITY: u32 = 4096;
 }
 
 thread_local! {
+    /// A command encoder the prefill chains record into instead of each
+    /// submitting its own, while the thread holds a submission group open
+    /// (`begin_prefill_group`/`end_prefill_group`). Every chain takes it out,
+    /// appends, and parks it again; a chain that has to read back submits
+    /// it in the process, and the group's end submits whatever is left. The
+    /// point is fewer submissions: each one costs the host over a
+    /// millisecond of driver validation and leaves the device idle for
+    /// about as long, and a layer used to make three.
+    ///
+    /// **Per thread**, because a group is one pass's: two slots prefilling
+    /// at once (or one prefilling while a batched decode step runs) each
+    /// record their own chain, and a slot shared between them lost commands
+    /// — one thread's park overwrote the other's encoder — and submitted
+    /// what was left out of order.
+    static PREFILL_ENCODER: std::cell::RefCell<Option<wgpu::CommandEncoder>> =
+        const { std::cell::RefCell::new(None) };
+    /// Set by a test that compares a fused chain against its unfused
+    /// float sequence bit for bit: the integer-dot GEMM is a different
+    /// arithmetic (8-bit activations), and on this module's random test
+    /// weights — whose scales drive projections to where a GELU is a step
+    /// — a last-bit difference becomes a large one. The chains run on the
+    /// calling thread, so this reaches exactly the test that set it.
+    static MMQ_OFF_ON_THIS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// This thread's recycled scratch buffers, by byte size, and the ones
+    /// out on loan to the current lease — see [`VulkanBackend::scratch_lease`].
+    ///
+    /// The prefill chains create a dozen device-side scratch buffers per
+    /// layer (the residual after attention, the normed rows, the quantized
+    /// activations, attention's output…) and drop them at the end of the
+    /// call. Dropped is not freed: a buffer lives until the device has
+    /// executed everything recorded against it, and once the chains stopped
+    /// waiting per layer, a whole chunk's worth stayed alive at once —
+    /// enough on a model near the card's limit to have the allocator open
+    /// new blocks and the card page, which cost more than the waits had.
+    /// Reusing a buffer across layers is safe by queue order alone: a
+    /// later layer's writes are recorded after the earlier layer's reads,
+    /// and nothing on the host ever reads these. **Per thread** for the
+    /// same reason the encoder above is — a second thread's chain would
+    /// otherwise be ordered against this one's parked, unsubmitted work.
+    static SCRATCH_POOL: std::cell::RefCell<ScratchPool> = const {
+        std::cell::RefCell::new(ScratchPool {
+            free: Vec::new(),
+            leased: None,
+            bytes: 0,
+        })
+    };
     /// Per-thread capture sink for the raw-Vulkan decode-replay path.
     /// When `Some`, the fused decode recording pushes a
     /// [`vulkan_replay::CaptureStep`] for every dispatch/copy it records
@@ -1388,6 +1550,116 @@ impl GpuTimings {
         })
     }
 }
+
+/// One compute pass carried across the recording functions of a fused
+/// layer, so that dispatches with no encoder-level command between them
+/// share a pass instead of each function opening its own.
+///
+/// A pass boundary is not free on the device: measured back to back with
+/// a whole-row norm, one dispatch per pass costs about twice what the same
+/// dispatches cost inside one pass, and a fused layer used to open around
+/// ten. Inside a pass the driver still orders dependent dispatches (a
+/// barrier between two that touch the same buffer), so the merge changes
+/// nothing about what a dispatch sees — only what it waits for.
+///
+/// `pass()` hands out the open pass, opening one if none is; `encoder()`
+/// closes it and hands out the encoder, for the copies and timestamp writes
+/// that cannot go inside a pass. The pass is detached from the encoder's
+/// borrow (`forget_lifetime`) so it can live in this struct; the cursor
+/// itself holds the encoder mutably for as long as it exists, which is what
+/// keeps the two from being used out of order.
+pub(crate) struct PassCursor<'e> {
+    encoder: &'e mut wgpu::CommandEncoder,
+    pass: Option<wgpu::ComputePass<'static>>,
+    /// `ORANGU_SPLIT_PASSES=1`: open a fresh pass at every `pass()` call —
+    /// each call site is where a pass used to begin, so this is the old
+    /// structure exactly, kept as the control arm of a sweep.
+    split: bool,
+}
+
+impl<'e> PassCursor<'e> {
+    pub(crate) fn new(encoder: &'e mut wgpu::CommandEncoder) -> Self {
+        static SPLIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        Self {
+            encoder,
+            pass: None,
+            split: *SPLIT.get_or_init(|| crate::engine::env::flag_on("ORANGU_SPLIT_PASSES")),
+        }
+    }
+
+    /// The open pass, opened now if there is none.
+    pub(crate) fn pass(&mut self) -> &mut wgpu::ComputePass<'static> {
+        if self.split {
+            self.pass = None;
+        }
+        if self.pass.is_none() {
+            let pass = self
+                .encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("orangu-server fused layer pass"),
+                    timestamp_writes: None,
+                })
+                .forget_lifetime();
+            self.pass = Some(pass);
+        }
+        self.pass.as_mut().expect("opened above")
+    }
+
+    /// Closes the pass, if one is open, and hands out the encoder.
+    pub(crate) fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
+        self.pass = None;
+        self.encoder
+    }
+}
+
+/// One slot's cached per-layer-embedding projection chain — every buffer,
+/// meta and bind group `VulkanBackend::record_ple_projection` used to
+/// create afresh each token. Only `gathered`'s contents change per token
+/// (rewritten with `write_buffer`); the projection's `x` is the layer-0
+/// input the caller already uploads. Building this per token cost six
+/// buffer creations and five bind groups on the host *before the step's
+/// first submission*, which is the one place host time is not hidden
+/// behind the device.
+struct PleProjectionResources {
+    total: usize,
+    per_layer: usize,
+    n_layer: usize,
+    scaled: wgpu::Buffer,
+    norm_w: wgpu::Buffer,
+    gathered: wgpu::Buffer,
+    summed: wgpu::Buffer,
+    final_buf: wgpu::Buffer,
+    meta_scale1: wgpu::Buffer,
+    norm_meta_buf: wgpu::Buffer,
+    meta_add: wgpu::Buffer,
+    meta_scale2: wgpu::Buffer,
+    bg_scale1: wgpu::BindGroup,
+    bg_norm: wgpu::BindGroup,
+    bg_add: wgpu::BindGroup,
+    bg_scale2: wgpu::BindGroup,
+}
+
+/// A bind group built over a buffer the *caller* named — the previous
+/// layer's output, attention's output, a slice of the per-layer-embedding
+/// projection — kept with the identity it was built for.
+///
+/// The cached resources of a fused layer bind their own arena buffers, and
+/// every per-call input used to be *copied* into one of those: four copies
+/// a layer, each a command outside any compute pass, so each also split the
+/// layer's pass. On the fused decode path the producer of every such input
+/// is itself a cached resource, so the buffer is the same one every token;
+/// a bind group built over it once is good for the rest of the process.
+/// The identity check is what keeps this honest: a different buffer or
+/// offset rebuilds, and a path that cannot name a device buffer (a CPU
+/// input, the replay capture) takes the copy as before.
+struct DirectInput {
+    buffer: wgpu::Buffer,
+    offset: u64,
+    bind_group: wgpu::BindGroup,
+}
+
+/// One cached [`DirectInput`] — `None` until first used.
+type DirectSlot = Mutex<Option<DirectInput>>;
 
 /// The query set + resolve/readback buffers `Self::timestamp_query_set`
 /// builds once and `Self::finish_timestamps`/`report_timestamps` write into
@@ -1597,6 +1869,14 @@ pub(crate) fn max_matmul_tokens_per_submission() -> usize {
     *MAX.get_or_init(|| {
         crate::engine::backend::max_multi_token_phase_tokens().max(COOP_MIN_N_TOKENS)
     })
+}
+
+/// How many rows a buffer holding a prefill's residual stream needs for
+/// `n_tokens`: the chains write every stripe padded (`padded_stripe_len`),
+/// and the last stripe's tail can reach the next full stripe width.
+pub fn prefill_rows_capacity(n_tokens: usize) -> usize {
+    let stripe = max_matmul_tokens_per_submission();
+    n_tokens.div_ceil(stripe) * stripe
 }
 
 /// The token width a prefill stripe is rounded **up** to, so that a whole
@@ -1959,6 +2239,49 @@ const READBACK_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// This is why a lost device used to show up as a backtrace through
 /// `wgpu_core::resource::Buffer::map_async`: the old callbacks called
 /// `.expect()` in place.
+/// See `SCRATCH_POOL`.
+struct ScratchPool {
+    /// Buffers nobody is using, newest last.
+    free: Vec<(u64, wgpu::Buffer)>,
+    /// Buffers handed out since the current lease began, `None` when no
+    /// lease is open (then `scratch_buffer` allocates and forgets, as it
+    /// always did).
+    leased: Option<Vec<(u64, wgpu::Buffer)>>,
+    /// Bytes in `free`, kept under [`SCRATCH_POOL_BYTES`].
+    bytes: u64,
+}
+
+/// The most a thread keeps in recycled scratch: one layer's worth at the
+/// widest stripe is well under this, and anything beyond it is evicted
+/// oldest first.
+const SCRATCH_POOL_BYTES: u64 = 192 << 20;
+
+/// While alive, every `scratch_buffer` on this thread comes from and
+/// returns to the thread's pool — one per prefill layer, opened by the
+/// architecture that drives the chains. Dropping it returns the buffers
+/// for the next layer's lease.
+pub struct ScratchLease {
+    _private: (),
+}
+
+impl Drop for ScratchLease {
+    fn drop(&mut self) {
+        SCRATCH_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if let Some(leased) = pool.leased.take() {
+                for (size, buffer) in leased {
+                    pool.bytes += size;
+                    pool.free.push((size, buffer));
+                }
+                while pool.bytes > SCRATCH_POOL_BYTES && !pool.free.is_empty() {
+                    let (size, _) = pool.free.remove(0);
+                    pool.bytes -= size;
+                }
+            }
+        });
+    }
+}
+
 #[derive(Default)]
 struct MapWait {
     /// Set once the callback has run, whatever it reported — the condition
@@ -2650,8 +2973,16 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             return usize::MAX;
         }
         // The dispatch is `div_ceil(64)` of `n_tokens * row_elems`, so the
-        // widest safe stripe is `limit * 64 / row_elems`, floored.
-        (limit.saturating_mul(64) / row_elems).max(1)
+        // widest safe stripe is `limit * 64 / row_elems`, floored — and
+        // floored again to a whole token tile, because a stripe is padded
+        // *up* to the next tile before it is dispatched: a bound that is
+        // not a tile multiple (255 at `n_ff = 16384`) padded to 256 exceeds
+        // itself, stripes again to 255, pads to 256, and never returns.
+        // That was a stack overflow on a 328-token prompt through the
+        // `muse-glimmer` chains.
+        let tile = (vulkan_shaders::coop_geom().tile_tokens() as usize).max(1);
+        let widest = limit.saturating_mul(64) / row_elems;
+        (widest / tile * tile).max(tile.min(widest)).max(1)
     }
 
     /// The largest single buffer this device will create, from its own
@@ -2772,18 +3103,92 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         StepTimestamps { set: Some(set) }
     }
 
+    /// Whether a row of `n_embd` takes the wide norm kernels — see
+    /// `Self::rmsnorm_wide_pipeline`.
+    fn norm_wide_for(&self, n_embd: usize) -> bool {
+        self.norm_wide && n_embd.is_multiple_of(4)
+    }
+
     /// The RMSNorm kernel for a row of `n_embd` — see [`norm_wg_for`].
     fn rmsnorm_for(&self, n_embd: usize) -> &wgpu::ComputePipeline {
+        if self.norm_wide_for(n_embd) {
+            return &self.rmsnorm_wide_pipeline;
+        }
         &self.rmsnorm_pipeline[norm_wg_index(n_embd)]
+    }
+
+    /// The row-strided norms for rows of `n_embd`, wide where the width allows.
+    fn rmsnorm_rows_for(&self, n_embd: usize) -> &wgpu::ComputePipeline {
+        if self.norm_wide_for(n_embd) {
+            return &self.rmsnorm_rows_wide_pipeline;
+        }
+        &self.rmsnorm_rows_pipeline
+    }
+
+    fn rmsnorm_add_rows_for(&self, n_embd: usize) -> &wgpu::ComputePipeline {
+        if self.norm_wide_for(n_embd) {
+            return &self.rmsnorm_add_rows_wide_pipeline;
+        }
+        &self.rmsnorm_add_rows_pipeline
+    }
+
+    fn rmsnorm_add_scale_rows_for(&self, n_embd: usize) -> &wgpu::ComputePipeline {
+        if self.norm_wide_for(n_embd) {
+            return &self.rmsnorm_add_scale_rows_wide_pipeline;
+        }
+        &self.rmsnorm_add_scale_rows_pipeline
     }
 
     /// The fused RMSNorm+add kernel for a row of `n_embd`.
     fn rmsnorm_add_for(&self, n_embd: usize) -> &wgpu::ComputePipeline {
+        if self.norm_wide_for(n_embd) {
+            return &self.rmsnorm_add_wide_pipeline;
+        }
         &self.rmsnorm_add_pipeline[norm_wg_index(n_embd)]
+    }
+
+    /// Whether a row of `n_embd` takes the norm-pair kernel — see
+    /// `Self::rmsnorm_add_norm_wide_pipeline`.
+    fn norm_pair_for(&self, n_embd: usize) -> bool {
+        self.norm_pairs && self.norm_wide_for(n_embd)
+    }
+
+    /// The norm-pair bind group: `x` (the `wo` output), `w1`, the residual,
+    /// `w2`, `y1` (the FFN residual), `y2` (the FFN norm's output), meta.
+    #[allow(clippy::too_many_arguments)]
+    fn norm_pair_bind_group(
+        &self,
+        x: BindSrc<'_>,
+        w1: &wgpu::Buffer,
+        residual: BindSrc<'_>,
+        w2: &wgpu::Buffer,
+        y1: BindSrc<'_>,
+        y2: BindSrc<'_>,
+        meta: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        fn entry(binding: u32, resource: wgpu::BindingResource<'_>) -> wgpu::BindGroupEntry<'_> {
+            wgpu::BindGroupEntry { binding, resource }
+        }
+        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("orangu-server norm pair bind group"),
+            layout: &self.norm_pair_bind_group_layout,
+            entries: &[
+                entry(0, x.resource()),
+                entry(1, w1.as_entire_binding()),
+                entry(2, residual.resource()),
+                entry(3, w2.as_entire_binding()),
+                entry(4, y1.resource()),
+                entry(5, y2.resource()),
+                entry(6, meta.as_entire_binding()),
+            ],
+        })
     }
 
     /// The fused RMSNorm+add+scale kernel for a row of `n_embd`.
     fn rmsnorm_add_scale_for(&self, n_embd: usize) -> &wgpu::ComputePipeline {
+        if self.norm_wide_for(n_embd) {
+            return &self.rmsnorm_add_scale_wide_pipeline;
+        }
         &self.rmsnorm_add_scale_pipeline[norm_wg_index(n_embd)]
     }
 
@@ -2916,6 +3321,10 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                 "q4_k_mmvq": self.q4_k_mmvq,
                 "q6_k_dual": self.q6_k_dual_pipeline.is_some(),
                 "packed_dot_f16": self.packed_dot_f16,
+                // Whether the prefill's integer-dot GEMM is built on this
+                // device — off where the driver does not accelerate the
+                // packed dot, which a split model's overflow device may not.
+                "prefill_mmq": self.prefill_mmq,
             },
             "tuning": {
                 "coop_min_n_tokens": self.coop_min_n_tokens,
@@ -3301,7 +3710,13 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             .features()
             .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
         let supports_timestamp_query = has_timestamp_query && has_timestamp_in_encoders;
-        let wants_timestamps = crate::engine::env::flag_on("ORANGU_GPU_TIMESTAMPS");
+        // `ops` is the per-dispatch timer (`OpTimer`) *instead of* the
+        // per-layer brackets: an encoder-level timestamp between two
+        // passes is not free, and the finer instrument already covers what
+        // the coarser one reports.
+        let wants_timestamps = crate::engine::env::flag_on("ORANGU_GPU_TIMESTAMPS")
+            && !std::env::var("ORANGU_GPU_TIMESTAMPS")
+                .is_ok_and(|v| v.trim().eq_ignore_ascii_case("ops"));
         // Say why, rather than accepting the flag and printing nothing. A
         // diagnostic that silently does nothing is worse than one that is
         // absent: it invites the reader to conclude the thing it measures
@@ -3360,6 +3775,15 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         if supports_timestamp_query {
             required_features |=
                 wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        }
+        // Stamping between the dispatches of one pass (`OpTimer`) is a
+        // third, separate capability.
+        let supports_timestamp_in_passes = supports_timestamp_query
+            && adapter
+                .features()
+                .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
+        if supports_timestamp_in_passes {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
         }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("orangu-server"),
@@ -3538,6 +3962,10 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             &elem4_pipeline_layout,
             vulkan_shaders::shader_source_silu_mul(),
         );
+        let sigmoid_gate_pipeline = build_elem_pipeline(
+            &elem3_pipeline_layout,
+            vulkan_shaders::shader_source_sigmoid_gate(),
+        );
         let bias_add_pipeline = build_elem_pipeline(
             &elem3_pipeline_layout,
             vulkan_shaders::shader_source_bias_add(),
@@ -3562,12 +3990,53 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             &elem5_pipeline_layout,
             vulkan_shaders::shader_source_rmsnorm_add_rows(),
         );
+        let rmsnorm_add_scale_rows_pipeline = build_elem_pipeline(
+            &elem5_pipeline_layout,
+            vulkan_shaders::shader_source_rmsnorm_add_scale_rows(),
+        );
+        let rmsnorm_rows_wide_pipeline = build_elem_pipeline(
+            &elem4_pipeline_layout,
+            vulkan_shaders::shader_source_rmsnorm_rows_wide(),
+        );
+        let rmsnorm_add_rows_wide_pipeline = build_elem_pipeline(
+            &elem5_pipeline_layout,
+            vulkan_shaders::shader_source_rmsnorm_add_rows_wide(),
+        );
+        let rmsnorm_add_scale_rows_wide_pipeline = build_elem_pipeline(
+            &elem5_pipeline_layout,
+            vulkan_shaders::shader_source_rmsnorm_add_scale_rows_wide(),
+        );
         let rmsnorm_add_scale_pipeline = NORM_WGS.map(|wg| {
             build_elem_pipeline(
                 &elem5_pipeline_layout,
                 vulkan_shaders::shader_source_rmsnorm_add_scale(subgroup_reduce, wg),
             )
         });
+        let rmsnorm_wide_pipeline = build_elem_pipeline(
+            &elem4_pipeline_layout,
+            vulkan_shaders::shader_source_rmsnorm_wide(),
+        );
+        let rmsnorm_add_wide_pipeline = build_elem_pipeline(
+            &elem5_pipeline_layout,
+            vulkan_shaders::shader_source_rmsnorm_add_wide(),
+        );
+        let rmsnorm_add_scale_wide_pipeline = build_elem_pipeline(
+            &elem5_pipeline_layout,
+            vulkan_shaders::shader_source_rmsnorm_add_scale_wide(),
+        );
+        let norm_wide = crate::engine::env::flag_on_unless_disabled("ORANGU_NORM_WIDE");
+        let norm_pair_bind_group_layout = norm_pair_bind_group_layout(&device);
+        let norm_pair_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("orangu-server norm pair pipeline layout"),
+                bind_group_layouts: &[Some(&norm_pair_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let rmsnorm_add_norm_wide_pipeline = build_elem_pipeline(
+            &norm_pair_pipeline_layout,
+            vulkan_shaders::shader_source_rmsnorm_add_norm_wide(),
+        );
+        let norm_pairs = crate::engine::env::flag_on_unless_disabled("ORANGU_NORM_PAIRS");
         let gelu_pipeline =
             build_elem_pipeline(&elem3_pipeline_layout, vulkan_shaders::shader_source_gelu());
         let scale_pipeline = build_elem_pipeline(
@@ -3647,6 +4116,20 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             &elem4_pipeline_layout,
             vulkan_shaders::shader_source_fused_norm_rope(),
         );
+        let head_norm_rope_wide_pipeline = build_elem_pipeline(
+            &elem4_pipeline_layout,
+            vulkan_shaders::shader_source_head_norm_rope_wide(),
+        );
+        let head_wide = crate::engine::env::flag_on_unless_disabled("ORANGU_HEAD_WIDE");
+        let kv_epilogue_bind_group_layout = kv_epilogue_bind_group_layout(&device);
+        let kv_epilogue_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("orangu-server kv epilogue pipeline layout"),
+                bind_group_layouts: &[Some(&kv_epilogue_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let kv_epilogue_pipeline = vulkan_shaders::shader_source_kv_epilogue(kv_storage)
+            .map(|source| build_elem_pipeline(&kv_epilogue_pipeline_layout, source));
 
         let elem2_bind_group_layout = elem2_bind_group_layout(&device);
         let elem2_pipeline_layout =
@@ -3703,6 +4186,35 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             build_pipeline(vulkan_shaders::shader_source_reduce_q4k_mmvq(
                 supports_subgroup,
             ))
+        });
+        // The prefill's integer-dot GEMM — the same `dot4I8Packed` builtin
+        // the decode MMVQ kernel uses. On by default only where the driver
+        // says the builtin is a native instruction: where it is not (an
+        // integrated GPU on this machine, say — a split model's overflow
+        // layers), the emulated dot loses to the float kernel by ~15% at a
+        // 128-token prefill, so that device keeps the float GEMM. An
+        // explicit `ORANGU_PREFILL_MMQ=1` overrides the property for the
+        // control arm of exactly that measurement.
+        let integer_dot_accelerated =
+            super::vulkan_replay::integer_dot_accelerated(&device).unwrap_or(false);
+        let prefill_mmq = match std::env::var("ORANGU_PREFILL_MMQ") {
+            Ok(_) => crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_MMQ"),
+            Err(_) => integer_dot_accelerated,
+        };
+        let mmq_q4k_pipeline =
+            prefill_mmq.then(|| build_pipeline(vulkan_shaders::shader_source_mmq_q4k()));
+        // The `Q6_K` form: 21% faster than the float kernel on the probe and
+        // ~3% on a prefill (its staging reads the 210-byte blocks a word at
+        // a time, half of them misaligned); `ORANGU_PREFILL_MMQ_Q6K=0` keeps
+        // that one projection on the float kernel.
+        let mmq_q6k_pipeline = (prefill_mmq
+            && crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_MMQ_Q6K"))
+        .then(|| build_pipeline(vulkan_shaders::shader_source_mmq_q6k()));
+        let quantize_q8_rows_pipeline = prefill_mmq.then(|| {
+            build_elem_pipeline(
+                &elem3_pipeline_layout,
+                vulkan_shaders::shader_source_quantize_q8_rows(),
+            )
         });
 
         // See
@@ -3776,6 +4288,24 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         // element-wise path it replaces for these types (same arithmetic in
         // the same order, one block header decode instead of `BLOCK_ELEMS`),
         // so there is no threshold to tune and nothing to gate on.
+        let float_wide_pipelines: HashMap<u32, wgpu::ComputePipeline> =
+            if !crate::engine::env::flag_on("ORANGU_NO_FLOAT_WIDE") {
+                [
+                    crate::engine::quant::GGML_TYPE_F32,
+                    crate::engine::quant::GGML_TYPE_F16,
+                ]
+                .into_iter()
+                .filter_map(|ggml_type| {
+                    let source = vulkan_shaders::shader_source_reduce_float_wide(
+                        ggml_type,
+                        subgroup_reduce,
+                    )?;
+                    Some((ggml_type, build_pipeline(source)))
+                })
+                .collect()
+            } else {
+                HashMap::new()
+            };
         let block_hoisted_pipelines: HashMap<u32, wgpu::ComputePipeline> =
             if !crate::engine::env::flag_on("ORANGU_NO_BLOCK_HOISTED") {
                 SUPPORTED_TYPES
@@ -3989,6 +4519,23 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             &elem4_pipeline_layout,
             vulkan_shaders::shader_source_argmax_reduce(),
         );
+        let topk_split_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("orangu-server topk split shader"),
+            source: wgpu::ShaderSource::Wgsl(vulkan_shaders::shader_source_topk_split().into()),
+        });
+        let topk_split_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("orangu-server topk split pipeline"),
+                layout: Some(&argmax_split_pipeline_layout),
+                module: &topk_split_module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: pipeline_cache.as_ref(),
+            });
+        let topk_reduce_pipeline = build_elem_pipeline(
+            &elem4_pipeline_layout,
+            vulkan_shaders::shader_source_topk_reduce(),
+        );
 
         // Persist whatever the driver accumulated across every
         // `build_pipeline`/`build_elem_pipeline`/`attn_pipeline` call
@@ -4009,6 +4556,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
 
         let mut backend = Self {
             readback_pool: std::sync::Mutex::new(HashMap::new()),
+            kv_stage_pool: std::sync::Mutex::new(Vec::new()),
             device,
             queue,
             timing_totals: Mutex::new(GpuTimings::default()),
@@ -4044,6 +4592,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             fused_scale_arena: Mutex::new(ScratchArena::new()),
             op_cache: Mutex::new(HashMap::new()),
             argmax_sample_cache: Mutex::new(HashMap::new()),
+            ple_projection_cache: Mutex::new(HashMap::new()),
             uniform_arena: Mutex::new(ScratchArena::new()),
             adapter_name,
             devices: candidates,
@@ -4055,6 +4604,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             mul_pipeline,
             gelu_mul_pipeline,
             silu_mul_pipeline,
+            sigmoid_gate_pipeline,
             bias_add_pipeline,
             gelu_pipeline,
             scale_pipeline,
@@ -4063,7 +4613,22 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             rmsnorm_add_pipeline,
             rmsnorm_rows_pipeline,
             rmsnorm_add_rows_pipeline,
+            rmsnorm_add_scale_rows_pipeline,
+            rmsnorm_rows_wide_pipeline,
+            rmsnorm_add_rows_wide_pipeline,
+            rmsnorm_add_scale_rows_wide_pipeline,
             rmsnorm_add_scale_pipeline,
+            rmsnorm_wide_pipeline,
+            rmsnorm_add_wide_pipeline,
+            rmsnorm_add_scale_wide_pipeline,
+            norm_wide,
+            head_norm_rope_wide_pipeline,
+            kv_epilogue_pipeline,
+            kv_epilogue_bind_group_layout,
+            head_wide,
+            rmsnorm_add_norm_wide_pipeline,
+            norm_pair_bind_group_layout,
+            norm_pairs,
             fused_cache: Mutex::new(HashMap::new()),
             attn_bind_group_layout,
             attn_paged_bind_group_layout,
@@ -4071,7 +4636,9 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             attn_pipeline,
             attn_paged_pipeline: std::sync::OnceLock::new(),
             prefill_attn: (!crate::engine::env::flag_on("ORANGU_NO_PREFILL_ATTN")),
-            prefill_fused_attn: crate::engine::env::flag_on("ORANGU_PREFILL_FUSED_ATTN"),
+            prefill_fused_attn: crate::engine::env::flag_on_unless_disabled(
+                "ORANGU_PREFILL_FUSED_ATTN",
+            ),
             prefill_gqa: attn_coop && (!crate::engine::env::flag_on("ORANGU_NO_PREFILL_GQA")),
             attn_prefill_pipelines: Mutex::new(HashMap::new()),
             attn_split_pipelines: Mutex::new(HashMap::new()),
@@ -4091,6 +4658,10 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             kv_quantize_q8_0_pipeline,
             q8_quantize_pipeline,
             q4_k_mmvq_fused_pipeline,
+            mmq_q4k_pipeline,
+            mmq_q6k_pipeline,
+            quantize_q8_rows_pipeline,
+            prefill_mmq,
             packed_dot_f16,
             q4_k_packed_f16_pipeline,
             wide_load,
@@ -4099,6 +4670,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             wide_unroll,
             wide_unroll_pipelines,
             block_hoisted_pipelines,
+            float_wide_pipelines,
             q4_k_unroll_packed_pipeline,
             q4_k_dual_pipeline,
             q4_k_light_pipeline,
@@ -4120,6 +4692,8 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             argmax_penalty_pipeline,
             argmax_split_pipeline,
             argmax_reduce_pipeline,
+            topk_split_pipeline,
+            topk_reduce_pipeline,
             gpu_sample,
             attn_split,
             flash_attn,
@@ -4132,7 +4706,9 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             untrusted_types: Vec::new(),
             detuned_types: Vec::new(),
             timestamps: Mutex::new(None),
+            op_timer: None,
         };
+        backend.op_timer = backend.build_op_timer(supports_timestamp_in_passes);
         backend.disable_miscompiled_decode_kernels();
         Some(backend)
     }
@@ -5329,6 +5905,166 @@ impl VulkanBackend {
         self.matmul_batch_dispatch_streamed(ops, false)
     }
 
+    /// Probe-only: the **device** time of one decode-shaped dispatch of `w`'s
+    /// matmul kernel, in microseconds — see [`Self::dispatch_kernel_us`].
+    /// Nothing is measured for the integer-dot path (`ORANGU_Q4K_MMVQ`),
+    /// which `matmul` routes elsewhere.
+    #[cfg(test)]
+    fn matmul_kernel_us(&self, x: &[f32], w: &QuantMatrix, reps: u32) -> Option<f64> {
+        self.matmul_kernel_us_tokens(x, 1, w, reps)
+            .map(|(us, _)| us)
+    }
+
+    /// [`Self::matmul_kernel_us`] over `n_tokens` rows of `x` — the kernel a
+    /// prefill chunk of that width takes (`pipeline_for_named` names it), so
+    /// a GEMM's rate can be read at the model's shape on the device clock.
+    #[cfg(test)]
+    pub(super) fn matmul_kernel_us_tokens(
+        &self,
+        x: &[f32],
+        n_tokens: usize,
+        w: &QuantMatrix,
+        reps: u32,
+    ) -> Option<(f64, &'static str)> {
+        let op = MatmulOp { x, n_tokens, w };
+        let (pipeline, name) = self.pipeline_for_named(w.ggml_type(), w.in_dim, n_tokens);
+        let _region_guard = self.prefill_region_guard();
+        let entry = self.op_entry_streamed(&op, 0, ROLE_BATCH, false);
+        let guard = entry.lock().expect("op cache entry poisoned");
+        self.queue
+            .write_buffer(&guard.x_buffer, guard.x_offset, bytemuck::cast_slice(x));
+        let us = self.dispatch_kernel_us(pipeline, &guard.bind_group, guard.workgroups, reps)?;
+        Some((us, name))
+    }
+
+    /// Probe-only: the **device** time of one dispatch of `pipeline` over
+    /// `bind_group`, in microseconds — `reps` back-to-back dispatches inside
+    /// one compute pass, bracketed by the pass's own GPU timestamps, divided
+    /// by `reps`. Nothing else is in the number: no upload, no submission,
+    /// no readback, no host wake-up. That is the difference between this and
+    /// timing a call with a wall clock, where at a decode shape the fixed
+    /// cost of the call is about half the reading (`decode_matvec_probe`'s
+    /// own tables). What *is* in it is the barrier the driver puts between
+    /// two dispatches that touch the same buffer — the cost as a decode step
+    /// pays it. `None` when the adapter has no timestamp query.
+    #[cfg(test)]
+    fn dispatch_kernel_us(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        bind_group: &wgpu::BindGroup,
+        workgroups: (u32, u32, u32),
+        reps: u32,
+    ) -> Option<f64> {
+        if !self
+            .device
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY)
+        {
+            return None;
+        }
+        let query_set = self.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("orangu-server kernel probe timestamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count: 2,
+        });
+        let resolve_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server kernel probe resolve"),
+            size: 16,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server kernel probe readback"),
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.new_encoder("orangu-server kernel probe encoder");
+        let (wx, wy, wz) = workgroups;
+        // `ORANGU_PROBE_PASS_PER_DISPATCH=1` opens a compute pass per
+        // dispatch instead of one for all of them — the difference between
+        // the two readings is what a pass boundary costs on this device.
+        if crate::engine::env::flag_on("ORANGU_PROBE_PASS_PER_DISPATCH") {
+            encoder.write_timestamp(&query_set, 0);
+            for _ in 0..reps {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("orangu-server kernel probe pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.dispatch_workgroups(wx, wy, wz);
+            }
+            encoder.write_timestamp(&query_set, 1);
+        } else {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server kernel probe pass"),
+                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                    query_set: &query_set,
+                    beginning_of_pass_write_index: Some(0),
+                    end_of_pass_write_index: Some(1),
+                }),
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            for _ in 0..reps {
+                pass.dispatch_workgroups(wx, wy, wz);
+            }
+        }
+        encoder.resolve_query_set(&query_set, 0..2, &resolve_buffer, 0);
+        encoder.copy_buffer_to_buffer(&resolve_buffer, 0, &readback_buffer, 0, 16);
+        self.queue.submit(Some(encoder.finish()));
+        const CONTEXT: &str = "reading back kernel probe timestamps";
+        let wait = self.map_read(&readback_buffer);
+        self.poll_blocking(CONTEXT);
+        wait.check(CONTEXT);
+        let data = self.mapped_bytes(&readback_buffer, CONTEXT);
+        let ticks: Vec<u64> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        readback_buffer.unmap();
+        let ns =
+            ticks[1].saturating_sub(ticks[0]) as f64 * f64::from(self.queue.get_timestamp_period());
+        Some(ns / 1_000.0 / f64::from(reps.max(1)))
+    }
+
+    /// Probe-only: the device time of one RMSNorm-family dispatch over a row
+    /// of `n_embd` — the whole-row single-workgroup kernels a decode step
+    /// runs several of per layer. `which` is `"norm"`, `"norm_add"` or
+    /// `"norm_add_scale"`.
+    #[cfg(test)]
+    fn norm_kernel_us(&self, which: &str, n_embd: usize, reps: u32) -> Option<f64> {
+        let x = self.upload_new(&vec![0.5f32; n_embd]);
+        let w = self.upload_new(&vec![1.0f32; n_embd]);
+        let y = self.upload_new(&vec![0.0f32; n_embd]);
+        let residual = self.upload_new(&vec![0.25f32; n_embd]);
+        let bytes = (n_embd as u64) * 4;
+        let (pipeline, bg) = match which {
+            "norm" => {
+                let meta = self.elem_meta_buffer(n_embd as u32, 1e-6);
+                let bg = self.elem4_bind_group(
+                    BindSrc::Slice(&x, 0, bytes),
+                    &w,
+                    BindSrc::Slice(&y, 0, bytes),
+                    &meta,
+                );
+                (self.rmsnorm_for(n_embd), bg)
+            }
+            "norm_add" => {
+                let meta = self.elem_meta_buffer(n_embd as u32, 1e-6);
+                let bg = self.elem5_bind_group(
+                    BindSrc::Slice(&x, 0, bytes),
+                    &w,
+                    BindSrc::Slice(&residual, 0, bytes),
+                    BindSrc::Slice(&y, 0, bytes),
+                    &meta,
+                );
+                (self.rmsnorm_add_for(n_embd), bg)
+            }
+            _ => return None,
+        };
+        self.dispatch_kernel_us(pipeline, &bg, (1, 1, 1), reps)
+    }
+
     /// [`Self::matmul_batch_dispatch`], optionally taking its weights from
     /// the recyclable streaming region — see [`StreamArena`].
     ///
@@ -5417,6 +6153,42 @@ impl VulkanBackend {
             }
         }
 
+        // The integer-dot form of every op the kernel takes (`mmq_for`: a
+        // `Q4_K`/`Q6_K` weight at a batch wide enough to tile) — the same
+        // kernels the fused prefill chains run, reached from here by the
+        // path every CPU-orchestrated architecture's prefill GEMM takes,
+        // where until now only the float tiled kernel was. Each op's rows
+        // are quantized once (`mmq_stage`) in the same pass, ahead of the
+        // dispatch that reads them; ops that share one input share one
+        // quantized copy. An op the kernel does not take keeps its float
+        // pipeline, so a batch can mix the two.
+        let mmq_takes: Vec<bool> = ops
+            .iter()
+            .map(|op| self.mmq_for(op.w, op.n_tokens))
+            .collect();
+        let shared_stage = shares_one_input
+            && mmq_takes.iter().all(|&takes| takes)
+            && ops
+                .iter()
+                .all(|op| op.w.in_dim == ops[0].w.in_dim && op.n_tokens == ops[0].n_tokens);
+        let mut stages: Vec<(wgpu::Buffer, wgpu::BindGroup, u32, wgpu::Buffer)> = Vec::new();
+        let mut mmq_ops: Vec<Option<MmqDispatch>> = Vec::with_capacity(ops.len());
+        for (i, (op, guard)) in ops.iter().zip(guards.iter()).enumerate() {
+            if !mmq_takes[i] {
+                mmq_ops.push(None);
+                continue;
+            }
+            if !(shared_stage && !stages.is_empty()) {
+                stages.push(self.mmq_stage(
+                    BindSrc::Slice(&guard.x_buffer, guard.x_offset, (op.x.len() as u64) * 4),
+                    op.n_tokens,
+                    op.w.in_dim,
+                ));
+            }
+            let q8 = &stages.last().expect("staged just above").0;
+            mmq_ops.push(Some(self.mmq_op(op.w, guard, q8)));
+        }
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -5427,7 +6199,14 @@ impl VulkanBackend {
                 label: Some("orangu-server matmul batch pass"),
                 timestamp_writes: None,
             });
-            for (pipeline, guard) in pipelines.iter().zip(guards.iter()) {
+            for (_, qbg, qwg, _) in &stages {
+                self.record_mmq_quantize(&mut pass, qbg, *qwg);
+            }
+            for ((pipeline, guard), mmq) in pipelines.iter().zip(guards.iter()).zip(&mmq_ops) {
+                if let Some((bg, grid, ggml_type)) = mmq {
+                    self.record_mmq(&mut pass, bg, *grid, *ggml_type);
+                    continue;
+                }
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, &guard.bind_group, &[]);
                 let (wx, wy, wz) = guard.workgroups;
@@ -5728,6 +6507,16 @@ impl VulkanBackend {
             && let Some(pipeline) = self.block_hoisted_pipelines.get(&ggml_type)
         {
             return (pipeline, "block-hoisted");
+        }
+        // One row per workgroup, like the generic reduce at `n_rows == 1`,
+        // and `vec4` rows — the two conditions the wide float kernel's
+        // geometry assumes.
+        if n_tokens < self.coop_min_n_tokens
+            && reduce_n_rows() == 1
+            && in_dim.is_multiple_of(8)
+            && let Some(pipeline) = self.float_wide_pipelines.get(&ggml_type)
+        {
+            return (pipeline, "float-wide");
         }
         // Checked *first*, so
         // `ORANGU_WIDE_LOAD=1 ORANGU_PACKED_DOT=1` together select the
@@ -6562,6 +7351,11 @@ pub struct FusedPostAttentionInput<'a> {
     /// a parameter since G2's first increment; the decode chain assumed GEGLU.
     pub activation: FfnActivation,
     pub eps: f32,
+    /// The epsilon of the two **post**-norms (`attn_post_norm`,
+    /// `ffn_post_norm`) where it differs from `eps` — `muse-glimmer` gives
+    /// them their own constant. `None` means the same `eps` everywhere,
+    /// which is every other architecture with post-norms.
+    pub post_norm_eps: Option<f32>,
     pub ple: Option<FusedPle<'a>>,
     pub layer_output_scale: Option<f32>,
     /// See [`OpCacheKey`]'s own doc comment — `0` for every ordinary
@@ -6668,6 +7462,13 @@ pub struct FusedAttnPrefillKv<'a> {
 /// `t` takes `start_pos + t`.
 #[derive(Clone, Copy)]
 pub struct FusedAttnPrefillInput<'a> {
+    /// The layer input on the device — `[n_tokens, n_embd]` rows at a byte
+    /// offset — with the attention norm's weight, when the caller keeps the
+    /// residual stream on the device across layers. The chain then records
+    /// the norm itself and `normed` is empty; otherwise `normed` is the
+    /// host's already-normed rows and these are `None`.
+    pub x_gpu: Option<(&'a wgpu::Buffer, u64)>,
+    pub attn_norm: Option<&'a [f32]>,
     /// `attn_norm`'s output, `[n_tokens, n_embd]`.
     pub normed: &'a [f32],
     pub n_tokens: usize,
@@ -6721,6 +7522,9 @@ pub struct FusedAttnPrefillInput<'a> {
     /// reference was not. Shapes matched throughout; only the semantics
     /// differed.
     pub normalize_v: bool,
+    /// See [`FusedAttnInput::attn_gate`]: a sigmoid gate on attention's
+    /// output, projected from the same normed rows as Q/K/V.
+    pub attn_gate: Option<&'a QuantMatrix>,
 }
 
 impl<'a> FusedAttnPrefillInput<'a> {
@@ -6728,6 +7532,46 @@ impl<'a> FusedAttnPrefillInput<'a> {
     /// do, but naming it keeps the striping loop's intent legible.
     fn reborrow(&self) -> Self {
         *self
+    }
+}
+
+/// K and V rows a prefill chain has copied into a readback buffer and **not
+/// waited for** — the host copy of positions
+/// [`crate::engine::kv_cache::LayerCache::advance_gpu_written`] has already
+/// counted. [`VulkanBackend::fill_kv_rows`] brings them home, one wait for a
+/// whole chunk's worth instead of one per KV-owning layer.
+pub struct PendingKvRows {
+    /// Where in the chunk's [`KvReadbackStage`] the rows were copied.
+    offset: u64,
+    /// `f32` elements per side: K's rows first, then V's.
+    kv_elems: usize,
+}
+
+/// One chunk's landing area for every deferred K/V readback: a single
+/// mappable buffer the attention chains copy their rows into at successive
+/// offsets, mapped once at the end of the chunk. One buffer per chunk
+/// rather than one per layer, because the per-layer form was measured to
+/// cost more than it saved on a model near the card's limit — two dozen
+/// short-lived readback buffers per chunk had the allocator opening new
+/// blocks and every kernel in the chunk slowed by a fifth as the card
+/// paged. Sized up to a power of two and kept in a two-deep pool so the
+/// chunk widths a prefill runs through map to a few sizes and no churn.
+pub struct KvReadbackStage {
+    buffer: wgpu::Buffer,
+    cap: u64,
+    used: u64,
+}
+
+impl KvReadbackStage {
+    /// Reserves `bytes` of the stage, or `None` when it is full — the caller
+    /// then waits for that layer's rows as before.
+    fn reserve(&mut self, bytes: u64) -> Option<u64> {
+        // Keep every reservation 256-byte aligned for the copies.
+        let start = self.used.div_ceil(256) * 256;
+        (start + bytes <= self.cap).then(|| {
+            self.used = start + bytes;
+            start
+        })
     }
 }
 
@@ -6764,6 +7608,16 @@ pub struct FusedAttnPrefillOutput {
 /// in a device buffer, and taking it from there turns the largest transfer in
 /// the layer — a readback immediately followed by an upload of the same
 /// `[n_tokens, n_head, head_dim]` block — into a device-to-device copy.
+/// What [`VulkanBackend::fused_ple_prefill_rows`] records after the
+/// projection: the post-norm over it, the residual add of the stage's input,
+/// and the per-layer output scale where the model has one.
+#[derive(Clone, Copy)]
+pub struct PleTail<'a> {
+    pub post_norm: &'a [f32],
+    pub eps: f32,
+    pub out_scale: Option<f32>,
+}
+
 #[derive(Clone, Copy)]
 pub enum AttnOutSrc<'a> {
     Host(&'a [f32]),
@@ -6853,6 +7707,11 @@ pub struct FusedAttnInput<'a> {
     /// unconditionally until now, which is correct for its only caller and
     /// silently wrong for any other.
     pub normalize_v: bool,
+    /// A sigmoid gate on attention's output, projected from the same normed
+    /// input as Q/K/V (`[n_embd, n_head * head_dim]`) and applied before
+    /// `wo` — `muse-glimmer`'s `attn_gate`. `None` for every other
+    /// architecture.
+    pub attn_gate: Option<&'a QuantMatrix>,
     /// `[head_dim]` — the same vector for every Q head. `None` on an
     /// architecture with no per-head Q norm (`llama`/`qwen2`/`mistral`/`phi`),
     /// where RoPE runs on its own through the standalone kernel.
@@ -6909,6 +7768,12 @@ pub struct FusedAttnInput<'a> {
     /// everywhere except the single-sequence decode path, and a full no-op
     /// when `None`.
     pub attn_ts: Option<(&'a wgpu::QuerySet, u32)>,
+    /// The Q/K/V projections are already in this slot's projection output
+    /// regions — a batched decode step ran them for every sequence at
+    /// once and copied this sequence's rows in — so the chain records
+    /// everything after them (biases, norms, RoPE, the cache write,
+    /// attention) and not the matmuls themselves.
+    pub projections_ready: bool,
 }
 
 /// [`VulkanBackend::fused_layer`]'s parameters — the union of
@@ -6934,6 +7799,8 @@ pub struct FusedLayerInput<'a> {
     pub q_bias: Option<&'a [f32]>,
     /// See [`FusedAttnInput::normalize_v`].
     pub normalize_v: bool,
+    /// See [`FusedAttnInput::attn_gate`].
+    pub attn_gate: Option<&'a QuantMatrix>,
     /// See [`FusedAttnInput::q_norm`].
     pub q_norm: Option<&'a [f32]>,
     /// Which pairs RoPE rotates — NEOX (`i` against `i + rope_dim/2`) or NORM
@@ -6974,6 +7841,8 @@ pub struct FusedLayerInput<'a> {
     pub activation: FfnActivation,
     pub ple: Option<FusedPle<'a>>,
     pub layer_output_scale: Option<f32>,
+    /// See [`FusedPostAttentionInput::post_norm_eps`].
+    pub post_norm_eps: Option<f32>,
     /// See [`FusedAttnInput::batch_slot`]'s own doc comment — threaded
     /// straight through to both the attention and post-attention halves
     /// this struct's own `record_fused_layer` chains together.
@@ -6982,6 +7851,11 @@ pub struct FusedLayerInput<'a> {
     /// half. `None` disables the per-op breakdown.
     pub attn_ts: Option<(&'a wgpu::QuerySet, u32)>,
 }
+
+/// One integer-dot GEMM dispatch as [`VulkanBackend::mmq_op`] builds it:
+/// its bind group, its workgroup grid, and the weight type that names the
+/// kernel.
+type MmqDispatch = (wgpu::BindGroup, (u32, u32, u32), u32);
 
 impl VulkanBackend {
     /// The gated-FFN activation kernel for `act`.
@@ -7025,18 +7899,54 @@ impl VulkanBackend {
     }
 
     fn scratch_buffer(&self, len_f32: usize) -> wgpu::Buffer {
-        self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("orangu-server fused scratch"),
-            size: (len_f32 as u64) * 4,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_SRC
-                | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        let size = (len_f32 as u64) * 4;
+        let recycled = SCRATCH_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            let leased = pool.leased.as_ref()?;
+            let _ = leased;
+            let at = pool.free.iter().rposition(|(s, _)| *s == size)?;
+            let (_, buffer) = pool.free.remove(at);
+            pool.bytes -= size;
+            Some(buffer)
+        });
+        let buffer = recycled.unwrap_or_else(|| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("orangu-server fused scratch"),
+                size,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        SCRATCH_POOL.with(|pool| {
+            if let Some(leased) = pool.borrow_mut().leased.as_mut() {
+                leased.push((size, buffer.clone()));
+            }
+        });
+        buffer
+    }
+
+    /// Opens a scratch lease on this thread — see [`ScratchLease`]. A
+    /// lease inside a lease is the same lease: the inner one returns
+    /// nothing and the outer one everything.
+    pub fn scratch_lease(&self) -> Option<ScratchLease> {
+        SCRATCH_POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.leased.is_some() {
+                return None;
+            }
+            pool.leased = Some(Vec::new());
+            Some(ScratchLease { _private: () })
         })
     }
 
+    /// A fresh buffer holding `data` — never a recycled one. `write_buffer`
+    /// lands at the next submission, ahead of any encoder still parked on
+    /// this thread, so writing into a buffer an earlier layer's parked
+    /// commands still read would hand that layer the later layer's data.
     fn upload_new(&self, data: &[f32]) -> wgpu::Buffer {
-        let buffer = self.scratch_buffer(data.len());
+        let buffer = self.fresh_buffer(data.len());
         self.queue
             .write_buffer(&buffer, 0, bytemuck::cast_slice(data));
         buffer
@@ -7047,10 +7957,25 @@ impl VulkanBackend {
     /// element-count-based assuming 4-byte elements, true of `u32` just as
     /// much as `f32`, so it's reused as-is rather than duplicated.
     fn upload_new_u32(&self, data: &[u32]) -> wgpu::Buffer {
-        let buffer = self.scratch_buffer(data.len());
+        let buffer = self.fresh_buffer(data.len());
         self.queue
             .write_buffer(&buffer, 0, bytemuck::cast_slice(data));
         buffer
+    }
+
+    /// A storage buffer of `len_f32` elements that is **never recycled** —
+    /// for anything the host writes with `write_buffer`, which lands at the
+    /// next submission regardless of what a parked encoder on this thread
+    /// still has recorded against a recycled buffer's previous contents.
+    fn fresh_buffer(&self, len_f32: usize) -> wgpu::Buffer {
+        self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server fused upload"),
+            size: (len_f32 as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
     }
 
     /// Meta for the bias-add shader: total elements plus the row width the
@@ -7089,6 +8014,499 @@ impl VulkanBackend {
         self.queue
             .write_buffer(&buffer, 0, bytemuck::bytes_of(&meta));
         buffer
+    }
+
+    /// Like `elem_meta_buffer` with `aux` set — the row quantizer reads the
+    /// row width there.
+    fn elem_meta_buffer_aux(&self, len: u32, aux: u32) -> wgpu::Buffer {
+        let meta = ElemMeta {
+            len,
+            aux,
+            extra: 0.0,
+            out_scale: 0.0,
+        };
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server elem meta"),
+            size: std::mem::size_of::<ElemMeta>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&buffer, 0, bytemuck::bytes_of(&meta));
+        buffer
+    }
+
+    /// Whether the integer-dot GEMM serves `w` at `n_tokens` — a `Q4_K`
+    /// weight whose shape fits the kernel's tiles (see
+    /// `vulkan_shaders::shader_source_mmq_q4k`), with the kernel built.
+    fn mmq_for(&self, w: &QuantMatrix, n_tokens: usize) -> bool {
+        self.mmq_pipeline_for(w.ggml_type()).is_some()
+            && !MMQ_OFF_ON_THIS_THREAD.with(|c| c.get())
+            && w.in_dim.is_multiple_of(256)
+            && w.out_dim
+                .is_multiple_of(vulkan_shaders::MMQ_TILE_ROWS as usize)
+            && n_tokens >= vulkan_shaders::MMQ_Q4K_TILE_TOKENS as usize
+    }
+
+    /// The integer-dot GEMM kernel for a weight type, where there is one.
+    fn mmq_pipeline_for(&self, ggml_type: u32) -> Option<&wgpu::ComputePipeline> {
+        match ggml_type {
+            t if t == crate::engine::quant::GGML_TYPE_Q4_K => self.mmq_q4k_pipeline.as_ref(),
+            t if t == crate::engine::quant::GGML_TYPE_Q6_K => self.mmq_q6k_pipeline.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The quantized form of one activation batch for the integer-dot GEMM:
+    /// the q8 buffer, and the quantize dispatch (bind group, workgroups)
+    /// that fills it from `x` — `[n_tokens, in_dim]` `f32` rows.
+    fn mmq_stage(
+        &self,
+        x: BindSrc<'_>,
+        n_tokens: usize,
+        in_dim: usize,
+    ) -> (wgpu::Buffer, wgpu::BindGroup, u32, wgpu::Buffer) {
+        // Whole token tiles of the widest kernel: a kernel stages the last
+        // tile's padding rows too (and discards their results), so they have
+        // to exist.
+        let tile = vulkan_shaders::MMQ_Q6K_TILE_TOKENS as usize;
+        let words = n_tokens.div_ceil(tile) * tile * (in_dim / 256) * 96;
+        let q8 = self.scratch_buffer(words);
+        let meta = self.elem_meta_buffer_aux((n_tokens * in_dim) as u32, in_dim as u32);
+        let bg = self.elem3_bind_group(x, &q8, &meta);
+        let wg = ((n_tokens * in_dim / 32) as u32).div_ceil(64);
+        (q8, bg, wg, meta)
+    }
+
+    /// Records the quantize dispatch of an [`Self::mmq_stage`].
+    fn record_mmq_quantize(&self, pass: &mut wgpu::ComputePass<'_>, bg: &wgpu::BindGroup, wg: u32) {
+        pass.set_pipeline(
+            self.quantize_q8_rows_pipeline
+                .as_ref()
+                .expect("mmq stage built without its quantizer"),
+        );
+        pass.set_bind_group(0, bg, &[]);
+        pass.dispatch_workgroups(wg, 1, 1);
+    }
+
+    /// The integer-dot GEMM over `entry`'s weight and output, reading the
+    /// staged q8 activations — the bind group, the tile grid, and the
+    /// weight type's kernel.
+    fn mmq_op(&self, w: &QuantMatrix, entry: &CachedOpResources, q8: &wgpu::Buffer) -> MmqDispatch {
+        let (wb, wo, ws) = &entry.weight_binding;
+        let bg = self.matmul_bind_group(
+            "orangu-server mmq bind group",
+            (wb, *wo, *ws),
+            BindSrc::Whole(q8),
+            entry.output_src(),
+            BindSrc::Slice(&entry.meta_chunk, entry.meta_offset, entry.meta_size),
+        );
+        let grid = (
+            (w.out_dim as u32) / vulkan_shaders::MMQ_TILE_ROWS,
+            (entry.n_tokens as u32).div_ceil(vulkan_shaders::mmq_tile_tokens(w.ggml_type())),
+            1,
+        );
+        (bg, grid, w.ggml_type())
+    }
+
+    /// Records an [`Self::mmq_op`].
+    fn record_mmq(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        bg: &wgpu::BindGroup,
+        grid: (u32, u32, u32),
+        ggml_type: u32,
+    ) {
+        pass.set_pipeline(
+            self.mmq_pipeline_for(ggml_type)
+                .expect("mmq op built without its kernel"),
+        );
+        pass.set_bind_group(0, bg, &[]);
+        pass.dispatch_workgroups(grid.0, grid.1, grid.2);
+    }
+
+    /// Probe-only: the device time of the integer-dot GEMM dispatch alone
+    /// (the activations quantized once beforehand), as
+    /// [`Self::matmul_kernel_us_tokens`] measures the float kernel.
+    #[cfg(test)]
+    pub(super) fn mmq_kernel_us_tokens(
+        &self,
+        x: &[f32],
+        n_tokens: usize,
+        w: &QuantMatrix,
+        reps: u32,
+    ) -> Option<f64> {
+        if !self.mmq_for(w, n_tokens) {
+            return None;
+        }
+        let op = MatmulOp { x, n_tokens, w };
+        let _region_guard = self.prefill_region_guard();
+        let entry = self.op_entry_streamed(&op, 0, ROLE_BATCH, false);
+        let guard = entry.lock().expect("op cache entry poisoned");
+        let x_buf = self.upload_new(x);
+        let (q8, qbg, qwg, _qmeta) = self.mmq_stage(BindSrc::Whole(&x_buf), n_tokens, w.in_dim);
+        let mut encoder = self.new_encoder("orangu-server mmq probe quantize");
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            self.record_mmq_quantize(&mut pass, &qbg, qwg);
+        }
+        self.queue.submit(Some(encoder.finish()));
+        let (bg, grid, _) = self.mmq_op(w, &guard, &q8);
+        let pipeline = self.mmq_pipeline_for(w.ggml_type())?;
+        self.dispatch_kernel_us(pipeline, &bg, grid, reps)
+    }
+
+    /// Probe-only: the device time of `reps` dispatches of an ad-hoc kernel
+    /// over the `elem3` layout (one storage input, one storage output, a
+    /// uniform meta), `workgroups` wide — for measuring an instruction's
+    /// throughput in isolation.
+    #[cfg(test)]
+    pub(super) fn adhoc_kernel_us(
+        &self,
+        source: String,
+        workgroups: u32,
+        reps: u32,
+    ) -> Option<f64> {
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("orangu-server ad-hoc probe shader"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&self.elem3_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: None,
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        let x = self.upload_new(&vec![1.0f32; 4096]);
+        let y = self.scratch_buffer(4096 * 64);
+        let meta = self.elem_meta_buffer(4096, 0.0);
+        let bg = self.elem3_bind_group(&x, &y, &meta);
+        self.dispatch_kernel_us(&pipeline, &bg, (workgroups, 1, 1), reps)
+    }
+
+    /// Runs `f` with the integer-dot GEMM disabled on this thread — see
+    /// `MMQ_OFF_ON_THIS_THREAD`.
+    #[cfg(test)]
+    pub(crate) fn without_prefill_mmq<T>(&self, f: impl FnOnce() -> T) -> T {
+        MMQ_OFF_ON_THIS_THREAD.with(|c| c.set(true));
+        let out = f();
+        MMQ_OFF_ON_THIS_THREAD.with(|c| c.set(false));
+        out
+    }
+
+    /// One decode step of several sequences at once, the attention half of
+    /// a layer: the Q/K/V projections run **once** over every sequence's
+    /// row (the weights are read once, which is what a decode step costs),
+    /// each sequence's rows are then copied into its own single-token
+    /// projection regions, and the rest of the layer's attention — norms,
+    /// RoPE at that sequence's position, the write into that sequence's
+    /// cache, attention over it — runs per sequence exactly as its solo
+    /// decode step would (`record_fused_attention` with
+    /// `projections_ready`), so every per-slot resource is the solo path's.
+    /// The outputs are gathered into one `[n_rows, n_head * head_dim]`
+    /// buffer for the batched post-attention chain.
+    ///
+    /// `input` describes the layer as the prefill chain does, with `x_gpu`
+    /// and `attn_norm` set: the rows are normed here. `n_tokens` is the row
+    /// count. `slot_offset` maps a row's request slot to the `batch_slot`
+    /// the architecture's own solo decode uses for it — it has to be the
+    /// same one, because a cache's attention dispatch binds the Q region of
+    /// whichever slot first attended through it. `None` where the batch
+    /// cannot be served — a chain that declines, or a replay capture — and
+    /// the caller runs the sequences one by one.
+    pub fn fused_attention_decode_batch(
+        &self,
+        input: &FusedAttnPrefillInput<'_>,
+        attn_norm: &[f32],
+        rows: &mut [crate::engine::arch::DecodeRow<'_>],
+        cache_index: usize,
+        slot_offset: usize,
+    ) -> Option<wgpu::Buffer> {
+        if self.q4_k_mmvq || Self::capture_active() || rows.is_empty() {
+            return None;
+        }
+        let n_rows = rows.len();
+        debug_assert_eq!(input.n_tokens, n_rows);
+        let (x_buf, x_off) = input.x_gpu?;
+        let wq = input.wq;
+        let n_embd = wq.in_dim;
+        let q_dim = input.n_head * input.head_dim;
+        let kv_dim = input.n_head_kv * input.head_dim;
+        let row_bytes = (n_embd as u64) * 4;
+
+        // The batched projections, over the pooled prefill regions.
+        let _region_guard = self.prefill_region_guard();
+        let q_op = MatmulOp {
+            x: &[],
+            n_tokens: n_rows,
+            w: wq,
+        };
+        let q_entry = self.op_entry_at(&q_op, 0, ROLE_ATTN_QKV);
+        let q_g = q_entry.lock().expect("op cache entry poisoned");
+        let kv_entries = input.kv.as_ref().map(|proj| {
+            let k_entry = self.op_entry_at(
+                &MatmulOp {
+                    x: &[],
+                    n_tokens: n_rows,
+                    w: proj.wk,
+                },
+                0,
+                ROLE_ATTN_QKV + 1,
+            );
+            let v_entry = proj.wv.map(|wv| {
+                self.op_entry_at(
+                    &MatmulOp {
+                        x: &[],
+                        n_tokens: n_rows,
+                        w: wv,
+                    },
+                    0,
+                    ROLE_ATTN_QKV + 2,
+                )
+            });
+            (proj, k_entry, v_entry)
+        });
+        let kv_guards = kv_entries.as_ref().map(|(proj, k, v)| {
+            (
+                *proj,
+                k.lock().expect("op cache entry poisoned"),
+                v.as_ref()
+                    .map(|v| v.lock().expect("op cache entry poisoned")),
+            )
+        });
+
+        // The norm, into a staging buffer the three projections copy from.
+        let normed = self.scratch_buffer(n_rows * n_embd);
+        let norm_w = self.upload_new(attn_norm);
+        let norm_meta = self.elem_meta_buffer(n_embd as u32, input.eps);
+        let norm_bg = self.elem4_bind_group(
+            BindSrc::Slice(x_buf, x_off, row_bytes * n_rows as u64),
+            &norm_w,
+            &normed,
+            &norm_meta,
+        );
+        let (mut encoder, grouped) =
+            self.take_prefill_encoder("orangu-server batched decode attention encoder");
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server batched decode norm pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(self.rmsnorm_rows_for(n_embd));
+            pass.set_bind_group(0, &norm_bg, &[]);
+            pass.dispatch_workgroups(n_rows as u32, 1, 1);
+        }
+        let normed_bytes = row_bytes * n_rows as u64;
+        encoder.copy_buffer_to_buffer(&normed, 0, &q_g.x_buffer, q_g.x_offset, normed_bytes);
+        if let Some((_, k_g, v_g)) = &kv_guards {
+            encoder.copy_buffer_to_buffer(&normed, 0, &k_g.x_buffer, k_g.x_offset, normed_bytes);
+            if let Some(g) = v_g {
+                encoder.copy_buffer_to_buffer(&normed, 0, &g.x_buffer, g.x_offset, normed_bytes);
+            }
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server batched decode qkv pass"),
+                timestamp_writes: None,
+            });
+            self.record_matmul(&mut pass, wq, &q_g);
+            self.op_stamp(&mut pass, "bd.attn.wq");
+            if let Some((proj, k_g, v_g)) = &kv_guards {
+                self.record_matmul(&mut pass, proj.wk, k_g);
+                self.op_stamp(&mut pass, "bd.attn.wk");
+                if let (Some(wv), Some(g)) = (proj.wv, v_g) {
+                    self.record_matmul(&mut pass, wv, g);
+                    self.op_stamp(&mut pass, "bd.attn.wv");
+                }
+            }
+        }
+
+        // The batched outputs through their own buffers: a slot's regions
+        // live in the same arena as the batch's, and a copy within one
+        // buffer is refused.
+        let q_rows = self.scratch_buffer(n_rows * q_dim);
+        encoder.copy_buffer_to_buffer(
+            &q_g.output_buffer,
+            q_g.output_offset,
+            &q_rows,
+            0,
+            (n_rows * q_dim) as u64 * 4,
+        );
+        let kv_rows = kv_guards.as_ref().map(|(_, k_g, v_g)| {
+            let k_rows = self.scratch_buffer(n_rows * kv_dim);
+            encoder.copy_buffer_to_buffer(
+                &k_g.output_buffer,
+                k_g.output_offset,
+                &k_rows,
+                0,
+                (n_rows * kv_dim) as u64 * 4,
+            );
+            let v_rows = v_g.as_ref().map(|g| {
+                let v_rows = self.scratch_buffer(n_rows * kv_dim);
+                encoder.copy_buffer_to_buffer(
+                    &g.output_buffer,
+                    g.output_offset,
+                    &v_rows,
+                    0,
+                    (n_rows * kv_dim) as u64 * 4,
+                );
+                v_rows
+            });
+            (k_rows, v_rows)
+        });
+
+        // Each sequence's rows into its own single-token regions, then its
+        // own attention.
+        let out = self.scratch_buffer(n_rows * q_dim);
+        for (i, row) in rows.iter_mut().enumerate() {
+            let slot = row.slot + slot_offset;
+            // The slot's own entries, locked only for the copies: the
+            // attention chain below locks them itself.
+            {
+                let sq = self.op_entry_for(wq, slot);
+                let sq_g = sq.lock().expect("op cache entry poisoned");
+                encoder.copy_buffer_to_buffer(
+                    &q_rows,
+                    (i * q_dim) as u64 * 4,
+                    &sq_g.output_buffer,
+                    sq_g.output_offset,
+                    (q_dim as u64) * 4,
+                );
+                if let (Some((proj, ..)), Some((k_rows, v_rows))) = (&kv_guards, &kv_rows) {
+                    let sk = self.op_entry_for(proj.wk, slot);
+                    let sk_g = sk.lock().expect("op cache entry poisoned");
+                    encoder.copy_buffer_to_buffer(
+                        k_rows,
+                        (i * kv_dim) as u64 * 4,
+                        &sk_g.output_buffer,
+                        sk_g.output_offset,
+                        (kv_dim as u64) * 4,
+                    );
+                    if let (Some(wv), Some(v_rows)) = (proj.wv, v_rows) {
+                        let sv = self.op_entry_for(wv, slot);
+                        let sv_g = sv.lock().expect("op cache entry poisoned");
+                        encoder.copy_buffer_to_buffer(
+                            v_rows,
+                            (i * kv_dim) as u64 * 4,
+                            &sv_g.output_buffer,
+                            sv_g.output_offset,
+                            (kv_dim as u64) * 4,
+                        );
+                    }
+                }
+            }
+            // The solo path's own normed buffer for this slot, so the
+            // layer's cached resources are built the same way whichever
+            // path builds them first.
+            let layer_res = self.fused_layer_entry_for(wq, n_embd, attn_norm, input.eps, slot);
+            let pos = row.pos;
+            let window_start = match input.n_swa {
+                0 => 0,
+                n_swa => pos.saturating_sub(n_swa - 1),
+            };
+            let mut cursor = PassCursor::new(&mut encoder);
+            let attn_out = self.record_fused_attention(
+                &mut cursor,
+                FusedAttnInput {
+                    projections_ready: true,
+                    normalize_v: input.normalize_v,
+                    attn_gate: None,
+                    q_bias: input.q_bias,
+                    pairing: input.pairing,
+                    normed: GpuInput::Gpu(
+                        &layer_res.normed_buf,
+                        (layer_res.normed_buf_offset / 4) as usize,
+                    ),
+                    wq,
+                    q_norm: input.q_norm,
+                    kv: input.kv.as_ref().map(|p| FusedAttnProjection {
+                        wk: p.wk,
+                        k_bias: p.k_bias,
+                        v_bias: p.v_bias,
+                        k_norm: p.k_norm,
+                        wv: p.wv,
+                    }),
+                    n_head: input.n_head,
+                    n_head_kv: input.n_head_kv,
+                    head_dim: input.head_dim,
+                    rope_dim: input.rope_dim,
+                    rope_freq_base: input.rope_freq_base,
+                    yarn: input.yarn,
+                    freq_factors: input.freq_factors,
+                    eps: input.eps,
+                    pos,
+                    window_start,
+                    window: (input.n_swa > 0).then_some(input.n_swa as u32),
+                    scale: input.scale,
+                    cache: &mut row.cache.layers[cache_index],
+                    batch_slot: slot,
+                    attn_ts: None,
+                },
+            );
+            drop(cursor);
+            encoder.copy_buffer_to_buffer(
+                &attn_out,
+                0,
+                &out,
+                (i * q_dim) as u64 * 4,
+                (q_dim as u64) * 4,
+            );
+        }
+        self.park_or_submit(encoder, grouped);
+        Some(out)
+    }
+
+    /// The integer-dot GEMM on its own — `x` rows in, `[n_tokens, out_dim]`
+    /// out — for the cross-check tests and the probe. `None` where the
+    /// kernel does not serve the shape.
+    #[cfg(test)]
+    pub(crate) fn mmq_matmul_for_test(
+        &self,
+        x: &[f32],
+        n_tokens: usize,
+        w: &QuantMatrix,
+    ) -> Option<Vec<f32>> {
+        if !self.mmq_for(w, n_tokens) {
+            return None;
+        }
+        let op = MatmulOp { x, n_tokens, w };
+        let _region_guard = self.prefill_region_guard();
+        let entry = self.op_entry_streamed(&op, 0, ROLE_BATCH, false);
+        let guard = entry.lock().expect("op cache entry poisoned");
+        let x_buf = self.upload_new(x);
+        let (q8, qbg, qwg, _qmeta) = self.mmq_stage(BindSrc::Whole(&x_buf), n_tokens, w.in_dim);
+        let (bg, grid, _) = self.mmq_op(w, &guard, &q8);
+        let mut encoder = self.new_encoder("orangu-server mmq test");
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            self.record_mmq_quantize(&mut pass, &qbg, qwg);
+            self.record_mmq(&mut pass, &bg, grid, w.ggml_type());
+        }
+        Some(self.submit_and_readback(
+            encoder,
+            &guard.output_buffer,
+            guard.output_offset,
+            n_tokens * w.out_dim,
+        ))
     }
 
     /// Like `elem_meta_buffer` but also sets `out_scale` — for the
@@ -7579,7 +8997,7 @@ impl VulkanBackend {
         let ff: &[f32] = match freq_factors {
             Some(ff) => ff,
             None => {
-                ff_owned = vec![1.0f32; half];
+                ff_owned = vec![1.0f32; half.max(1)];
                 &ff_owned
             }
         };
@@ -7659,7 +9077,7 @@ impl VulkanBackend {
         let ff: &[f32] = match freq_factors {
             Some(ff) => ff,
             None => {
-                ff_owned = vec![1.0f32; half];
+                ff_owned = vec![1.0f32; half.max(1)];
                 &ff_owned
             }
         };
@@ -7951,11 +9369,11 @@ impl VulkanBackend {
 
     /// Records `w`'s matmul dispatch (`x -> y`, `n_tokens == 1`) into
     /// `pass`, using `entry`'s already-cached bind group/workgroup count.
-    fn record_matmul<'p>(
-        &'p self,
-        pass: &mut wgpu::ComputePass<'p>,
+    fn record_matmul(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
         w: &QuantMatrix,
-        entry: &'p CachedOpResources,
+        entry: &CachedOpResources,
     ) {
         // Integer-dot MMVQ path (`ORANGU_Q4K_MMVQ`) when this op has it — the
         // q8 activation must already be quantized (`record_mmvq_quantize`, a
@@ -8026,6 +9444,100 @@ impl VulkanBackend {
     /// `copy → entry.x_buffer` the cached bind group would otherwise need.
     /// Weight/output/meta come from `entry`; only binding 1 (the activation)
     /// differs. Non-MMVQ only (MMVQ reads a q8 buffer, not the raw activation).
+    /// One q8 quantization of the activation at `input` for every MMVQ op in
+    /// `consumers` — `None` when none of them has one, so a layer with no
+    /// Q4_K projection builds nothing.
+    ///
+    /// The consumers' own `MmvqOp`s keep their private q8 buffers; they are
+    /// simply not written or read on the fused path any more. The meta and
+    /// workgroup geometry are the same ones `build_op_resources` derives,
+    /// taken from the first consumer so the two cannot drift.
+    fn shared_q8_for(
+        &self,
+        input: (&wgpu::Buffer, u64, u64),
+        in_dim: usize,
+        consumers: [Option<(&QuantMatrix, &CachedOpResources)>; 3],
+    ) -> Option<SharedQ8> {
+        let (input_buf, input_offset, input_len) = input;
+        let first = consumers
+            .iter()
+            .flatten()
+            .find_map(|(_, g)| g.mmvq.as_ref())?;
+        let q8_len = first.q8_len;
+        let q8_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server shared mmvq q8 activation"),
+            size: q8_len,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let quantize_meta = self.cast_meta_buffer(in_dim as u32, 0);
+        let quantize_bind_group = self.elem3_bind_group(
+            BindSrc::Slice(input_buf, input_offset, input_len),
+            BindSrc::Slice(&q8_buffer, 0, q8_len),
+            &quantize_meta,
+        );
+        let mut bgs: [Option<wgpu::BindGroup>; 3] = [None, None, None];
+        for (slot, consumer) in consumers.iter().enumerate() {
+            if let Some((w, g)) = consumer
+                && g.mmvq.is_some()
+            {
+                let (wchunk, woff, wsize) = g.weight_binding.clone();
+                bgs[slot] = Some(self.matmul_bind_group(
+                    "orangu-server shared mmvq bind group",
+                    (&wchunk, woff, wsize),
+                    BindSrc::Slice(&q8_buffer, 0, q8_len),
+                    BindSrc::Slice(&g.output_buffer, g.output_offset, g.output_len),
+                    BindSrc::Slice(&g.meta_chunk, g.meta_offset, g.meta_size),
+                ));
+                debug_assert_eq!(w.in_dim, in_dim);
+            }
+        }
+        let [mmvq_bg_wq, mmvq_bg_wk, mmvq_bg_wv] = bgs;
+        Some(SharedQ8 {
+            q8_buffer,
+            quantize_bind_group,
+            quantize_meta,
+            quantize_workgroups: first.quantize_workgroups,
+            mmvq_bg_wq,
+            mmvq_bg_wk,
+            mmvq_bg_wv,
+        })
+    }
+
+    /// The shared quantize dispatch — one per layer, in its own pass so the
+    /// matmuls that follow read finished bytes.
+    fn record_shared_q8_quantize(&self, pass: &mut wgpu::ComputePass<'_>, q8: &SharedQ8) {
+        pass.set_pipeline(
+            self.q8_quantize_pipeline
+                .as_ref()
+                .expect("shared q8 built but no q8_quantize_pipeline"),
+        );
+        pass.set_bind_group(0, &q8.quantize_bind_group, &[]);
+        let (wx, wy, wz) = q8.quantize_workgroups;
+        pass.dispatch_workgroups(wx, wy, wz);
+    }
+
+    /// An MMVQ matmul reading the layer's shared q8 rather than its own.
+    fn record_mmvq_matmul_shared(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        entry: &CachedOpResources,
+        bg: &wgpu::BindGroup,
+    ) {
+        let mmvq = entry
+            .mmvq
+            .as_ref()
+            .expect("a shared mmvq bind group exists only for an op with an mmvq");
+        pass.set_pipeline(
+            self.q4_k_mmvq_fused_pipeline
+                .as_ref()
+                .expect("mmvq op built but no q4_k_mmvq_fused_pipeline"),
+        );
+        pass.set_bind_group(0, bg, &[]);
+        let (wx, wy, wz) = mmvq.mmvq_workgroups;
+        pass.dispatch_workgroups(wx, wy, wz);
+    }
+
     fn matmul_bind_group_with_input(
         &self,
         w: &QuantMatrix,
@@ -8080,12 +9592,12 @@ impl VulkanBackend {
     /// `entry.bind_group`/`entry.x_buffer`. Pipeline/workgroups still come from
     /// `entry`; the replay capture references `input_buf` so `ORANGU_REPLAY`
     /// stays byte-exact. Non-MMVQ only.
-    fn record_matmul_shared_input<'p>(
-        &'p self,
-        pass: &mut wgpu::ComputePass<'p>,
+    fn record_matmul_shared_input(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
         w: &QuantMatrix,
-        entry: &'p CachedOpResources,
-        input_bg: &'p wgpu::BindGroup,
+        entry: &CachedOpResources,
+        input_bg: &wgpu::BindGroup,
         input_buf: &wgpu::Buffer,
         input_offset: u64,
     ) {
@@ -8143,11 +9655,7 @@ impl VulkanBackend {
     /// reads its output can't share a pass (no intra-pass hazard barrier). A
     /// no-op for ops without MMVQ resources, so callers can call it
     /// unconditionally over a matmul group.
-    fn record_mmvq_quantize<'p>(
-        &'p self,
-        pass: &mut wgpu::ComputePass<'p>,
-        entry: &'p CachedOpResources,
-    ) {
+    fn record_mmvq_quantize(&self, pass: &mut wgpu::ComputePass<'_>, entry: &CachedOpResources) {
         if let Some(mmvq) = &entry.mmvq {
             pass.set_pipeline(
                 self.q8_quantize_pipeline
@@ -8360,6 +9868,7 @@ impl VulkanBackend {
 
         FusedPleResources {
             bg_gelu_mul,
+            gelu_mul_direct: Mutex::new(None),
             bg_ple_gate_matmul,
             bg_post_norm_add,
             meta_post_norm_scaled,
@@ -8458,6 +9967,13 @@ impl VulkanBackend {
         let ffn_norm_w = self.upload_new(input.ffn_norm);
         let ffn_post_norm_w = input.ffn_post_norm.map(|w| self.upload_new(w));
         let meta_embd_eps = self.elem_meta_buffer(n_embd as u32, input.eps);
+        // The post-norms' own epsilon where the architecture has one; the
+        // fused norm pair takes a single epsilon, so it is skipped then.
+        let meta_embd_post = input
+            .post_norm_eps
+            .filter(|e| *e != input.eps)
+            .map(|e| self.elem_meta_buffer(n_embd as u32, e));
+        let meta_post = meta_embd_post.as_ref().unwrap_or(&meta_embd_eps);
         let meta_ffn_plain = self.elem_meta_buffer(ffn_len as u32, 0.0);
 
         // `wo`'s own post-matmul RMSNorm and the residual add that always
@@ -8478,7 +9994,7 @@ impl VulkanBackend {
                 w,
                 BindSrc::Slice(&residual_buf, residual_buf_offset, n_embd_bytes),
                 BindSrc::Slice(&x1, x1_offset, n_embd_bytes),
-                &meta_embd_eps,
+                meta_post,
             )
         });
         let meta_embd_plain = self.elem_meta_buffer(n_embd as u32, 0.0);
@@ -8496,6 +10012,22 @@ impl VulkanBackend {
             BindSrc::Slice(&ffn_normed, ffn_normed_offset, n_embd_bytes),
             &meta_embd_eps,
         );
+        // The two dispatches above as one, over the copied residual; the
+        // direct-residual form is built per call (`norm_pair_direct`).
+        let bg_norm_pair = attn_post_norm_w
+            .as_ref()
+            .filter(|_| self.norm_pair_for(n_embd) && meta_embd_post.is_none())
+            .map(|w| {
+                self.norm_pair_bind_group(
+                    wo_g.output_src(),
+                    w,
+                    BindSrc::Slice(&residual_buf, residual_buf_offset, n_embd_bytes),
+                    &ffn_norm_w,
+                    BindSrc::Slice(&x1, x1_offset, n_embd_bytes),
+                    BindSrc::Slice(&ffn_normed, ffn_normed_offset, n_embd_bytes),
+                    &meta_embd_eps,
+                )
+            });
         // On the non-MMVQ path the FFN norm's output (`ffn_normed`) is
         // fed to the gate and up matmuls *directly* via these read-only-input
         // bind groups (both read the one `ffn_normed` slice — read-sharing a
@@ -8567,7 +10099,7 @@ impl VulkanBackend {
                 w,
                 BindSrc::Slice(&x1, x1_offset, n_embd_bytes),
                 BindSrc::Slice(&x2, x2_offset, n_embd_bytes),
-                &meta_embd_eps,
+                meta_post,
             )
         });
         let bg_ffn_add = ffn_post_norm_w.is_none().then(|| {
@@ -8640,6 +10172,10 @@ impl VulkanBackend {
         FusedResources {
             bg_gate_matmul,
             bg_up_matmul,
+            wo_direct: Mutex::new(None),
+            attn_residual_direct: Mutex::new(None),
+            norm_pair_direct: Mutex::new(None),
+            bg_norm_pair,
             residual_buf,
             residual_buf_offset,
             x1,
@@ -8661,6 +10197,7 @@ impl VulkanBackend {
             ffn_norm_w,
             ffn_post_norm_w,
             meta_embd_eps,
+            meta_embd_post,
             meta_ffn_plain,
             x1_offset,
             gelu_out_offset,
@@ -8721,7 +10258,7 @@ impl VulkanBackend {
     /// [`Self::record_fused_attention`] in one submission instead of two.
     fn record_fused_post_attention(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        cursor: &mut PassCursor<'_>,
         input: FusedPostAttentionInput<'_>,
     ) -> (wgpu::Buffer, u64) {
         let n_embd = input.wo.out_dim;
@@ -8766,62 +10303,168 @@ impl VulkanBackend {
         // `n_embd` here copied too many bytes out of a too-small source
         // buffer — silently corrupting `wo`'s input immediately after the
         // very first attention call once the two dims genuinely differ.
-        self.upload_or_copy(
-            encoder,
-            &wo_g.x_buffer,
-            wo_g.x_offset,
-            input.attn_out,
-            input.wo.in_dim,
-        );
-        self.upload_or_copy(
-            encoder,
-            &res.residual_buf,
-            res.residual_buf_offset,
-            input.residual,
-            n_embd,
-        );
+        // Each is read in place when it can be (`DirectInput`), copied into
+        // the layer's own buffer otherwise. The integer-dot path quantizes
+        // `wo`'s input in its own buffer, so it always takes the copy.
+        let direct = self.direct_inputs();
+        let n_embd_bytes = (n_embd as u64) * 4;
+        let wo_direct_bg = match input.attn_out {
+            GpuInput::Gpu(buf, off) if direct && !self.q4_k_mmvq => {
+                let off = (off as u64) * 4;
+                let bg = self.direct_bind_group(&res.wo_direct, buf, off, || {
+                    self.matmul_bind_group_with_input(
+                        input.wo,
+                        buf,
+                        off,
+                        (input.wo.in_dim as u64) * 4,
+                        &wo_g,
+                    )
+                });
+                Some((bg, buf, off))
+            }
+            _ => {
+                self.upload_or_copy(
+                    cursor.encoder(),
+                    &wo_g.x_buffer,
+                    wo_g.x_offset,
+                    input.attn_out,
+                    input.wo.in_dim,
+                );
+                None
+            }
+        };
+        let meta_post = res.meta_embd_post.as_ref().unwrap_or(&res.meta_embd_eps);
+        let norm_pair_bg = match (input.residual, &res.bg_norm_pair, &res.attn_post_norm_w) {
+            (GpuInput::Gpu(buf, off), Some(_), Some(w)) if direct => {
+                let off = (off as u64) * 4;
+                Some(self.direct_bind_group(&res.norm_pair_direct, buf, off, || {
+                    self.norm_pair_bind_group(
+                        wo_g.output_src(),
+                        w,
+                        BindSrc::Slice(buf, off, n_embd_bytes),
+                        &res.ffn_norm_w,
+                        BindSrc::Slice(&res.x1, res.x1_offset, n_embd_bytes),
+                        BindSrc::Slice(&res.ffn_normed, res.ffn_normed_offset, n_embd_bytes),
+                        &res.meta_embd_eps,
+                    )
+                }))
+            }
+            _ => None,
+        };
+        let attn_residual_bg = match input.residual {
+            GpuInput::Gpu(buf, off) if direct => {
+                let off = (off as u64) * 4;
+                Some(
+                    self.direct_bind_group(&res.attn_residual_direct, buf, off, || {
+                        match &res.attn_post_norm_w {
+                            Some(w) => self.elem5_bind_group(
+                                wo_g.output_src(),
+                                w,
+                                BindSrc::Slice(buf, off, n_embd_bytes),
+                                BindSrc::Slice(&res.x1, res.x1_offset, n_embd_bytes),
+                                meta_post,
+                            ),
+                            None => self.elem4_bind_group(
+                                wo_g.output_src(),
+                                BindSrc::Slice(buf, off, n_embd_bytes),
+                                BindSrc::Slice(&res.x1, res.x1_offset, n_embd_bytes),
+                                &res.meta_embd_plain,
+                            ),
+                        }
+                    }),
+                )
+            }
+            _ => {
+                self.upload_or_copy(
+                    cursor.encoder(),
+                    &res.residual_buf,
+                    res.residual_buf_offset,
+                    input.residual,
+                    n_embd,
+                );
+                None
+            }
+        };
+        let mut ple_gelu_mul_bg: Option<wgpu::BindGroup> = None;
         if let (Some(ple), Some(pres)) = (&input.ple, &res.ple) {
-            self.upload_or_copy(
-                encoder,
-                &pres.per_layer_buf,
-                pres.per_layer_buf_offset,
-                ple.per_layer_slice,
-                ple.per_layer_dim,
-            );
+            match (ple.per_layer_slice, &pres.bg_gelu_mul) {
+                (GpuInput::Gpu(buf, off), Some(_)) if direct => {
+                    let off = (off as u64) * 4;
+                    let bytes = (ple.per_layer_dim as u64) * 4;
+                    let (ple_gate_g, ple_proj_g) =
+                        ple_g_refs.expect("a layer with PLE has its PLE op entries");
+                    ple_gelu_mul_bg =
+                        Some(self.direct_bind_group(&pres.gelu_mul_direct, buf, off, || {
+                            self.elem4_bind_group(
+                                ple_gate_g.output_src(),
+                                BindSrc::Slice(buf, off, bytes),
+                                BindSrc::Slice(&ple_proj_g.x_buffer, ple_proj_g.x_offset, bytes),
+                                &pres.meta_plain,
+                            )
+                        }));
+                }
+                _ => self.upload_or_copy(
+                    cursor.encoder(),
+                    &pres.per_layer_buf,
+                    pres.per_layer_buf_offset,
+                    ple.per_layer_slice,
+                    ple.per_layer_dim,
+                ),
+            }
         }
 
         if self.q4_k_mmvq {
-            let mut qpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("orangu-server fused wo quantize pass"),
-                timestamp_writes: None,
-            });
-            self.record_mmvq_quantize(&mut qpass, &wo_g);
+            let qpass = cursor.pass();
+            self.record_mmvq_quantize(qpass, &wo_g);
+            self.op_stamp(qpass, "attn.wo_quantize");
         }
 
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("orangu-server fused wo+norms pass"),
-                timestamp_writes: None,
-            });
-            self.record_matmul(&mut pass, input.wo, &wo_g);
+            let pass = cursor.pass();
+            match &wo_direct_bg {
+                Some((bg, buf, off)) => {
+                    self.record_matmul_shared_input(pass, input.wo, &wo_g, bg, buf, *off)
+                }
+                None => self.record_matmul(pass, input.wo, &wo_g),
+            }
+            self.op_stamp(pass, "attn.wo");
 
-            match (&res.bg_attn_post_norm_add, &res.bg_attn_add) {
-                (Some(bg), _) => {
-                    pass.set_pipeline(self.rmsnorm_add_for(n_embd));
+            // The post-norm+residual and the FFN norm as one dispatch where
+            // the pair kernel applies (a post-norm, a wide row, the flag);
+            // the rolled two otherwise.
+            match (
+                norm_pair_bg.as_ref().or(res.bg_norm_pair.as_ref()),
+                &res.bg_attn_post_norm_add,
+                &res.bg_attn_add,
+            ) {
+                (Some(bg), _, _) if !Self::capture_active() => {
+                    pass.set_pipeline(&self.rmsnorm_add_norm_wide_pipeline);
                     pass.set_bind_group(0, bg, &[]);
                     pass.dispatch_workgroups(1, 1, 1);
+                    self.op_stamp(pass, "attn.post_norm_add+ffn.norm");
                 }
-                (None, Some(bg)) => {
+                (_, Some(bg), _) => {
+                    pass.set_pipeline(self.rmsnorm_add_for(n_embd));
+                    pass.set_bind_group(0, attn_residual_bg.as_ref().unwrap_or(bg), &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                    self.op_stamp(pass, "attn.post_norm_add");
+                    pass.set_pipeline(self.rmsnorm_for(n_embd));
+                    pass.set_bind_group(0, &res.bg_ffn_norm, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                    self.op_stamp(pass, "ffn.norm");
+                }
+                (_, None, Some(bg)) => {
                     pass.set_pipeline(&self.add_pipeline);
-                    pass.set_bind_group(0, bg, &[]);
+                    pass.set_bind_group(0, attn_residual_bg.as_ref().unwrap_or(bg), &[]);
                     pass.dispatch_workgroups((n_embd as u32).div_ceil(64), 1, 1);
+                    self.op_stamp(pass, "attn.post_norm_add");
+                    pass.set_pipeline(self.rmsnorm_for(n_embd));
+                    pass.set_bind_group(0, &res.bg_ffn_norm, &[]);
+                    pass.dispatch_workgroups(1, 1, 1);
+                    self.op_stamp(pass, "ffn.norm");
                 }
-                (None, None) => unreachable!("one of the two shapes is always built"),
+                (_, None, None) => unreachable!("one of the two shapes is always built"),
             }
-
-            pass.set_pipeline(self.rmsnorm_for(n_embd));
-            pass.set_bind_group(0, &res.bg_ffn_norm, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
         }
         {
             use vulkan_replay::DescriptorKind::{Storage, Uniform};
@@ -8909,7 +10552,7 @@ impl VulkanBackend {
         // are skipped entirely. MMVQ quantizes each op's `x_buffer` in place, so
         // it still needs `ffn_normed` copied into `gate.x`/`up.x` first.
         if res.bg_gate_matmul.is_none() {
-            encoder.copy_buffer_to_buffer(
+            cursor.encoder().copy_buffer_to_buffer(
                 &res.ffn_normed,
                 res.ffn_normed_offset,
                 &gate_g.x_buffer,
@@ -8923,7 +10566,7 @@ impl VulkanBackend {
                 dst_offset: gate_g.x_offset,
                 size: (n_embd as u64) * 4,
             });
-            encoder.copy_buffer_to_buffer(
+            cursor.encoder().copy_buffer_to_buffer(
                 &res.ffn_normed,
                 res.ffn_normed_offset,
                 &up_g.x_buffer,
@@ -8940,41 +10583,40 @@ impl VulkanBackend {
         }
 
         if self.q4_k_mmvq {
-            let mut qpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("orangu-server fused ffn quantize pass"),
-                timestamp_writes: None,
-            });
-            self.record_mmvq_quantize(&mut qpass, &gate_g);
-            self.record_mmvq_quantize(&mut qpass, &up_g);
+            let qpass = cursor.pass();
+            self.record_mmvq_quantize(qpass, &gate_g);
+            self.record_mmvq_quantize(qpass, &up_g);
+            self.op_stamp(qpass, "ffn.quantize");
         }
 
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("orangu-server fused ffn pass"),
-                timestamp_writes: None,
-            });
+            let pass = cursor.pass();
             match (&res.bg_gate_matmul, &res.bg_up_matmul) {
                 (Some(bg_gate), Some(bg_up)) => {
                     self.record_matmul_shared_input(
-                        &mut pass,
+                        pass,
                         input.ffn_gate,
                         &gate_g,
                         bg_gate,
                         &res.ffn_normed,
                         res.ffn_normed_offset,
                     );
+                    self.op_stamp(pass, "ffn.gate");
                     self.record_matmul_shared_input(
-                        &mut pass,
+                        pass,
                         input.ffn_up,
                         &up_g,
                         bg_up,
                         &res.ffn_normed,
                         res.ffn_normed_offset,
                     );
+                    self.op_stamp(pass, "ffn.up");
                 }
                 _ => {
-                    self.record_matmul(&mut pass, input.ffn_gate, &gate_g);
-                    self.record_matmul(&mut pass, input.ffn_up, &up_g);
+                    self.record_matmul(pass, input.ffn_gate, &gate_g);
+                    self.op_stamp(pass, "ffn.gate");
+                    self.record_matmul(pass, input.ffn_up, &up_g);
+                    self.op_stamp(pass, "ffn.up");
                 }
             }
 
@@ -8985,6 +10627,7 @@ impl VulkanBackend {
                 pass.set_pipeline(self.ffn_activation_pipeline(input.activation));
                 pass.set_bind_group(0, bg_gelu_mul, &[]);
                 pass.dispatch_workgroups(res.ffn_wg, 1, 1);
+                self.op_stamp(pass, "ffn.activation");
             } else {
                 // The split form exists only for the GEGLU shape, which is the
                 // only one that ever takes this branch — gemma's. A SwiGLU
@@ -9003,6 +10646,7 @@ impl VulkanBackend {
                 pass.set_pipeline(&self.mul_pipeline);
                 pass.set_bind_group(0, &res.bg_mul, &[]);
                 pass.dispatch_workgroups(res.ffn_wg, 1, 1);
+                self.op_stamp(pass, "ffn.activation");
             }
         }
         {
@@ -9076,19 +10720,15 @@ impl VulkanBackend {
         // `down_g.x_buffer` (see `build_fused_resources`).
 
         if self.q4_k_mmvq {
-            let mut qpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("orangu-server fused down quantize pass"),
-                timestamp_writes: None,
-            });
-            self.record_mmvq_quantize(&mut qpass, &down_g);
+            let qpass = cursor.pass();
+            self.record_mmvq_quantize(qpass, &down_g);
+            self.op_stamp(qpass, "ffn.down_quantize");
         }
 
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("orangu-server fused down+norms pass"),
-                timestamp_writes: None,
-            });
-            self.record_matmul(&mut pass, input.ffn_down, &down_g);
+            let pass = cursor.pass();
+            self.record_matmul(pass, input.ffn_down, &down_g);
+            self.op_stamp(pass, "ffn.down");
 
             match (&res.bg_ffn_post_norm_add, &res.bg_ffn_add) {
                 (Some(bg), _) => {
@@ -9103,6 +10743,7 @@ impl VulkanBackend {
                 }
                 (None, None) => unreachable!("one of the two shapes is always built"),
             }
+            self.op_stamp(pass, "ffn.post_norm_add");
         }
         {
             use vulkan_replay::DescriptorKind::{Storage, Uniform};
@@ -9142,7 +10783,7 @@ impl VulkanBackend {
             // Skip the `x2 → ple_gate.x` copy when the gate matmul
             // reads `x2` directly (shared-input). MMVQ keeps it.
             if pres.bg_ple_gate_matmul.is_none() {
-                encoder.copy_buffer_to_buffer(
+                cursor.encoder().copy_buffer_to_buffer(
                     final_buf.0,
                     final_buf.1,
                     &ple_gate_g.x_buffer,
@@ -9159,34 +10800,30 @@ impl VulkanBackend {
             }
 
             if self.q4_k_mmvq {
-                let mut qpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("orangu-server fused ple gate quantize pass"),
-                    timestamp_writes: None,
-                });
-                self.record_mmvq_quantize(&mut qpass, ple_gate_g);
+                let qpass = cursor.pass();
+                self.record_mmvq_quantize(qpass, ple_gate_g);
             }
 
             {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("orangu-server fused ple gate pass"),
-                    timestamp_writes: None,
-                });
+                let pass = cursor.pass();
                 match &pres.bg_ple_gate_matmul {
                     Some(bg) => self.record_matmul_shared_input(
-                        &mut pass,
+                        pass,
                         ple_input.gate_w,
                         ple_gate_g,
                         bg,
                         final_buf.0,
                         final_buf.1,
                     ),
-                    None => self.record_matmul(&mut pass, ple_input.gate_w, ple_gate_g),
+                    None => self.record_matmul(pass, ple_input.gate_w, ple_gate_g),
                 }
+                self.op_stamp(pass, "ple.gate");
                 match &pres.bg_gelu_mul {
                     Some(bg) => {
                         pass.set_pipeline(&self.gelu_mul_pipeline);
-                        pass.set_bind_group(0, bg, &[]);
+                        pass.set_bind_group(0, ple_gelu_mul_bg.as_ref().unwrap_or(bg), &[]);
                         pass.dispatch_workgroups(pres.wg, 1, 1);
+                        self.op_stamp(pass, "ple.gelu_mul");
                     }
                     None => {
                         pass.set_pipeline(&self.gelu_pipeline);
@@ -9203,6 +10840,7 @@ impl VulkanBackend {
                             &[],
                         );
                         pass.dispatch_workgroups(pres.wg, 1, 1);
+                        self.op_stamp(pass, "ple.gelu_mul");
                     }
                 }
             }
@@ -9299,7 +10937,7 @@ impl VulkanBackend {
             // gelu·mul wrote `ple_proj.x` directly. MMVQ keeps it.
             if pres.bg_gelu_mul.is_none() {
                 let mulled = pres.mulled.as_ref().expect("split mulled");
-                encoder.copy_buffer_to_buffer(
+                cursor.encoder().copy_buffer_to_buffer(
                     mulled,
                     pres.mulled_offset,
                     &ple_proj_g.x_buffer,
@@ -9316,19 +10954,14 @@ impl VulkanBackend {
             }
 
             if self.q4_k_mmvq {
-                let mut qpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("orangu-server fused ple proj quantize pass"),
-                    timestamp_writes: None,
-                });
-                self.record_mmvq_quantize(&mut qpass, ple_proj_g);
+                let qpass = cursor.pass();
+                self.record_mmvq_quantize(qpass, ple_proj_g);
             }
 
             {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("orangu-server fused ple proj pass"),
-                    timestamp_writes: None,
-                });
-                self.record_matmul(&mut pass, ple_input.proj_w, ple_proj_g);
+                let pass = cursor.pass();
+                self.record_matmul(pass, ple_input.proj_w, ple_proj_g);
+                self.op_stamp(pass, "ple.proj");
 
                 match &pres.bg_post_norm_add {
                     Some(bg) => {
@@ -9340,6 +10973,7 @@ impl VulkanBackend {
                         pass.set_pipeline(pipeline);
                         pass.set_bind_group(0, bg, &[]);
                         pass.dispatch_workgroups(1, 1, 1);
+                        self.op_stamp(pass, "ple.post_norm_add");
                     }
                     None => {
                         pass.set_pipeline(self.rmsnorm_for(n_embd));
@@ -9361,6 +10995,7 @@ impl VulkanBackend {
                             &[],
                         );
                         pass.dispatch_workgroups(res.embd_wg, 1, 1);
+                        self.op_stamp(pass, "ple.post_norm_add");
                     }
                 }
             }
@@ -9451,13 +11086,11 @@ impl VulkanBackend {
 
         if let Some(sres) = &res.scale {
             {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("orangu-server fused scale pass"),
-                    timestamp_writes: None,
-                });
+                let pass = cursor.pass();
                 pass.set_pipeline(&self.scale_pipeline);
                 pass.set_bind_group(0, &sres.bg, &[]);
                 pass.dispatch_workgroups(res.embd_wg, 1, 1);
+                self.op_stamp(pass, "layer.output_scale");
             }
             {
                 use vulkan_replay::DescriptorKind::{Storage, Uniform};
@@ -9518,7 +11151,9 @@ impl VulkanBackend {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("orangu-server fused post-attention (standalone) encoder"),
             });
-        let (final_buf, final_offset) = self.record_fused_post_attention(&mut encoder, input);
+        let mut cursor = PassCursor::new(&mut encoder);
+        let (final_buf, final_offset) = self.record_fused_post_attention(&mut cursor, input);
+        drop(cursor);
         self.submit_and_readback(encoder, &final_buf, final_offset, n_embd)
     }
 
@@ -9908,14 +11543,132 @@ impl VulkanBackend {
         // binds its own slice of this, so the result is one GPU buffer the
         // post-attention chain can consume directly however the batch striped.
         let out_buf = self.scratch_buffer(input.n_tokens * input.n_head * input.head_dim);
-        let (attn_out, k_rows, v_rows) =
-            self.record_attention_prefill(&input, cache, &out_buf, 0)?;
+        let (attn_out, k_rows, v_rows, pending) =
+            self.record_attention_prefill(&input, cache, &out_buf, 0, None)?;
+        debug_assert!(
+            pending.is_empty(),
+            "nothing is deferred on the waiting path"
+        );
         Some(FusedAttnPrefillOutput {
             attn_out_buf: out_buf,
             attn_out,
             k_rows,
             v_rows,
         })
+    }
+
+    /// [`Self::fused_attention_prefill`] for a caller that leaves attention's
+    /// output on the device **and will call [`Self::fill_kv_rows`] before
+    /// the chunk ends**: the K/V rows a KV-owning layer writes are counted
+    /// into the cache at once (`advance_gpu_written`) and their host copy is
+    /// left in flight, so the chain submits without waiting. The output's
+    /// `k_rows`/`v_rows` are empty; the rows arrive through the returned
+    /// pendings, one per stripe. A caller that does not resolve them leaves
+    /// the cache's host rows behind its `len` for good — the prefix reuse
+    /// and slot save of that request would then see a shorter prompt than
+    /// the device holds — which is why this is a separate entry point rather
+    /// than the default.
+    pub fn fused_attention_prefill_deferred(
+        &self,
+        input: FusedAttnPrefillInput<'_>,
+        cache: &mut crate::engine::kv_cache::LayerCache,
+        stage: &mut KvReadbackStage,
+    ) -> Option<(FusedAttnPrefillOutput, Vec<PendingKvRows>)> {
+        if self.q4_k_mmvq {
+            return None;
+        }
+        if input.n_tokens > max_matmul_tokens_per_submission() && !input.causal {
+            return None;
+        }
+        debug_assert!(
+            !input.want_attn_out_host,
+            "a deferred chain leaves everything on the device"
+        );
+        let out_buf = self.scratch_buffer(input.n_tokens * input.n_head * input.head_dim);
+        let (attn_out, k_rows, v_rows, pending) =
+            self.record_attention_prefill(&input, cache, &out_buf, 0, Some(stage))?;
+        Some((
+            FusedAttnPrefillOutput {
+                attn_out_buf: out_buf,
+                attn_out,
+                k_rows,
+                v_rows,
+            },
+            pending,
+        ))
+    }
+
+    /// A stage for one chunk's deferred K/V rows, holding at least `bytes`.
+    pub fn kv_readback_stage(&self, bytes: u64) -> KvReadbackStage {
+        let cap = bytes.max(1 << 20).next_power_of_two();
+        let pooled = self.kv_stage_pool.lock().ok().and_then(|mut pool| {
+            let at = pool.iter().position(|b| b.size() >= cap)?;
+            Some(pool.swap_remove(at))
+        });
+        let buffer = pooled.unwrap_or_else(|| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("orangu-server prefill K/V readback stage"),
+                size: cap,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        KvReadbackStage {
+            cap: buffer.size(),
+            buffer,
+            used: 0,
+        }
+    }
+
+    /// Brings home every K/V row a chunk's chains left in `stage`, in
+    /// order, and fills them into their layer caches — one map and one wait
+    /// for the whole chunk. Everything that wrote them has been submitted by
+    /// the time a chunk ends (the last group is closed before this is
+    /// called), which is what makes the map meaningful.
+    pub fn fill_kv_rows(
+        &self,
+        stage: KvReadbackStage,
+        pending: Vec<(usize, Vec<PendingKvRows>)>,
+        cache: &mut crate::engine::kv_cache::KvCache,
+    ) {
+        const CONTEXT: &str = "reading back a prefill chunk's K/V rows";
+        if stage.used > 0 {
+            let trace = ple_trace();
+            let t_wait = TraceClock::start();
+            let wait = self.map_read(&stage.buffer);
+            self.wait_mapped(&wait, CONTEXT);
+            let wait_ms = t_wait.ms();
+            let t_fill = TraceClock::start();
+            {
+                let data = self.mapped_bytes(&stage.buffer, CONTEXT);
+                let bytes: &[u8] = &data;
+                for (cache_index, rows) in &pending {
+                    for p in rows {
+                        let len = (p.kv_elems * 2 * 4) as u64;
+                        let all: &[f32] = bytemuck::cast_slice(
+                            &bytes[p.offset as usize..(p.offset + len) as usize],
+                        );
+                        let (k_rows, v_rows) = all.split_at(p.kv_elems);
+                        cache.layers[*cache_index].fill_gpu_written(k_rows, v_rows);
+                    }
+                }
+            }
+            stage.buffer.unmap();
+            if trace {
+                eprintln!(
+                    "orangu-server: [prefill-trace]   kv-fill {} layers {:.1} MiB wait={wait_ms:.1} \
+                     fill={:.1}",
+                    pending.len(),
+                    stage.used as f64 / (1024.0 * 1024.0),
+                    t_fill.ms()
+                );
+            }
+        }
+        if let Ok(mut pool) = self.kv_stage_pool.lock()
+            && pool.len() < 2
+        {
+            pool.push(stage.buffer);
+        }
     }
 
     /// One batch (or one stripe of one) of [`Self::fused_attention_prefill`],
@@ -9928,12 +11681,16 @@ impl VulkanBackend {
         cache: &mut crate::engine::kv_cache::LayerCache,
         out_buf: &wgpu::Buffer,
         out_row: usize,
-    ) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        mut stage: Option<&mut KvReadbackStage>,
+    ) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<PendingKvRows>)> {
         let FusedAttnPrefillInput {
             pairing,
             normalize_v,
+            attn_gate,
             q_bias,
             normed,
+            x_gpu: _,
+            attn_norm: _,
             n_tokens,
             start_pos,
             wq,
@@ -9953,7 +11710,10 @@ impl VulkanBackend {
             want_attn_out_host,
         } = *input;
         let n_embd = wq.in_dim;
-        debug_assert_eq!(normed.len(), n_tokens * n_embd);
+        let (x_gpu, attn_norm) = (input.x_gpu, input.attn_norm);
+        if x_gpu.is_none() {
+            debug_assert_eq!(normed.len(), n_tokens * n_embd);
+        }
         let kv_dim = n_head_kv * head_dim;
         let q_elems = n_tokens * n_head * head_dim;
 
@@ -9967,13 +11727,14 @@ impl VulkanBackend {
             let mut attn_out = Vec::new();
             let mut k_rows = Vec::new();
             let mut v_rows = Vec::new();
+            let mut pending = Vec::new();
             let mut start = 0;
             while start < n_tokens {
                 let end = (start + max_matmul_tokens_per_submission()).min(n_tokens);
                 let len = end - start;
                 // Unlike the FFN chain, a stripe must not be padded: padded
                 // rows would be written into the KV cache as real positions.
-                let (a, k, v) = self.record_attention_prefill(
+                let (a, k, v, p) = self.record_attention_prefill(
                     &FusedAttnPrefillInput {
                         // Only the per-stripe fields are overridden here;
                         // everything else — the RoPE pairing, whether V is
@@ -9981,7 +11742,11 @@ impl VulkanBackend {
                         // `..input.reborrow()` and must *not* be restated, or a
                         // striped prompt silently runs a different
                         // configuration from an unstriped one.
-                        normed: &normed[start * n_embd..end * n_embd],
+                        normed: match x_gpu {
+                            Some(_) => &[],
+                            None => &normed[start * n_embd..end * n_embd],
+                        },
+                        x_gpu: x_gpu.map(|(b, off)| (b, off + (start * n_embd) as u64 * 4)),
                         n_tokens: len,
                         start_pos: start_pos + start,
                         ..input.reborrow()
@@ -9989,13 +11754,15 @@ impl VulkanBackend {
                     cache,
                     out_buf,
                     out_row + start,
+                    stage.as_deref_mut(),
                 )?;
                 attn_out.extend(a);
                 k_rows.extend(k);
                 v_rows.extend(v);
+                pending.extend(p);
                 start = end;
             }
-            return Some((attn_out, k_rows, v_rows));
+            return Some((attn_out, k_rows, v_rows, pending));
         }
 
         let half = rope_dim / 2;
@@ -10003,7 +11770,7 @@ impl VulkanBackend {
         let ff: &[f32] = match freq_factors {
             Some(ff) => ff,
             None => {
-                ff_owned = vec![1.0f32; half];
+                ff_owned = vec![1.0f32; half.max(1)];
                 &ff_owned
             }
         };
@@ -10019,8 +11786,29 @@ impl VulkanBackend {
         // The staging hop is required rather than incidental: every op's `x`
         // region lives in the shared `x_arena`, and wgpu rejects a copy whose
         // source and destination are the same buffer.
-        let normed_staging = self.upload_new(normed);
-        let normed_bytes = (normed.len() as u64) * 4;
+        let normed_bytes = (n_tokens * n_embd) as u64 * 4;
+        // With the residual stream on the device, the staging buffer is the
+        // norm's own output, written by a dispatch recorded below rather than
+        // uploaded — the same fan-out then follows either way.
+        let normed_staging = match x_gpu {
+            Some(_) => self.scratch_buffer(n_tokens * n_embd),
+            None => self.upload_new(normed),
+        };
+        let attn_norm_rows = match (x_gpu, attn_norm) {
+            (Some((xb, xoff)), Some(w)) => {
+                let w_buf = self.upload_new(w);
+                let meta = self.elem_meta_buffer(n_embd as u32, eps);
+                let bg = self.elem4_bind_group(
+                    BindSrc::Slice(xb, xoff, normed_bytes),
+                    &w_buf,
+                    &normed_staging,
+                    &meta,
+                );
+                Some((bg, w_buf, meta))
+            }
+            (Some(_), None) => return None,
+            (None, _) => None,
+        };
         let q_op = MatmulOp {
             x: &[],
             n_tokens,
@@ -10062,6 +11850,22 @@ impl VulkanBackend {
                 .map(|e| e.lock().expect("op cache entry poisoned"));
             (k_g, v_g)
         });
+        // The attention gate's projection, live beside Q/K/V in the same
+        // submission, so it takes the fourth slot of the pooled region.
+        let gate_entry = attn_gate.map(|w| {
+            self.op_entry_at(
+                &MatmulOp {
+                    x: &[],
+                    n_tokens,
+                    w,
+                },
+                0,
+                ROLE_ATTN_QKV + 3,
+            )
+        });
+        let gate_g = gate_entry
+            .as_ref()
+            .map(|e| e.lock().expect("op cache entry poisoned"));
 
         let ff_buf = self.upload_new(ff);
         // Projection biases, applied before anything reads the projections.
@@ -10110,7 +11914,14 @@ impl VulkanBackend {
         // This call appends exactly `n_tokens` positions starting here, and a
         // range that long generally crosses page boundaries — so unlike the
         // decode step it gets back a list of runs rather than one row.
-        let write_pos = cache.len;
+        //
+        // A layer without its own K/V reads a donor's cache, which the donor
+        // has already advanced past this batch — so for it the range is the
+        // batch's own positions, not `len` onward. Asked from `len`, the pool
+        // handed out pages for positions nothing would ever write, and a
+        // sequence reserved for exactly its capacity outgrew its block table
+        // one layer in.
+        let write_pos = if kv.is_some() { cache.len } else { start_pos };
         let paged = cache.paged_range_refs(&self.queue, write_pos, n_tokens);
         // The write, as runs. A contiguous cache is the one-run case, so the
         // cast dispatches and the `f32` copies below are written once and both
@@ -10165,7 +11976,15 @@ impl VulkanBackend {
                 (p.layer_buffer.clone(), probs, 0u64, p.half, p.half, p.half)
             }
             None => {
-                let kv_refs = cache.sync_gpu(&self.device, &self.queue, n_head, self.kv_storage);
+                // Sized for the rows this call writes (a KV-owning layer) or
+                // reads past `len` (a donor's window), not for one.
+                let kv_refs = cache.sync_gpu_ahead(
+                    &self.device,
+                    &self.queue,
+                    n_head,
+                    self.kv_storage,
+                    (write_pos + n_tokens).saturating_sub(cache.len),
+                );
                 (
                     kv_refs.buffer.clone(),
                     kv_refs.probs.clone(),
@@ -10387,7 +12206,18 @@ impl VulkanBackend {
             },
         );
 
-        let mut encoder = self.new_encoder("orangu-server fused prefill attention encoder");
+        let (mut encoder, grouped) =
+            self.take_prefill_encoder("orangu-server fused prefill attention encoder");
+        if let Some((bg, ..)) = &attn_norm_rows {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server fused prefill attention norm pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(self.rmsnorm_rows_for(n_embd));
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(n_tokens as u32, 1, 1);
+            self.op_stamp(&mut pass, "pp.attn.norm");
+        }
         // Fan the single staged upload out into each projection's own input
         // region. Encoder-ordered copies, not `queue.write_buffer`, so they are
         // guaranteed to land before the matmuls that read them.
@@ -10416,16 +12246,89 @@ impl VulkanBackend {
                 );
             }
         }
+        if let Some(g) = &gate_g {
+            encoder.copy_buffer_to_buffer(
+                &normed_staging,
+                0,
+                &g.x_buffer,
+                g.x_offset,
+                normed_bytes,
+            );
+        }
+        self.op_stamp_encoder(&mut encoder, "pp.gap");
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("orangu-server fused prefill qkv pass"),
                 timestamp_writes: None,
             });
-            self.record_matmul(&mut pass, wq, &q_g);
-            if let Some((proj, k_g, v_g, ..)) = &kv_side {
-                self.record_matmul(&mut pass, proj.wk, k_g);
-                if let (Some(wv), Some(g)) = (proj.wv, v_g) {
-                    self.record_matmul(&mut pass, wv, g);
+            // The projections on the integer-dot GEMM where every one of
+            // them fits it — the normed rows quantized once for all three
+            // — and on the float kernels otherwise.
+            let mmq_qkv = {
+                let all_fit = self.mmq_for(wq, n_tokens)
+                    && kv_side.as_ref().is_none_or(|(proj, ..)| {
+                        self.mmq_for(proj.wk, n_tokens)
+                            && proj.wv.is_none_or(|wv| self.mmq_for(wv, n_tokens))
+                    });
+                all_fit.then(|| self.mmq_stage(BindSrc::Whole(&normed_staging), n_tokens, n_embd))
+            };
+            match &mmq_qkv {
+                Some((q8, qbg, qwg, _)) => {
+                    self.record_mmq_quantize(&mut pass, qbg, *qwg);
+                    self.op_stamp(&mut pass, "pp.attn.quantize");
+                    let op = self.mmq_op(wq, &q_g, q8);
+                    self.record_mmq(&mut pass, &op.0, op.1, op.2);
+                    self.op_stamp(&mut pass, "pp.attn.wq");
+                    if let (Some(w), Some(g)) = (attn_gate, &gate_g) {
+                        match self
+                            .mmq_for(w, n_tokens)
+                            .then_some(mmq_qkv.as_ref())
+                            .flatten()
+                        {
+                            Some((q8, ..)) => {
+                                let op = self.mmq_op(w, g, q8);
+                                self.record_mmq(&mut pass, &op.0, op.1, op.2);
+                            }
+                            None => self.record_matmul(&mut pass, w, g),
+                        }
+                        self.op_stamp(&mut pass, "pp.attn.gate");
+                    }
+                    if let Some((proj, k_g, v_g, ..)) = &kv_side {
+                        let op = self.mmq_op(proj.wk, k_g, q8);
+                        self.record_mmq(&mut pass, &op.0, op.1, op.2);
+                        self.op_stamp(&mut pass, "pp.attn.wk");
+                        if let (Some(wv), Some(g)) = (proj.wv, v_g) {
+                            let op = self.mmq_op(wv, g, q8);
+                            self.record_mmq(&mut pass, &op.0, op.1, op.2);
+                            self.op_stamp(&mut pass, "pp.attn.wv");
+                        }
+                    }
+                }
+                None => {
+                    self.record_matmul(&mut pass, wq, &q_g);
+                    self.op_stamp(&mut pass, "pp.attn.wq");
+                    if let (Some(w), Some(g)) = (attn_gate, &gate_g) {
+                        match self
+                            .mmq_for(w, n_tokens)
+                            .then_some(mmq_qkv.as_ref())
+                            .flatten()
+                        {
+                            Some((q8, ..)) => {
+                                let op = self.mmq_op(w, g, q8);
+                                self.record_mmq(&mut pass, &op.0, op.1, op.2);
+                            }
+                            None => self.record_matmul(&mut pass, w, g),
+                        }
+                        self.op_stamp(&mut pass, "pp.attn.gate");
+                    }
+                    if let Some((proj, k_g, v_g, ..)) = &kv_side {
+                        self.record_matmul(&mut pass, proj.wk, k_g);
+                        self.op_stamp(&mut pass, "pp.attn.wk");
+                        if let (Some(wv), Some(g)) = (proj.wv, v_g) {
+                            self.record_matmul(&mut pass, wv, g);
+                            self.op_stamp(&mut pass, "pp.attn.wv");
+                        }
+                    }
                 }
             }
 
@@ -10468,12 +12371,14 @@ impl VulkanBackend {
                 }
                 PrefillKNormRope::Split { .. } => unreachable!("Q never splits"),
             }
+            self.op_stamp(&mut pass, "pp.attn.q_norm_rope");
 
             if let Some((.., k_stage, _, _, _)) = &kv_side {
                 if let PrefillKNormRope::Fused { bg, .. } = k_stage {
                     pass.set_pipeline(&self.fused_norm_rope_pipeline);
                     pass.set_bind_group(0, bg, &[]);
                     pass.dispatch_workgroups(n_head_kv as u32, n_tokens as u32, 1);
+                    self.op_stamp(&mut pass, "pp.attn.k_norm_rope");
                 } else if let PrefillKNormRope::RopeOnly { bg, .. } = k_stage {
                     pass.set_pipeline(&self.rope_pipeline);
                     pass.set_bind_group(0, bg, &[]);
@@ -10513,6 +12418,7 @@ impl VulkanBackend {
                     pass.set_pipeline(&self.perhead_rmsnorm_weightless_pipeline);
                     pass.set_bind_group(0, v_norm_bg, &[]);
                     pass.dispatch_workgroups((n_tokens * n_head_kv) as u32, 1, 1);
+                    self.op_stamp(&mut pass, "pp.attn.v_norm");
                 }
 
                 // Only now does K get rotated — V never does.
@@ -10541,6 +12447,7 @@ impl VulkanBackend {
                         pass.set_bind_group(0, v_bg, &[]);
                         pass.dispatch_workgroups(len.div_ceil(64), 1, 1);
                     }
+                    self.op_stamp(&mut pass, "pp.attn.kv_write");
                 }
             }
         }
@@ -10577,6 +12484,17 @@ impl VulkanBackend {
             pass.set_pipeline(&attn_pipeline);
             pass.set_bind_group(0, &attn_bg, &[]);
             pass.dispatch_workgroups(grid_x, n_tokens as u32, 1);
+            self.op_stamp(&mut pass, "pp.attn.attention");
+            if let Some(g) = &gate_g {
+                // `attn_out *= sigmoid(gate)`, in place, before anything
+                // reads attention's rows.
+                let meta = self.elem_meta_buffer(q_elems as u32, 0.0);
+                let bg = self.elem3_bind_group(g.output_src(), out_slice, &meta);
+                pass.set_pipeline(&self.sigmoid_gate_pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups((q_elems as u32).div_ceil(64), 1, 1);
+                self.op_stamp(&mut pass, "pp.attn.gate_mul");
+            }
         }
 
         if want_attn_out_host {
@@ -10611,11 +12529,38 @@ impl VulkanBackend {
             );
         }
 
+        self.op_stamp_encoder(&mut encoder, "pp.attn.readback_copies");
         if readback_len == 0 {
-            // Nothing to bring home: submit and let queue ordering hand the
-            // results to whatever reads them next.
-            self.queue.submit(Some(encoder.finish()));
-            return Some((Vec::new(), Vec::new(), Vec::new()));
+            // Nothing to bring home: submit (or park, in a group) and let
+            // queue ordering hand the results to whatever reads them next.
+            self.park_or_submit(encoder, grouped);
+            return Some((Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+        }
+        let byte_len = (readback_len as u64) * 4;
+        if host_q == 0
+            && let Some(offset) = stage.as_deref_mut().and_then(|s| s.reserve(byte_len))
+        {
+            // The rows go to the chunk's stage now and are read after the
+            // chunk (`fill_kv_rows`); the positions are counted at once, so
+            // the next stripe writes past them and the next layer's window
+            // covers them. No wait here — this was the one place the
+            // device-resident prefill still drained the device per layer.
+            let stage = stage.as_deref().expect("reserved above");
+            encoder.copy_buffer_to_buffer(&combined, 0, &stage.buffer, offset, byte_len);
+            self.park_or_submit(encoder, grouped);
+            drop(kv_side);
+            drop(kv_guards);
+            drop(q_g);
+            cache.advance_gpu_written(n_tokens);
+            return Some((
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![PendingKvRows {
+                    offset,
+                    kv_elems: kv_readback,
+                }],
+            ));
         }
         let all = self.submit_and_readback(encoder, &combined, 0, readback_len);
         drop(kv_side);
@@ -10633,7 +12578,12 @@ impl VulkanBackend {
         if !k_rows.is_empty() {
             cache.commit_gpu_written(k_rows, v_rows);
         }
-        Some((attn_out.to_vec(), k_rows.to_vec(), v_rows.to_vec()))
+        Some((
+            attn_out.to_vec(),
+            k_rows.to_vec(),
+            v_rows.to_vec(),
+            Vec::new(),
+        ))
     }
 
     /// A prefill layer's **whole post-attention chain** in one submission:
@@ -10672,7 +12622,59 @@ impl VulkanBackend {
         eps: f32,
         activation: FfnActivation,
     ) -> Option<Vec<f32>> {
+        self.fused_post_attention_prefill_rows(
+            attn_out,
+            AttnOutSrc::Host(residual),
+            n_tokens,
+            wo,
+            attn_post_norm,
+            ffn_norm,
+            gate,
+            up,
+            down,
+            ffn_post_norm,
+            eps,
+            activation,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// [`Self::fused_post_attention_prefill`] with the residual wherever it
+    /// is — host rows, or `[n_tokens, n_embd]` rows already on the device —
+    /// and, given `out`, the result left on the device from that row of the
+    /// caller's buffer instead of read back (the returned vector is then
+    /// empty). Nothing waits on the device in that form: the submission goes
+    /// out and the next chain's commands queue behind it, which is what lets a
+    /// whole prefill chunk run without the host in the loop. A striped batch
+    /// writes each stripe at its own row; a padded tail lands past
+    /// `n_tokens`, so `out` must hold `padded_stripe_len` rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_post_attention_prefill_rows(
+        &self,
+        attn_out: AttnOutSrc<'_>,
+        residual: AttnOutSrc<'_>,
+        n_tokens: usize,
+        wo: &QuantMatrix,
+        attn_post_norm: Option<&[f32]>,
+        ffn_norm: &[f32],
+        gate: &QuantMatrix,
+        up: &QuantMatrix,
+        down: &QuantMatrix,
+        ffn_post_norm: Option<&[f32]>,
+        eps: f32,
+        activation: FfnActivation,
+        out: Option<(&wgpu::Buffer, usize)>,
+        out_scale: Option<f32>,
+        post_norm_eps: Option<f32>,
+    ) -> Option<Vec<f32>> {
         if self.q4_k_mmvq {
+            return None;
+        }
+        // The layer output scale rides on the FFN post-norm's kernel; a
+        // layer with a scale and no post-norm has no fused form here.
+        if out_scale.is_some() && ffn_post_norm.is_none() {
             return None;
         }
         let n_embd = wo.out_dim;
@@ -10683,7 +12685,7 @@ impl VulkanBackend {
         let stripe_tokens =
             max_matmul_tokens_per_submission().min(self.max_stripe_tokens_for(gate.out_dim));
         if n_tokens > stripe_tokens {
-            let mut out = Vec::with_capacity(n_tokens * n_embd);
+            let mut all = Vec::with_capacity(if out.is_none() { n_tokens * n_embd } else { 0 });
             let mut start = 0;
             while start < n_tokens {
                 let end = (start + stripe_tokens).min(n_tokens);
@@ -10709,11 +12711,22 @@ impl VulkanBackend {
                         rows.saturating_sub(start).min(len),
                     ),
                 };
-                let resid_stripe =
-                    pad_rows(&residual[start * n_embd..end * n_embd], len, padded, n_embd);
-                let mut stripe = self.fused_post_attention_prefill(
+                let resid_host;
+                let resid_stripe = match residual {
+                    AttnOutSrc::Host(r) => {
+                        resid_host =
+                            pad_rows(&r[start * n_embd..end * n_embd], len, padded, n_embd);
+                        AttnOutSrc::Host(&resid_host)
+                    }
+                    AttnOutSrc::Gpu(b, off, rows) => AttnOutSrc::Gpu(
+                        b,
+                        off + (start * n_embd) as u64 * 4,
+                        rows.saturating_sub(start).min(len),
+                    ),
+                };
+                let mut stripe = self.fused_post_attention_prefill_rows(
                     attn_stripe,
-                    &resid_stripe,
+                    resid_stripe,
                     padded,
                     wo,
                     attn_post_norm,
@@ -10724,12 +12737,17 @@ impl VulkanBackend {
                     ffn_post_norm,
                     eps,
                     activation,
+                    out.map(|(b, row)| (b, row + start)),
+                    out_scale,
+                    post_norm_eps,
                 )?;
-                stripe.truncate(len * n_embd);
-                out.extend(stripe);
+                if out.is_none() {
+                    stripe.truncate(len * n_embd);
+                    all.extend(stripe);
+                }
                 start = end;
             }
-            return Some(out);
+            return Some(all);
         }
         let ffn_len = gate.out_dim;
         let rows = n_tokens as u32;
@@ -10776,7 +12794,17 @@ impl VulkanBackend {
             self.queue
                 .write_buffer(&wo_g.x_buffer, wo_g.x_offset, bytemuck::cast_slice(a));
         }
-        let residual_buf = self.upload_new(residual);
+        // The residual: uploaded, or bound where it already is. A device
+        // residual's rows past `rows` are whatever the buffer holds — they only
+        // feed padded output rows, which are discarded.
+        let residual_owned;
+        let residual_src: BindSrc<'_> = match residual {
+            AttnOutSrc::Host(r) => {
+                residual_owned = self.upload_new(r);
+                BindSrc::Whole(&residual_owned)
+            }
+            AttnOutSrc::Gpu(b, off, _) => BindSrc::Slice(b, off, (row_elems as u64) * 4),
+        };
         // An architecture without post-norms (Llama, Qwen2, Mistral, Phi) is
         // not a norm with weights of one — that would still normalize. It is
         // *no norm*: the residual add runs on its own. So there is no weight to
@@ -10790,8 +12818,20 @@ impl VulkanBackend {
         // the FFN norm's input and the FFN residual's addend, so it has to
         // outlive the FFN block rather than be written over by it.
         let x1 = self.scratch_buffer(row_elems);
-        let out_buf = self.scratch_buffer(row_elems);
+        let out_owned;
+        let out_src: BindSrc<'_> = match out {
+            Some((b, row)) => BindSrc::Slice(b, (row * n_embd) as u64 * 4, (row_elems as u64) * 4),
+            None => {
+                out_owned = self.scratch_buffer(row_elems);
+                BindSrc::Whole(&out_owned)
+            }
+        };
         let meta_embd = self.elem_meta_buffer(n_embd as u32, eps);
+        // The post-norms' own epsilon where the architecture gives them one.
+        let meta_embd_post = post_norm_eps
+            .filter(|e| *e != eps)
+            .map(|e| self.elem_meta_buffer(n_embd as u32, e));
+        let meta_post = meta_embd_post.as_ref().unwrap_or(&meta_embd);
         let meta_ffn = self.elem_meta_buffer((n_tokens * ffn_len) as u32, 0.0);
 
         // Two shapes for the same step. With a post-norm it is
@@ -10803,9 +12843,9 @@ impl VulkanBackend {
         let meta_row_elems = self.elem_meta_buffer(row_elems as u32, 0.0);
         let bg_attn_resid = attn_post_norm_w
             .as_ref()
-            .map(|w| self.elem5_bind_group(wo_g.output_src(), w, &residual_buf, &x1, &meta_embd));
+            .map(|w| self.elem5_bind_group(wo_g.output_src(), w, residual_src, &x1, meta_post));
         let bg_attn_add = (attn_post_norm_w.is_none())
-            .then(|| self.elem4_bind_group(wo_g.output_src(), &residual_buf, &x1, &meta_row_elems));
+            .then(|| self.elem4_bind_group(wo_g.output_src(), residual_src, &x1, &meta_row_elems));
         // The FFN norm writes here, and the result is then copied into both
         // projections' own input regions. The copies are recorded into the
         // encoder (unlike `queue.write_buffer`, which is ordered against
@@ -10813,6 +12853,44 @@ impl VulkanBackend {
         // between the norm and the projections that read them.
         let ffn_normed = self.scratch_buffer(row_elems);
         let bg_ffn_norm = self.elem4_bind_group(&x1, &ffn_norm_w, &ffn_normed, &meta_embd);
+        // The integer-dot form of the gate and up projections — both `Q4_K`
+        // at a batch the kernel tiles — over the FFN norm's rows quantized
+        // once (`mmq_stage`); `None` keeps the float kernels.
+        let mmq_ffn = (self.mmq_for(gate, n_tokens) && self.mmq_for(up, n_tokens)).then(|| {
+            let (q8, qbg, qwg, qmeta) =
+                self.mmq_stage(BindSrc::Whole(&ffn_normed), n_tokens, gate.in_dim);
+            let gate_op = self.mmq_op(gate, &gate_g, &q8);
+            let up_op = self.mmq_op(up, &up_g, &q8);
+            (q8, qbg, qwg, qmeta, gate_op, up_op)
+        });
+        // The down projection the same way, over the activation's rows in
+        // its own input region; and `wo` over attention's output in its.
+        let mmq_down = self.mmq_for(down, n_tokens).then(|| {
+            let (q8, qbg, qwg, qmeta) = self.mmq_stage(
+                BindSrc::Slice(
+                    &down_g.x_buffer,
+                    down_g.x_offset,
+                    ((n_tokens * ffn_len) as u64) * 4,
+                ),
+                n_tokens,
+                down.in_dim,
+            );
+            let op = self.mmq_op(down, &down_g, &q8);
+            (q8, qbg, qwg, qmeta, op)
+        });
+        let mmq_wo = self.mmq_for(wo, n_tokens).then(|| {
+            let (q8, qbg, qwg, qmeta) = self.mmq_stage(
+                BindSrc::Slice(
+                    &wo_g.x_buffer,
+                    wo_g.x_offset,
+                    ((n_tokens * wo.in_dim) as u64) * 4,
+                ),
+                n_tokens,
+                wo.in_dim,
+            );
+            let op = self.mmq_op(wo, &wo_g, &q8);
+            (q8, qbg, qwg, qmeta, op)
+        });
         let bg_gelu_mul = self.elem4_bind_group(
             gate_g.output_src(),
             up_g.output_src(),
@@ -10824,14 +12902,27 @@ impl VulkanBackend {
             &meta_ffn,
         );
         let bg_ffn_add = (ffn_post_norm_w.is_none())
-            .then(|| self.elem4_bind_group(down_g.output_src(), &x1, &out_buf, &meta_row_elems));
-        let bg_ffn_resid = ffn_post_norm_w
-            .as_ref()
-            .map(|w| self.elem5_bind_group(down_g.output_src(), w, &x1, &out_buf, &meta_embd));
+            .then(|| self.elem4_bind_group(down_g.output_src(), &x1, out_src, &meta_row_elems));
+        // With a layer output scale the FFN post-norm's kernel is the
+        // scaled one, reading the scale from its own meta.
+        let meta_embd_scaled = out_scale.map(|scale| {
+            self.elem_meta_buffer_scaled(n_embd as u32, post_norm_eps.unwrap_or(eps), scale)
+        });
+        let bg_ffn_resid = ffn_post_norm_w.as_ref().map(|w| {
+            self.elem5_bind_group(
+                down_g.output_src(),
+                w,
+                &x1,
+                out_src,
+                meta_embd_scaled.as_ref().unwrap_or(meta_post),
+            )
+        });
         let bind_ms = t_bind.ms();
 
         let t_record = TraceClock::start();
-        let mut encoder = self.new_encoder("orangu-server fused prefill layer encoder");
+        let (mut encoder, grouped) =
+            self.take_prefill_encoder("orangu-server fused prefill layer encoder");
+        self.op_stamp_encoder(&mut encoder, "pp.gap");
         // Device-to-device when attention left its output on the GPU. Recorded
         // rather than a `queue.write_buffer`, so it is ordered against the
         // matmul that reads it rather than merely against submission.
@@ -10860,11 +12951,19 @@ impl VulkanBackend {
                     label: Some("orangu-server fused prefill layer pass"),
                     timestamp_writes: None,
                 });
-                self.record_matmul(&mut pass, wo, &wo_g);
+                match &mmq_wo {
+                    Some((_, qbg, qwg, _, op)) => {
+                        self.record_mmq_quantize(&mut pass, qbg, *qwg);
+                        self.op_stamp(&mut pass, "pp.wo.quantize");
+                        self.record_mmq(&mut pass, &op.0, op.1, op.2);
+                    }
+                    None => self.record_matmul(&mut pass, wo, &wo_g),
+                }
+                self.op_stamp(&mut pass, "pp.wo");
 
                 match (&bg_attn_resid, &bg_attn_add) {
                     (Some(bg), _) => {
-                        pass.set_pipeline(&self.rmsnorm_add_rows_pipeline);
+                        pass.set_pipeline(self.rmsnorm_add_rows_for(n_embd));
                         pass.set_bind_group(0, bg, &[]);
                         pass.dispatch_workgroups(rows, 1, 1);
                     }
@@ -10875,10 +12974,12 @@ impl VulkanBackend {
                     }
                     (None, None) => unreachable!("one of the two shapes is always built"),
                 }
+                self.op_stamp(&mut pass, "pp.attn_post_norm_add");
 
-                pass.set_pipeline(&self.rmsnorm_rows_pipeline);
+                pass.set_pipeline(self.rmsnorm_rows_for(n_embd));
                 pass.set_bind_group(0, &bg_ffn_norm, &[]);
                 pass.dispatch_workgroups(rows, 1, 1);
+                self.op_stamp(&mut pass, "pp.ffn_norm");
             }
             encoder.copy_buffer_to_buffer(
                 &ffn_normed,
@@ -10894,23 +12995,54 @@ impl VulkanBackend {
                 up_g.x_offset,
                 normed_bytes,
             );
+            self.op_stamp_encoder(&mut encoder, "pp.normed_copies");
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("orangu-server fused prefill layer FFN pass"),
                     timestamp_writes: None,
                 });
-                self.record_matmul(&mut pass, gate, &gate_g);
-                self.record_matmul(&mut pass, up, &up_g);
+                // The gate and up projections on the integer-dot GEMM where
+                // it serves them: the FFN norm's rows quantized once, both
+                // read the result.
+                match &mmq_ffn {
+                    Some((_, qbg, qwg, _, gate_op, up_op)) => {
+                        self.record_mmq_quantize(&mut pass, qbg, *qwg);
+                        self.op_stamp(&mut pass, "pp.ffn.quantize");
+                        self.record_mmq(&mut pass, &gate_op.0, gate_op.1, gate_op.2);
+                        self.op_stamp(&mut pass, "pp.ffn.gate");
+                        self.record_mmq(&mut pass, &up_op.0, up_op.1, up_op.2);
+                        self.op_stamp(&mut pass, "pp.ffn.up");
+                    }
+                    None => {
+                        self.record_matmul(&mut pass, gate, &gate_g);
+                        self.op_stamp(&mut pass, "pp.ffn.gate");
+                        self.record_matmul(&mut pass, up, &up_g);
+                        self.op_stamp(&mut pass, "pp.ffn.up");
+                    }
+                }
 
                 pass.set_pipeline(self.ffn_activation_pipeline(activation));
                 pass.set_bind_group(0, &bg_gelu_mul, &[]);
                 pass.dispatch_workgroups(self.flat_workgroups(n_tokens * ffn_len), 1, 1);
+                self.op_stamp(&mut pass, "pp.ffn.activation");
 
-                self.record_matmul(&mut pass, down, &down_g);
+                match &mmq_down {
+                    Some((_, qbg, qwg, _, op)) => {
+                        self.record_mmq_quantize(&mut pass, qbg, *qwg);
+                        self.op_stamp(&mut pass, "pp.ffn.quantize");
+                        self.record_mmq(&mut pass, &op.0, op.1, op.2);
+                    }
+                    None => self.record_matmul(&mut pass, down, &down_g),
+                }
+                self.op_stamp(&mut pass, "pp.ffn.down");
 
                 match (&bg_ffn_resid, &bg_ffn_add) {
                     (Some(bg), _) => {
-                        pass.set_pipeline(&self.rmsnorm_add_rows_pipeline);
+                        pass.set_pipeline(if out_scale.is_some() {
+                            self.rmsnorm_add_scale_rows_for(n_embd)
+                        } else {
+                            self.rmsnorm_add_rows_for(n_embd)
+                        });
                         pass.set_bind_group(0, bg, &[]);
                         pass.dispatch_workgroups(rows, 1, 1);
                     }
@@ -10921,10 +13053,27 @@ impl VulkanBackend {
                     }
                     (None, None) => unreachable!("one of the two shapes is always built"),
                 }
+                self.op_stamp(&mut pass, "pp.ffn_post_norm_add");
             }
         }
         let record_ms = t_record.ms();
-        let (out, rb) = self.submit_and_readback_split(encoder, &out_buf, 0, row_elems);
+        // Left on the device: submitted (or parked), not waited for.
+        if out.is_some() {
+            self.park_or_submit(encoder, grouped);
+            if trace {
+                eprintln!(
+                    "orangu-server: [prefill-trace]   fpa-split n_tokens={n_tokens} \
+                     entry={entry_ms:.1} upload={upload_ms:.1} bind={bind_ms:.1} \
+                     record={record_ms:.1} (left on the device)"
+                );
+            }
+            return Some(Vec::new());
+        }
+        let out_buf = match out_src {
+            BindSrc::Whole(b) => b,
+            BindSrc::Slice(..) => unreachable!("a read-back result is a whole scratch buffer"),
+        };
+        let (out, rb) = self.submit_and_readback_split(encoder, out_buf, 0, row_elems);
         if trace {
             eprintln!(
                 "orangu-server: [prefill-trace]   fpa-split n_tokens={n_tokens} \
@@ -10955,6 +13104,36 @@ impl VulkanBackend {
         proj: &QuantMatrix,
         per_layer: &[f32],
     ) -> Option<Vec<f32>> {
+        self.fused_ple_prefill_rows(
+            AttnOutSrc::Host(x),
+            n_tokens,
+            gate,
+            proj,
+            per_layer,
+            None,
+            None,
+        )
+    }
+
+    /// [`Self::fused_ple_prefill`] with `x` wherever it is and, given a
+    /// `tail`, the stage's own post-norm, residual add and per-layer output
+    /// scale recorded after the projection — so what comes out is the layer's
+    /// final value, not the projection. With `out`, that value is left on the
+    /// device from that row of the caller's buffer and nothing is waited for
+    /// (the returned vector is empty); the same contract as
+    /// [`Self::fused_post_attention_prefill_rows`]. A `tail` needs `x` on the
+    /// device or on the host alike — it is the residual.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_ple_prefill_rows(
+        &self,
+        x: AttnOutSrc<'_>,
+        n_tokens: usize,
+        gate: &QuantMatrix,
+        proj: &QuantMatrix,
+        per_layer: &[f32],
+        tail: Option<PleTail<'_>>,
+        out: Option<(&wgpu::Buffer, usize)>,
+    ) -> Option<Vec<f32>> {
         if self.q4_k_mmvq {
             return None;
         }
@@ -10968,35 +13147,58 @@ impl VulkanBackend {
         let stripe_tokens =
             max_matmul_tokens_per_submission().min(self.max_stripe_tokens_for(gate.out_dim));
         if n_tokens > stripe_tokens {
-            let mut out = Vec::with_capacity(n_tokens * out_dim);
+            let mut all = Vec::with_capacity(if out.is_none() { n_tokens * out_dim } else { 0 });
             let mut start = 0;
             while start < n_tokens {
                 let end = (start + stripe_tokens).min(n_tokens);
                 let len = end - start;
                 let padded = padded_stripe_len(len, n_tokens);
-                let x_stripe = pad_rows(
-                    &x[start * gate.in_dim..end * gate.in_dim],
-                    len,
-                    padded,
-                    gate.in_dim,
-                );
+                let x_host;
+                let x_stripe = match x {
+                    AttnOutSrc::Host(h) => {
+                        x_host = pad_rows(
+                            &h[start * gate.in_dim..end * gate.in_dim],
+                            len,
+                            padded,
+                            gate.in_dim,
+                        );
+                        AttnOutSrc::Host(&x_host)
+                    }
+                    AttnOutSrc::Gpu(b, off, rows) => AttnOutSrc::Gpu(
+                        b,
+                        off + (start * gate.in_dim) as u64 * 4,
+                        rows.saturating_sub(start).min(len),
+                    ),
+                };
                 let pl_stripe = pad_rows(
                     &per_layer[start * per_layer_dim..end * per_layer_dim],
                     len,
                     padded,
                     per_layer_dim,
                 );
-                let mut stripe =
-                    self.fused_ple_prefill(&x_stripe, padded, gate, proj, &pl_stripe)?;
-                stripe.truncate(len * out_dim);
-                out.extend(stripe);
+                let mut stripe = self.fused_ple_prefill_rows(
+                    x_stripe,
+                    padded,
+                    gate,
+                    proj,
+                    &pl_stripe,
+                    tail,
+                    out.map(|(b, row)| (b, row + start)),
+                )?;
+                if out.is_none() {
+                    stripe.truncate(len * out_dim);
+                    all.extend(stripe);
+                }
                 start = end;
             }
-            return Some(out);
+            return Some(all);
         }
 
         let gate_op = MatmulOp {
-            x,
+            x: match x {
+                AttnOutSrc::Host(h) => h,
+                AttnOutSrc::Gpu(..) => &[],
+            },
             n_tokens,
             w: gate,
         };
@@ -11015,11 +13217,48 @@ impl VulkanBackend {
         let entry_ms = t_bind.ms();
 
         let t_upload = TraceClock::start();
-        self.queue
-            .write_buffer(&gate_g.x_buffer, gate_g.x_offset, bytemuck::cast_slice(x));
+        let x_bytes = (n_tokens * gate.in_dim) as u64 * 4;
+        // A host `x` goes through its own staging buffer and an encoder copy
+        // rather than `write_buffer` into the pooled region: a group records
+        // several stripes into one encoder, and a `write_buffer` lands at the
+        // submission's start — before the earlier stripe's dispatches read it.
+        let x_staged = match x {
+            AttnOutSrc::Host(h) => Some(self.upload_new(h)),
+            AttnOutSrc::Gpu(..) => None,
+        };
         // The multiply's second operand is the only extra upload this needs.
         let per_layer_buf = self.upload_new(per_layer);
         let upload_ms = t_upload.ms();
+        // The tail's resources: the post-norm weight, and the residual — the
+        // gate's own `x` region for a host `x` (uploaded above, and read-only
+        // to everything in this chain), or `x` where it is on the device.
+        let tail_out_owned = match (tail, out) {
+            (Some(_), None) => Some(self.scratch_buffer(n_tokens * out_dim)),
+            _ => None,
+        };
+        let tail_res = tail.map(|t| {
+            let w = self.upload_new(t.post_norm);
+            let meta = match t.out_scale {
+                Some(scale) => self.elem_meta_buffer_scaled(out_dim as u32, t.eps, scale),
+                None => self.elem_meta_buffer(out_dim as u32, t.eps),
+            };
+            let residual: BindSrc<'_> = match (x, &x_staged) {
+                (AttnOutSrc::Host(_), Some(staged)) => BindSrc::Whole(staged),
+                (AttnOutSrc::Host(_), None) => unreachable!("staged above"),
+                (AttnOutSrc::Gpu(b, off, _), _) => BindSrc::Slice(b, off, x_bytes),
+            };
+            let out_src: BindSrc<'_> = match (out, &tail_out_owned) {
+                (Some((b, row)), _) => BindSrc::Slice(
+                    b,
+                    (row * out_dim) as u64 * 4,
+                    (n_tokens * out_dim) as u64 * 4,
+                ),
+                (None, Some(owned)) => BindSrc::Whole(owned),
+                (None, None) => unreachable!("allocated above for a read-back tail"),
+            };
+            let bg = self.elem5_bind_group(proj_g.output_src(), &w, residual, out_src, &meta);
+            (bg, w, meta, t.out_scale.is_some(), out_src)
+        });
 
         let t_bg = TraceClock::start();
         let elems = n_tokens * per_layer_dim;
@@ -11033,7 +13272,32 @@ impl VulkanBackend {
         let bind_ms = t_bg.ms();
 
         let t_record = TraceClock::start();
-        let mut encoder = self.new_encoder("orangu-server fused prefill PLE encoder");
+        let (mut encoder, grouped) =
+            self.take_prefill_encoder("orangu-server fused prefill PLE encoder");
+        self.op_stamp_encoder(&mut encoder, "pp.gap");
+        match (x, &x_staged) {
+            (AttnOutSrc::Gpu(b, off, rows), _) => {
+                let real = (rows * gate.in_dim) as u64 * 4;
+                encoder.copy_buffer_to_buffer(b, off, &gate_g.x_buffer, gate_g.x_offset, real);
+                if x_bytes > real {
+                    encoder.clear_buffer(
+                        &gate_g.x_buffer,
+                        gate_g.x_offset + real,
+                        Some(x_bytes - real),
+                    );
+                }
+            }
+            (AttnOutSrc::Host(_), Some(staged)) => {
+                encoder.copy_buffer_to_buffer(
+                    staged,
+                    0,
+                    &gate_g.x_buffer,
+                    gate_g.x_offset,
+                    x_bytes,
+                );
+            }
+            (AttnOutSrc::Host(_), None) => unreachable!("staged above"),
+        }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("orangu-server fused prefill PLE pass"),
@@ -11049,21 +13313,47 @@ impl VulkanBackend {
             // result is unchanged — the cross-check tests run with it set.
             for _ in 0..ple_repeat() {
                 self.record_matmul(&mut pass, gate, &gate_g);
+                self.op_stamp(&mut pass, "pp.ple.gate");
 
                 pass.set_pipeline(&self.gelu_mul_pipeline);
                 pass.set_bind_group(0, &bg_gelu_mul, &[]);
                 pass.dispatch_workgroups((elems as u32).div_ceil(64), 1, 1);
+                self.op_stamp(&mut pass, "pp.ple.gelu_mul");
 
                 self.record_matmul(&mut pass, proj, &proj_g);
+                self.op_stamp(&mut pass, "pp.ple.proj");
+            }
+            if let Some((bg, _, _, scaled, _)) = &tail_res {
+                pass.set_pipeline(if *scaled {
+                    self.rmsnorm_add_scale_rows_for(out_dim)
+                } else {
+                    self.rmsnorm_add_rows_for(out_dim)
+                });
+                pass.set_bind_group(0, bg, &[]);
+                pass.dispatch_workgroups(n_tokens as u32, 1, 1);
+                self.op_stamp(&mut pass, "pp.ple.post_norm_add");
             }
         }
         let record_ms = t_record.ms();
-        let (out, rb) = self.submit_and_readback_split(
-            encoder,
-            &proj_g.output_buffer,
-            proj_g.output_offset,
-            n_tokens * out_dim,
-        );
+        if out.is_some() {
+            self.park_or_submit(encoder, grouped);
+            if trace {
+                eprintln!(
+                    "orangu-server: [prefill-trace]   ple-split n_tokens={n_tokens} \
+                     entry={entry_ms:.1} upload={upload_ms:.1} bind={bind_ms:.1} \
+                     record={record_ms:.1} (left on the device)"
+                );
+            }
+            return Some(Vec::new());
+        }
+        let (src, src_off) = match &tail_res {
+            Some((.., BindSrc::Whole(b))) => (*b, 0),
+            Some((.., BindSrc::Slice(..))) => {
+                unreachable!("a read-back tail is a whole scratch buffer")
+            }
+            None => (&proj_g.output_buffer, proj_g.output_offset),
+        };
+        let (out, rb) = self.submit_and_readback_split(encoder, src, src_off, n_tokens * out_dim);
         if trace {
             eprintln!(
                 "orangu-server: [prefill-trace]   ple-split n_tokens={n_tokens} \
@@ -11517,7 +13807,7 @@ impl VulkanBackend {
         let ff: &[f32] = match input.freq_factors {
             Some(f) => f,
             None => {
-                ff_owned = vec![1.0f32; half];
+                ff_owned = vec![1.0f32; half.max(1)];
                 &ff_owned
             }
         };
@@ -11704,37 +13994,47 @@ impl VulkanBackend {
         // Build shared-input Q/K/V projection matmul bind groups that
         // read `normed` (the attn-norm output) directly, so the Q/K/V matmuls
         // skip the `normed → {q,k,v}.x` copy — same trick as the FFN gate/up and
-        // PLE. Only on the non-MMVQ decode path (GPU `normed`); MMVQ quantizes
-        // `x_buffer` in place so it keeps the copy.
-        let shared_input =
-            !self.q4_k_mmvq && (!crate::engine::env::flag_on("ORANGU_NO_FUSED_SHARED_INPUT"));
-        let (bg_wq_matmul, bg_wk_matmul, bg_wv_matmul) = match (shared_input, input.normed) {
-            (true, GpuInput::Gpu(nb, noff)) => {
-                let noff_b = (noff as u64) * 4;
-                let n_embd_b = (input.wq.in_dim as u64) * 4;
-                let wq_bg =
-                    Some(self.matmul_bind_group_with_input(input.wq, nb, noff_b, n_embd_b, wq_g));
-                let wk_bg = match (input.kv.as_ref(), wk_g) {
-                    (Some(proj), Some(g)) => {
-                        Some(self.matmul_bind_group_with_input(proj.wk, nb, noff_b, n_embd_b, g))
-                    }
-                    _ => None,
-                };
-                let wv_bg = match (input.kv.as_ref().and_then(|p| p.wv), wv_g) {
-                    (Some(w), Some(g)) => {
-                        Some(self.matmul_bind_group_with_input(w, nb, noff_b, n_embd_b, g))
-                    }
-                    _ => None,
-                };
-                (wq_bg, wk_bg, wv_bg)
-            }
-            _ => (None, None, None),
-        };
+        // PLE. A projection with an MMVQ op does not read f32 at all; it gets
+        // the shared *q8* below instead, and the f32 bind group is built only
+        // for the ones without (a Q6_K V projection on the MMVQ path).
+        let shared_input = !crate::engine::env::flag_on("ORANGU_NO_FUSED_SHARED_INPUT");
+        let (bg_wq_matmul, bg_wk_matmul, bg_wv_matmul, shared_q8) =
+            match (shared_input, input.normed) {
+                (true, GpuInput::Gpu(nb, noff)) => {
+                    let noff_b = (noff as u64) * 4;
+                    let n_embd_b = (input.wq.in_dim as u64) * 4;
+                    let f32_bg = |w: &QuantMatrix, g: &CachedOpResources| {
+                        (g.mmvq.is_none())
+                            .then(|| self.matmul_bind_group_with_input(w, nb, noff_b, n_embd_b, g))
+                    };
+                    let wq_bg = f32_bg(input.wq, wq_g);
+                    let wk_bg = match (input.kv.as_ref(), wk_g) {
+                        (Some(proj), Some(g)) => f32_bg(proj.wk, g),
+                        _ => None,
+                    };
+                    let wv_bg = match (input.kv.as_ref().and_then(|p| p.wv), wv_g) {
+                        (Some(w), Some(g)) => f32_bg(w, g),
+                        _ => None,
+                    };
+                    let shared_q8 = self.shared_q8_for(
+                        (nb, noff_b, n_embd_b),
+                        input.wq.in_dim,
+                        [
+                            Some((input.wq, wq_g)),
+                            input.kv.as_ref().zip(wk_g).map(|(p, g)| (p.wk, g)),
+                            input.kv.as_ref().and_then(|p| p.wv).zip(wv_g),
+                        ],
+                    );
+                    (wq_bg, wk_bg, wv_bg, shared_q8)
+                }
+                _ => (None, None, None, None),
+            };
 
         FusedAttnLayerResources {
             bg_wq_matmul,
             bg_wk_matmul,
             bg_wv_matmul,
+            shared_q8,
             q_norm_rope_bg,
             q_rope_only,
             q_bias_bg,
@@ -12243,7 +14543,7 @@ impl VulkanBackend {
 
     fn record_fused_attention(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        cursor: &mut PassCursor<'_>,
         input: FusedAttnInput<'_>,
     ) -> wgpu::Buffer {
         let kv_dim = input.n_head_kv * input.head_dim;
@@ -12271,25 +14571,92 @@ impl VulkanBackend {
         // When the Q/K/V matmuls read `normed` directly (shared-input,
         // built in the cached layer resources on the non-MMVQ GPU path), skip
         // the `normed → {q,k,v}.x` copies. Otherwise (MMVQ / CPU input) copy.
-        let attn_shared = !self.q4_k_mmvq
-            && (!crate::engine::env::flag_on("ORANGU_NO_FUSED_SHARED_INPUT"))
-            && matches!(input.normed, GpuInput::Gpu(..));
         let normed_gpu: Option<(&wgpu::Buffer, u64)> = match &input.normed {
             GpuInput::Gpu(b, o) => Some((*b, (*o as u64) * 4)),
             GpuInput::Cpu(_) => None,
         };
-        if !attn_shared {
-            self.upload_or_copy(encoder, &wq_g.x_buffer, wq_g.x_offset, input.normed, n_embd);
-            if let Some(g) = &wk_g {
-                self.upload_or_copy(encoder, &g.x_buffer, g.x_offset, input.normed, n_embd);
-            }
-            if let Some(g) = &wv_g {
-                self.upload_or_copy(encoder, &g.x_buffer, g.x_offset, input.normed, n_embd);
-            }
-        }
 
         let layer =
             self.fused_attn_layer_entry_for(&input, &wq_g, wk_g.as_deref(), wv_g.as_deref());
+
+        // Copy `normed` into a projection's own input buffer only when that
+        // projection has no shared way to read it: neither an f32 shared-input
+        // bind group nor a share of the layer's q8. On the decode path with a
+        // GPU `normed` every projection has one or the other, and no copy
+        // happens at all.
+        let shares_q8 = |bg: &Option<wgpu::BindGroup>| bg.is_some();
+        // With the projections already computed there is nothing to feed
+        // them, so nothing is copied either.
+        let q_shared = input.projections_ready
+            || layer.bg_wq_matmul.is_some()
+            || layer
+                .shared_q8
+                .as_ref()
+                .is_some_and(|q| shares_q8(&q.mmvq_bg_wq));
+        let k_shared = input.projections_ready
+            || layer.bg_wk_matmul.is_some()
+            || layer
+                .shared_q8
+                .as_ref()
+                .is_some_and(|q| shares_q8(&q.mmvq_bg_wk));
+        let v_shared = input.projections_ready
+            || layer.bg_wv_matmul.is_some()
+            || layer
+                .shared_q8
+                .as_ref()
+                .is_some_and(|q| shares_q8(&q.mmvq_bg_wv));
+        if !q_shared {
+            self.upload_or_copy(
+                cursor.encoder(),
+                &wq_g.x_buffer,
+                wq_g.x_offset,
+                input.normed,
+                n_embd,
+            );
+        }
+        if let Some(g) = &wk_g
+            && !k_shared
+        {
+            self.upload_or_copy(
+                cursor.encoder(),
+                &g.x_buffer,
+                g.x_offset,
+                input.normed,
+                n_embd,
+            );
+        }
+        if let Some(g) = &wv_g
+            && !v_shared
+        {
+            self.upload_or_copy(
+                cursor.encoder(),
+                &g.x_buffer,
+                g.x_offset,
+                input.normed,
+                n_embd,
+            );
+        }
+
+        // The attention gate's projection reads the same `normed`, through
+        // its own copied input — it has no share of the layer's q8 or the
+        // shared-input bind groups, which are built for Q/K/V alone.
+        let gate_entry = input
+            .attn_gate
+            .map(|w| self.op_entry_for(w, input.batch_slot));
+        let gate_g = gate_entry
+            .as_ref()
+            .map(|e| e.lock().expect("op cache entry poisoned"));
+        if let Some(g) = &gate_g
+            && !input.projections_ready
+        {
+            self.upload_or_copy(
+                cursor.encoder(),
+                &g.x_buffer,
+                g.x_offset,
+                input.normed,
+                n_embd,
+            );
+        }
 
         // Consume `input` now — nothing above needs the whole struct
         // again, so the rest of this function works with owned fields
@@ -12317,6 +14684,8 @@ impl VulkanBackend {
             cache,
             batch_slot: _,
             attn_ts,
+            projections_ready,
+            attn_gate,
         } = input;
 
         // `pos` is the one field in these cached meta buffers that
@@ -12583,6 +14952,15 @@ impl VulkanBackend {
             } else {
                 None
             };
+            let kv_epilogue = self.kv_epilogue_dispatch(
+                &layer,
+                wk_g.as_deref(),
+                wv_g.as_deref(),
+                BindSrc::Slice(&k_buf, k_off, k_size),
+                BindSrc::Slice(&v_buf, v_off, v_size),
+                head_dim,
+                rope_dim,
+            );
             // Split-k attention — see
             // `Self::try_init`'s own comment on `attn_split`. `partial_ml`/
             // `partial_acc` are scratch, consumed entirely within the
@@ -12679,6 +15057,7 @@ impl VulkanBackend {
                     readback_buf,
                     k_cast,
                     v_cast,
+                    kv_epilogue,
                     split,
                 },
             );
@@ -12745,59 +15124,74 @@ impl VulkanBackend {
         // integer-dot path is active; the quantize dispatches must be in their
         // own pass so the matmul reads the finished q8 buffer (no intra-pass
         // barrier between them).
-        if self.q4_k_mmvq {
-            let mut qpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("orangu-server fused attention qkv quantize pass"),
-                timestamp_writes: None,
-            });
-            self.record_mmvq_quantize(&mut qpass, &wq_g);
-            if let Some(wk_guard) = &wk_g {
-                self.record_mmvq_quantize(&mut qpass, wk_guard);
-            }
-            if let Some(wv_guard) = &wv_g {
-                self.record_mmvq_quantize(&mut qpass, wv_guard);
+        if self.q4_k_mmvq && !projections_ready {
+            let qpass = cursor.pass();
+            match &layer.shared_q8 {
+                // Once for the layer; every Q4_K projection reads it.
+                Some(q8) => self.record_shared_q8_quantize(qpass, q8),
+                None => {
+                    self.record_mmvq_quantize(qpass, &wq_g);
+                    if let Some(wk_guard) = &wk_g {
+                        self.record_mmvq_quantize(qpass, wk_guard);
+                    }
+                    if let Some(wv_guard) = &wv_g {
+                        self.record_mmvq_quantize(qpass, wv_guard);
+                    }
+                }
             }
         }
 
+        // Whether the one-dispatch epilogue in pass A already left the key
+        // and value in the mirror, making pass B and the mirror write below
+        // nothing to do.
+        let mut kv_done = false;
+
         // Pass A: QKV matmuls, Q-norm, Q-RoPE, K-norm (independent of the
         // v_scratch copy below, so all safe in one pass).
+        //
+        // Each projection reads its input the cheapest way it has: the
+        // layer's shared q8 (an MMVQ op), the f32 `normed` directly (a
+        // shared-input bind group), or its own copied buffer (neither).
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("orangu-server fused attention qkv+qnormrope+knormrope pass"),
-                timestamp_writes: None,
-            });
-            match &layer.bg_wq_matmul {
-                Some(bg) => {
-                    let (nb, no) = normed_gpu.expect("bg_wq_matmul implies GPU normed");
-                    self.record_matmul_shared_input(&mut pass, wq, &wq_g, bg, nb, no);
-                }
-                None => self.record_matmul(&mut pass, wq, &wq_g),
-            }
-            if let (Some(proj), Some(wk_guard)) = (&kv, &wk_g) {
-                match &layer.bg_wk_matmul {
-                    Some(bg) => {
-                        let (nb, no) = normed_gpu.expect("bg_wk_matmul implies GPU normed");
-                        self.record_matmul_shared_input(&mut pass, proj.wk, wk_guard, bg, nb, no);
+            let pass = cursor.pass();
+            let q8 = layer.shared_q8.as_ref();
+            if !projections_ready {
+                match (q8.and_then(|q| q.mmvq_bg_wq.as_ref()), &layer.bg_wq_matmul) {
+                    (Some(bg), _) => self.record_mmvq_matmul_shared(pass, &wq_g, bg),
+                    (None, Some(bg)) => {
+                        let (nb, no) = normed_gpu.expect("bg_wq_matmul implies GPU normed");
+                        self.record_matmul_shared_input(pass, wq, &wq_g, bg, nb, no);
                     }
-                    None => self.record_matmul(&mut pass, proj.wk, wk_guard),
+                    (None, None) => self.record_matmul(pass, wq, &wq_g),
                 }
-            }
-            if let (Some(proj), Some(wv_guard)) = (&kv, &wv_g)
-                && proj.wv.is_some()
-            {
-                match &layer.bg_wv_matmul {
-                    Some(bg) => {
-                        let (nb, no) = normed_gpu.expect("bg_wv_matmul implies GPU normed");
-                        self.record_matmul_shared_input(
-                            &mut pass,
-                            proj.wv.unwrap(),
-                            wv_guard,
-                            bg,
-                            nb,
-                            no,
-                        );
+                self.op_stamp(pass, "attn.wq");
+                if let (Some(w), Some(g)) = (attn_gate, &gate_g) {
+                    self.record_matmul(pass, w, g);
+                    self.op_stamp(pass, "attn.gate");
+                }
+                if let (Some(proj), Some(wk_guard)) = (&kv, &wk_g) {
+                    match (q8.and_then(|q| q.mmvq_bg_wk.as_ref()), &layer.bg_wk_matmul) {
+                        (Some(bg), _) => self.record_mmvq_matmul_shared(pass, wk_guard, bg),
+                        (None, Some(bg)) => {
+                            let (nb, no) = normed_gpu.expect("bg_wk_matmul implies GPU normed");
+                            self.record_matmul_shared_input(pass, proj.wk, wk_guard, bg, nb, no);
+                        }
+                        (None, None) => self.record_matmul(pass, proj.wk, wk_guard),
                     }
-                    None => self.record_matmul(&mut pass, proj.wv.unwrap(), wv_guard),
+                    self.op_stamp(pass, "attn.wk");
+                }
+                if let (Some(proj), Some(wv_guard)) = (&kv, &wv_g)
+                    && let Some(wv) = proj.wv
+                {
+                    match (q8.and_then(|q| q.mmvq_bg_wv.as_ref()), &layer.bg_wv_matmul) {
+                        (Some(bg), _) => self.record_mmvq_matmul_shared(pass, wv_guard, bg),
+                        (None, Some(bg)) => {
+                            let (nb, no) = normed_gpu.expect("bg_wv_matmul implies GPU normed");
+                            self.record_matmul_shared_input(pass, wv, wv_guard, bg, nb, no);
+                        }
+                        (None, None) => self.record_matmul(pass, wv, wv_guard),
+                    }
+                    self.op_stamp(pass, "attn.wv");
                 }
             }
 
@@ -12825,11 +15219,14 @@ impl VulkanBackend {
 
             pass.set_pipeline(if layer.q_rope_only {
                 &self.rope_pipeline
+            } else if self.head_wide_for(head_dim, rope_dim) {
+                &self.head_norm_rope_wide_pipeline
             } else {
                 &self.fused_norm_rope_pipeline
             });
             pass.set_bind_group(0, &layer.q_norm_rope_bg, &[]);
             pass.dispatch_workgroups(layer.q_norm_rope_wg, 1, 1);
+            self.op_stamp(pass, "attn.q_norm_rope");
             // The capture describes the *fused* norm+RoPE step. Without a Q
             // norm the dispatch above is the standalone RoPE kernel on a
             // different binding, which the replay path has never covered — so
@@ -12854,12 +15251,49 @@ impl VulkanBackend {
                 });
             }
 
+            // The whole key/value epilogue in one dispatch where the layer
+            // and the mirror allow it (`Self::kv_epilogue_dispatch`): K's
+            // norm and RoPE, V's norm, and both writes into the mirror. The
+            // rolled path below — one dispatch per step, and the mirror
+            // write in its own block further down — is what a capture
+            // describes, so it stays while one is open.
+            if let (Some(epilogue), Some(kv_res), Some(pipeline)) = (
+                dispatch.kv_epilogue.as_ref(),
+                &layer.kv,
+                self.kv_epilogue_pipeline.as_ref(),
+            ) && !Self::capture_active()
+            {
+                self.queue.write_buffer(
+                    &epilogue.meta_buf,
+                    0,
+                    bytemuck::bytes_of(&KvEpilogueMeta {
+                        n_head_kv: n_head_kv as u32,
+                        head_dim: head_dim as u32,
+                        rope_dim: rope_dim as u32,
+                        pos: pos as u32,
+                        freq_base: rope_freq_base,
+                        eps,
+                        pairing: rope_layout_code(pairing),
+                        k_norm: u32::from(matches!(kv_res.k_norm_rope, KNormRope::Fused { .. })),
+                        v_norm: u32::from(normalize_v),
+                        dst_offset: (kv_row * kv_dim) as u32,
+                        _pad: [0; 2],
+                        yarn,
+                    }),
+                );
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &epilogue.bind_group, &[]);
+                pass.dispatch_workgroups(2 * n_head_kv as u32, 1, 1);
+                self.op_stamp(pass, "attn.kv_epilogue");
+                kv_done = true;
+            }
+
             // K's own norm(+RoPE, when fused — `KNormRope::Fused` is only
             // reachable when this layer owns its own V projection, so
             // there's no V-copy dependency on K's intermediate value to
             // order around). When split, only K-norm runs here; K's own
             // RoPE waits for pass B below, same as before this fusion.
-            if let Some(kv_res) = &layer.kv {
+            if let (Some(kv_res), false) = (&layer.kv, kv_done) {
                 match &kv_res.k_norm_rope {
                     KNormRope::Fused {
                         bg,
@@ -12871,6 +15305,7 @@ impl VulkanBackend {
                         pass.set_pipeline(&self.fused_norm_rope_pipeline);
                         pass.set_bind_group(0, bg, &[]);
                         pass.dispatch_workgroups(*wg, 1, 1);
+                        self.op_stamp(pass, "attn.k_norm_rope");
                         if let Some(wk_guard) = &wk_g {
                             self.capture_push(|| {
                                 fused_norm_rope_capture_step(
@@ -12899,6 +15334,7 @@ impl VulkanBackend {
                         pass.set_pipeline(&self.perhead_rmsnorm_pipeline);
                         pass.set_bind_group(0, k_norm_bg, &[]);
                         pass.dispatch_workgroups(*k_norm_wg, 1, 1);
+                        self.op_stamp(pass, "attn.k_norm");
                     }
                     // No K norm: RoPE alone, here in pass A. The `Split` case
                     // has to defer its RoPE to pass B because a V-copy reads
@@ -12909,6 +15345,7 @@ impl VulkanBackend {
                         pass.set_pipeline(&self.rope_pipeline);
                         pass.set_bind_group(0, bg, &[]);
                         pass.dispatch_workgroups(*wg, 1, 1);
+                        self.op_stamp(pass, "attn.k_rope");
                     }
                 }
             }
@@ -12923,7 +15360,7 @@ impl VulkanBackend {
         if let (Some(wk_guard), Some(kv_res)) = (&wk_g, &layer.kv)
             && let Some(scratch) = &kv_res.v_scratch
         {
-            encoder.copy_buffer_to_buffer(
+            cursor.encoder().copy_buffer_to_buffer(
                 &wk_guard.output_buffer,
                 wk_guard.output_offset,
                 scratch,
@@ -12934,15 +15371,13 @@ impl VulkanBackend {
 
         // Pass B: V's weightless norm, and K's own RoPE when it wasn't
         // already folded into pass A's fused dispatch above.
-        if let Some(kv_res) = &layer.kv {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("orangu-server fused attention vnorm+krope pass"),
-                timestamp_writes: None,
-            });
+        if let (Some(kv_res), false) = (&layer.kv, kv_done) {
+            let pass = cursor.pass();
             if normalize_v {
                 pass.set_pipeline(&self.perhead_rmsnorm_weightless_pipeline);
                 pass.set_bind_group(0, &kv_res.v_norm_bg, &[]);
                 pass.dispatch_workgroups(kv_res.v_norm_wg, 1, 1);
+                self.op_stamp(pass, "attn.v_norm");
             }
             self.capture_push(|| {
                 use vulkan_replay::{CaptureBinding, CaptureStep, DescriptorKind};
@@ -12985,6 +15420,7 @@ impl VulkanBackend {
                 pass.set_pipeline(&self.rope_pipeline);
                 pass.set_bind_group(0, k_rope_bg, &[]);
                 pass.dispatch_workgroups(*k_rope_wg, 1, 1);
+                self.op_stamp(pass, "attn.k_rope");
             }
         }
 
@@ -12996,7 +15432,7 @@ impl VulkanBackend {
         // `f32` — so non-`f32` mirrors dispatch a cast/quantize shader
         // instead, using the two dispatches built alongside `dispatch`
         // itself above. The `f32` path is a plain byte copy.
-        if let (Some(wk_guard), Some(kv_res)) = (&wk_g, &layer.kv) {
+        if let (Some(wk_guard), Some(kv_res), false) = (&wk_g, &layer.kv, kv_done) {
             match self.kv_storage {
                 vulkan_shaders::KvStorage::F16 => {
                     let offset = (kv_row * kv_dim) as u32;
@@ -13019,10 +15455,7 @@ impl VulkanBackend {
                     self.queue
                         .write_buffer(&v_cast.meta_buf, 0, bytemuck::bytes_of(&cast_meta));
                     let wg = (kv_dim as u32).div_ceil(64);
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("orangu-server kv cast pass"),
-                        timestamp_writes: None,
-                    });
+                    let pass = cursor.pass();
                     pass.set_pipeline(
                         self.kv_cast_pipeline
                             .as_ref()
@@ -13032,6 +15465,7 @@ impl VulkanBackend {
                     pass.dispatch_workgroups(wg, 1, 1);
                     pass.set_bind_group(0, &v_cast.bind_group, &[]);
                     pass.dispatch_workgroups(wg, 1, 1);
+                    self.op_stamp(pass, "attn.kv_write");
                     self.capture_push(|| {
                         kv_cast_capture_step(
                             &wk_guard.output_buffer,
@@ -13076,10 +15510,7 @@ impl VulkanBackend {
                     self.queue
                         .write_buffer(&v_cast.meta_buf, 0, bytemuck::bytes_of(&quant_meta));
                     let wg = n_blocks.div_ceil(64);
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("orangu-server kv quantize q8_0 pass"),
-                        timestamp_writes: None,
-                    });
+                    let pass = cursor.pass();
                     pass.set_pipeline(
                         self.kv_quantize_q8_0_pipeline
                             .as_ref()
@@ -13089,6 +15520,7 @@ impl VulkanBackend {
                     pass.dispatch_workgroups(wg, 1, 1);
                     pass.set_bind_group(0, &v_cast.bind_group, &[]);
                     pass.dispatch_workgroups(wg, 1, 1);
+                    self.op_stamp(pass, "attn.kv_write");
                 }
                 vulkan_shaders::KvStorage::F32 => {
                     let byte_offset = (kv_row * kv_dim * 4) as u64;
@@ -13096,7 +15528,7 @@ impl VulkanBackend {
                     // Copy destinations are absolute buffer offsets, so add the
                     // region base (unlike the bound sub-ranges above, whose
                     // shader offsets are already relative).
-                    encoder.copy_buffer_to_buffer(
+                    cursor.encoder().copy_buffer_to_buffer(
                         &wk_guard.output_buffer,
                         wk_guard.output_offset,
                         &k_buf,
@@ -13107,7 +15539,7 @@ impl VulkanBackend {
                         Some(g) => (&g.output_buffer, g.output_offset),
                         None => (kv_res.v_scratch.as_ref().unwrap(), 0),
                     };
-                    encoder.copy_buffer_to_buffer(
+                    cursor.encoder().copy_buffer_to_buffer(
                         v_source,
                         v_source_offset,
                         &v_buf,
@@ -13124,7 +15556,7 @@ impl VulkanBackend {
         // whole post-attention chain) is ffn-side. No-op when `attn_ts` is
         // `None`.
         if let Some((ts, slot)) = attn_ts {
-            encoder.write_timestamp(ts, slot);
+            cursor.encoder().write_timestamp(ts, slot);
         }
 
         // Pass C: attention, now that the cache includes this token's own
@@ -13152,18 +15584,17 @@ impl VulkanBackend {
             } else {
                 n_head as u32
             };
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("orangu-server fused attention split pass"),
-                timestamp_writes: None,
-            });
+            let pass = cursor.pass();
             pass.set_pipeline(&split_pipeline);
             pass.set_bind_group(0, &split.split_bind_group, &[]);
             // Must match the `k_num` written into the split/reduce metas above.
             let split_k = self.adaptive_split_k((pos - window_start + 1) as u32);
             pass.dispatch_workgroups(phase1_x, split_k, 1);
+            self.op_stamp(pass, "attn.split");
             pass.set_pipeline(&self.attn_split_reduce_pipeline);
             pass.set_bind_group(0, &split.reduce_bind_group, &[]);
             pass.dispatch_workgroups(n_head as u32, 1, 1);
+            self.op_stamp(pass, "attn.split_reduce");
             // Capture the split or coop kernel (flash needs head_dim 512; GQA
             // rewrites the kernel/grid — both excluded, they're opt-in). Coop is
             // the default when it applies, so the capture must match it.
@@ -13213,21 +15644,30 @@ impl VulkanBackend {
                 });
             }
         } else {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("orangu-server fused attention pass"),
-                timestamp_writes: None,
-            });
+            let pass = cursor.pass();
             pass.set_pipeline(&self.attn_pipeline);
             pass.set_bind_group(0, &dispatch.bind_group, &[]);
             pass.dispatch_workgroups(n_head as u32, 1, 1);
+            self.op_stamp(pass, "attn.attention");
         }
 
         // End of Pass C (attention) — see the bracket comment above.
         if let Some((ts, slot)) = attn_ts {
-            encoder.write_timestamp(ts, slot + 1);
+            cursor.encoder().write_timestamp(ts, slot + 1);
         }
 
         let out_buf = dispatch.out_buf.clone();
+        if let Some(g) = &gate_g {
+            // `attn_out *= sigmoid(gate)`, in place, before `wo` reads it.
+            let len = (n_head * head_dim) as u32;
+            let meta = self.elem_meta_buffer(len, 0.0);
+            let bg = self.elem3_bind_group(g.output_src(), BindSrc::Whole(&out_buf), &meta);
+            let pass = cursor.pass();
+            pass.set_pipeline(&self.sigmoid_gate_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(len.div_ceil(64), 1, 1);
+            self.op_stamp(pass, "attn.gate_mul");
+        }
         if kv.is_some() {
             cache.advance_gpu_only();
         }
@@ -13289,7 +15729,9 @@ impl VulkanBackend {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("orangu-server fused attention (standalone) encoder"),
             });
-        let out_buf = self.record_fused_attention(&mut encoder, input);
+        let mut cursor = PassCursor::new(&mut encoder);
+        let out_buf = self.record_fused_attention(&mut cursor, input);
+        drop(cursor);
         self.submit_and_readback(encoder, &out_buf, 0, n_head * head_dim)
     }
 
@@ -13298,6 +15740,120 @@ impl VulkanBackend {
     /// buffers/bind group: the residual-stream buffer, the pre-attention
     /// norm's output buffer and bind group, and the final readback
     /// buffer.
+    /// Whether a fused layer may bind its per-call inputs where they already
+    /// are (`DirectInput`) instead of copying them into its own buffers:
+    /// not while a replay capture is describing the copy-based chain, and
+    /// not under `ORANGU_COPY_INPUTS=1`, the control arm of a sweep.
+    fn direct_inputs(&self) -> bool {
+        static COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let copy = *COPY.get_or_init(|| crate::engine::env::flag_on("ORANGU_COPY_INPUTS"));
+        !copy && !Self::capture_active()
+    }
+
+    /// Whether a raw-replay capture is being recorded on this thread. The
+    /// capture describes the rolled dispatches, so a kernel it has never
+    /// covered steps aside while one is open rather than leave a step out.
+    fn capture_active() -> bool {
+        DECODE_CAPTURE.with(|c| c.borrow().is_some())
+    }
+
+    /// Whether the straight-line per-head kernels serve a head of this shape:
+    /// `head_norm_rope_wide_pipeline` and `kv_epilogue_pipeline` hold one
+    /// head per workgroup in `vec4`s, up to `HEAD_WIDE_MAX_DIM` wide.
+    fn head_wide_for(&self, head_dim: usize, rope_dim: usize) -> bool {
+        self.head_wide
+            && head_dim.is_multiple_of(4)
+            && head_dim <= vulkan_shaders::HEAD_WIDE_MAX_DIM
+            && rope_dim.is_multiple_of(2)
+            && rope_dim <= head_dim
+    }
+
+    /// The K/V epilogue bound over one layer's key and value projections and
+    /// one cache's mirror regions — `None` where the rolled dispatches stay:
+    /// a `q8_0` mirror, a head the wide kernels do not cover, a layer that
+    /// borrows its V from K (`KNormRope::Split`), or projection biases (the
+    /// bias dispatches would have to land between the matmul and this).
+    #[allow(clippy::too_many_arguments)]
+    fn kv_epilogue_dispatch(
+        &self,
+        layer: &FusedAttnLayerResources,
+        wk_g: Option<&CachedOpResources>,
+        wv_g: Option<&CachedOpResources>,
+        k_dst: BindSrc<'_>,
+        v_dst: BindSrc<'_>,
+        head_dim: usize,
+        rope_dim: usize,
+    ) -> Option<crate::engine::kv_cache::KvCastDispatch> {
+        self.kv_epilogue_pipeline.as_ref()?;
+        if !self.head_wide_for(head_dim, rope_dim) {
+            return None;
+        }
+        let kv_res = layer.kv.as_ref()?;
+        let (wk_g, wv_g) = (wk_g?, wv_g?);
+        if kv_res.k_bias_bg.is_some() || kv_res.v_bias_bg.is_some() {
+            return None;
+        }
+        // Without a K norm the weight binding is never read; the divisors
+        // stand in for it so the bind group is complete.
+        let (norm_w, ff) = match &kv_res.k_norm_rope {
+            KNormRope::Fused { k_norm_w, k_ff, .. } => (k_norm_w, k_ff),
+            KNormRope::RopeOnly { k_ff, .. } => (k_ff, k_ff),
+            KNormRope::Split { .. } => return None,
+        };
+        let meta_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server kv epilogue meta"),
+            size: std::mem::size_of::<KvEpilogueMeta>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        fn entry(binding: u32, resource: wgpu::BindingResource<'_>) -> wgpu::BindGroupEntry<'_> {
+            wgpu::BindGroupEntry { binding, resource }
+        }
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("orangu-server kv epilogue bind group"),
+            layout: &self.kv_epilogue_bind_group_layout,
+            entries: &[
+                entry(0, wk_g.output_src().resource()),
+                entry(1, wv_g.output_src().resource()),
+                entry(2, norm_w.as_entire_binding()),
+                entry(3, ff.as_entire_binding()),
+                entry(4, k_dst.resource()),
+                entry(5, v_dst.resource()),
+                entry(6, meta_buf.as_entire_binding()),
+            ],
+        });
+        Some(crate::engine::kv_cache::KvCastDispatch {
+            bind_group,
+            meta_buf,
+        })
+    }
+
+    /// The bind group in `slot` if it was built over `(buffer, offset)`;
+    /// otherwise the one `make` builds, which replaces it. A `BindGroup` is
+    /// a handle, so the clone out is cheap.
+    fn direct_bind_group(
+        &self,
+        slot: &DirectSlot,
+        buffer: &wgpu::Buffer,
+        offset: u64,
+        make: impl FnOnce() -> wgpu::BindGroup,
+    ) -> wgpu::BindGroup {
+        let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(d) = guard.as_ref()
+            && d.buffer == *buffer
+            && d.offset == offset
+        {
+            return d.bind_group.clone();
+        }
+        let bind_group = make();
+        *guard = Some(DirectInput {
+            buffer: buffer.clone(),
+            offset,
+            bind_group: bind_group.clone(),
+        });
+        bind_group
+    }
+
     fn build_fused_layer_resources(
         &self,
         n_embd: usize,
@@ -13342,6 +15898,7 @@ impl VulkanBackend {
             attn_norm_bg,
             attn_norm_w,
             attn_norm_meta: meta,
+            attn_norm_direct: Mutex::new(None),
         }
     }
 
@@ -13405,7 +15962,7 @@ impl VulkanBackend {
     /// while driving its own full-forward-pass encoder directly.
     pub fn record_fused_layer(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        cursor: &mut PassCursor<'_>,
         input: FusedLayerInput<'_>,
     ) -> (wgpu::Buffer, u64) {
         let n_embd = input.wq.in_dim;
@@ -13423,6 +15980,7 @@ impl VulkanBackend {
             pairing,
             activation,
             normalize_v,
+            attn_gate,
             q_bias,
             attn_norm: _,
             wq,
@@ -13450,20 +16008,64 @@ impl VulkanBackend {
             ffn_post_norm,
             ple,
             layer_output_scale,
+            post_norm_eps,
             batch_slot,
             attn_ts,
         } = input;
 
-        self.upload_or_copy(encoder, &layer_res.x_buf, layer_res.x_buf_offset, x, n_embd);
+        // The previous layer's output is read where it is when it can be
+        // (`DirectInput`); otherwise it is copied into this layer's own
+        // `x_buf` and read from there.
+        let n_embd_bytes = (n_embd as u64) * 4;
+        let direct_x = match x {
+            GpuInput::Gpu(buf, off) if self.direct_inputs() => Some((buf, (off as u64) * 4)),
+            _ => None,
+        };
+        let attn_norm_bg = match direct_x {
+            Some((buf, off)) => {
+                self.direct_bind_group(&layer_res.attn_norm_direct, buf, off, || {
+                    self.elem4_bind_group(
+                        BindSrc::Slice(buf, off, n_embd_bytes),
+                        &layer_res.attn_norm_w,
+                        BindSrc::Slice(
+                            &layer_res.normed_buf,
+                            layer_res.normed_buf_offset,
+                            n_embd_bytes,
+                        ),
+                        &layer_res.attn_norm_meta,
+                    )
+                })
+            }
+            None => {
+                self.upload_or_copy(
+                    cursor.encoder(),
+                    &layer_res.x_buf,
+                    layer_res.x_buf_offset,
+                    x,
+                    n_embd,
+                );
+                layer_res.attn_norm_bg.clone()
+            }
+        };
+        let (residual_buf, residual_offset) = match direct_x {
+            Some((buf, off)) => (buf, off),
+            None => (&layer_res.x_buf, layer_res.x_buf_offset),
+        };
 
+        // The caller's pass carries on into this layer: a chunk of layers is
+        // one pass, broken only where a copy or a timestamp has to go between
+        // dispatches — see `PassCursor`. `ORANGU_LAYER_PASSES=1` restores a
+        // pass per layer, the structure this replaced, as a control.
+        static LAYER_PASSES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *LAYER_PASSES.get_or_init(|| crate::engine::env::flag_on("ORANGU_LAYER_PASSES")) {
+            cursor.encoder();
+        }
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("orangu-server fused layer attn_norm pass"),
-                timestamp_writes: None,
-            });
+            let pass = cursor.pass();
             pass.set_pipeline(self.rmsnorm_for(n_embd));
-            pass.set_bind_group(0, &layer_res.attn_norm_bg, &[]);
+            pass.set_bind_group(0, &attn_norm_bg, &[]);
             pass.dispatch_workgroups(1, 1, 1);
+            self.op_stamp(pass, "attn.norm");
         }
         self.capture_push(|| {
             use vulkan_replay::{CaptureBinding, CaptureStep, DescriptorKind};
@@ -13509,9 +16111,11 @@ impl VulkanBackend {
         });
 
         let attn_out_buf = self.record_fused_attention(
-            encoder,
+            cursor,
             FusedAttnInput {
+                projections_ready: false,
                 normalize_v,
+                attn_gate,
                 q_bias,
                 pairing,
                 normed: GpuInput::Gpu(
@@ -13540,12 +16144,12 @@ impl VulkanBackend {
         );
 
         self.record_fused_post_attention(
-            encoder,
+            cursor,
             FusedPostAttentionInput {
                 stop_at_ffn_norm: input.stop_at_ffn_norm,
                 activation,
                 attn_out: GpuInput::Gpu(&attn_out_buf, 0),
-                residual: GpuInput::Gpu(&layer_res.x_buf, (layer_res.x_buf_offset / 4) as usize),
+                residual: GpuInput::Gpu(residual_buf, (residual_offset / 4) as usize),
                 wo,
                 attn_post_norm,
                 ffn_norm,
@@ -13554,6 +16158,7 @@ impl VulkanBackend {
                 ffn_down,
                 ffn_post_norm,
                 eps,
+                post_norm_eps,
                 ple,
                 layer_output_scale,
                 batch_slot,
@@ -13578,7 +16183,8 @@ impl VulkanBackend {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("orangu-server fused layer (standalone) encoder"),
             });
-        let (final_buf, final_offset) = self.record_fused_layer(&mut encoder, input);
+        let (final_buf, final_offset) =
+            self.record_fused_layer(&mut PassCursor::new(&mut encoder), input);
         self.submit_and_readback(encoder, &final_buf, final_offset, n_embd)
     }
 
@@ -13603,6 +16209,35 @@ impl VulkanBackend {
         len_f32: usize,
     ) -> Vec<f32> {
         self.submit_and_readback(encoder, src, 0, len_f32)
+    }
+
+    /// A second buffer's contents after [`Self::submit_and_readback_for_test`]
+    /// ran the work: a fresh, empty submission just to read.
+    #[cfg(test)]
+    pub(crate) fn readback_for_test(&self, src: &wgpu::Buffer, len_f32: usize) -> Vec<f32> {
+        self.readback_rows(src, len_f32)
+    }
+
+    /// The first `len_f32` values of `src`, after everything submitted so far
+    /// has run — an empty submission of its own, then the wait. How a prefill
+    /// brings its device-resident residual stream home.
+    pub fn readback_rows(&self, src: &wgpu::Buffer, len_f32: usize) -> Vec<f32> {
+        // The group's encoder, when one is open: what is read must first run,
+        // and a group that is submitted here simply starts afresh after.
+        let (encoder, _) = self.take_prefill_encoder("orangu-server rows readback");
+        self.submit_and_readback(encoder, src, 0, len_f32)
+    }
+
+    /// Writes `rows` at the start of `buf` — ordered before the next
+    /// submission, which is where a batched step's first chain reads it.
+    pub fn upload_rows(&self, buf: &wgpu::Buffer, rows: &[f32]) {
+        self.queue.write_buffer(buf, 0, bytemuck::cast_slice(rows));
+    }
+
+    /// A device buffer of `len_f32` values for a prefill's residual stream —
+    /// see `prefill_rows_capacity` for how many rows it has to hold.
+    pub fn prefill_rows_buffer(&self, len_f32: usize) -> wgpu::Buffer {
+        self.scratch_buffer(len_f32)
     }
 
     pub fn new_encoder(&self, label: &str) -> wgpu::CommandEncoder {
@@ -13642,6 +16277,7 @@ impl VulkanBackend {
         pass.set_pipeline(self.rmsnorm_for(n_embd));
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(1, 1, 1);
+        self.op_stamp(&mut pass, "tail.output_norm");
         drop(pass);
         self.capture_push(|| {
             use vulkan_replay::DescriptorKind::{Storage, Uniform};
@@ -13695,8 +16331,49 @@ impl VulkanBackend {
                 timestamp_writes: None,
             });
             self.record_matmul(&mut pass, w, &g);
+            self.op_stamp(&mut pass, "tail.matmul");
         }
         (g.output_buffer.clone(), g.output_offset)
+    }
+
+    /// Opens a prefill submission group: until `end_prefill_group`, the
+    /// prefill chains record into one encoder — see `PREFILL_ENCODER`.
+    pub fn begin_prefill_group(&self) {
+        PREFILL_ENCODER.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(self.new_encoder("orangu-server prefill group encoder"));
+            }
+        });
+    }
+
+    /// Submits the open group's encoder, if anything was recorded into it,
+    /// and closes the group.
+    pub fn end_prefill_group(&self) {
+        let taken = PREFILL_ENCODER.with(|slot| slot.borrow_mut().take());
+        if let Some(encoder) = taken {
+            self.submit_intermediate(encoder);
+        }
+    }
+
+    /// The group's encoder while one is open, a fresh one otherwise — what
+    /// every prefill chain records into.
+    fn take_prefill_encoder(&self, label: &str) -> (wgpu::CommandEncoder, bool) {
+        let taken = PREFILL_ENCODER.with(|slot| slot.borrow_mut().take());
+        match taken {
+            Some(encoder) => (encoder, true),
+            None => (self.new_encoder(label), false),
+        }
+    }
+
+    /// A chain's encoder when nothing has to come back: parked for the next
+    /// chain when it is the group's, submitted when it is the chain's own.
+    fn park_or_submit(&self, encoder: wgpu::CommandEncoder, grouped: bool) {
+        if grouped {
+            PREFILL_ENCODER.with(|slot| *slot.borrow_mut() = Some(encoder));
+        } else {
+            self.queue.submit(Some(encoder.finish()));
+        }
     }
 
     /// Finishes and submits `encoder` **without** any readback or `poll`,
@@ -13850,6 +16527,224 @@ impl VulkanBackend {
     /// layout), and reused for every later call. Cheap to clone: like
     /// `wgpu::Buffer`, `QuerySet` is itself just a handle to the real
     /// GPU-side resource.
+    /// The per-dispatch timer, when `ORANGU_GPU_TIMESTAMPS=ops` asked for it
+    /// — see [`OpTimer`]. Says why when it cannot, rather than measuring
+    /// nothing silently (the same rule as the per-stage flag).
+    fn build_op_timer(&self, supports_in_pass: bool) -> Option<Mutex<OpTimer>> {
+        let wants = std::env::var("ORANGU_GPU_TIMESTAMPS")
+            .is_ok_and(|v| v.trim().eq_ignore_ascii_case("ops"));
+        if !wants {
+            return None;
+        }
+        if !supports_in_pass {
+            eprintln!(
+                "orangu-server: ORANGU_GPU_TIMESTAMPS=ops is set but this adapter cannot \
+                 write a timestamp inside a compute pass — no per-dispatch breakdown will be printed"
+            );
+            return None;
+        }
+        let capacity = OpTimer::CAPACITY;
+        let byte_len = u64::from(capacity) * 8;
+        let query_set = self.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("orangu-server op timestamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count: capacity,
+        });
+        let resolve_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server op timestamp resolve"),
+            size: byte_len,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server op timestamp readback"),
+            size: byte_len,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Some(Mutex::new(OpTimer {
+            query_set,
+            resolve_buffer,
+            readback_buffer,
+            capacity,
+            labels: Vec::with_capacity(capacity as usize),
+            overflowed: false,
+            prev_end: None,
+        }))
+    }
+
+    /// Opens a step: forgets the previous step's stamps and writes the step
+    /// start at slot 0. A no-op without the timer.
+    pub fn begin_op_step(&self, encoder: &mut wgpu::CommandEncoder) {
+        let Some(timer) = &self.op_timer else {
+            return;
+        };
+        let mut t = timer.lock().unwrap_or_else(|p| p.into_inner());
+        t.labels.clear();
+        t.overflowed = false;
+        encoder.write_timestamp(&t.query_set, 0);
+        t.labels.push("start");
+    }
+
+    /// Stamps the dispatch just recorded into `pass` under `label`. A no-op
+    /// without the timer, so the recording paths call it unconditionally.
+    pub fn op_stamp(&self, pass: &mut wgpu::ComputePass<'_>, label: &'static str) {
+        let Some(timer) = &self.op_timer else {
+            return;
+        };
+        let mut t = timer.lock().unwrap_or_else(|p| p.into_inner());
+        let slot = t.labels.len() as u32;
+        if slot >= t.capacity {
+            t.overflowed = true;
+            return;
+        }
+        pass.write_timestamp(&t.query_set, slot);
+        t.labels.push(label);
+    }
+
+    /// Like [`Self::op_stamp`] for a dispatch recorded outside any pass, or
+    /// for a boundary (a submission, a copy) worth naming.
+    pub fn op_stamp_encoder(&self, encoder: &mut wgpu::CommandEncoder, label: &'static str) {
+        let Some(timer) = &self.op_timer else {
+            return;
+        };
+        let mut t = timer.lock().unwrap_or_else(|p| p.into_inner());
+        let slot = t.labels.len() as u32;
+        if slot >= t.capacity {
+            t.overflowed = true;
+            return;
+        }
+        encoder.write_timestamp(&t.query_set, slot);
+        t.labels.push(label);
+    }
+
+    /// Opens a step that spans submissions — a prefill, whose chains each
+    /// submit their own encoder. No start stamp: every chain stamps a
+    /// `pp.gap` boundary as its first command, so the interval before each
+    /// chain's first dispatch is the host's turn between submissions and is
+    /// reported under that name. A no-op without the timer.
+    pub fn begin_op_span(&self) {
+        let Some(timer) = &self.op_timer else {
+            return;
+        };
+        let mut t = timer.lock().unwrap_or_else(|p| p.into_inner());
+        t.labels.clear();
+        t.overflowed = false;
+    }
+
+    /// Closes a step opened by [`Self::begin_op_span`]: resolves the stamps
+    /// in a submission of its own (ordered after every chain's), waits, and
+    /// reports as [`Self::report_op_step`] does. The first slot is the first
+    /// chain's own boundary stamp, which the report uses as its base — so a
+    /// span with nothing stamped reports nothing.
+    pub fn finish_op_span(&self, start_pos: usize) {
+        let Some(timer) = &self.op_timer else {
+            return;
+        };
+        {
+            let t = timer.lock().unwrap_or_else(|p| p.into_inner());
+            if t.labels.len() < 2 {
+                return;
+            }
+        }
+        let mut encoder = self.new_encoder("orangu-server op span resolve");
+        self.finish_op_step(&mut encoder);
+        self.queue.submit(Some(encoder.finish()));
+        self.report_op_step(start_pos);
+    }
+
+    /// Appends the resolve + copy for this step's stamps; the encoder must be
+    /// the last one submitted for the step.
+    pub fn finish_op_step(&self, encoder: &mut wgpu::CommandEncoder) {
+        let Some(timer) = &self.op_timer else {
+            return;
+        };
+        let t = timer.lock().unwrap_or_else(|p| p.into_inner());
+        let n = t.labels.len() as u32;
+        if n < 2 {
+            return;
+        }
+        encoder.resolve_query_set(&t.query_set, 0..n, &t.resolve_buffer, 0);
+        encoder.copy_buffer_to_buffer(
+            &t.resolve_buffer,
+            0,
+            &t.readback_buffer,
+            0,
+            u64::from(n) * 8,
+        );
+    }
+
+    /// Reads the step's stamps back (the step must have been submitted and
+    /// waited for) and prints one line per label, largest total first:
+    /// `label total_ms count avg_us`.
+    pub fn report_op_step(&self, start_pos: usize) {
+        let Some(timer) = &self.op_timer else {
+            return;
+        };
+        let mut t = timer.lock().unwrap_or_else(|p| p.into_inner());
+        let n = t.labels.len();
+        if n < 2 {
+            return;
+        }
+        const CONTEXT: &str = "reading back per-dispatch GPU timestamps";
+        let wait = self.map_read(&t.readback_buffer);
+        self.poll_blocking(CONTEXT);
+        wait.check(CONTEXT);
+        let data = self.mapped_bytes(&t.readback_buffer, CONTEXT);
+        let ticks: Vec<u64> = bytemuck::cast_slice(&data[..n * 8]).to_vec();
+        drop(data);
+        t.readback_buffer.unmap();
+        let ns_per_tick = f64::from(self.queue.get_timestamp_period());
+        // label -> (count, total ns), in first-seen order so the print is
+        // stable across steps.
+        let mut order: Vec<&'static str> = Vec::new();
+        let mut totals: HashMap<&'static str, (u64, f64)> = HashMap::new();
+        for i in 1..n {
+            let ns = ticks[i].saturating_sub(ticks[i - 1]) as f64 * ns_per_tick;
+            let e = totals.entry(t.labels[i]).or_insert_with(|| {
+                order.push(t.labels[i]);
+                (0, 0.0)
+            });
+            e.0 += 1;
+            e.1 += ns;
+        }
+        let total_ns = ticks[n - 1].saturating_sub(ticks[0]) as f64 * ns_per_tick;
+        let gap = t
+            .prev_end
+            .map(|prev| ticks[0].saturating_sub(prev) as f64 * ns_per_tick / 1e6);
+        t.prev_end = Some(ticks[n - 1]);
+        order.sort_by(|a, b| totals[b].1.total_cmp(&totals[a].1));
+        eprintln!(
+            "orangu-server: [gpu-ops] pos {start_pos}: {} stamps, total {:.3}ms, idle before {}{}",
+            n - 1,
+            total_ns / 1e6,
+            gap.map_or("-".to_string(), |g| format!("{g:.3}ms")),
+            if t.overflowed {
+                " (overflowed; later dispatches unstamped)"
+            } else {
+                ""
+            }
+        );
+        for label in order {
+            let (count, ns) = totals[label];
+            eprintln!(
+                "orangu-server: [gpu-ops]   {label:<28} {:>8.3}ms {count:>5}x {:>8.1}us",
+                ns / 1e6,
+                ns / 1e3 / count as f64
+            );
+        }
+        // The device memory picture behind every submission: each block is
+        // one driver object a submission carries and the kernel validates.
+        if let Some(report) = self.device.generate_allocator_report() {
+            eprintln!(
+                "orangu-server: [gpu-ops]   memory: {} blocks, {} allocations, {:.1} MiB reserved",
+                report.blocks.len(),
+                report.allocations.len(),
+                report.total_reserved_bytes as f64 / (1024.0 * 1024.0)
+            );
+        }
+    }
+
     pub fn timestamp_query_set(&self, n_layer: usize) -> wgpu::QuerySet {
         let mut guard = self.timestamps.lock().expect("timestamp queries poisoned");
         // `n_layer + 3` boundary slots (start, post-PLE, one per layer, tail)
@@ -14083,40 +16978,89 @@ impl VulkanBackend {
         let proj_g = proj_entry.lock().expect("op cache entry poisoned");
         self.upload_or_copy(encoder, &proj_g.x_buffer, proj_g.x_offset, x, proj_w.in_dim);
 
-        let projection_scale = 1.0 / (proj_w.in_dim as f32).sqrt();
-        let input_scale = 1.0 / 2f32.sqrt();
-
-        let scaled = self.scratch_buffer(total);
-        let norm_w = self.upload_new(proj_norm);
-        let gathered_buf = self.upload_new(gathered);
-        let summed = self.scratch_buffer(total);
-        let final_buf = self.scratch_buffer(total);
-
-        let meta_scale1 = self.elem_meta_buffer(total as u32, projection_scale);
-        let norm_meta = PerHeadNormMeta {
-            n_head: n_layer as u32,
-            head_dim: per_layer as u32,
-            eps,
-            _pad: 0,
+        let res = {
+            let mut cache = self
+                .ple_projection_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match cache.get(&batch_slot) {
+                Some(r) if r.total == total && r.per_layer == per_layer && r.n_layer == n_layer => {
+                    r.clone()
+                }
+                _ => {
+                    let projection_scale = 1.0 / (proj_w.in_dim as f32).sqrt();
+                    let input_scale = 1.0 / 2f32.sqrt();
+                    let scaled = self.scratch_buffer(total);
+                    let norm_w = self.upload_new(proj_norm);
+                    let gathered = self.scratch_buffer(total);
+                    let summed = self.scratch_buffer(total);
+                    let final_buf = self.scratch_buffer(total);
+                    let meta_scale1 = self.elem_meta_buffer(total as u32, projection_scale);
+                    let norm_meta = PerHeadNormMeta {
+                        n_head: n_layer as u32,
+                        head_dim: per_layer as u32,
+                        eps,
+                        _pad: 0,
+                    };
+                    let norm_meta_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("orangu-server ple projection norm meta"),
+                        size: std::mem::size_of::<PerHeadNormMeta>() as u64,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    self.queue
+                        .write_buffer(&norm_meta_buf, 0, bytemuck::bytes_of(&norm_meta));
+                    let meta_add = self.elem_meta_buffer(total as u32, 0.0);
+                    let meta_scale2 = self.elem_meta_buffer(total as u32, input_scale);
+                    let bg_scale1 =
+                        self.elem3_bind_group(proj_g.output_src(), &scaled, &meta_scale1);
+                    // Same (weight, x-in-place, meta) role assignment as
+                    // `gpu_perhead_rmsnorm`'s own `elem3_bind_group` call —
+                    // RMSNorm writes back into `scaled` itself.
+                    let bg_norm = self.elem3_bind_group(&norm_w, &scaled, &norm_meta_buf);
+                    let bg_add = self.elem4_bind_group(&scaled, &gathered, &summed, &meta_add);
+                    let bg_scale2 = self.elem3_bind_group(&summed, &final_buf, &meta_scale2);
+                    let r = Arc::new(PleProjectionResources {
+                        total,
+                        per_layer,
+                        n_layer,
+                        scaled,
+                        norm_w,
+                        gathered,
+                        summed,
+                        final_buf,
+                        meta_scale1,
+                        norm_meta_buf,
+                        meta_add,
+                        meta_scale2,
+                        bg_scale1,
+                        bg_norm,
+                        bg_add,
+                        bg_scale2,
+                    });
+                    cache.insert(batch_slot, r.clone());
+                    r
+                }
+            }
         };
-        let norm_meta_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("orangu-server ple projection norm meta"),
-            size: std::mem::size_of::<PerHeadNormMeta>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         self.queue
-            .write_buffer(&norm_meta_buf, 0, bytemuck::bytes_of(&norm_meta));
-        let meta_add = self.elem_meta_buffer(total as u32, 0.0);
-        let meta_scale2 = self.elem_meta_buffer(total as u32, input_scale);
-
-        let bg_scale1 = self.elem3_bind_group(proj_g.output_src(), &scaled, &meta_scale1);
-        // Same (weight, x-in-place, meta) role assignment as
-        // `gpu_perhead_rmsnorm`'s own `elem3_bind_group` call — RMSNorm
-        // writes back into `scaled` itself.
-        let bg_norm = self.elem3_bind_group(&norm_w, &scaled, &norm_meta_buf);
-        let bg_add = self.elem4_bind_group(&scaled, &gathered_buf, &summed, &meta_add);
-        let bg_scale2 = self.elem3_bind_group(&summed, &final_buf, &meta_scale2);
+            .write_buffer(&res.gathered, 0, bytemuck::cast_slice(gathered));
+        let PleProjectionResources {
+            scaled,
+            norm_w,
+            gathered: gathered_buf,
+            summed,
+            final_buf,
+            meta_scale1,
+            norm_meta_buf,
+            meta_add,
+            meta_scale2,
+            bg_scale1,
+            bg_norm,
+            bg_add,
+            bg_scale2,
+            ..
+        } = &*res;
 
         let wg = (total as u32).div_ceil(64);
         if self.q4_k_mmvq {
@@ -14132,22 +17076,24 @@ impl VulkanBackend {
                 timestamp_writes: None,
             });
             self.record_matmul(&mut pass, proj_w, &proj_g);
+            self.op_stamp(&mut pass, "ple.projection");
 
             pass.set_pipeline(&self.scale_pipeline);
-            pass.set_bind_group(0, &bg_scale1, &[]);
+            pass.set_bind_group(0, bg_scale1, &[]);
             pass.dispatch_workgroups(wg, 1, 1);
 
             pass.set_pipeline(&self.perhead_rmsnorm_pipeline);
-            pass.set_bind_group(0, &bg_norm, &[]);
+            pass.set_bind_group(0, bg_norm, &[]);
             pass.dispatch_workgroups(n_layer as u32, 1, 1);
 
             pass.set_pipeline(&self.add_pipeline);
-            pass.set_bind_group(0, &bg_add, &[]);
+            pass.set_bind_group(0, bg_add, &[]);
             pass.dispatch_workgroups(wg, 1, 1);
 
             pass.set_pipeline(&self.scale_pipeline);
-            pass.set_bind_group(0, &bg_scale2, &[]);
+            pass.set_bind_group(0, bg_scale2, &[]);
             pass.dispatch_workgroups(wg, 1, 1);
+            self.op_stamp(&mut pass, "ple.scale_norm_add");
         }
         // Raw-Vulkan replay capture: the proj matmul self-captures
         // (`record_matmul`); mirror the four elementwise/norm dispatches here in
@@ -14218,7 +17164,7 @@ impl VulkanBackend {
                 )
             });
         }
-        final_buf
+        final_buf.clone()
     }
 
     /// `true` unless `ORANGU_NO_GPU_SAMPLE=1` was set at startup — see
@@ -14342,6 +17288,7 @@ impl VulkanBackend {
             self.elem4_bind_group(&partial_val, &partial_idx, &out_buf, &reduce_meta_buf);
 
         ArgmaxSampleResources {
+            topk: None,
             n_vocab,
             recent_cap,
             logits_buf,
@@ -14461,6 +17408,190 @@ impl VulkanBackend {
 
         out_buf
     }
+
+    /// The sampled-decode twin of [`Self::record_argmax_sample`]: the same
+    /// softcap and repeat penalty on the device, then the `k` largest
+    /// logits (`k <= vulkan_shaders::TOPK_MAX`) instead of the single
+    /// largest — the candidates a top-k sampler would have found after
+    /// reading the whole vocabulary back. Returns the buffer holding
+    /// `k` values followed by `k` indices as bits; read it with
+    /// [`Self::submit_and_readback_topk`]. What the host sampler still does
+    /// over those `k` — temperature, softmax, top-p, min-p, the draw — is
+    /// unchanged, and equivalent: temperature scales every logit alike, so
+    /// the top `k` before it are the top `k` after it.
+    pub fn record_topk_sample(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        input: GpuArgmaxSampleInput<'_>,
+        k: u32,
+        batch_slot: usize,
+    ) -> wgpu::Buffer {
+        let k = k.clamp(1, vulkan_shaders::TOPK_MAX);
+        let GpuArgmaxSampleInput {
+            logits,
+            n_vocab,
+            recent_tokens,
+            repeat_penalty,
+            logit_softcap,
+        } = input;
+        let sample_meta = SampleMeta {
+            n_vocab: n_vocab as u32,
+            n_recent: recent_tokens.len() as u32,
+            repeat_penalty,
+            logit_softcap: logit_softcap
+                .filter(|c| c.is_finite() && *c > 0.0)
+                .unwrap_or(0.0),
+        };
+        let (logits_buf, recent_buf, sample_meta_buf, penalty_bg, topk) = {
+            let mut cache = self
+                .argmax_sample_cache
+                .lock()
+                .expect("argmax cache poisoned");
+            let entry = cache.entry(batch_slot);
+            let res = match entry {
+                std::collections::hash_map::Entry::Occupied(e)
+                    if e.get().n_vocab == n_vocab && e.get().recent_cap >= recent_tokens.len() =>
+                {
+                    e.into_mut()
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let cap = recent_tokens.len().max(e.get().recent_cap).max(64);
+                    e.insert(self.build_argmax_sample_resources(n_vocab, cap));
+                    e.into_mut()
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let cap = recent_tokens.len().max(64);
+                    e.insert(self.build_argmax_sample_resources(n_vocab, cap))
+                }
+            };
+            if res.topk.is_none() {
+                let slice = vulkan_shaders::TOPK_SLICE;
+                let n_split = (n_vocab as u32).div_ceil(slice).max(1);
+                let cap = vulkan_shaders::TOPK_MAX;
+                let partial_val = self.scratch_buffer((n_split * cap) as usize);
+                let partial_idx = self.scratch_buffer((n_split * cap) as usize);
+                let out = self.scratch_buffer((2 * cap) as usize);
+                let meta_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("orangu-server topk meta"),
+                    size: 16,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let split_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("orangu-server topk split bind group"),
+                    layout: &self.argmax_split_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: res.logits_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: partial_val.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: partial_idx.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: meta_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+                // `ElemMeta { len: candidates, aux: k }` — rewritten per call.
+                let reduce_meta_buf = self.elem_meta_buffer(n_split * cap, 0.0);
+                let reduce_bind_group =
+                    self.elem4_bind_group(&partial_val, &partial_idx, &out, &reduce_meta_buf);
+                res.topk = Some(TopkResources {
+                    n_split,
+                    out,
+                    meta_buf,
+                    split_bind_group,
+                    reduce_meta_buf,
+                    reduce_bind_group,
+                });
+            }
+            let topk = res.topk.as_ref().expect("built above");
+            (
+                res.logits_buf.clone(),
+                res.recent_buf.clone(),
+                res.sample_meta_buf.clone(),
+                res.penalty_bind_group.clone(),
+                (
+                    topk.n_split,
+                    topk.out.clone(),
+                    topk.meta_buf.clone(),
+                    topk.split_bind_group.clone(),
+                    topk.reduce_meta_buf.clone(),
+                    topk.reduce_bind_group.clone(),
+                ),
+            )
+        };
+        let (n_split, out, meta_buf, split_bg, reduce_meta_buf, reduce_bg) = topk;
+
+        self.upload_or_copy(encoder, &logits_buf, 0, logits, n_vocab);
+        if recent_tokens.is_empty() {
+            self.queue
+                .write_buffer(&recent_buf, 0, bytemuck::cast_slice(&[0u32]));
+        } else {
+            self.queue
+                .write_buffer(&recent_buf, 0, bytemuck::cast_slice(recent_tokens));
+        }
+        self.queue
+            .write_buffer(&sample_meta_buf, 0, bytemuck::bytes_of(&sample_meta));
+        let slice = vulkan_shaders::TOPK_SLICE;
+        self.queue.write_buffer(
+            &meta_buf,
+            0,
+            bytemuck::cast_slice(&[n_vocab as u32, n_split, k, slice]),
+        );
+        let reduce_meta = ElemMeta {
+            len: n_split * k,
+            aux: k,
+            extra: 0.0,
+            out_scale: 0.0,
+        };
+        self.queue
+            .write_buffer(&reduce_meta_buf, 0, bytemuck::bytes_of(&reduce_meta));
+
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("orangu-server topk sample pass"),
+            timestamp_writes: None,
+        });
+        if sample_meta.logit_softcap > 0.0 {
+            pass.set_pipeline(&self.argmax_softcap_pipeline);
+            pass.set_bind_group(0, &penalty_bg, &[]);
+            pass.dispatch_workgroups((n_vocab as u32).div_ceil(64), 1, 1);
+        }
+        pass.set_pipeline(&self.argmax_penalty_pipeline);
+        pass.set_bind_group(0, &penalty_bg, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+        pass.set_pipeline(&self.topk_split_pipeline);
+        pass.set_bind_group(0, &split_bg, &[]);
+        pass.dispatch_workgroups(n_split, 1, 1);
+        self.op_stamp(&mut pass, "tail.topk_split");
+        pass.set_pipeline(&self.topk_reduce_pipeline);
+        pass.set_bind_group(0, &reduce_bg, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+        self.op_stamp(&mut pass, "tail.topk_reduce");
+        drop(pass);
+
+        out
+    }
+
+    /// Submits `encoder` and reads the `k` `(token, logit)` candidates
+    /// [`Self::record_topk_sample`] left in `out`, largest first.
+    pub fn submit_and_readback_topk(
+        &self,
+        encoder: wgpu::CommandEncoder,
+        out: &wgpu::Buffer,
+        k: u32,
+    ) -> Vec<(u32, f32)> {
+        let k = k.clamp(1, vulkan_shaders::TOPK_MAX) as usize;
+        let raw = self.submit_and_readback(encoder, out, 0, 2 * k);
+        (0..k).map(|i| (raw[k + i].to_bits(), raw[i])).collect()
+    }
 }
 
 /// PLE's own gate/GELU/multiply/proj/RMSNorm/residual-add sub-chain's
@@ -14504,6 +17635,9 @@ struct FusedPleResources {
     /// `ple_gate` matmul (reads `x2` directly). `Some` on the non-MMVQ path;
     /// when set, the record path skips the two PLE copies + the separate mul.
     bg_gelu_mul: Option<wgpu::BindGroup>,
+    /// `bg_gelu_mul` reading the per-layer-embedding slice in place — see
+    /// [`DirectInput`].
+    gelu_mul_direct: DirectSlot,
     bg_ple_gate_matmul: Option<wgpu::BindGroup>,
     /// Fused PLE post-projection RMSNorm+residual-add (`rmsnorm_add`,
     /// `x3 = rmsnorm(ple_proj)*post_norm_w + x2`). `Some` unless
@@ -14864,6 +17998,43 @@ struct FusedAttnLayerResources {
     bg_wq_matmul: Option<wgpu::BindGroup>,
     bg_wk_matmul: Option<wgpu::BindGroup>,
     bg_wv_matmul: Option<wgpu::BindGroup>,
+    /// The integer-dot path's answer to the same copies: the attn-norm output
+    /// quantized to q8 **once per layer**, read by every Q4_K projection.
+    /// `Some` on the MMVQ path with a GPU `normed` input; `None` otherwise.
+    shared_q8: Option<SharedQ8>,
+}
+
+/// One quantized activation shared by every integer-dot matmul that reads
+/// the same input.
+///
+/// The MMVQ path quantizes its input to q8 before the matmul, and it did so
+/// **per matmul**: Q and K each copied the layer's normed vector into their
+/// own buffer and each ran their own quantize dispatch over it — the same
+/// activation quantized to the same bytes once per consumer, with a buffer
+/// copy in front of each. Quantizing once and binding the result to each
+/// consumer removes the copies and the repeats; the kernels are untouched
+/// and the output is bit-identical.
+///
+/// Measured as a wash on decode throughput where it was tried: the
+/// projection side of a layer is a small share of a token's GPU time, and
+/// commands recorded into one submission cost little each. It is kept
+/// because it is strictly less work for the same bytes, which is worth more
+/// on a device whose front end, rather than its memory, is the limit.
+struct SharedQ8 {
+    /// Kept alive for the bind groups below; nothing reads it from the host.
+    #[allow(dead_code)]
+    q8_buffer: wgpu::Buffer,
+    quantize_bind_group: wgpu::BindGroup,
+    #[allow(dead_code)]
+    quantize_meta: wgpu::Buffer,
+    quantize_workgroups: (u32, u32, u32),
+    /// MMVQ matmul bind groups reading the shared q8, one per Q4_K
+    /// projection of the layer. A projection whose weight is not Q4_K has no
+    /// MMVQ op and no entry here; it reads the f32 `normed` through the
+    /// shared-input bind group instead.
+    mmvq_bg_wq: Option<wgpu::BindGroup>,
+    mmvq_bg_wk: Option<wgpu::BindGroup>,
+    mmvq_bg_wv: Option<wgpu::BindGroup>,
 }
 
 /// [`FusedAttnLayerResources::kv`] — only present for layers that own
@@ -14966,10 +18137,11 @@ struct FusedLayerResources {
     /// dispatch binds (`vulkan_replay`) — the capture step. No
     /// extra allocation: same buffer objects the bind group already holds.
     /// Only read by the replay cross-check tests.
-    #[allow(dead_code)]
     attn_norm_w: wgpu::Buffer,
-    #[allow(dead_code)]
     attn_norm_meta: wgpu::Buffer,
+    /// `attn_norm_bg` over the previous layer's output in place — see
+    /// [`DirectInput`].
+    attn_norm_direct: DirectSlot,
 }
 
 /// One gemma4 layer's cached `fused_post_attention` resources — built once
@@ -15009,6 +18181,14 @@ struct FusedResources {
     x2: wgpu::Buffer,
     x2_offset: u64,
     bg_attn_post_norm_add: Option<wgpu::BindGroup>,
+    /// `wo` reading attention's output in place, and the attention
+    /// residual add reading the layer input in place — see [`DirectInput`].
+    wo_direct: DirectSlot,
+    attn_residual_direct: DirectSlot,
+    /// The norm pair (`attn.post_norm_add` + `ffn.norm` in one dispatch) over
+    /// the copied residual, and its per-call form over a direct one.
+    bg_norm_pair: Option<wgpu::BindGroup>,
+    norm_pair_direct: DirectSlot,
     bg_ffn_norm: wgpu::BindGroup,
     /// Copy elimination: shared-input matmul bind groups for the FFN
     /// gate/up projections that read `ffn_normed` **directly** (read-only)
@@ -15040,6 +18220,9 @@ struct FusedResources {
     ffn_norm_w: wgpu::Buffer,
     ffn_post_norm_w: Option<wgpu::Buffer>,
     meta_embd_eps: wgpu::Buffer,
+    /// The post-norms' own meta when their epsilon differs — see
+    /// [`FusedPostAttentionInput::post_norm_eps`].
+    meta_embd_post: Option<wgpu::Buffer>,
     meta_ffn_plain: wgpu::Buffer,
     x1_offset: u64,
     gelu_out_offset: u64,

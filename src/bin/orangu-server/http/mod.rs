@@ -26,7 +26,7 @@ use axum::{
     Router,
     extract::State,
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
@@ -172,6 +172,56 @@ pub fn overloaded_response() -> axum::response::Response {
         OVERLOADED_MESSAGE,
     )
         .into_response()
+}
+
+/// The HTTP answer to a request this server cannot serve **as sent** — today,
+/// one whose context is longer than the device has room for.
+///
+/// `400`, not `500`: nothing is broken, and the difference decides what the
+/// caller does next. A client that sees `500` retries the same request or
+/// files a bug; one that sees `400` shortens the prompt — which is the only
+/// thing that can work, and which `/auto_review` does automatically by falling
+/// back to a file's diff alone.
+pub fn too_long_response(message: String) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (axum::http::StatusCode::BAD_REQUEST, message).into_response()
+}
+
+/// Refuses a request whose *prompt* is longer than this device can hold, before
+/// any of it is processed — `None` when it fits, or when there is no device
+/// ceiling to apply.
+///
+/// The prompt alone, not the prompt plus `max_tokens`. `max_tokens` is a cap
+/// on the answer, not a reservation, and the engine already clamps it to the
+/// model's own context length; the device ceiling clamps it the same way (see
+/// `engine::generate`). Counting it here refused every request from a client
+/// that asks for a generous cap without knowing the card — the web console
+/// asks for 32768 on every turn, and on a device whose room is 16384 tokens
+/// that made the console unusable on any prompt at all.
+///
+/// **A `400`, not a `500`.** Nothing is broken and retrying changes nothing:
+/// the only thing that can work is a shorter prompt, and the status code is
+/// what tells a client to try that rather than file a bug. `/auto_review` does
+/// exactly that, dropping a file's whole-file context and reviewing its diff.
+///
+/// Asked here rather than only inside the engine because *here* is where an
+/// answer is still free. Past this point the prompt is on its way to a device
+/// that answers an oversized request by stalling until its driver resets it,
+/// taking every other request on the process with it.
+pub fn reject_oversized_context(prompt_tokens: usize) -> Option<Response> {
+    let ceiling = crate::engine::generate::kv_device_token_ceiling()?;
+    if crate::engine::generate::prompt_fits_device(prompt_tokens, ceiling) {
+        return None;
+    }
+    // `CONTEXT_TOO_LONG_MARKER` is what a client matches on to tell this
+    // apart from every other `400` — see its own doc comment.
+    Some(too_long_response(format!(
+        "prompt ({prompt_tokens} tokens) plus one generated token needs {} {}, more than \
+         the {ceiling} this server has room for on its device — send a shorter prompt, or \
+         serve this model on a device with more memory\n",
+        prompt_tokens.saturating_add(1),
+        orangu::llm::CONTEXT_TOO_LONG_MARKER
+    )))
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {

@@ -628,7 +628,7 @@ impl LlamaModel {
         tail: Tail,
     ) -> Option<(wgpu::CommandEncoder, wgpu::Buffer, u64)> {
         use crate::engine::backend::vulkan::{
-            FfnActivation, FusedAttnProjection, FusedLayerInput, GpuInput, RopeYarn,
+            FfnActivation, FusedAttnProjection, FusedLayerInput, GpuInput, PassCursor, RopeYarn,
         };
 
         if no_fused_qkv() || no_fused_post_attention() {
@@ -711,7 +711,7 @@ impl LlamaModel {
                 }
             };
             let out = vulkan.record_fused_layer(
-                &mut encoder,
+                &mut PassCursor::new(&mut encoder),
                 FusedLayerInput {
                     stop_at_ffn_norm: npu.is_some(),
                     x: x_input,
@@ -768,6 +768,8 @@ impl LlamaModel {
                     ffn_post_norm: None,
                     ple: None,
                     layer_output_scale: None,
+                    attn_gate: None,
+                    post_norm_eps: None,
                     batch_slot: slot_id,
                     attn_ts: ts.attn_slot(il, n_layer),
                 },
@@ -1171,10 +1173,13 @@ impl LlamaModel {
                 .and_then(|vulkan| {
                     vulkan.fused_attention_prefill(
                         crate::engine::backend::vulkan::FusedAttnPrefillInput {
+                            x_gpu: None,
+                            attn_norm: None,
                             q_bias: layer.q_bias.as_deref(),
                             pairing: self.rope.layout,
                             yarn: crate::engine::backend::vulkan::RopeYarn::from_params(&self.rope),
                             normalize_v: false,
+                            attn_gate: None,
                             normed: &normed,
                             n_tokens,
                             start_pos,
@@ -1526,6 +1531,9 @@ impl ModelForward for LlamaModel {
             if tokens.len() == 1
                 && self.mul.is_identity()
                 && let Some(params) = &greedy_sample
+                // A `top_k > 0` asks for candidates, which only the device top-k
+                // path answers; this architecture has the greedy path alone.
+                && params.top_k == 0
                 && let Some(vulkan) = self.backend.as_wgpu()
                 && vulkan.gpu_sample()
                 // Sampling on the device is only worth having if the logits are

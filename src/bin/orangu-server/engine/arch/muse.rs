@@ -272,6 +272,204 @@ impl MuseModel {
         }
     }
 
+    /// One decode step as **one submission per device**: every layer
+    /// through `record_fused_layer`, the output norm and the logits
+    /// projection recorded behind them, read back once. The chain takes
+    /// what this architecture adds to the llama block — no rotation on a
+    /// full-attention layer (`rope_dim: 0`), the sigmoid gate on
+    /// attention's output (`attn_gate`), the post-norms' own epsilon
+    /// (`post_norm_eps`) — so the whole layer stays on the device; before,
+    /// each layer was five `Backend` calls with the activations home
+    /// between them, two hundred submissions a token. `None` where the
+    /// chain does not apply (a multi-token step, `ORANGU_MUSE_FUSED=0`).
+    /// The logit scale and softcap are applied on the host, as `forward`
+    /// applies them.
+    fn record_decode_forward(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Option<Vec<f32>> {
+        if tokens.len() != 1 || !muse_fused() {
+            return None;
+        }
+        let tok = tokens[0] as usize;
+        if tok >= self.config.n_vocab {
+            return None;
+        }
+        let n_embd = self.config.n_embd;
+        let mut x = self.tok_embeddings.row(tok).to_vec();
+        super::rms_norm_rows(&mut x, n_embd, self.config.rms_eps);
+
+        let runs = super::decode_device_runs(
+            self.backend.as_ref(),
+            self.layers.iter().map(|layer| layer.wo.device()),
+        )?;
+        let tail_device = self.output_weight.device();
+        for (index, (device, layers)) in runs.iter().enumerate() {
+            let vulkan = self.backend.as_wgpu_on(*device)?;
+            let last = index + 1 == runs.len();
+            let with_tail = last && *device == tail_device;
+            let (encoder, buf, offset) = self.record_decode_run(
+                vulkan,
+                cache,
+                layers.clone(),
+                &x,
+                start_pos,
+                slot_id,
+                with_tail,
+            )?;
+            if with_tail {
+                let mut logits =
+                    vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1);
+                self.apply_logit_transforms(&mut logits);
+                if vulkan.gpu_timestamps() {
+                    vulkan.report_timestamps(start_pos, self.layers.len());
+                }
+                return Some(logits);
+            }
+            x = vulkan.submit_and_read_at(encoder, &buf, offset, n_embd);
+        }
+        // The output projection lives on a device that ran no layers: norm
+        // and project there from the host copy of the residual.
+        let vulkan = self.backend.as_wgpu_on(tail_device)?;
+        let mut encoder = vulkan.new_encoder("orangu-server muse decode tail");
+        let normed = vulkan.record_output_norm(
+            &mut encoder,
+            crate::engine::backend::vulkan::GpuInput::Cpu(&x),
+            &self.output_norm,
+            self.config.rms_eps,
+            n_embd,
+        );
+        let _ = vulkan.record_full_matmul(
+            &mut encoder,
+            crate::engine::backend::vulkan::GpuInput::Gpu(&normed, 0),
+            &self.output_weight,
+            slot_id + 1,
+        );
+        let mut logits = vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1);
+        self.apply_logit_transforms(&mut logits);
+        Some(logits)
+    }
+
+    /// The layers `layers` of one decode step on one device, from the
+    /// residual `x_in` — with the output norm and logits projection behind
+    /// them when `with_tail`, else ending at the last layer's residual.
+    #[allow(clippy::too_many_arguments)]
+    fn record_decode_run(
+        &self,
+        vulkan: &crate::engine::backend::VulkanBackend,
+        cache: &mut KvCache,
+        layers: std::ops::Range<usize>,
+        x_in: &[f32],
+        start_pos: usize,
+        slot_id: usize,
+        with_tail: bool,
+    ) -> Option<(wgpu::CommandEncoder, wgpu::Buffer, u64)> {
+        use crate::engine::backend::vulkan::{
+            FfnActivation, FusedAttnProjection, FusedLayerInput, GpuInput, PassCursor, RopeYarn,
+        };
+        if !vulkan.prefill_attention_enabled() {
+            return None;
+        }
+        let cfg = &self.config;
+        let n_embd = cfg.n_embd;
+        let head_dim = self.head_dim();
+        let mut encoder = vulkan.new_encoder("orangu-server muse decode");
+        let n_layer = self.layers.len();
+        let ts = vulkan.begin_step_timestamps(&mut encoder, n_layer);
+        let mut bufs: Vec<(wgpu::Buffer, u64)> = Vec::with_capacity(layers.len());
+        for il in layers {
+            let layer = &self.layers[il];
+            let x_input = match bufs.last() {
+                Some((buf, offset)) => GpuInput::Gpu(buf, (*offset / 4) as usize),
+                None => GpuInput::Cpu(x_in),
+            };
+            let (window_start, window) = if layer.is_swa && self.n_swa > 0 {
+                (
+                    start_pos.saturating_sub(self.n_swa - 1),
+                    Some(self.n_swa as u32),
+                )
+            } else {
+                (0, None)
+            };
+            let out = vulkan.record_fused_layer(
+                &mut PassCursor::new(&mut encoder),
+                FusedLayerInput {
+                    stop_at_ffn_norm: false,
+                    x: x_input,
+                    pairing: self.rope.layout,
+                    yarn: RopeYarn::from_params(&self.rope),
+                    activation: FfnActivation::Swiglu,
+                    normalize_v: false,
+                    attn_gate: Some(&layer.w_gate),
+                    attn_norm: &layer.attn_norm,
+                    wq: &layer.wq,
+                    q_bias: None,
+                    q_norm: Some(&layer.attn_q_norm),
+                    kv: Some(FusedAttnProjection {
+                        wk: &layer.wk,
+                        wv: Some(&layer.wv),
+                        k_bias: None,
+                        v_bias: None,
+                        k_norm: Some(&layer.attn_k_norm),
+                    }),
+                    n_head: cfg.n_head,
+                    n_head_kv: cfg.n_head_kv,
+                    head_dim,
+                    // A full-attention layer of this architecture is NoPE:
+                    // nothing to rotate, which the chain reads as zero
+                    // rotated dimensions.
+                    rope_dim: if layer.is_swa { self.rope.rope_dim } else { 0 },
+                    rope_freq_base: self.rope.freq_base,
+                    freq_factors: None,
+                    eps: cfg.rms_eps,
+                    pos: start_pos,
+                    window_start,
+                    window,
+                    scale: 1.0 / (head_dim as f32).sqrt(),
+                    cache: &mut cache.layers[il],
+                    wo: &layer.wo,
+                    attn_post_norm: Some(&layer.attn_post_norm),
+                    ffn_norm: &layer.ffn_norm,
+                    ffn_gate: &layer.ffn_gate,
+                    ffn_up: &layer.ffn_up,
+                    ffn_down: &layer.ffn_down,
+                    ffn_post_norm: Some(&layer.ffn_post_norm),
+                    ple: None,
+                    layer_output_scale: None,
+                    post_norm_eps: Some(POST_NORM_EPS),
+                    batch_slot: slot_id,
+                    attn_ts: ts.attn_slot(il, n_layer),
+                },
+            );
+            ts.after_layer(&mut encoder, il);
+            bufs.push(out);
+        }
+        let (last_buf, last_offset) = bufs.last()?;
+        if !with_tail {
+            let (buf, offset) = (last_buf.clone(), *last_offset);
+            ts.finish(vulkan, &mut encoder, n_layer);
+            return Some((encoder, buf, offset));
+        }
+        let normed = vulkan.record_output_norm(
+            &mut encoder,
+            GpuInput::Gpu(last_buf, (*last_offset / 4) as usize),
+            &self.output_norm,
+            cfg.rms_eps,
+            n_embd,
+        );
+        let (logits_buf, logits_offset) = vulkan.record_full_matmul(
+            &mut encoder,
+            GpuInput::Gpu(&normed, 0),
+            &self.output_weight,
+            slot_id + 1,
+        );
+        ts.finish(vulkan, &mut encoder, n_layer);
+        Some((encoder, logits_buf, logits_offset))
+    }
+
     /// Every layer, from the token embeddings to the last residual —
     /// `[n_tokens, n_embd]`. Shared by `forward`, `forward_all_logits` and
     /// `forward_hidden_states`, which differ only in what they do with it.
@@ -315,6 +513,75 @@ impl MuseModel {
 
         for (il, layer) in self.layers.iter().enumerate() {
             tensor::rmsnorm_into(&mut normed, &x, &layer.attn_norm, n_tokens, n_embd, eps);
+
+            // The two fused prefill chains, as `arch::llama` runs them:
+            // attention with the gate applied on the device and its output
+            // left there, then `wo`, both post-norms at their own epsilon,
+            // and the FFN in one submission. `None` from either falls
+            // through to the step-by-step sequence below.
+            if muse_fused()
+                && let Some(vulkan) = self.backend.as_wgpu_on(layer.wo.device())
+                && vulkan.prefill_fused_attention_enabled()
+                && let Some(attn) = vulkan.fused_attention_prefill(
+                    crate::engine::backend::vulkan::FusedAttnPrefillInput {
+                        x_gpu: None,
+                        attn_norm: None,
+                        q_bias: None,
+                        pairing: self.rope.layout,
+                        yarn: crate::engine::backend::vulkan::RopeYarn::from_params(&self.rope),
+                        normalize_v: false,
+                        attn_gate: Some(&layer.w_gate),
+                        normed: &normed,
+                        n_tokens,
+                        start_pos,
+                        wq: &layer.wq,
+                        q_norm: Some(&layer.attn_q_norm),
+                        kv: Some(crate::engine::backend::vulkan::FusedAttnPrefillKv {
+                            k_bias: None,
+                            v_bias: None,
+                            wk: &layer.wk,
+                            k_norm: Some(&layer.attn_k_norm),
+                            wv: Some(&layer.wv),
+                        }),
+                        n_head,
+                        n_head_kv,
+                        head_dim,
+                        rope_dim: if layer.is_swa { self.rope.rope_dim } else { 0 },
+                        rope_freq_base: self.rope.freq_base,
+                        freq_factors: None,
+                        eps,
+                        n_swa: if layer.is_swa { self.n_swa } else { 0 },
+                        causal: true,
+                        scale: 1.0 / (head_dim as f32).sqrt(),
+                        want_attn_out_host: false,
+                    },
+                    &mut cache.layers[il],
+                )
+                && let Some(out) = vulkan.fused_post_attention_prefill_rows(
+                    crate::engine::backend::vulkan::AttnOutSrc::Gpu(
+                        &attn.attn_out_buf,
+                        0,
+                        n_tokens,
+                    ),
+                    crate::engine::backend::vulkan::AttnOutSrc::Host(&x),
+                    n_tokens,
+                    &layer.wo,
+                    Some(&layer.attn_post_norm),
+                    &layer.ffn_norm,
+                    &layer.ffn_gate,
+                    &layer.ffn_up,
+                    &layer.ffn_down,
+                    Some(&layer.ffn_post_norm),
+                    eps,
+                    crate::engine::backend::vulkan::FfnActivation::Swiglu,
+                    None,
+                    None,
+                    Some(POST_NORM_EPS),
+                )
+            {
+                x = out;
+                continue;
+            }
 
             // Q, K, V and the gate are four independent projections of the
             // same normed input — one batched dispatch instead of four
@@ -473,6 +740,14 @@ impl MuseModel {
     }
 }
 
+/// `ORANGU_MUSE_FUSED=0` keeps every decode step on the step-by-step path —
+/// one `Backend` call per matmul, the activations home between them — the
+/// control arm for the fused chain. On unless `0`.
+fn muse_fused() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_MUSE_FUSED"))
+}
+
 impl ModelForward for MuseModel {
     fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
         self.backend.as_wgpu()
@@ -494,12 +769,17 @@ impl ModelForward for MuseModel {
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
-        _slot_id: usize,
+        slot_id: usize,
     ) -> Result<Vec<f32>> {
         let cfg = &self.config;
         let n_tokens = tokens.len();
         let n_embd = cfg.n_embd;
 
+        // A one-token step goes through the fused chain when it can;
+        // `None` falls through to the step-by-step path below.
+        if let Some(logits) = self.record_decode_forward(cache, tokens, start_pos, slot_id) {
+            return Ok(logits);
+        }
         let x = self.run_layers(cache, tokens, start_pos)?;
         // Only the last token's hidden state is needed for next-token
         // logits — a batched prefill doesn't need every position's output.

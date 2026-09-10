@@ -292,15 +292,67 @@ impl Sampler {
         apply_top_p(&mut candidates, self.params.top_p);
         apply_min_p(&mut candidates, self.params.min_p);
 
+        self.draw(&candidates)
+    }
+
+    /// One weighted draw over `candidates`, whose second field is a
+    /// probability.
+    fn draw(&mut self, candidates: &[(u32, f32)]) -> u32 {
         let total: f32 = candidates.iter().map(|(_, p)| p).sum();
         let mut draw = self.rng.random::<f32>() * total;
-        for &(id, p) in &candidates {
+        for &(id, p) in candidates {
             draw -= p;
             if draw <= 0.0 {
                 return id;
             }
         }
         candidates.first().map(|(id, _)| *id).unwrap_or(0)
+    }
+
+    /// How many candidates the device may pre-select for this sampler — its
+    /// `top_k` when the whole pick can be made from those alone, `0` when
+    /// it cannot (greedy, no `top_k`, a `top_k` past the device's cap, or a
+    /// grammar, whose fallback needs the whole vocabulary). See
+    /// [`Self::sample_from_candidates`].
+    pub fn device_top_k(&self) -> u32 {
+        const CAP: usize = 64;
+        // `ORANGU_NO_DEVICE_TOPK=1` keeps the whole-vocabulary path, as the
+        // control arm of a sweep.
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| crate::engine::env::flag_on("ORANGU_NO_DEVICE_TOPK")) {
+            return 0;
+        }
+        if self.is_greedy() || self.constraint.is_some() {
+            return 0;
+        }
+        let k = self.params.top_k;
+        if k == 0 || k > CAP {
+            return 0;
+        }
+        k as u32
+    }
+
+    /// [`Self::sample`] for a step whose repeat penalty and `top_k` were
+    /// already applied by the device, which handed back the `top_k`
+    /// `(token, logit)` pairs ([`Self::device_top_k`] said how many). What
+    /// is left is exactly what [`Self::pick`] does past its own `top_k`:
+    /// temperature, the descending order, softmax, `top_p`, `min_p`, the
+    /// draw — the same candidates in the same order, so the same
+    /// distribution.
+    pub fn sample_from_candidates(&mut self, candidates: Vec<(u32, f32)>) -> u32 {
+        let mut candidates = candidates;
+        for (_, v) in candidates.iter_mut() {
+            *v /= self.params.temperature;
+        }
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+        softmax_pairs(&mut candidates);
+        apply_top_p(&mut candidates, self.params.top_p);
+        apply_min_p(&mut candidates, self.params.min_p);
+        let id = self.draw(&candidates);
+        if let Some(constraint) = self.constraint.as_mut() {
+            constraint.accept(id);
+        }
+        id
     }
 }
 

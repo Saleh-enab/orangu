@@ -1529,6 +1529,60 @@ fn prepare(args: Args) -> Result<Prepared> {
             Some((Arc::new(pool), Arc::new(index)))
         })
         .flatten();
+    // What one contiguous request may hold on the device, now that both the
+    // weights and the pool's own device pages are placed — see
+    // `engine::generate::set_kv_device_token_ceiling`. A request's answer is
+    // cut to fit under this, and a prompt that leaves no room under it is
+    // refused with an error rather than allowed to grow its mirror until the
+    // driver resets the card.
+    //
+    // `None` unless every part of the sum is known: no device, unknown VRAM,
+    // or a model whose KV geometry gives no per-token cost all mean "nothing
+    // to bound by", and a bound invented from a missing number would refuse
+    // requests this device can serve.
+    let kv_ceiling = match paged_kv.as_ref() {
+        // With a pool, one request may hold what the pool holds — no more.
+        //
+        // Not arithmetic on what is left after the pool's own pages, which is
+        // the number that looks right and measures wrong. That subtraction
+        // reads as roughly three times the pool, and a device measured this
+        // way is reliably lost well before reaching it: VRAM sits within a few
+        // percent of full through any sizeable request, and what kills it is
+        // not an allocation that fails but a submission that stalls while the
+        // driver pages, until its reset timeout expires and the context is
+        // torn down. Headroom that the driver needs to keep working is not
+        // headroom a KV cache may spend.
+        //
+        // The pool's own capacity is already this deployment's answer to "how
+        // much KV working set fits here", derived from *this machine's* device
+        // headroom and this model's KV geometry by `KvPool::pages_within` —
+        // so this scales with the card rather than being a number written down
+        // for one of them. Holding a single request to it says the same thing
+        // about one request, and stays inside the range that measured stable.
+        Some((pool, _)) => Some(pool.token_capacity()),
+        // Without a pool there is nothing else on the device competing for
+        // this, and the arithmetic is what it has always been.
+        None => footprint
+            .as_ref()
+            .filter(|_| backend.as_wgpu().is_some())
+            .and_then(|footprint| {
+                let headroom = backend
+                    .as_wgpu()
+                    .and_then(|wgpu| footprint.headroom_on(wgpu.device_in_use()))?;
+                footprint.kv_tokens_in(headroom)
+            }),
+    };
+    // Said out loud, because the report above has just quoted a much larger
+    // number — the room the weights leave — and an operator reading only that
+    // one would be surprised by a refusal at a quarter of it.
+    if let Some(tokens) = kv_ceiling {
+        println!(
+            "orangu-server: [kv] one request may hold up to {tokens} tokens of context; \
+             an answer stops there, and a longer prompt is refused rather than risking the device"
+        );
+    }
+    engine::generate::set_kv_device_token_ceiling(kv_ceiling);
+
     if engine::kv_pool::paged_kv_enabled() && !paged_supported {
         println!(
             "orangu-server: [kv] paged cache off — this device's attention \
@@ -1683,6 +1737,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         chat_template_source,
         slots,
         prefix_cache,
+        decode_batcher: Arc::new(engine::decode_batch::DecodeBatcher::new()),
         slot_store,
         role,
         reasoning_effort,
@@ -2292,6 +2347,18 @@ async fn serve(prepared: Prepared) -> Result<()> {
             engine.model.n_trunk_layer(),
             engine.model.config().n_ctx_train,
         );
+        // The role, under the model, because it is the other half of "what
+        // will this server do with my request": it decides the sampling
+        // defaults, whether reasoning is suppressed, and whether the
+        // generation endpoints answer at all. Without it on the banner the
+        // only way to tell a `--review` server from an `--all` one was to
+        // send a request and read the answer.
+        //
+        // A coordinator can name a different role per request
+        // (`x-orangu-role`), so this is what the *process* was started as and
+        // what a request that names nothing gets. A request served under
+        // another role says so on its own completion line.
+        println!("Mode       {}", role.label());
         // Speculation changes how fast an answer arrives and never what it
         // says, so it belongs on the banner rather than in a note: it is a
         // property of this server worth seeing beside the model, and a pair
@@ -2604,11 +2671,13 @@ pub(crate) fn model_support(
             // Every shard, not just the representative: a split model's
             // later shards carry their own tensor directory, and can use a
             // quantization shard 1 never does. Headers only — no tensor
-            // data is read, so this stays cheap even for a many-shard model.
+            // data is read, and the summary open leaves the vocabulary
+            // unread too: the architecture and the tensor types are all
+            // the question needs.
             let mut architecture = None;
             let mut unsupported_quant = None;
             for path in &group.paths {
-                let Ok(gguf) = GgufFile::open(path) else {
+                let Ok(gguf) = GgufFile::open_summary(path) else {
                     continue;
                 };
                 let (arch, bad_quant) = engine::loader::model_load_support(&gguf);

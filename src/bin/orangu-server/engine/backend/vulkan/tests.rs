@@ -1941,7 +1941,11 @@ fn cross_check_n_tokens(ggml_type: u32, in_dim: usize, out_dim: usize, n_tokens:
     }
 
     let cpu_out = CpuBackend.matmul_dequant(&x, n_tokens, &w);
-    let gpu_out = vulkan.matmul(&x, n_tokens, &w);
+    // The float kernels: this is a tight check of the tiled GEMM against
+    // the dequantized product, and the integer-dot kernel the generic
+    // batch path takes at these widths is a different (8-bit activation)
+    // computation with its own test, `mmq_q4k_gemm_matches_the_cpu_product`.
+    let gpu_out = vulkan.without_prefill_mmq(|| vulkan.matmul(&x, n_tokens, &w));
 
     // The reference the GPU is checked against. The MMVQ path
     // (`ORANGU_Q4K_MMVQ`) quantizes the activation to q8, so comparing it to
@@ -3080,7 +3084,9 @@ fn cross_check_recorded_matmul(ggml_type: u32, in_dim: usize, out_dim: usize, n_
         .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
         .collect();
 
-    let expected = vulkan.matmul(&x, n_tokens, &w);
+    // The recorded form dispatches the float kernel, so the backend call
+    // it is held exact against must too.
+    let expected = vulkan.without_prefill_mmq(|| vulkan.matmul(&x, n_tokens, &w));
 
     // The recorded path, driven exactly as a fused chain drives it.
     let op = MatmulOp {
@@ -3449,10 +3455,13 @@ fn concurrent_fused_attention_prefills_do_not_corrupt_each_other() {
             vulkan
                 .fused_attention_prefill(
                     FusedAttnPrefillInput {
+                        x_gpu: None,
+                        attn_norm: None,
                         yarn: RopeYarn::IDENTITY,
                         q_bias: None,
                         pairing: crate::engine::tensor::RopeLayout::Neox,
                         normalize_v: true,
+                        attn_gate: None,
                         normed: &c.normed,
                         n_tokens,
                         start_pos: 0,
@@ -4186,6 +4195,7 @@ fn fused_post_attention_matches_cpu_reference_with_ple() {
         ffn_down: &ffn_down,
         ffn_post_norm: Some(&ffn_post_norm),
         eps,
+        post_norm_eps: None,
         ple: Some(FusedPle {
             gate_w: &ple_gate_w,
             proj_w: &ple_proj_w,
@@ -4285,6 +4295,7 @@ fn fused_post_attention_matches_cpu_reference_without_ple() {
         ffn_down: &ffn_down,
         ffn_post_norm: Some(&ffn_post_norm),
         eps,
+        post_norm_eps: None,
         ple: None,
         layer_output_scale: None,
         batch_slot: 0,
@@ -4411,6 +4422,7 @@ fn fused_post_attention_repeated_calls_use_fresh_data_not_cached_data() {
             ffn_down: &ffn_down,
             ffn_post_norm: Some(&ffn_post_norm),
             eps,
+            post_norm_eps: None,
             ple: Some(FusedPle {
                 gate_w: &ple_gate_w,
                 proj_w: &ple_proj_w,
@@ -4833,7 +4845,10 @@ fn paged_prefill_agrees_at_len(page: usize, pages: usize, positions: usize) {
         return;
     };
     let (page_tokens, n_pages) = (page, pages);
-    let pool_pages: usize = n_pages * 2;
+    // Twice the sequence, plus the two this test then holds back on purpose:
+    // a sequence is admitted against pool room now, so a pool that is exactly
+    // twice the sequence and half held is one page short of promising it.
+    let pool_pages: usize = n_pages * 2 + 2;
     const N_HEAD: usize = 4;
     const N_HEAD_KV: usize = 2;
     const HEAD_DIM: usize = 64;
@@ -4914,7 +4929,8 @@ fn paged_prefill_agrees_at_len(page: usize, pages: usize, positions: usize) {
         n_positions + page_tokens,
         &strided_dims(&pool),
     )
-    .into_paged(pool.clone());
+    .try_into_paged(pool.clone())
+    .unwrap_or_else(|_| panic!("test pool has room"));
     for i in 0..n_positions {
         paged.layers[0].push(&rows_k[i], &rows_v[i]);
     }
@@ -6337,17 +6353,38 @@ fn gpu_perhead_rmsnorm_weightless_matches_cpu_reference() {
 /// directly into the GPU cache rather than going through `push`.
 #[test]
 fn fused_attention_matches_cpu_reference_owns_v() {
+    cross_check_fused_attention_owns_v(32, 4, 2, 8, 8);
+}
+
+/// The served model's two attention shapes — eight query heads over one
+/// KV head, 256 wide on the sliding-window layers and 512 wide with a
+/// 512-wide RoPE on the full-attention ones. The small shape above fits in
+/// one `vec4` per lane of the wide per-head kernels; these fill both slots
+/// (`vulkan_shaders::HEAD_WIDE_MAX_DIM`) and run the rotation loop more
+/// than once per lane.
+#[test]
+fn fused_attention_matches_cpu_reference_at_the_sliding_window_shape() {
+    cross_check_fused_attention_owns_v(64, 8, 1, 256, 256);
+}
+
+#[test]
+fn fused_attention_matches_cpu_reference_at_the_full_attention_shape() {
+    cross_check_fused_attention_owns_v(64, 8, 1, 512, 512);
+}
+
+fn cross_check_fused_attention_owns_v(
+    n_embd: usize,
+    n_head: usize,
+    n_head_kv: usize,
+    head_dim: usize,
+    rope_dim: usize,
+) {
     let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
     };
 
-    let n_embd = 32;
-    let n_head = 4;
-    let n_head_kv = 2;
-    let head_dim = 8;
-    let rope_dim = 8;
     let group_size = n_head / n_head_kv;
     let kv_dim = n_head_kv * head_dim;
     let capacity = 16;
@@ -6456,8 +6493,10 @@ fn fused_attention_matches_cpu_reference_owns_v() {
         }
 
         let got = vulkan.fused_attention(FusedAttnInput {
+            projections_ready: false,
             yarn: RopeYarn::IDENTITY,
             normalize_v: true,
+            attn_gate: None,
             q_bias: None,
             pairing: crate::engine::tensor::RopeLayout::Neox,
             normed: GpuInput::Cpu(&normed),
@@ -6623,8 +6662,10 @@ fn fused_attention_matches_cpu_reference_kv_dim_32() {
         }
 
         let got = vulkan.fused_attention(FusedAttnInput {
+            projections_ready: false,
             yarn: RopeYarn::IDENTITY,
             normalize_v: true,
+            attn_gate: None,
             q_bias: None,
             pairing: crate::engine::tensor::RopeLayout::Neox,
             normed: GpuInput::Cpu(&normed),
@@ -6785,8 +6826,10 @@ fn fused_attention_matches_cpu_reference_shared_v_with_freq_factors() {
     }
 
     let got = vulkan.fused_attention(FusedAttnInput {
+        projections_ready: false,
         yarn: RopeYarn::IDENTITY,
         normalize_v: true,
+        attn_gate: None,
         q_bias: None,
         pairing: crate::engine::tensor::RopeLayout::Neox,
         normed: GpuInput::Cpu(&normed),
@@ -6955,8 +6998,10 @@ fn fused_attention_two_layers_sharing_one_kv_cache_stay_independent() {
     let q_a = cpu_q(&wq_a, &q_norm_a, &normed_a, 0);
     let expected_a = expected_attn(&q_a, &reference_cache);
     let got_a = vulkan.fused_attention(FusedAttnInput {
+        projections_ready: false,
         yarn: RopeYarn::IDENTITY,
         normalize_v: true,
+        attn_gate: None,
         q_bias: None,
         pairing: crate::engine::tensor::RopeLayout::Neox,
         normed: GpuInput::Cpu(&normed_a),
@@ -7006,8 +7051,10 @@ fn fused_attention_two_layers_sharing_one_kv_cache_stay_independent() {
     let q_b = cpu_q(&wq_b, &q_norm_b, &normed_b, 0);
     let expected_b = expected_attn(&q_b, &reference_cache);
     let got_b = vulkan.fused_attention(FusedAttnInput {
+        projections_ready: false,
         yarn: RopeYarn::IDENTITY,
         normalize_v: true,
+        attn_gate: None,
         q_bias: None,
         pairing: crate::engine::tensor::RopeLayout::Neox,
         normed: GpuInput::Cpu(&normed_b),
@@ -7184,7 +7231,15 @@ fn fused_ple_prefill_matches_the_unfused_sequence_small() {
 
 #[test]
 fn fused_ple_prefill_matches_the_unfused_sequence_multi_chunk() {
-    cross_check_fused_ple_prefill(192);
+    // At this width the unfused sequence's matmuls take the integer-dot
+    // kernel through the generic batch path, and the chain quantizes its
+    // intermediates at different points than the CPU sequence does; on
+    // synthetic weights with outputs in the billions that is not a 6%
+    // comparison. The chain's structure is what this checks, on the float
+    // kernels; the integer-dot kernel has its own test.
+    if let Some(vulkan) = shared_vulkan() {
+        vulkan.without_prefill_mmq(|| cross_check_fused_ple_prefill(192));
+    }
 }
 
 /// Cross-checks `fused_post_attention_prefill` — `wo`, the attention
@@ -7210,6 +7265,24 @@ fn cross_check_fused_attention_prefill(n_tokens: usize, owns_v: bool, start_pos:
     cross_check_fused_attention_prefill_paged(n_tokens, owns_v, start_pos, false);
 }
 
+/// The chain's **deferred** form (`fused_attention_prefill_deferred` +
+/// `fill_kv_rows`), against the same unfused reference: attention's output
+/// stays on the device and is read back for the comparison, and the K/V
+/// rows reach the host only through the fill — so what this checks is that
+/// the cache ends up holding, row for row, what the in-order path pushes.
+fn cross_check_fused_attention_prefill_deferred(n_tokens: usize, start_pos: usize, paged: bool) {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    vulkan.without_prefill_mmq(|| {
+        cross_check_fused_attention_prefill_paged_float_mode(
+            vulkan, n_tokens, true, start_pos, paged, true,
+        )
+    });
+}
+
 /// `paged` runs the fused recorder against a cache backed by the page pool
 /// instead of a per-request mirror, comparing against the same unfused
 /// reference. The reference is deliberately *not* paged: a paged reference
@@ -7225,6 +7298,33 @@ fn cross_check_fused_attention_prefill_paged(
         eprintln!("{NO_GPU_SKIP}");
         return;
     };
+    // An exact comparison against the float sequence: the integer-dot GEMM
+    // is checked on its own (`mmq_q4k_gemm_matches_the_cpu_product`).
+    vulkan.without_prefill_mmq(|| {
+        cross_check_fused_attention_prefill_paged_float(vulkan, n_tokens, owns_v, start_pos, paged)
+    });
+}
+
+fn cross_check_fused_attention_prefill_paged_float(
+    vulkan: &VulkanBackend,
+    n_tokens: usize,
+    owns_v: bool,
+    start_pos: usize,
+    paged: bool,
+) {
+    cross_check_fused_attention_prefill_paged_float_mode(
+        vulkan, n_tokens, owns_v, start_pos, paged, false,
+    )
+}
+
+fn cross_check_fused_attention_prefill_paged_float_mode(
+    vulkan: &VulkanBackend,
+    n_tokens: usize,
+    owns_v: bool,
+    start_pos: usize,
+    paged: bool,
+    deferred: bool,
+) {
     if vulkan.q4_k_mmvq {
         eprintln!("skipping: ORANGU_Q4K_MMVQ selects the unfused fallback path");
         return;
@@ -7382,7 +7482,8 @@ fn cross_check_fused_attention_prefill_paged(
         }
         held_pool = Some((pool.clone(), held));
         crate::engine::kv_cache::KvCache::new_with_strided_dims(capacity, &strided_dims(&pool))
-            .into_paged(pool)
+            .try_into_paged(pool)
+            .unwrap_or_else(|_| panic!("test pool has room"))
     } else {
         crate::engine::kv_cache::KvCache::new_with_dims(capacity, &[kv_dim])
     };
@@ -7392,40 +7493,67 @@ fn cross_check_fused_attention_prefill_paged(
     if paged {
         cache.commit_pages();
     }
-    let got = vulkan
-        .fused_attention_prefill(
-            FusedAttnPrefillInput {
-                yarn: RopeYarn::IDENTITY,
-                q_bias: None,
-                pairing: crate::engine::tensor::RopeLayout::Neox,
-                normalize_v: true,
-                normed: &normed,
-                n_tokens,
-                start_pos,
-                wq: &wq,
-                q_norm: Some(&q_norm),
-                kv: Some(FusedAttnPrefillKv {
-                    k_bias: None,
-                    v_bias: None,
-                    wk: &wk,
-                    k_norm: Some(&k_norm),
-                    wv: wv.as_ref(),
-                }),
-                n_head,
-                n_head_kv,
-                head_dim,
-                rope_dim,
-                rope_freq_base,
-                freq_factors: None,
-                eps,
-                n_swa: 0,
-                causal: true,
-                scale,
-                want_attn_out_host: true,
-            },
-            &mut cache.layers[0],
-        )
-        .expect("fused prefill attention returned None on a supported path");
+    let input = FusedAttnPrefillInput {
+        x_gpu: None,
+        attn_norm: None,
+        yarn: RopeYarn::IDENTITY,
+        q_bias: None,
+        pairing: crate::engine::tensor::RopeLayout::Neox,
+        normalize_v: true,
+        attn_gate: None,
+        normed: &normed,
+        n_tokens,
+        start_pos,
+        wq: &wq,
+        q_norm: Some(&q_norm),
+        kv: Some(FusedAttnPrefillKv {
+            k_bias: None,
+            v_bias: None,
+            wk: &wk,
+            k_norm: Some(&k_norm),
+            wv: wv.as_ref(),
+        }),
+        n_head,
+        n_head_kv,
+        head_dim,
+        rope_dim,
+        rope_freq_base,
+        freq_factors: None,
+        eps,
+        n_swa: 0,
+        causal: true,
+        scale,
+        want_attn_out_host: !deferred,
+    };
+    let got = if deferred {
+        let mut stage = vulkan.kv_readback_stage((n_tokens * kv_dim * 2 * 4) as u64);
+        let (mut out, pending) = vulkan
+            .fused_attention_prefill_deferred(input, &mut cache.layers[0], &mut stage)
+            .expect("fused prefill attention returned None on a supported path");
+        assert!(
+            !pending.is_empty(),
+            "a KV-owning layer leaves rows in flight"
+        );
+        assert_eq!(
+            cache.layers[0].pending_rows(),
+            n_tokens,
+            "every position is counted before its rows arrive"
+        );
+        vulkan.end_prefill_group();
+        vulkan.fill_kv_rows(stage, vec![(0, pending)], &mut cache);
+        assert_eq!(cache.layers[0].pending_rows(), 0);
+        out.attn_out = vulkan.readback_rows(&out.attn_out_buf, n_tokens * n_head * head_dim);
+        for pos in start_pos..start_pos + n_tokens {
+            let (gk, gv) = cache.layers[0].host_row(pos);
+            out.k_rows.extend_from_slice(gk);
+            out.v_rows.extend_from_slice(gv);
+        }
+        out
+    } else {
+        vulkan
+            .fused_attention_prefill(input, &mut cache.layers[0])
+            .expect("fused prefill attention returned None on a supported path")
+    };
 
     let cmp = |label: &str, a: &[f32], b: &[f32]| {
         assert_eq!(a.len(), b.len(), "{label}: length");
@@ -7477,6 +7605,17 @@ fn cross_check_fused_attention_prefill_shaped(n_tokens: usize, start_pos: usize,
         eprintln!("{NO_GPU_SKIP}");
         return;
     };
+    vulkan.without_prefill_mmq(|| {
+        cross_check_fused_attention_prefill_shaped_float(vulkan, n_tokens, start_pos, biases)
+    });
+}
+
+fn cross_check_fused_attention_prefill_shaped_float(
+    vulkan: &VulkanBackend,
+    n_tokens: usize,
+    start_pos: usize,
+    biases: &str,
+) {
     if vulkan.q4_k_mmvq {
         eprintln!("skipping: ORANGU_Q4K_MMVQ selects the unfused fallback path");
         return;
@@ -7499,6 +7638,12 @@ fn cross_check_fused_attention_prefill_shaped(n_tokens: usize, start_pos: usize,
     let wq = build(n_embd, n_head * head_dim);
     let wk = build(n_embd, kv_dim);
     let wv = build(n_embd, kv_dim);
+    // `g` in `biases`: a sigmoid gate on attention's output from its own
+    // projection; `n`: no rotation (`rope_dim: 0`) — the muse-glimmer
+    // full-attention layer's two departures from the llama shape.
+    let gated = biases.contains('g');
+    let rotate = !biases.contains('n');
+    let w_gate = gated.then(|| build(n_embd, n_head * head_dim));
     let mut rand_vec = |n: usize| -> Vec<f32> {
         (0..n)
             .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
@@ -7559,22 +7704,24 @@ fn cross_check_fused_attention_prefill_shaped(n_tokens: usize, start_pos: usize,
         cache_ref.layers[0].push(&vec![0.0; kv_dim], &vec![0.0; kv_dim]);
     }
     for t in 0..n_tokens {
-        crate::engine::tensor::rope_apply_params_inplace(
-            &mut q[t * n_head * head_dim..(t + 1) * n_head * head_dim],
-            n_head,
-            head_dim,
-            start_pos + t,
-            None,
-            &rope,
-        );
-        crate::engine::tensor::rope_apply_params_inplace(
-            &mut k[t * kv_dim..(t + 1) * kv_dim],
-            n_head_kv,
-            head_dim,
-            start_pos + t,
-            None,
-            &rope,
-        );
+        if rotate {
+            crate::engine::tensor::rope_apply_params_inplace(
+                &mut q[t * n_head * head_dim..(t + 1) * n_head * head_dim],
+                n_head,
+                head_dim,
+                start_pos + t,
+                None,
+                &rope,
+            );
+            crate::engine::tensor::rope_apply_params_inplace(
+                &mut k[t * kv_dim..(t + 1) * kv_dim],
+                n_head_kv,
+                head_dim,
+                start_pos + t,
+                None,
+                &rope,
+            );
+        }
         cache_ref.layers[0].push(
             &k[t * kv_dim..(t + 1) * kv_dim],
             &v[t * kv_dim..(t + 1) * kv_dim],
@@ -7591,6 +7738,12 @@ fn cross_check_fused_attention_prefill_shaped(n_tokens: usize, start_pos: usize,
         scale,
         |t| (0, start_pos + t),
     );
+    if let Some(w) = &w_gate {
+        let gate = vulkan.matmul(&normed, n_tokens, w);
+        for (o, g) in expected.iter_mut().zip(gate.iter()) {
+            *o *= crate::engine::tensor::sigmoid(*g);
+        }
+    }
 
     let mut cache =
         crate::engine::kv_cache::KvCache::new_with_dims(start_pos + n_tokens + 8, &[kv_dim]);
@@ -7600,6 +7753,8 @@ fn cross_check_fused_attention_prefill_shaped(n_tokens: usize, start_pos: usize,
     let out = vulkan
         .fused_attention_prefill(
             FusedAttnPrefillInput {
+                x_gpu: None,
+                attn_norm: None,
                 yarn: RopeYarn::IDENTITY,
                 // The whole point of this helper: the reference above
                 // applies these, so the fused call has to be given them.
@@ -7610,6 +7765,7 @@ fn cross_check_fused_attention_prefill_shaped(n_tokens: usize, start_pos: usize,
                 q_bias: q_bias.as_deref(),
                 pairing: crate::engine::tensor::RopeLayout::Norm,
                 normalize_v: false,
+                attn_gate: w_gate.as_ref(),
                 normed: &normed,
                 n_tokens,
                 start_pos,
@@ -7625,7 +7781,7 @@ fn cross_check_fused_attention_prefill_shaped(n_tokens: usize, start_pos: usize,
                 n_head,
                 n_head_kv,
                 head_dim,
-                rope_dim,
+                rope_dim: if rotate { rope_dim } else { 0 },
                 rope_freq_base,
                 freq_factors: None,
                 eps,
@@ -7679,6 +7835,17 @@ fn fused_attention_prefill_matches_the_unfused_sequence_without_norms() {
 }
 
 /// See [`fused_attention_prefill_matches_the_unfused_sequence_without_norms`].
+/// The muse-glimmer full-attention layer through the prefill chain: a
+/// sigmoid gate from its own projection on attention's output, and no
+/// rotation at all (`rope_dim: 0`) — against the CPU sequence with the
+/// gate applied on the host. Past one stripe too, so the gate's own
+/// pooled region and the in-place gating are exercised per stripe.
+#[test]
+fn fused_attention_prefill_gated_unrotated_matches_the_unfused_sequence() {
+    cross_check_fused_attention_prefill_shaped(40, 0, "gn");
+    cross_check_fused_attention_prefill_shaped(300, 16, "gn");
+}
+
 #[test]
 fn fused_attention_prefill_without_norms_matches_at_a_nonzero_start_pos() {
     cross_check_fused_attention_prefill_no_norms(9, 5);
@@ -7748,6 +7915,32 @@ fn fused_attention_prefill_matches_the_unfused_sequence_wide() {
 #[test]
 fn fused_attention_prefill_matches_the_unfused_sequence_striped() {
     cross_check_fused_attention_prefill(160, true, 0);
+}
+
+/// A chunk that runs **past the mirror the cache had**: 16 positions on the
+/// host size the per-request mirror at its 256-row floor, and the chunk
+/// then writes 300 more. Sized for one row ahead, the write ran off the
+/// end of the K region into V, and the positions were only right again
+/// once the *next* call re-uploaded them from a host copy that had waited
+/// for them — a 1,563-token prompt on the contiguous path answered
+/// differently from the unfused sequence because of it. The mirror is
+/// sized for the rows about to be written now (`sync_gpu_ahead`).
+#[test]
+fn fused_attention_prefill_matches_the_unfused_sequence_past_the_mirror() {
+    cross_check_fused_attention_prefill(300, true, 16);
+}
+
+/// The deferred form on the contiguous mirror, past its floor as above,
+/// and on the page pool: the rows counted first and filled after the
+/// chunk must be, row for row, what the in-order path pushed.
+#[test]
+fn fused_attention_prefill_deferred_fills_the_rows_it_counted() {
+    cross_check_fused_attention_prefill_deferred(300, 16, false);
+}
+
+#[test]
+fn fused_attention_prefill_deferred_fills_the_rows_it_counted_paged() {
+    cross_check_fused_attention_prefill_deferred(160, 0, true);
 }
 
 /// A cross-layer **KV-donor** layer (`kv: None`): it projects Q only and
@@ -7835,10 +8028,13 @@ fn fused_attention_prefill_matches_the_unfused_sequence_kv_donor() {
     let got = vulkan
         .fused_attention_prefill(
             FusedAttnPrefillInput {
+                x_gpu: None,
+                attn_norm: None,
                 yarn: RopeYarn::IDENTITY,
                 q_bias: None,
                 pairing: crate::engine::tensor::RopeLayout::Neox,
                 normalize_v: true,
+                attn_gate: None,
                 normed: &normed,
                 n_tokens,
                 start_pos,
@@ -7934,10 +8130,13 @@ fn fused_post_attention_prefill_gpu_source_matches_the_host_source() {
     let n3: Vec<f32> = rand_vec(n_embd).iter().map(|v| 1.0 + v * 0.1).collect();
 
     let attn_input = |want_host: bool| FusedAttnPrefillInput {
+        x_gpu: None,
+        attn_norm: None,
         yarn: RopeYarn::IDENTITY,
         q_bias: None,
         pairing: crate::engine::tensor::RopeLayout::Neox,
         normalize_v: true,
+        attn_gate: None,
         normed: &normed,
         n_tokens,
         start_pos: 0,
@@ -8047,6 +8246,26 @@ fn cross_check_fused_post_attention_shaped(
         eprintln!("{NO_GPU_SKIP}");
         return;
     };
+    vulkan.without_prefill_mmq(|| {
+        cross_check_fused_post_attention_shaped_float(
+            vulkan,
+            n_tokens,
+            n_embd,
+            attn_dim,
+            ffn_len,
+            gemma_shaped,
+        )
+    });
+}
+
+fn cross_check_fused_post_attention_shaped_float(
+    vulkan: &VulkanBackend,
+    n_tokens: usize,
+    n_embd: usize,
+    attn_dim: usize,
+    ffn_len: usize,
+    gemma_shaped: bool,
+) {
     if vulkan.q4_k_mmvq {
         eprintln!("skipping: ORANGU_Q4K_MMVQ selects the unfused fallback path");
         return;
@@ -8136,6 +8355,42 @@ fn cross_check_fused_post_attention_shaped(
             "n_tokens={n_tokens}: mismatch at {i}: unfused={a} fused={b}"
         );
     }
+
+    // The same chain with a layer output scale folded into its last step
+    // — the form a dense gemma layer without a per-layer-embedding stage
+    // takes on the device-resident stream — against the sequence scaled
+    // on the host.
+    if gemma_shaped {
+        let scale = 0.65f32;
+        let got = vulkan
+            .fused_post_attention_prefill_rows(
+                AttnOutSrc::Host(&attn_out),
+                AttnOutSrc::Host(&residual),
+                n_tokens,
+                &wo,
+                Some(attn_post_norm.as_slice()),
+                &ffn_norm,
+                &gate,
+                &up,
+                &down,
+                Some(ffn_post_norm.as_slice()),
+                eps,
+                FfnActivation::Geglu,
+                None,
+                Some(scale),
+                None,
+            )
+            .expect("the scaled form exists whenever the post-norm does");
+        assert_eq!(got.len(), expected.len());
+        for (i, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+            let a = a * scale;
+            let tol = 6e-2 * a.abs().max(1.0);
+            assert!(
+                (a - b).abs() <= tol,
+                "n_tokens={n_tokens}: scaled mismatch at {i}: unfused={a} fused={b}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -8203,8 +8458,15 @@ fn padding_a_stripe_leaves_its_real_rows_unchanged() {
     let mut x_padded = x.clone();
     x_padded.resize(padded * in_dim, 0.0);
 
-    let unpadded = vulkan.matmul(&x, real_rows, &w);
-    let widened = vulkan.matmul(&x_padded, padded, &w);
+    // Float kernels on both sides: the padded width is one the integer-dot
+    // kernel would take and the real width is not, and this checks the
+    // stripe padding, not the two kernels against each other.
+    let (unpadded, widened) = vulkan.without_prefill_mmq(|| {
+        (
+            vulkan.matmul(&x, real_rows, &w),
+            vulkan.matmul(&x_padded, padded, &w),
+        )
+    });
     for i in 0..real_rows * out_dim {
         let (a, b) = (unpadded[i], widened[i]);
         let rel = (a - b).abs() / a.abs().max(1.0);
@@ -8434,7 +8696,15 @@ fn fused_ffn_prefill_matches_the_unfused_sequence_small() {
 
 #[test]
 fn fused_ffn_prefill_matches_the_unfused_sequence_multi_chunk() {
-    cross_check_fused_ffn_prefill(192);
+    // At this width the unfused sequence's matmuls take the integer-dot
+    // kernel through the generic batch path, and the chain quantizes its
+    // intermediates at different points than the CPU sequence does; on
+    // synthetic weights with outputs in the billions that is not a 6%
+    // comparison. The chain's structure is what this checks, on the float
+    // kernels; the integer-dot kernel has its own test.
+    if let Some(vulkan) = shared_vulkan() {
+        vulkan.without_prefill_mmq(|| cross_check_fused_ffn_prefill(192));
+    }
 }
 
 /// Cross-checks `fused_layer` — the whole `attn_norm -> QKV/RoPE/
@@ -8594,6 +8864,7 @@ fn cross_check_fused_layer_llama_shaped(biases: &str) {
             stop_at_ffn_norm: false,
             yarn: RopeYarn::IDENTITY,
             normalize_v: false, // llama does not normalize V
+            attn_gate: None,
             q_bias: q_bias.as_deref(),
             pairing,
             activation: FfnActivation::Swiglu,
@@ -8629,6 +8900,7 @@ fn cross_check_fused_layer_llama_shaped(biases: &str) {
             ffn_post_norm: None,
             ple: None,
             layer_output_scale: None,
+            post_norm_eps: None,
             batch_slot: 0,
             attn_ts: None,
         });
@@ -8639,6 +8911,184 @@ fn cross_check_fused_layer_llama_shaped(biases: &str) {
                 (a - b).abs() <= 6e-2 * a.abs().max(1.0),
                 "biases={biases:?} step={step} pos={pos}: mismatch at {i}: \
                      cpu={a} fused={b}"
+            );
+        }
+    }
+}
+
+/// The **muse-glimmer** shape of a fused decode layer, against the
+/// step-by-step CPU sequence `MuseModel::run_layers` runs: per-head Q/K
+/// norms, **no rotation** on a full-attention layer (`rope_dim: 0`), a
+/// sigmoid gate on attention's output projected from the same normed
+/// input, sandwich post-norms with **their own epsilon**, SwiGLU. Three
+/// things the chain learned for this architecture, each load-bearing:
+/// a rotated head, an ungated output or the wrong epsilon on the
+/// post-norms each fails this at the first position.
+#[test]
+fn fused_layer_muse_shaped_matches_cpu_reference() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+
+    let n_embd = 24;
+    let n_head = 4;
+    let n_head_kv = 2;
+    let head_dim = 6;
+    let ffn_len = 16;
+    let kv_dim = n_head_kv * head_dim;
+    let capacity = 64;
+    let eps = 1e-6;
+    let post_eps = 0.5;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let mut seed = 0x0A5E_0A5E_u64;
+    let build = |in_dim: usize, out_dim: usize, seed: &mut u64| {
+        let mut bytes = Vec::new();
+        for _ in 0..out_dim {
+            for _ in 0..in_dim {
+                bytes.extend(build_block(GGML_TYPE_F32, seed));
+            }
+        }
+        test_quant_matrix(&bytes, GGML_TYPE_F32, in_dim, out_dim)
+    };
+    let rand_vec = |len: usize, seed: &mut u64| -> Vec<f32> {
+        (0..len)
+            .map(|_| (next_byte(seed) as f32 - 128.0) / 64.0)
+            .collect()
+    };
+
+    let attn_norm = rand_vec(n_embd, &mut seed);
+    let wq = build(n_embd, n_head * head_dim, &mut seed);
+    let wk = build(n_embd, kv_dim, &mut seed);
+    let wv = build(n_embd, kv_dim, &mut seed);
+    let w_gate = build(n_embd, n_head * head_dim, &mut seed);
+    let q_norm = rand_vec(head_dim, &mut seed);
+    let k_norm = rand_vec(head_dim, &mut seed);
+    let wo = build(n_head * head_dim, n_embd, &mut seed);
+    let attn_post_norm = rand_vec(n_embd, &mut seed);
+    let ffn_norm = rand_vec(n_embd, &mut seed);
+    let ffn_gate = build(n_embd, ffn_len, &mut seed);
+    let ffn_up = build(n_embd, ffn_len, &mut seed);
+    let ffn_down = build(ffn_len, n_embd, &mut seed);
+    let ffn_post_norm = rand_vec(n_embd, &mut seed);
+
+    let mut kv_cache = crate::engine::kv_cache::KvCache::new_with_dims(capacity, &[kv_dim]);
+    let mut reference_cache = crate::engine::kv_cache::KvCache::new_with_dims(capacity, &[kv_dim]);
+    for _ in 0..3 {
+        let k = rand_vec(kv_dim, &mut seed);
+        let v = rand_vec(kv_dim, &mut seed);
+        kv_cache.layers[0].push(&k, &v);
+        reference_cache.layers[0].push(&k, &v);
+    }
+
+    for step in 0..6 {
+        let pos = kv_cache.layers[0].len;
+        let x = rand_vec(n_embd, &mut seed);
+
+        let mut normed = x.clone();
+        crate::engine::tensor::rmsnorm_inplace(&mut normed, &attn_norm, 1, n_embd, eps);
+        let mut q = CpuBackend.matmul_dequant(&normed, 1, &wq);
+        let mut k = CpuBackend.matmul_dequant(&normed, 1, &wk);
+        let v = CpuBackend.matmul_dequant(&normed, 1, &wv);
+        let gate = CpuBackend.matmul_dequant(&normed, 1, &w_gate);
+        crate::engine::tensor::rmsnorm_inplace(&mut q, &q_norm, n_head, head_dim, eps);
+        crate::engine::tensor::rmsnorm_inplace(&mut k, &k_norm, n_head_kv, head_dim, eps);
+        // No rotation: a full-attention layer of this architecture; and no
+        // norm on V, as on the llama family.
+        reference_cache.layers[0].push(&k, &v);
+
+        let mut attn = vec![0f32; n_head * head_dim];
+        crate::engine::attention::multi_head_attention(
+            &mut attn,
+            &q,
+            &reference_cache.layers[0],
+            n_head,
+            n_head / n_head_kv,
+            head_dim,
+            scale,
+            |_| (0, pos),
+        );
+        for (o, g) in attn.iter_mut().zip(gate.iter()) {
+            *o *= crate::engine::tensor::sigmoid(*g);
+        }
+
+        let mut xr = x.clone();
+        let mut attn_proj = CpuBackend.matmul_dequant(&attn, 1, &wo);
+        crate::engine::tensor::rmsnorm_inplace(
+            &mut attn_proj,
+            &attn_post_norm,
+            1,
+            n_embd,
+            post_eps,
+        );
+        crate::engine::tensor::add_inplace(&mut xr, &attn_proj);
+
+        let mut normed2 = xr.clone();
+        crate::engine::tensor::rmsnorm_inplace(&mut normed2, &ffn_norm, 1, n_embd, eps);
+        let g = CpuBackend.matmul_dequant(&normed2, 1, &ffn_gate);
+        let u = CpuBackend.matmul_dequant(&normed2, 1, &ffn_up);
+        let act: Vec<f32> = g
+            .iter()
+            .zip(u.iter())
+            .map(|(g, u)| (g / (1.0 + (-g).exp())) * u)
+            .collect();
+        let mut ffn_out = CpuBackend.matmul_dequant(&act, 1, &ffn_down);
+        crate::engine::tensor::rmsnorm_inplace(&mut ffn_out, &ffn_post_norm, 1, n_embd, post_eps);
+        crate::engine::tensor::add_inplace(&mut xr, &ffn_out);
+        let expected = xr;
+
+        let got = vulkan.fused_layer(FusedLayerInput {
+            stop_at_ffn_norm: false,
+            yarn: RopeYarn::IDENTITY,
+            normalize_v: false,
+            attn_gate: Some(&w_gate),
+            q_bias: None,
+            pairing: crate::engine::tensor::RopeLayout::Neox,
+            activation: FfnActivation::Swiglu,
+            x: GpuInput::Cpu(&x),
+            attn_norm: &attn_norm,
+            wq: &wq,
+            q_norm: Some(&q_norm),
+            kv: Some(FusedAttnProjection {
+                k_bias: None,
+                v_bias: None,
+                wk: &wk,
+                k_norm: Some(&k_norm),
+                wv: Some(&wv),
+            }),
+            n_head,
+            n_head_kv,
+            head_dim,
+            rope_dim: 0,
+            rope_freq_base: 10000.0,
+            freq_factors: None,
+            eps,
+            pos,
+            window_start: 0,
+            window: None,
+            scale,
+            cache: &mut kv_cache.layers[0],
+            wo: &wo,
+            attn_post_norm: Some(&attn_post_norm),
+            ffn_norm: &ffn_norm,
+            ffn_gate: &ffn_gate,
+            ffn_up: &ffn_up,
+            ffn_down: &ffn_down,
+            ffn_post_norm: Some(&ffn_post_norm),
+            ple: None,
+            layer_output_scale: None,
+            post_norm_eps: Some(post_eps),
+            batch_slot: 0,
+            attn_ts: None,
+        });
+
+        assert_eq!(got.len(), expected.len());
+        for (i, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 6e-2 * a.abs().max(1.0),
+                "step={step} pos={pos}: mismatch at {i}: cpu={a} fused={b}"
             );
         }
     }
@@ -8749,8 +9199,10 @@ fn fused_attention_decode_matches_cpu_on_the_llama_shape() {
     );
 
     let got = vulkan.fused_attention(FusedAttnInput {
+        projections_ready: false,
         yarn: RopeYarn::IDENTITY,
         normalize_v: false, // llama does not normalize V
+        attn_gate: None,
         q_bias: None,
         pairing,
         normed: GpuInput::Cpu(&normed),
@@ -8860,6 +9312,7 @@ fn fused_post_attention_decode_matches_prefill_on_the_llama_shape() {
         ffn_down: &ffn_down,
         ffn_post_norm: None,
         eps,
+        post_norm_eps: None,
         ple: None,
         layer_output_scale: None,
         batch_slot: 0,
@@ -9084,6 +9537,7 @@ fn fused_layer_matches_cpu_reference_full_layer_with_ple() {
             stop_at_ffn_norm: false,
             yarn: RopeYarn::IDENTITY,
             normalize_v: true,
+            attn_gate: None,
             q_bias: None,
             pairing: crate::engine::tensor::RopeLayout::Neox,
             activation: FfnActivation::Geglu,
@@ -9125,6 +9579,7 @@ fn fused_layer_matches_cpu_reference_full_layer_with_ple() {
                 per_layer_dim: per_layer_slice.len(),
             }),
             layer_output_scale: Some(layer_output_scale),
+            post_norm_eps: None,
             batch_slot: 0,
             attn_ts: None,
         });
@@ -9370,6 +9825,7 @@ fn fused_layer_kv_donor_matches_cpu_reference_many_steps() {
             stop_at_ffn_norm: false,
             yarn: RopeYarn::IDENTITY,
             normalize_v: true,
+            attn_gate: None,
             q_bias: None,
             pairing: crate::engine::tensor::RopeLayout::Neox,
             activation: FfnActivation::Geglu,
@@ -9405,6 +9861,7 @@ fn fused_layer_kv_donor_matches_cpu_reference_many_steps() {
             ffn_post_norm: Some(&l0.ffn_post_norm),
             ple: None,
             layer_output_scale: None,
+            post_norm_eps: None,
             batch_slot: 0,
             attn_ts: None,
         });
@@ -9421,6 +9878,7 @@ fn fused_layer_kv_donor_matches_cpu_reference_many_steps() {
             stop_at_ffn_norm: false,
             yarn: RopeYarn::IDENTITY,
             normalize_v: true,
+            attn_gate: None,
             q_bias: None,
             pairing: crate::engine::tensor::RopeLayout::Neox,
             activation: FfnActivation::Geglu,
@@ -9450,6 +9908,7 @@ fn fused_layer_kv_donor_matches_cpu_reference_many_steps() {
             ffn_post_norm: Some(&l1.ffn_post_norm),
             ple: None,
             layer_output_scale: None,
+            post_norm_eps: None,
             batch_slot: 0,
             attn_ts: None,
         });
@@ -9581,7 +10040,9 @@ fn paged_fused_decode_matches_cpu_reference() {
     let group_size = n_head / n_head_kv;
     let kv_dim = n_head_kv * head_dim;
     let page_tokens = 4;
-    let pool_pages = 16;
+    // Half of these are held back below (see the junk fill), so this is twice
+    // what the sequence needs plus room to be promised it.
+    let pool_pages = 24;
     let capacity = 32;
     let eps = 1e-6;
     let rope_freq_base = 10000.0;
@@ -9633,7 +10094,8 @@ fn paged_fused_decode_matches_cpu_reference() {
 
     let mut kv_cache =
         crate::engine::kv_cache::KvCache::new_with_strided_dims(capacity, &strided_dims(&pool))
-            .into_paged(pool.clone());
+            .try_into_paged(pool.clone())
+            .unwrap_or_else(|_| panic!("test pool has room"));
     let mut reference_cache = crate::engine::kv_cache::KvCache::new_with_dims(capacity, &[kv_dim]);
     for _ in 0..3 {
         let k: Vec<f32> = rand_vec(kv_dim, &mut seed);
@@ -9701,8 +10163,10 @@ fn paged_fused_decode_matches_cpu_reference() {
         }
 
         let got = vulkan.fused_attention(FusedAttnInput {
+            projections_ready: false,
             yarn: RopeYarn::IDENTITY,
             normalize_v: true,
+            attn_gate: None,
             q_bias: None,
             pairing: crate::engine::tensor::RopeLayout::Neox,
             normed: GpuInput::Cpu(&normed),
@@ -9866,4 +10330,605 @@ fn _scratch_decode_probe_shape_sweep() {
             }
         }
     }
+}
+
+/// The wide whole-row norms (`vec4`, straight-line loads) must produce what
+/// the scalar grid-stride kernels produce — at a model width, at a width
+/// that overflows the straight-line slots into the tail loop, and at one
+/// too narrow to fill the workgroup — for all three members of the family.
+///
+/// Compared kernel against kernel rather than against a CPU reference:
+/// the scalar kernel is already held to the reference by the fused-chain
+/// tests, and what this rewrite changed is the load structure, not the
+/// arithmetic, so the two should agree to rounding.
+#[test]
+fn wide_norms_match_the_scalar_norms() {
+    let _gpu_lock = gpu_test_lock();
+    let Some(gpu) = shared_test_backend() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let tail_width = vulkan_shaders::NORM_WIDE_WG * vulkan_shaders::NORM_WIDE_SLOTS * 4 + 512;
+    for n_embd in [1536usize, 256, 960, tail_width] {
+        let x: Vec<f32> = (0..n_embd)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.03)
+            .collect();
+        let w: Vec<f32> = (0..n_embd).map(|i| 0.5 + (i % 7) as f32 * 0.1).collect();
+        let r: Vec<f32> = (0..n_embd).map(|i| (i % 13) as f32 * 0.02 - 0.1).collect();
+        let eps = 1e-6;
+        let out_scale = 0.75;
+        for kind in ["norm", "norm_add", "norm_add_scale"] {
+            let run = |wide: bool| -> Vec<f32> {
+                let xb = gpu.upload_new(&x);
+                let wb = gpu.upload_new(&w);
+                let rb = gpu.upload_new(&r);
+                let yb = gpu.upload_new(&vec![0.0f32; n_embd]);
+                let bytes = (n_embd as u64) * 4;
+                let scalar_index = norm_wg_index(n_embd);
+                let mut encoder = gpu.new_encoder("wide norm parity");
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+                    match kind {
+                        "norm" => {
+                            let meta = gpu.elem_meta_buffer(n_embd as u32, eps);
+                            let bg = gpu.elem4_bind_group(
+                                BindSrc::Slice(&xb, 0, bytes),
+                                &wb,
+                                BindSrc::Slice(&yb, 0, bytes),
+                                &meta,
+                            );
+                            pass.set_pipeline(if wide {
+                                &gpu.rmsnorm_wide_pipeline
+                            } else {
+                                &gpu.rmsnorm_pipeline[scalar_index]
+                            });
+                            pass.set_bind_group(0, &bg, &[]);
+                            pass.dispatch_workgroups(1, 1, 1);
+                        }
+                        "norm_add" => {
+                            let meta = gpu.elem_meta_buffer(n_embd as u32, eps);
+                            let bg = gpu.elem5_bind_group(
+                                BindSrc::Slice(&xb, 0, bytes),
+                                &wb,
+                                BindSrc::Slice(&rb, 0, bytes),
+                                BindSrc::Slice(&yb, 0, bytes),
+                                &meta,
+                            );
+                            pass.set_pipeline(if wide {
+                                &gpu.rmsnorm_add_wide_pipeline
+                            } else {
+                                &gpu.rmsnorm_add_pipeline[scalar_index]
+                            });
+                            pass.set_bind_group(0, &bg, &[]);
+                            pass.dispatch_workgroups(1, 1, 1);
+                        }
+                        _ => {
+                            let meta = gpu.elem_meta_buffer_scaled(n_embd as u32, eps, out_scale);
+                            let bg = gpu.elem5_bind_group(
+                                BindSrc::Slice(&xb, 0, bytes),
+                                &wb,
+                                BindSrc::Slice(&rb, 0, bytes),
+                                BindSrc::Slice(&yb, 0, bytes),
+                                &meta,
+                            );
+                            pass.set_pipeline(if wide {
+                                &gpu.rmsnorm_add_scale_wide_pipeline
+                            } else {
+                                &gpu.rmsnorm_add_scale_pipeline[scalar_index]
+                            });
+                            pass.set_bind_group(0, &bg, &[]);
+                            pass.dispatch_workgroups(1, 1, 1);
+                        }
+                    }
+                }
+                gpu.submit_and_readback_for_test(encoder, &yb, n_embd)
+            };
+            let scalar = run(false);
+            let wide = run(true);
+            // A CPU rendering of the same formula, so a shared mistake in the
+            // two kernels cannot pass.
+            let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / n_embd as f32;
+            let scale = 1.0 / (mean_sq + eps).sqrt();
+            for i in 0..n_embd {
+                let want = match kind {
+                    "norm" => x[i] * scale * w[i],
+                    "norm_add" => x[i] * scale * w[i] + r[i],
+                    _ => (x[i] * scale * w[i] + r[i]) * out_scale,
+                };
+                assert!(
+                    (wide[i] - scalar[i]).abs() <= 1e-5 * (1.0 + scalar[i].abs()),
+                    "{kind} width {n_embd} at {i}: wide {} vs scalar {}",
+                    wide[i],
+                    scalar[i]
+                );
+                assert!(
+                    (wide[i] - want).abs() <= 1e-4 * (1.0 + want.abs()),
+                    "{kind} width {n_embd} at {i}: wide {} vs cpu {want}",
+                    wide[i]
+                );
+            }
+        }
+    }
+}
+
+/// The integer-dot prefill GEMM against the CPU's dequantized product, at
+/// the served model's FFN shape (`1536 → 6144`, cut to 512 rows) and its
+/// down-projection width (`6144 → 512`), one and two token tiles wide. Not
+/// bit-exact — the activation is quantized to 8 bits per 32-block — so the
+/// bound is on the error relative to the row's magnitude, the same kind the
+/// decode MMVQ kernel meets; a wrong scale, sub-block or nibble half is off
+/// by whole multiples, not by a rounding.
+#[test]
+fn mmq_q4k_gemm_matches_the_cpu_product() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let mut seed = 0x51EE_D4A7_u64;
+    for (ggml_type, in_dim, out_dim, n_tokens) in [
+        (GGML_TYPE_Q4_K, 1536usize, 512usize, 64usize),
+        (GGML_TYPE_Q4_K, 6144, 512, 128),
+        (GGML_TYPE_Q4_K, 1536, 256, 90),
+        // `Q6_K`: 210-byte blocks, so the odd blocks of a row start two
+        // bytes into a word, and a row of `1536` is not 16-byte aligned.
+        (crate::engine::quant::GGML_TYPE_Q6_K, 6144, 512, 128),
+        (crate::engine::quant::GGML_TYPE_Q6_K, 1536, 256, 90),
+    ] {
+        let mut bytes = Vec::new();
+        for _ in 0..out_dim * (in_dim / 256) {
+            bytes.extend(build_block(ggml_type, &mut seed));
+        }
+        let w = test_quant_matrix(&bytes, ggml_type, in_dim, out_dim);
+        let x: Vec<f32> = (0..n_tokens * in_dim)
+            .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
+            .collect();
+        let Some(got) = vulkan.mmq_matmul_for_test(&x, n_tokens, &w) else {
+            eprintln!("mmq kernel not built (ORANGU_PREFILL_MMQ=0?) — nothing to check");
+            return;
+        };
+        let want = CpuBackend.matmul_dequant(&x, n_tokens, &w);
+        assert_eq!(got.len(), want.len());
+        let mut worst = 0.0f32;
+        for t in 0..n_tokens {
+            let row = &want[t * out_dim..(t + 1) * out_dim];
+            let mag = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-3);
+            for o in 0..out_dim {
+                let i = t * out_dim + o;
+                let err = (got[i] - want[i]).abs() / mag;
+                worst = worst.max(err);
+                assert!(
+                    err <= 2e-2,
+                    "[type {ggml_type}: {in_dim}x{out_dim}] token {t} row {o}: mmq {} vs cpu {} (row magnitude {mag})",
+                    got[i],
+                    want[i]
+                );
+            }
+        }
+        eprintln!(
+            "[type {ggml_type}: {in_dim}x{out_dim}] {n_tokens} tokens: worst relative error {worst:.2e}"
+        );
+    }
+}
+
+/// The generic batch path — `Backend::matmul_batch`, what every
+/// CPU-orchestrated architecture's prefill GEMM goes through — takes the
+/// integer-dot kernel for the ops it accepts, and the result is **bit for
+/// bit** what the kernel produces on its own (same quantize, same kernel,
+/// same data): a wiring check, not a tolerance one. Three ops sharing one
+/// input (a layer's Q/K/V shape) share one quantized copy; a fourth op at
+/// a width the kernel does not tile stays on the float kernel in the same
+/// batch, so the two can mix. The CPU product is the sanity bound at the
+/// kernel test's own tolerance.
+#[test]
+fn the_generic_batch_takes_the_integer_dot_kernel() {
+    let _gpu_lock = gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let mut seed = 0x5EED_5EED_u64;
+    let (in_dim, out_dim, n_tokens) = (1536usize, 256usize, 90usize);
+    let mut weights = Vec::new();
+    for ggml_type in [
+        GGML_TYPE_Q4_K,
+        GGML_TYPE_Q4_K,
+        crate::engine::quant::GGML_TYPE_Q6_K,
+    ] {
+        let mut bytes = Vec::new();
+        for _ in 0..out_dim * (in_dim / 256) {
+            bytes.extend(build_block(ggml_type, &mut seed));
+        }
+        weights.push(test_quant_matrix(&bytes, ggml_type, in_dim, out_dim));
+    }
+    let x: Vec<f32> = (0..n_tokens * in_dim)
+        .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
+        .collect();
+    let ops: Vec<MatmulOp<'_>> = weights
+        .iter()
+        .map(|w| MatmulOp { x: &x, n_tokens, w })
+        .collect();
+    let got = vulkan.matmul_batch(&ops);
+    for (w, got) in weights.iter().zip(&got) {
+        let Some(alone) = vulkan.mmq_matmul_for_test(&x, n_tokens, w) else {
+            eprintln!("mmq kernel not built (ORANGU_PREFILL_MMQ=0?) — nothing to check");
+            return;
+        };
+        assert_eq!(got.len(), alone.len());
+        assert!(
+            got == &alone,
+            "type {}: the batch path's result is not the kernel's own",
+            w.ggml_type()
+        );
+        let want = CpuBackend.matmul_dequant(&x, n_tokens, w);
+        for t in 0..n_tokens {
+            let row = &want[t * out_dim..(t + 1) * out_dim];
+            let mag = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-3);
+            for o in 0..out_dim {
+                let i = t * out_dim + o;
+                assert!(
+                    (got[i] - want[i]).abs() / mag <= 2e-2,
+                    "type {}: token {t} row {o}: batch {} vs cpu {}",
+                    w.ggml_type(),
+                    got[i],
+                    want[i]
+                );
+            }
+        }
+    }
+
+    // A width the kernel does not tile (out_dim 80) beside one it does,
+    // in one batch: the float kernel's exact result for the one, the
+    // integer-dot kernel's for the other.
+    let mut bytes = Vec::new();
+    for _ in 0..80 * (in_dim / 256) {
+        bytes.extend(build_block(GGML_TYPE_Q4_K, &mut seed));
+    }
+    let narrow = test_quant_matrix(&bytes, GGML_TYPE_Q4_K, in_dim, 80);
+    let mixed = vulkan.matmul_batch(&[
+        MatmulOp {
+            x: &x,
+            n_tokens,
+            w: &weights[0],
+        },
+        MatmulOp {
+            x: &x,
+            n_tokens,
+            w: &narrow,
+        },
+    ]);
+    assert!(
+        mixed[0] == got[0],
+        "the mixed batch changed the integer-dot op's result"
+    );
+    let narrow_float = vulkan.without_prefill_mmq(|| vulkan.matmul(&x, n_tokens, &narrow));
+    assert!(
+        mixed[1] == narrow_float,
+        "the op the kernel does not take must stay on the float kernel, exactly"
+    );
+}
+
+/// The row-strided wide norms must match the rolled rows kernels row for
+/// row: three rows of a width inside the straight-line slots, with the
+/// weight shared across rows and each row's own residual.
+#[test]
+fn wide_row_norms_match_the_rolled_row_norms() {
+    let _gpu_lock = gpu_test_lock();
+    let Some(gpu) = shared_test_backend() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let rows = 3usize;
+    for n_embd in [1536usize, 256] {
+        let x: Vec<f32> = (0..rows * n_embd)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.03)
+            .collect();
+        let w: Vec<f32> = (0..n_embd).map(|i| 0.5 + (i % 7) as f32 * 0.1).collect();
+        let r: Vec<f32> = (0..rows * n_embd)
+            .map(|i| (i % 13) as f32 * 0.02 - 0.1)
+            .collect();
+        let eps = 1e-6;
+        let out_scale = 0.75;
+        let bytes = (rows * n_embd) as u64 * 4;
+        for kind in ["norm", "norm_add", "norm_add_scale"] {
+            let run = |wide: bool| -> Vec<f32> {
+                let xb = gpu.upload_new(&x);
+                let wb = gpu.upload_new(&w);
+                let rb = gpu.upload_new(&r);
+                let yb = gpu.upload_new(&vec![0.0f32; rows * n_embd]);
+                let mut encoder = gpu.new_encoder("wide row norm parity");
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+                    match kind {
+                        "norm" => {
+                            let meta = gpu.elem_meta_buffer(n_embd as u32, eps);
+                            let bg = gpu.elem4_bind_group(
+                                BindSrc::Slice(&xb, 0, bytes),
+                                &wb,
+                                BindSrc::Slice(&yb, 0, bytes),
+                                &meta,
+                            );
+                            pass.set_pipeline(if wide {
+                                &gpu.rmsnorm_rows_wide_pipeline
+                            } else {
+                                &gpu.rmsnorm_rows_pipeline
+                            });
+                            pass.set_bind_group(0, &bg, &[]);
+                        }
+                        "norm_add" => {
+                            let meta = gpu.elem_meta_buffer(n_embd as u32, eps);
+                            let bg = gpu.elem5_bind_group(
+                                BindSrc::Slice(&xb, 0, bytes),
+                                &wb,
+                                BindSrc::Slice(&rb, 0, bytes),
+                                BindSrc::Slice(&yb, 0, bytes),
+                                &meta,
+                            );
+                            pass.set_pipeline(if wide {
+                                &gpu.rmsnorm_add_rows_wide_pipeline
+                            } else {
+                                &gpu.rmsnorm_add_rows_pipeline
+                            });
+                            pass.set_bind_group(0, &bg, &[]);
+                        }
+                        _ => {
+                            let meta = gpu.elem_meta_buffer_scaled(n_embd as u32, eps, out_scale);
+                            let bg = gpu.elem5_bind_group(
+                                BindSrc::Slice(&xb, 0, bytes),
+                                &wb,
+                                BindSrc::Slice(&rb, 0, bytes),
+                                BindSrc::Slice(&yb, 0, bytes),
+                                &meta,
+                            );
+                            pass.set_pipeline(if wide {
+                                &gpu.rmsnorm_add_scale_rows_wide_pipeline
+                            } else {
+                                &gpu.rmsnorm_add_scale_rows_pipeline
+                            });
+                            pass.set_bind_group(0, &bg, &[]);
+                        }
+                    }
+                    pass.dispatch_workgroups(rows as u32, 1, 1);
+                }
+                gpu.submit_and_readback_for_test(encoder, &yb, rows * n_embd)
+            };
+            let rolled = run(false);
+            let wide = run(true);
+            for row in 0..rows {
+                let xr = &x[row * n_embd..(row + 1) * n_embd];
+                let mean_sq = xr.iter().map(|v| v * v).sum::<f32>() / n_embd as f32;
+                let scale = 1.0 / (mean_sq + eps).sqrt();
+                for i in 0..n_embd {
+                    let j = row * n_embd + i;
+                    let want = match kind {
+                        "norm" => xr[i] * scale * w[i],
+                        "norm_add" => xr[i] * scale * w[i] + r[j],
+                        _ => (xr[i] * scale * w[i] + r[j]) * out_scale,
+                    };
+                    assert!(
+                        (wide[j] - rolled[j]).abs() <= 1e-5 * (1.0 + rolled[j].abs()),
+                        "{kind} width {n_embd} row {row} at {i}: wide {} vs rolled {}",
+                        wide[j],
+                        rolled[j]
+                    );
+                    assert!(
+                        (wide[j] - want).abs() <= 1e-4 * (1.0 + want.abs()),
+                        "{kind} width {n_embd} row {row} at {i}: wide {} vs cpu {want}",
+                        wide[j]
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The norm pair — post-norm+residual, then the FFN norm over that result —
+/// must leave both outputs as the two scalar dispatches would: `y1` is the
+/// FFN's residual and `y2` its input, so both are read downstream. Widths
+/// inside the straight-line slots and one past them (the rolled tail, which
+/// re-reads its own `y1`).
+#[test]
+fn the_norm_pair_matches_the_two_scalar_norms() {
+    let _gpu_lock = gpu_test_lock();
+    let Some(gpu) = shared_test_backend() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let tail_width = vulkan_shaders::NORM_WIDE_WG * vulkan_shaders::NORM_WIDE_SLOTS * 4 + 512;
+    for n_embd in [1536usize, 256, tail_width] {
+        let x: Vec<f32> = (0..n_embd)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.03)
+            .collect();
+        let w1: Vec<f32> = (0..n_embd).map(|i| 0.5 + (i % 7) as f32 * 0.1).collect();
+        let w2: Vec<f32> = (0..n_embd).map(|i| 1.5 - (i % 5) as f32 * 0.2).collect();
+        let r: Vec<f32> = (0..n_embd).map(|i| (i % 13) as f32 * 0.02 - 0.1).collect();
+        let eps = 1e-6;
+        let bytes = (n_embd as u64) * 4;
+        let scalar_index = norm_wg_index(n_embd);
+        let xb = gpu.upload_new(&x);
+        let w1b = gpu.upload_new(&w1);
+        let w2b = gpu.upload_new(&w2);
+        let rb = gpu.upload_new(&r);
+        let meta = gpu.elem_meta_buffer(n_embd as u32, eps);
+
+        // The two scalar dispatches.
+        let y1s = gpu.upload_new(&vec![0.0f32; n_embd]);
+        let y2s = gpu.upload_new(&vec![0.0f32; n_embd]);
+        let mut encoder = gpu.new_encoder("norm pair parity: scalar");
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            let bg = gpu.elem5_bind_group(
+                BindSrc::Slice(&xb, 0, bytes),
+                &w1b,
+                BindSrc::Slice(&rb, 0, bytes),
+                BindSrc::Slice(&y1s, 0, bytes),
+                &meta,
+            );
+            pass.set_pipeline(&gpu.rmsnorm_add_pipeline[scalar_index]);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+            let bg = gpu.elem4_bind_group(
+                BindSrc::Slice(&y1s, 0, bytes),
+                &w2b,
+                BindSrc::Slice(&y2s, 0, bytes),
+                &meta,
+            );
+            pass.set_pipeline(&gpu.rmsnorm_pipeline[scalar_index]);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        let y1_scalar = gpu.submit_and_readback_for_test(encoder, &y1s, n_embd);
+        let y2_scalar = gpu.readback_for_test(&y2s, n_embd);
+
+        // The pair.
+        let y1p = gpu.upload_new(&vec![0.0f32; n_embd]);
+        let y2p = gpu.upload_new(&vec![0.0f32; n_embd]);
+        let mut encoder = gpu.new_encoder("norm pair parity: pair");
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            let bg = gpu.norm_pair_bind_group(
+                BindSrc::Slice(&xb, 0, bytes),
+                &w1b,
+                BindSrc::Slice(&rb, 0, bytes),
+                &w2b,
+                BindSrc::Slice(&y1p, 0, bytes),
+                BindSrc::Slice(&y2p, 0, bytes),
+                &meta,
+            );
+            pass.set_pipeline(&gpu.rmsnorm_add_norm_wide_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        let y1_pair = gpu.submit_and_readback_for_test(encoder, &y1p, n_embd);
+        let y2_pair = gpu.readback_for_test(&y2p, n_embd);
+
+        // And the formula on the CPU, so a shared mistake cannot pass.
+        let s1 = 1.0 / (x.iter().map(|v| v * v).sum::<f32>() / n_embd as f32 + eps).sqrt();
+        let y1: Vec<f32> = (0..n_embd).map(|i| x[i] * s1 * w1[i] + r[i]).collect();
+        let s2 = 1.0 / (y1.iter().map(|v| v * v).sum::<f32>() / n_embd as f32 + eps).sqrt();
+        for i in 0..n_embd {
+            let want2 = y1[i] * s2 * w2[i];
+            assert!(
+                (y1_pair[i] - y1_scalar[i]).abs() <= 1e-5 * (1.0 + y1_scalar[i].abs()),
+                "width {n_embd} y1 at {i}: pair {} vs scalar {}",
+                y1_pair[i],
+                y1_scalar[i]
+            );
+            assert!(
+                (y2_pair[i] - y2_scalar[i]).abs() <= 1e-5 * (1.0 + y2_scalar[i].abs()),
+                "width {n_embd} y2 at {i}: pair {} vs scalar {}",
+                y2_pair[i],
+                y2_scalar[i]
+            );
+            assert!(
+                (y1_pair[i] - y1[i]).abs() <= 1e-4 * (1.0 + y1[i].abs()),
+                "width {n_embd} y1 at {i}: pair {} vs cpu {}",
+                y1_pair[i],
+                y1[i]
+            );
+            assert!(
+                (y2_pair[i] - want2).abs() <= 1e-4 * (1.0 + want2.abs()),
+                "width {n_embd} y2 at {i}: pair {} vs cpu {want2}",
+                y2_pair[i]
+            );
+        }
+    }
+}
+
+/// The device top-k must return exactly the `k` largest penalized logits,
+/// largest first, at a real vocabulary size — with the winners planted
+/// across different slices (so a slice's local top-k and the merge are both
+/// exercised), the penalty applied to some of them (so the ordering is the
+/// *penalized* one), and a `k` that is neither 1 nor the cap.
+#[test]
+fn record_topk_sample_returns_the_k_largest_penalized_logits() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let n_vocab = 262_144usize;
+    let mut seed = 0x70CC_u64;
+    let mut logits = vec![0f32; n_vocab];
+    for v in logits.iter_mut() {
+        *v = (next_byte(&mut seed) as f32 - 128.0) / 64.0;
+    }
+    // Planted winners across slices; two of them are "recent" and get
+    // penalized below others.
+    let planted: [(usize, f32); 6] = [
+        (7, 9.0),
+        (4_100, 8.5),
+        (131_072, 8.0),
+        (200_001, 7.5),
+        (262_143, 7.0),
+        (65_536, 6.5),
+    ];
+    for &(i, v) in &planted {
+        logits[i] = v;
+    }
+    let recent: [u32; 2] = [7, 200_001];
+    let repeat_penalty = 1.5f32;
+
+    // The host's answer over the same rules.
+    let mut penalized = logits.clone();
+    for &t in &recent {
+        let v = penalized[t as usize];
+        penalized[t as usize] = if v > 0.0 {
+            v / repeat_penalty
+        } else {
+            v * repeat_penalty
+        };
+    }
+    let k = 40u32;
+    let mut want: Vec<(u32, f32)> = penalized
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i as u32, v))
+        .collect();
+    want.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    want.truncate(k as usize);
+
+    let mut encoder = vulkan.new_encoder("test topk sample encoder");
+    let buf = vulkan.record_topk_sample(
+        &mut encoder,
+        GpuArgmaxSampleInput {
+            logits: GpuInput::Cpu(&logits),
+            n_vocab,
+            recent_tokens: &recent,
+            repeat_penalty,
+            logit_softcap: None,
+        },
+        k,
+        2,
+    );
+    let got = vulkan.submit_and_readback_topk(encoder, &buf, k);
+    assert_eq!(got.len(), k as usize);
+    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+        assert_eq!(g.0, w.0, "candidate {i}: gpu {g:?} vs host {w:?}");
+        assert!(
+            (g.1 - w.1).abs() <= 1e-5,
+            "candidate {i}: gpu {g:?} vs host {w:?}"
+        );
+    }
+    // The penalized planted tokens sit where the penalty put them: 7 (9.0
+    // -> 6.0) below 65_536 (6.5), and 200_001 (7.5 -> 5.0) below both.
+    let pos = |t: u32| {
+        got.iter()
+            .position(|c| c.0 == t)
+            .expect("planted token in the top k")
+    };
+    assert!(pos(65_536) < pos(7));
+    assert!(pos(7) < pos(200_001));
 }

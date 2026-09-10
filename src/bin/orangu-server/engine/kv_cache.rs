@@ -114,6 +114,11 @@ pub struct LayerCache {
     /// a reader that silently fell back to it would read zeros and produce a
     /// plausible answer, which is the failure this flag exists to make loud.
     pool_backed: bool,
+    /// Positions counted in `len` whose host rows are still on their way
+    /// back from the device — see [`Self::advance_gpu_written`]. Zero except
+    /// between that call and the [`Self::fill_gpu_written`] that pairs with
+    /// it, which is within one prefill chunk.
+    pending_rows: usize,
 }
 
 /// The pages of **one sequence**, shared by every layer of it.
@@ -135,6 +140,14 @@ struct SequencePages {
     /// device, or when the table buffer was full, in which case this sequence
     /// uses the per-request mirror and is correct but not shared on the device.
     table: Option<(usize, usize)>,
+    /// Recovered rather than unwrapped everywhere below, because this lock is
+    /// held across a panicking `Drop`. A panic anywhere under it poisons it,
+    /// and a `Drop` that then unwraps turns that one failed request into
+    /// `panic in a destructor during cleanup` — a non-unwinding abort that
+    /// takes the whole server down, no matter that the request itself was
+    /// recoverable. The state behind it is a page list; the worst a recovered
+    /// guard can see is a sequence that stopped halfway, which is exactly what
+    /// happened.
     inner: Mutex<SeqPages>,
 }
 
@@ -142,6 +155,13 @@ struct SequencePages {
 struct SeqPages {
     /// Physical page per logical page, in order — the block table.
     pages: Vec<u32>,
+    /// Pages this sequence was promised by the pool and has not taken yet.
+    ///
+    /// Counted down by every page it takes and handed back on drop, so the
+    /// pool's own promise total stays honest even for a sequence that stops
+    /// far short of the length it was admitted for — which is every sequence
+    /// that finishes before `max_tokens`.
+    promised: usize,
     /// How many layers have written their region of each page. A page is
     /// sealed, and so becomes shareable, only when every layer has.
     filled: Vec<usize>,
@@ -167,7 +187,24 @@ struct SeqPages {
 }
 
 impl SequencePages {
-    fn new(pool: std::sync::Arc<crate::engine::kv_pool::KvPool>, max_pages: usize) -> Self {
+    /// A sequence that has been promised room for `max_pages`, or `None` when
+    /// the pool has no such room to promise.
+    ///
+    /// The promise is the admission decision, and it is made **here**, once,
+    /// while there is still a caller that can act on the answer — see
+    /// [`KvPool::try_reserve`]. Everything downstream of it (`page_for`,
+    /// `adopt_pages`) is a sequence growing one page at a time with no way to
+    /// report "the pool is full", which is why it used to say so by aborting
+    /// the process.
+    ///
+    /// [`KvPool::try_reserve`]: crate::engine::kv_pool::KvPool::try_reserve
+    fn reserve(
+        pool: std::sync::Arc<crate::engine::kv_pool::KvPool>,
+        max_pages: usize,
+    ) -> Option<Self> {
+        if !pool.try_reserve(max_pages) {
+            return None;
+        }
         // Reserved up front, for the whole sequence's possible length: growing
         // it later would move the region, and the base is baked into every
         // dispatch's meta uniform.
@@ -175,11 +212,14 @@ impl SequencePages {
             .device_pages()
             .and_then(|_| pool.alloc_table(max_pages))
             .map(|base| (base, max_pages));
-        Self {
+        Some(Self {
             pool,
             table,
-            inner: Mutex::new(SeqPages::default()),
-        }
+            inner: Mutex::new(SeqPages {
+                promised: max_pages,
+                ..SeqPages::default()
+            }),
+        })
     }
 
     /// Pushes the block table to the device if it has changed since the last
@@ -190,7 +230,10 @@ impl SequencePages {
     /// layers ask.
     fn sync_table(&self, queue: &wgpu::Queue) -> Option<(usize, usize)> {
         let (base, cap) = self.table?;
-        let mut inner = self.inner.lock().expect("sequence pages poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if inner.table_synced != inner.pages.len() {
             if inner.pages.len() > cap {
                 // More pages than were reserved: this sequence outgrew its
@@ -208,7 +251,7 @@ impl SequencePages {
     fn joins(&self, layer: usize) {
         self.inner
             .lock()
-            .expect("sequence pages poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .participants
             .insert(layer);
     }
@@ -232,17 +275,29 @@ impl SequencePages {
     /// so it is complete and immutable, and adopting it cannot pick up
     /// half-written rows.
     fn page_for(&self, i: usize) -> (u32, bool) {
-        let mut inner = self.inner.lock().expect("sequence pages poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(&page) = inner.pages.get(i) {
             // Another layer of this sequence got here first.
             return (page, self.pool.is_sealed(page));
         }
         debug_assert_eq!(i, inner.pages.len(), "pages are sealed in order");
         let tag = inner.tags.get(i).copied().unwrap_or(0);
+        // Out of this sequence's own promise, which is why there is no failure
+        // to handle: `SequencePages::reserve` took a page for this position
+        // out of everyone else's availability before the request was admitted.
+        // The `expect` that used to stand here claimed the same thing without
+        // anything making it true, and a prompt larger than the whole pool —
+        // an ordinary code review of a 3.5k-line file — reached it and aborted
+        // the server.
+        let claim = usize::from(inner.promised > 0);
+        inner.promised -= claim;
         let got = self
             .pool
-            .acquire(&[tag])
-            .expect("the scheduler admits a request only against pool room")[0];
+            .acquire_for(&[tag], claim)
+            .expect("a promised page is always available")[0];
         inner.pages.push(got.page);
         // A page adopted whole is already complete; counting it as filled by
         // every participant keeps `seal_complete` from trying to publish it a
@@ -254,7 +309,10 @@ impl SequencePages {
 
     /// Records that one more layer has written `i`, sealing it once all have.
     fn layer_filled(&self, i: usize) {
-        let mut inner = self.inner.lock().expect("sequence pages poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.filled[i] += 1;
         // **Deliberately no seal here.** Sealing publishes a page for sharing,
         // and a page is only publishable once every layer that will write it
@@ -283,7 +341,10 @@ impl SequencePages {
     /// Drops every page past `keep`, once — idempotent, because every layer
     /// rolls back to the same token count and each of them asks.
     fn truncate_to(&self, keep: usize) {
-        let mut inner = self.inner.lock().expect("sequence pages poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if inner.pages.len() <= keep {
             return;
         }
@@ -307,7 +368,10 @@ impl SequencePages {
     /// Idempotent: a page already sealed is skipped, so calling this after
     /// every chunk costs a scan of the fill counts and nothing else.
     fn seal_complete(&self) {
-        let inner = self.inner.lock().expect("sequence pages poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let participants = inner.participants.len();
         if participants == 0 {
             return;
@@ -320,7 +384,10 @@ impl SequencePages {
     }
 
     fn adopt(&self, pages: &[u32]) {
-        let mut inner = self.inner.lock().expect("sequence pages poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.pages = pages.to_vec();
         inner.table_synced = 0;
         // Adopted pages are already sealed by whoever built them; counting them
@@ -330,13 +397,16 @@ impl SequencePages {
     }
 
     fn set_tags(&self, tags: &[u64]) {
-        self.inner.lock().expect("sequence pages poisoned").tags = tags.to_vec();
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .tags = tags.to_vec();
     }
 
     fn pages(&self) -> Vec<u32> {
         self.inner
             .lock()
-            .expect("sequence pages poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pages
             .clone()
     }
@@ -347,8 +417,14 @@ impl Drop for SequencePages {
     /// finished request's pages stay held for the life of the process, and the
     /// pool runs out while every page in it is reclaimable.
     fn drop(&mut self) {
-        let inner = self.inner.lock().expect("sequence pages poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.pool.release(&inner.pages);
+        // And the length this sequence was admitted for but never reached —
+        // every request that stops before `max_tokens`, which is most of them.
+        self.pool.release_reserved(inner.promised);
         if let Some((base, entries)) = self.table {
             self.pool.free_table(base, entries);
         }
@@ -602,6 +678,11 @@ pub struct GpuAttnDispatch {
     pub v_cast: Option<KvCastDispatch>,
     /// Split-k attention — `None` unless `VulkanBackend::attn_split` is
     /// set. See [`AttnSplitDispatch`]'s own doc comment.
+    /// The one-dispatch K/V epilogue (`VulkanBackend::kv_epilogue_pipeline`)
+    /// bound over this layer's projections and this cache's mirror; `None`
+    /// where the layer's shape or the mirror's storage keeps the separate
+    /// norm, RoPE and cast dispatches.
+    pub kv_epilogue: Option<KvCastDispatch>,
     pub split: Option<AttnSplitDispatch>,
 }
 
@@ -842,6 +923,7 @@ impl LayerCache {
             stride,
             paged: None,
             pool_backed: false,
+            pending_rows: 0,
         }
     }
 
@@ -867,6 +949,7 @@ impl LayerCache {
             // token count means, so this never needs the original's.
             stride: 1,
             pool_backed: false,
+            pending_rows: 0,
         }
     }
 
@@ -890,6 +973,7 @@ impl LayerCache {
             // those two would defeat the point of taking it.
             paged: None,
             pool_backed: false,
+            pending_rows: 0,
         }
     }
 
@@ -1027,12 +1111,31 @@ impl LayerCache {
         n_head: usize,
         kv_storage: crate::engine::backend::vulkan_shaders::KvStorage,
     ) -> GpuKvRefs {
+        self.sync_gpu_ahead(device, queue, n_head, kv_storage, 1)
+    }
+
+    /// [`Self::sync_gpu`] for a caller about to write `rows_ahead` positions
+    /// straight into the mirror: the mirror is sized for `len + rows_ahead`
+    /// rows *now*, so the write lands inside it. Sized for one row, as the
+    /// decode step needs, a prefill chunk's write past the mirror's end was
+    /// dropped on the device and the positions were then re-uploaded from
+    /// the host copy on the next call — which held them only because that
+    /// call had waited for them.
+    pub fn sync_gpu_ahead(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        n_head: usize,
+        kv_storage: crate::engine::backend::vulkan_shaders::KvStorage,
+        rows_ahead: usize,
+    ) -> GpuKvRefs {
         assert!(
             !self.pool_backed,
             "sync_gpu on a layer served from the pool: its mirror holds no rows"
         );
         let capacity = self.capacity;
         let kv_dim = self.kv_dim;
+        let needed = self.len + rows_ahead.max(1);
         // `len + 1`, not `len`: the fused decode path binds these buffers and
         // then writes the *current* token's key and value at row `len`, before
         // the host-side `push` that will make that row committed. Sizing to
@@ -1047,7 +1150,7 @@ impl LayerCache {
         // sequence that could get no pages at all — every dispatch that can
         // read through the block table does, and the assertion above is what
         // holds the two apart.
-        let want = mirror_rows_for(self.len + 1, capacity);
+        let want = mirror_rows_for(needed, capacity);
         // Grow before syncing, never shrink. A mirror that is already big
         // enough is left exactly as it is, so the steady state — every decode
         // step after the first — does no work here at all.
@@ -1055,7 +1158,7 @@ impl LayerCache {
             None => {
                 self.gpu = Some(GpuLayerCache::new(device, want, kv_dim, n_head, kv_storage));
             }
-            Some(gpu) if gpu.rows < self.len + 1 => {
+            Some(gpu) if gpu.rows < needed => {
                 let old = self.gpu.take().expect("checked present");
                 let mut grown = GpuLayerCache::new(device, want, kv_dim, n_head, kv_storage);
                 // Carry the rows already on the device across on the device.
@@ -1223,9 +1326,27 @@ impl LayerCache {
             "KV cache is full ({} positions)",
             self.capacity
         );
+        assert_eq!(
+            self.pending_rows, 0,
+            "a push while {} GPU-written positions are still unfilled would put its row \
+             ahead of theirs",
+            self.pending_rows
+        );
+        self.len += 1;
+        self.push_row(k, v);
+    }
+
+    /// The host side of a [`Self::push`]: appends one row to the tail and
+    /// seals the page it completes. `len` is the caller's to advance — it
+    /// already has been when the row arrives late through
+    /// [`Self::fill_gpu_written`].
+    fn push_row(&mut self, k: &[f32], v: &[f32]) {
         debug_assert_eq!(k.len(), self.kv_dim);
         debug_assert_eq!(v.len(), self.kv_dim);
-        debug_assert_eq!(self.k.len(), (self.len - self.sealed_rows()) * self.kv_dim);
+        debug_assert_eq!(
+            self.k.len(),
+            (self.len - self.sealed_rows() - self.pending_rows) * self.kv_dim
+        );
         if let Some(paged) = self.paged.as_ref()
             && self.k.is_empty()
             && paged.pages.is_empty()
@@ -1236,7 +1357,6 @@ impl LayerCache {
         }
         self.k.extend_from_slice(k);
         self.v.extend_from_slice(v);
-        self.len += 1;
         // A full tail becomes a page. Done here rather than lazily on the next
         // read so that a page is sealed at the moment it stops changing, which
         // is the property everything else about the pool is built on.
@@ -1244,6 +1364,89 @@ impl LayerCache {
             && self.k.len() / self.kv_dim == paged.rows_per_page
         {
             self.seal_tail();
+        }
+    }
+
+    /// Counts `n` positions a GPU-resident prefill has written into the
+    /// mirror **before their host rows have come back** — the first half of
+    /// [`Self::commit_gpu_written`], with [`Self::fill_gpu_written`] the
+    /// second.
+    ///
+    /// Split so the chain that wrote them need not wait: the position
+    /// counters are what the next stripe and the next layer read (`len` is
+    /// where the next stripe writes, and the device pages already hold the
+    /// values), while the host copy is read only after the chunk — by prefix
+    /// reuse and slot save. Waiting for the rows at every KV-owning layer
+    /// drained the device at each of them; this lets one wait at the chunk's
+    /// end serve all of them. Until the fill, `len` runs ahead of the host
+    /// rows by `pending_rows`, which is the same gap
+    /// [`Self::advance_gpu_only`] leaves permanently and every host-side
+    /// reader already bounds itself by ([`KvCache::host_committed_len`]).
+    pub fn advance_gpu_written(&mut self, n: usize) {
+        assert!(
+            self.len + n <= self.capacity,
+            "KV cache is full ({} positions, {n} more asked)",
+            self.capacity
+        );
+        self.len += n;
+        self.pending_rows += n;
+        if let Some(gpu) = &mut self.gpu {
+            gpu.synced_len = self.len;
+        }
+    }
+
+    /// The rows for the oldest `k_rows.len() / kv_dim` positions counted by
+    /// [`Self::advance_gpu_written`] and not yet filled — the same `f32`
+    /// values [`Self::commit_gpu_written`] takes, arriving late. Fills are
+    /// consumed in the order the advances were made, which is the order the
+    /// chunk's stripes wrote them.
+    pub fn fill_gpu_written(&mut self, k_rows: &[f32], v_rows: &[f32]) {
+        assert_eq!(
+            k_rows.len(),
+            v_rows.len(),
+            "K and V must fill the same positions"
+        );
+        assert_eq!(
+            k_rows.len() % self.kv_dim,
+            0,
+            "filled rows ({}) are not a whole number of kv_dim ({}) positions",
+            k_rows.len(),
+            self.kv_dim
+        );
+        let n = k_rows.len() / self.kv_dim;
+        assert!(
+            n <= self.pending_rows,
+            "filling {n} positions when only {} were advanced unfilled",
+            self.pending_rows
+        );
+        for (k, v) in k_rows
+            .chunks_exact(self.kv_dim)
+            .zip(v_rows.chunks_exact(self.kv_dim))
+        {
+            self.pending_rows -= 1;
+            self.push_row(k, v);
+        }
+    }
+
+    /// Positions counted in `len` whose host rows have not arrived yet —
+    /// non-zero only inside a prefill chunk, between
+    /// [`Self::advance_gpu_written`] and its [`Self::fill_gpu_written`].
+    #[cfg(test)]
+    pub fn pending_rows(&self) -> usize {
+        self.pending_rows
+    }
+
+    /// Forgets positions that were advanced and never filled — a chunk that
+    /// failed between the two halves. `len` steps back to the last row the
+    /// host holds; the device rows past it are overwritten before they are
+    /// read again. Nothing to do on a healthy cache.
+    pub fn discard_pending_rows(&mut self) {
+        if self.pending_rows > 0 {
+            self.len -= self.pending_rows;
+            self.pending_rows = 0;
+            if let Some(gpu) = &mut self.gpu {
+                gpu.synced_len = gpu.synced_len.min(self.len);
+            }
         }
     }
 
@@ -1281,17 +1484,11 @@ impl LayerCache {
             k_rows.len(),
             self.kv_dim
         );
-        for (k, v) in k_rows
-            .chunks_exact(self.kv_dim)
-            .zip(v_rows.chunks_exact(self.kv_dim))
-        {
-            self.push(k, v);
-        }
         // The GPU wrote these into the mirror itself, so the incremental upload
-        // in `sync_gpu` has nothing left to do for them.
-        if let Some(gpu) = &mut self.gpu {
-            gpu.synced_len = self.len;
-        }
+        // in `sync_gpu` has nothing left to do for them — `advance_gpu_written`
+        // marks that, and the fill appends the host copy.
+        self.advance_gpu_written(k_rows.len() / self.kv_dim);
+        self.fill_gpu_written(k_rows, v_rows);
     }
 
     /// This layer's committed length **in tokens**.
@@ -1628,6 +1825,15 @@ impl LayerCache {
     fn rows_between_side(&self, from: usize, to: usize, keys: bool) -> std::borrow::Cow<'_, [f32]> {
         if self.paged.is_none() {
             let buf = if keys { &self.k } else { &self.v };
+            assert!(
+                to * self.kv_dim <= buf.len(),
+                "rows {from}..{to} asked of a contiguous layer holding {} host rows (len {}, \
+                 {} pending, kv_dim {})",
+                buf.len() / self.kv_dim.max(1),
+                self.len,
+                self.pending_rows,
+                self.kv_dim
+            );
             return std::borrow::Cow::Borrowed(&buf[from * self.kv_dim..to * self.kv_dim]);
         }
         let mut out = Vec::with_capacity((to - from) * self.kv_dim);
@@ -1729,13 +1935,50 @@ impl LayerCache {
         // it recorded. Acquiring per layer would take one reference per layer
         // for a page that is one page.
         if paged.layer == 0 {
-            let got = paged.seq.pool.acquire(tags).ok()?;
+            // Adopted pages become live and held by this sequence exactly like
+            // built ones, so they come out of the same promise.
+            let claim = {
+                let mut inner = paged
+                    .seq
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let claim = inner.promised.min(tags.len());
+                inner.promised -= claim;
+                claim
+            };
+            let got = match paged.seq.pool.acquire_for(tags, claim) {
+                Ok(got) => got,
+                Err(_) => {
+                    // Nothing was taken (the pool is all-or-nothing), so the
+                    // promise goes straight back and the request prefills the
+                    // prefix itself.
+                    paged.seq.pool.release_reserved(claim);
+                    let mut inner = paged
+                        .seq
+                        .inner
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    inner.promised += claim;
+                    return None;
+                }
+            };
             if !got.iter().all(|a| a.hit) {
                 // Something was reclaimed between the index promising it and
                 // this call. Give back what was taken rather than filling the
                 // gaps: a half-adopted prefix is not a prefix.
                 let pages: Vec<u32> = got.iter().map(|a| a.page).collect();
                 paged.seq.pool.release(&pages);
+                // Released, so the promise these pages were claimed against is
+                // owed back as well — the sequence still has its full length
+                // ahead of it, it just has to build the prefix itself.
+                paged.seq.pool.release_reserved(claim);
+                let mut inner = paged
+                    .seq
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                inner.promised += claim;
                 return None;
             }
             paged
@@ -1859,6 +2102,15 @@ impl LayerCache {
     pub fn value_at(&self, pos: usize, kv_head: usize, head_dim: usize) -> &[f32] {
         let row = self.row_v(pos);
         &row[kv_head * head_dim..(kv_head + 1) * head_dim]
+    }
+
+    /// Row `pos`'s key and value as the host holds them — what slot save
+    /// serializes and prefix reuse copies. For checking that a path which
+    /// fills the host copy late ([`Self::fill_gpu_written`]) leaves the same
+    /// rows as one that pushed them in order.
+    #[cfg(test)]
+    pub(crate) fn host_row(&self, pos: usize) -> (&[f32], &[f32]) {
+        (self.row_k(pos), self.row_v(pos))
     }
 
     /// Row `pos`'s keys, from whichever side of the seal it is on.
@@ -2079,21 +2331,48 @@ impl KvCache {
     /// `prefix_cache::CachedPrefill::reusable_prefix_len` already forces
     /// all-or-nothing reuse on it. So it is carried across untouched, and only
     /// the positional layers change where their rows live.
-    pub fn into_paged(mut self, pool: std::sync::Arc<crate::engine::kv_pool::KvPool>) -> Self {
+    /// **`Err` hands the cache back unchanged** when the pool has no room to
+    /// promise this sequence its whole length. That is not a failure to
+    /// report: the caller keeps the ordinary contiguous cache it built, which
+    /// grows on demand and answers the request exactly as it did before there
+    /// was a pool. What it costs is prefix *sharing* for that one request —
+    /// worth saying no to, because the alternative is admitting a request the
+    /// pool cannot finish and discovering it a page at a time.
+    ///
+    /// A prompt larger than the whole pool is not hypothetical. The pool is
+    /// sized from the device headroom this machine actually has, and on a
+    /// modest one that is a five-figure token count — while a single
+    /// `/auto_review` request carrying a few thousand lines of source is
+    /// several times that.
+    pub fn try_into_paged(
+        mut self,
+        pool: std::sync::Arc<crate::engine::kv_pool::KvPool>,
+    ) -> Result<Self, Self> {
         assert_eq!(
             self.layers.len(),
             pool.layers().len(),
             "the pool was built for a different model's layer count"
         );
-        let max_pages = pool.pages_for(self.layers.first().map_or(0, |l| l.capacity * l.stride));
-        let seq = std::sync::Arc::new(SequencePages::new(pool.clone(), max_pages));
-        for (i, layer) in self.layers.iter_mut().enumerate() {
+        // Shape before room. A cache the pool could never hold rows for is a
+        // programming error and is still reported as one; taking pool room
+        // first would spend it on a conversion about to be refused, and — since
+        // a refused reservation returns `Err` rather than panicking — would
+        // turn that error into a silent fallback to the contiguous path.
+        for (i, layer) in self.layers.iter().enumerate() {
             let geom = pool.layers()[i];
             assert_eq!(
                 (layer.kv_dim, layer.stride),
                 (geom.kv_dim, geom.stride),
                 "layer {i}'s geometry does not match the pool's"
             );
+        }
+        let max_pages = pool.pages_for(self.layers.first().map_or(0, |l| l.capacity * l.stride));
+        let Some(seq) = SequencePages::reserve(pool.clone(), max_pages) else {
+            return Err(self);
+        };
+        let seq = std::sync::Arc::new(seq);
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let geom = pool.layers()[i];
             layer.k.clear();
             layer.v.clear();
             layer.len = 0;
@@ -2108,7 +2387,7 @@ impl KvCache {
                 device_synced: 0,
             });
         }
-        self
+        Ok(self)
     }
 
     /// Publishes every page whose positions are complete, making them
@@ -2351,6 +2630,15 @@ impl KvCache {
     /// and unreadable to anyone else, so reuse is bounded by the host side —
     /// and by the **shortest** layer, not the longest, because a prefix is
     /// only reusable to the depth every layer can supply it.
+    /// [`LayerCache::discard_pending_rows`] on every layer — run before a
+    /// cache is written again, so a chunk that failed mid-way cannot leave a
+    /// later request pushing behind rows that never arrived.
+    pub fn discard_pending_rows(&mut self) {
+        for layer in &mut self.layers {
+            layer.discard_pending_rows();
+        }
+    }
+
     pub fn host_committed_len(&self) -> usize {
         self.layers
             .iter()
@@ -3252,6 +3540,48 @@ mod tests {
     /// A row is copied into a page and read back out, so anything but the same
     /// bits is a addressing bug, and a tolerance would hide exactly the
     /// off-by-one-page error this is written to catch.
+    /// A cache the pool cannot promise room for comes back **unpaged**, not
+    /// half-built and not refused.
+    ///
+    /// This is the whole shape of the fix: the sequence used to be handed to
+    /// the pool regardless, discover a page short somewhere inside a forward
+    /// pass, and take the process down with it — a prompt bigger than the pool
+    /// is an ordinary thing for a client to send, and it must cost that client
+    /// page sharing, not everyone else the server.
+    #[test]
+    fn a_cache_the_pool_cannot_promise_stays_contiguous() {
+        use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+        use std::sync::Arc;
+
+        let geom = vec![LayerGeometry {
+            kv_dim: 8,
+            stride: 1,
+        }];
+        // Four pages of four tokens: sixteen tokens is the whole pool.
+        let pool = Arc::new(KvPool::with_policy(4, 4, geom, Policy::Lru));
+        let dims = strided_dims(&pool);
+
+        let small = KvCache::new_with_strided_dims(8, &dims)
+            .try_into_paged(pool.clone())
+            .unwrap_or_else(|_| panic!("eight tokens fit a sixteen-token pool"));
+        assert!(small.layers[0].paged.is_some());
+
+        // Twice the pool: refused, and the caller gets its cache back intact.
+        let big = KvCache::new_with_strided_dims(32, &dims)
+            .try_into_paged(pool.clone())
+            .err()
+            .expect("a sequence twice the pool cannot be promised");
+        assert!(
+            big.layers[0].paged.is_none(),
+            "a refused cache is the contiguous one it started as"
+        );
+
+        // And the refusal took nothing: what the small one did not claim is
+        // still there for the next request.
+        drop(small);
+        assert_eq!(pool.available(), 4);
+    }
+
     fn paged_and_contiguous_agree(kv_dim: usize, stride: usize, page_tokens: usize, rows: usize) {
         use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
         use std::sync::Arc;
@@ -3259,10 +3589,19 @@ mod tests {
         let geom = vec![LayerGeometry { kv_dim, stride }];
         // Room for far more pages than the sequence needs, so this measures
         // addressing rather than reclaim.
-        let pool = Arc::new(KvPool::with_policy(64, page_tokens, geom, Policy::Lru));
         let capacity = rows * stride + stride;
-        let mut paged =
-            KvCache::new_with_strided_dims(capacity, &strided_dims(&pool)).into_paged(pool);
+        // Room for far more pages than the sequence needs, so this measures
+        // addressing rather than reclaim — and at least enough for the
+        // sequence to be admitted at all.
+        let pool = Arc::new(KvPool::with_policy(
+            capacity.div_ceil(page_tokens).max(64),
+            page_tokens,
+            geom,
+            Policy::Lru,
+        ));
+        let mut paged = KvCache::new_with_strided_dims(capacity, &strided_dims(&pool))
+            .try_into_paged(pool)
+            .unwrap_or_else(|_| panic!("test pool has room"));
         let mut plain = KvCache::new_with_strided_dims(capacity, &[(kv_dim, stride)]);
 
         for r in 0..rows {
@@ -3336,8 +3675,9 @@ mod tests {
                 stride: 1,
             }];
             let pool = Arc::new(KvPool::with_policy(64, PAGE, geom, Policy::Lru));
-            let mut paged =
-                KvCache::new_with_strided_dims(64, &strided_dims(&pool)).into_paged(pool.clone());
+            let mut paged = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
+                .try_into_paged(pool.clone())
+                .unwrap_or_else(|_| panic!("test pool has room"));
             let mut plain = KvCache::new_with_strided_dims(64, &[(KV, 1)]);
             for r in 0..12usize {
                 let k: Vec<f32> = (0..KV).map(|d| (r * KV + d) as f32).collect();
@@ -3379,8 +3719,9 @@ mod tests {
         }];
         let pool = Arc::new(KvPool::with_policy(16, 4, geom, Policy::Lru));
         {
-            let mut cache =
-                KvCache::new_with_strided_dims(64, &strided_dims(&pool)).into_paged(pool.clone());
+            let mut cache = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
+                .try_into_paged(pool.clone())
+                .unwrap_or_else(|_| panic!("test pool has room"));
             for r in 0..9usize {
                 cache.layers[0].push(&[r as f32; 4], &[r as f32; 4]);
             }
@@ -3406,7 +3747,9 @@ mod tests {
             stride: 1,
         }];
         let pool = Arc::new(KvPool::with_policy(32, 4, geom, Policy::Lru));
-        let mut paged = KvCache::new_with_strided_dims(64, &strided_dims(&pool)).into_paged(pool);
+        let mut paged = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
+            .try_into_paged(pool)
+            .unwrap_or_else(|_| panic!("test pool has room"));
         let mut plain = KvCache::new_with_strided_dims(64, &[(KV, 1)]);
         for r in 0..11usize {
             let k: Vec<f32> = (0..KV).map(|d| (r * KV + d) as f32).collect();
@@ -3441,7 +3784,9 @@ mod tests {
             stride: 1,
         }];
         let pool = Arc::new(KvPool::with_policy(32, 4, geom, Policy::Lru));
-        let mut paged = KvCache::new_with_strided_dims(64, &strided_dims(&pool)).into_paged(pool);
+        let mut paged = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
+            .try_into_paged(pool)
+            .unwrap_or_else(|_| panic!("test pool has room"));
         for r in 0..9usize {
             paged.layers[0].push(&[r as f32; KV], &[-(r as f32); KV]);
         }
@@ -3494,8 +3839,9 @@ mod tests {
 
         // First sequence: builds the shared prefix itself.
         let tags = page_tags(&shared, PAGE);
-        let mut first =
-            KvCache::new_with_strided_dims(64, &strided_dims(&pool)).into_paged(pool.clone());
+        let mut first = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
+            .try_into_paged(pool.clone())
+            .unwrap_or_else(|_| panic!("test pool has room"));
         first.set_page_tags(&tags);
         for r in 0..shared.len() {
             let k: Vec<f32> = (0..KV).map(|d| row(r, d)).collect();
@@ -3516,8 +3862,9 @@ mod tests {
         // Second sequence: resolves the same prompt and adopts it.
         let resolved = index.resolve(&shared, false);
         assert_eq!(resolved.shared.len(), 3, "the whole prompt is known");
-        let mut second =
-            KvCache::new_with_strided_dims(64, &strided_dims(&pool)).into_paged(pool.clone());
+        let mut second = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
+            .try_into_paged(pool.clone())
+            .unwrap_or_else(|_| panic!("test pool has room"));
         let adopted = second
             .adopt_shared_pages(&resolved.shared, PAGE)
             .expect("the pages are resident");
@@ -3588,8 +3935,12 @@ mod tests {
             stride: 1,
         }];
         let pool = Arc::new(KvPool::with_policy(4, 4, geom, Policy::Lru));
-        let mut cache =
-            KvCache::new_with_strided_dims(64, &strided_dims(&pool)).into_paged(pool.clone());
+        // Sixteen tokens, which is the whole pool: a sequence is admitted for
+        // the length it might reach, so a cache asking for more than the pool
+        // holds is refused outright now rather than discovering it mid-flight.
+        let mut cache = KvCache::new_with_strided_dims(16, &strided_dims(&pool))
+            .try_into_paged(pool.clone())
+            .unwrap_or_else(|_| panic!("test pool has room"));
         // Tags nothing ever sealed.
         assert!(cache.adopt_shared_pages(&[11, 22], 4).is_none());
         assert_eq!(
@@ -3615,7 +3966,10 @@ mod tests {
             }],
             Policy::Lru,
         ));
-        let mut cache = KvCache::new_with_strided_dims(64, &strided_dims(&pool)).into_paged(pool);
+        // 32 tokens: eight pages of four, which is exactly this pool.
+        let mut cache = KvCache::new_with_strided_dims(32, &strided_dims(&pool))
+            .try_into_paged(pool)
+            .unwrap_or_else(|_| panic!("test pool has room"));
         assert!(cache.layers[0].block_table().is_empty());
         for r in 0..9usize {
             cache.layers[0].push(&[r as f32; KV], &[r as f32; KV]);
@@ -3657,7 +4011,9 @@ mod tests {
         pool.attach_device(device, KvStorage::F16, 64);
         let pool = Arc::new(pool);
 
-        let mut cache = KvCache::new_with_strided_dims(64, &strided_dims(&pool)).into_paged(pool);
+        let mut cache = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
+            .try_into_paged(pool)
+            .unwrap_or_else(|_| panic!("test pool has room"));
         for r in 0..12usize {
             cache.layers[0].push(&[r as f32; KV], &[r as f32; KV]);
         }
@@ -3726,7 +4082,9 @@ mod tests {
         let built = KvCache::new_mixed(64, &[KV], &[RecurrentSpec::delta_net(2, 3, 1, 2)]);
         assert_eq!(built.recurrent.len(), 1);
 
-        let paged = built.into_paged(pool);
+        let paged = built
+            .try_into_paged(pool)
+            .unwrap_or_else(|_| panic!("test pool has room"));
         assert_eq!(
             paged.recurrent.len(),
             1,
@@ -3755,7 +4113,9 @@ mod tests {
             }],
             Policy::Lru,
         ));
-        let _ = KvCache::new_with_strided_dims(64, &[(16, 1)]).into_paged(pool);
+        let _ = KvCache::new_with_strided_dims(32, &[(16, 1)])
+            .try_into_paged(pool)
+            .unwrap_or_else(|_| panic!("test pool has room"));
     }
 
     #[test]

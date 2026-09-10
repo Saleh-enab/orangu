@@ -39,12 +39,19 @@ tells the coordinator which model is wanted; it:
    active* — this is what makes those report on what's actually running
    rather than forcing a swap — and only falls back further to the
    `all`-role profile when nothing is active yet.
-4. If a *different* profile's `orangu-server` is currently running, stops it.
+4. If a *different* profile's `orangu-server` is currently running, stops it
+   — **unless that process already serves what this profile asks for.** Two
+   profiles that name the same model, listener, backend, slots and web port
+   and differ only in `role` are one process: a role decides sampling
+   defaults and whether reasoning is suppressed, and both of those travel
+   with the request instead (see [Roles share a
+   process](#roles-share-a-process)).
 5. Starts the requested profile's `orangu-server` (with that profile's own
    role flag — `--all`/`--code`/`--review`/`--explorer`/`--embedding` — and
    model) if it isn't already running, and waits for `GET /v1/models` to
    answer.
-6. Forwards the original request unchanged and streams the response back.
+6. Forwards the original request unchanged — plus an `x-orangu-role` header
+   naming the resolved profile's role — and streams the response back.
 
 Only one `orangu-server` process is ever alive under the coordinator.
 Swapping pays the cost of a fresh model load, so this suits a
@@ -344,6 +351,110 @@ exactly as `orangu-server --init` does:
 
 No prompt requires typing an offered value — a local path or a
 not-yet-downloaded `<user>/<model>[:quant]` spec is equally valid.
+
+
+## The server belongs to the coordinator
+
+At most one `orangu-server` is alive under a coordinator, and its lifetime is
+the coordinator's to end. Three things enforce that, because each covers a
+case the others cannot:
+
+- **`Ctrl+C`, `SIGTERM`, or `POST /shutdown`** run the shutdown path, which
+  stops the child and waits for it to actually exit.
+- **A `SIGKILL`** runs nothing at all, so the child asks the kernel to signal
+  it when its parent goes away (`PR_SET_PDEATHSIG`, Linux). A server started
+  by hand is unaffected — this is set per child, between fork and exec.
+- **A server already serving this profile is adopted**, not competed with.
+  Before starting one, the coordinator asks `/props` what is on the address:
+  when the `model` is exactly the spec the profile names and the `role` is one
+  that can serve it, that server *is* what starting one would produce, so it is
+  used as-is — no second process, no reload, no wait.
+
+  ```
+  adopting the orangu-server already serving 'all' at http://127.0.0.1:8100 (process 716)
+  ```
+
+  The comparison is deliberately exact. Adopting the wrong server would be
+  worse than starting a doomed one, because it is silent: requests answered by
+  another model with nothing saying so. A profile naming a local path or a
+  catalogue number will not match the label a server reports and simply starts
+  its own.
+
+  An adopted server is stopped like any other when a swap needs the port. A
+  server that must not be touched belongs on its own `port`, where no swap will
+  ask for it.
+
+- **An `orangu-server` serving something else** has the address taken from
+  it. That is the same act as swapping away from an adopted server, and who
+  started the incumbent changes nothing about it — the address belongs to the
+  profile by configuration:
+
+  ```
+  taking http://127.0.0.1:8100 for 'all': process 22103 is serving
+  ggml-org/embeddinggemma-300M-GGUF in embedding mode, which this profile does
+  not ask for
+  ```
+
+  Only against a pid the kernel agrees is an `orangu-server` (`/proc/<pid>/comm`
+  on Linux). The pid comes from a `/health` answer — a network fact — and it is
+  about to be signalled; a server reporting someone else's pid would otherwise
+  have the coordinator stop an unrelated process for it.
+
+- **Anything else already listening** on the profile's port is *not* touched,
+  and is reported rather than trusted. The readiness probe is `GET /health`,
+  which names the process answering, and a pid that is not the child just
+  spawned is reported:
+
+  ```
+  'review' cannot serve http://127.0.0.1:8100: process 4159676 is already
+  listening there, and it is not the orangu-server just started (process
+  4159810). Stop it — an orangu-server or orangu-coordinator left running from
+  earlier is the usual cause — or give this profile its own `port`.
+  ```
+
+The third exists because of what its absence looked like. The probe used to
+be "does anything answer at this address", which a leftover server satisfies
+instantly — so the coordinator recorded a swap that never happened and
+proxied every request to a process it had not started, serving whatever model
+*that* one held. Its own child failed to bind and exited; the next request
+found it dead, restarted it, and repeated, one model load per attempt, with
+nothing in the log saying anything was wrong beyond a stray `Address already
+in use`.
+
+## Roles share a process
+
+A common configuration gives `all`, `code`, `review` and `explorer` the same
+model file, differing only in `role`. Three of them share a process; **`review`
+does not** — a review is run by an `orangu-server --review`, so the `Mode` row
+on its banner says what is serving it. Moving between them used to stop the
+`orangu-server` and start another one on the identical weights: a full model
+load in each direction, and every cached prefix on the old process died with
+it. An `/auto_review` run alternating with ordinary chat paid that twice per
+turn.
+
+It no longer does. `ensure_active` keeps the running process whenever the
+requested profile differs from it in nothing but `role`, and the proxy sends
+the resolved role along with each request as `x-orangu-role`.
+`orangu-server` reads that header for the two things a role actually decides
+— the sampling defaults it starts from, and whether reasoning is suppressed
+— and ignores it for anything it cannot change: a header cannot make an
+`--embedding` server answer chat, because which endpoints work is a property
+of the model that was loaded.
+
+Anything else — a different model, port, backend, `slots` or `web` — is a
+different process and still swaps. So is `review`, so that a review always runs
+on a server started in that role. So is `embeddings`, in either direction,
+however identical the rest of the profile: an `--embedding` server refuses the
+generation endpoints outright, so sharing a process with a chat role would
+answer chat with `501` rather than swapping to something that can serve it.
+
+The visible effect, on four same-model profiles:
+
+| | before | after |
+| :-- | --: | --: |
+| a request that switches role | ~11 s | ~0.4 s |
+| model loads across seven such requests | 5 | 1 |
+| cached prompt tokens surviving a switch | none | all of them |
 
 ## Pointing orangu.conf at it
 

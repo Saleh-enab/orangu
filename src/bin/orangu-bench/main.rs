@@ -265,6 +265,14 @@ struct Args {
     #[arg(long, default_value_t = false)]
     flamegraph_png: bool,
 
+    /// Profile every running orangu, orangu-coordinator and orangu-server for `--flamegraph-duration` while you drive the workload; one flamegraph per process in DIR. Measures nothing itself.
+    #[arg(long, value_name = "DIR")]
+    flamegraph_layers: Option<String>,
+
+    /// Seconds to keep sampling under `--flamegraph-layers`.
+    #[arg(long, default_value_t = 60, value_name = "SECONDS")]
+    flamegraph_duration: u64,
+
     /// Compare already-collapsed `.folded` profiles side by side; measure nothing.
     #[arg(long, value_delimiter = ',', value_name = "LIST")]
     compare_profiles: Vec<String>,
@@ -316,6 +324,10 @@ struct Args {
     /// Seconds to wait between measured points, for a card that heats up.
     #[arg(long, default_value_t = 0, value_name = "SECONDS")]
     delay: u64,
+
+    /// Sampling temperature for the timed decode; `0` is greedy
+    #[arg(long, default_value_t = 0.0, value_name = "T")]
+    temperature: f32,
 
     /// Print the shell completion script for the detected shell and exit.
     #[arg(short = 's', long = "shell-completions")]
@@ -902,6 +914,7 @@ fn run_once(
     prompt: &str,
     n_gen: u32,
     model: &Option<String>,
+    temperature: f32,
 ) -> anyhow::Result<Sample> {
     let mut body = serde_json::json!({
         "prompt": prompt,
@@ -909,7 +922,10 @@ fn run_once(
         // The native (non-OpenAI) field name, harmless to servers that
         // ignore it — sending both maximizes cross-server compatibility.
         "n_predict": n_gen,
-        "temperature": 0,
+        // Greedy unless asked otherwise: a sampled decode takes a different
+        // path through the server (a logits readback and a host sampler),
+        // and that path is what a client that sends no temperature gets.
+        "temperature": temperature,
         "stream": true,
         "cache_prompt": false,
         // Generate exactly `n_gen` tokens regardless of content — without this a
@@ -1086,6 +1102,14 @@ fn run(args: &Args) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Samples processes it did not start and drives no workload of its own,
+    // so it belongs with the read-only modes: the point is that the traffic
+    // is the real thing — an `/auto_review` in a real orangu, through a real
+    // coordinator — and this tool only watches.
+    if let Some(dir) = &args.flamegraph_layers {
+        return profile_layers(args, std::path::Path::new(dir));
+    }
+
     // Starts its own servers, so it comes before the client below is pointed
     // at one that is not up yet.
     if args.sweep.is_some() {
@@ -1123,7 +1147,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
         // warming up with a completion would fail the run before it started —
         // which is exactly what kept `--embed`'s models unmeasurable.
         if args.embed.is_empty() {
-            run_once(&client, &args.url, &p, 8, &args.model)?;
+            run_once(&client, &args.url, &p, 8, &args.model, args.temperature)?;
         } else {
             run_embed_once(&client, &args.url, &p, &args.model)?;
         }
@@ -1884,7 +1908,7 @@ fn warm_up_for_sweep(client: &reqwest::blocking::Client, args: &Args) -> anyhow:
     // Always: this is what creates the compute threads, and it is the only
     // warmup an embedding-only server's endpoints allow.
     if args.embed.is_empty() {
-        run_once(client, &args.url, &p, 8, &args.model)?;
+        run_once(client, &args.url, &p, 8, &args.model, args.temperature)?;
     } else {
         run_embed_once(client, &args.url, &p, &args.model)?;
     }
@@ -2734,7 +2758,14 @@ fn run_tg(
         let _ = moe::take_stages(client, &args.url);
         for _ in 0..args.reps.max(1) {
             args.drop_page_cache(client);
-            let s = run_once(client, &args.url, &prompt, args.n_gen, &args.model)?;
+            let s = run_once(
+                client,
+                &args.url,
+                &prompt,
+                args.n_gen,
+                &args.model,
+                args.temperature,
+            )?;
             rates.push(s.tok_per_s());
             last_sample = Some(s);
         }
@@ -3184,6 +3215,117 @@ fn compare_profiles(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The three binaries a request passes through, in the order it passes
+/// through them. Each gets its own flamegraph under `--flamegraph-layers`,
+/// because what limits tokens per second can sit in any of them and a profile
+/// of the server alone cannot say which.
+const LAYERS: [&str; 3] = ["orangu", "orangu-coordinator", "orangu-server"];
+
+/// Which layer a sampled thread's `comm` belongs to, or `None` for anything
+/// that is not one of the three.
+///
+/// `comm` is the kernel's 15-byte name for the thread group, so
+/// `orangu-coordinator` arrives as `orangu-coordina`; each layer is matched on
+/// its own first fifteen bytes. Worker threads carry their own names
+/// (`tokio-rt-worker`, rayon's pool), which is why the *process* comm is what
+/// the recorder splits on and this only ever sees the main thread's name.
+fn layer_of_comm(comm: &str) -> Option<&'static str> {
+    LAYERS.into_iter().find(|layer| {
+        let want: String = layer.chars().take(15).collect();
+        comm == want
+    })
+}
+
+/// `--flamegraph-layers`: sample the whole machine for a fixed window while the
+/// operator drives the workload, then render one flamegraph per orangu-family
+/// process that ran during it.
+///
+/// System-wide rather than attached per pid, and that is the whole design: a
+/// coordinator replaces its `orangu-server` on every model swap, and an
+/// `/auto_review` begins with one, so the process worth profiling is one that
+/// did not exist when sampling started. `perf record -p` cannot see it;
+/// `perf record -a` sees every thread from the moment it runs. A second
+/// `orangu` started mid-window is picked up the same way, which is what makes
+/// this the tool for a multi-client run: every process that existed during the
+/// window gets a graph, named by layer and pid.
+fn profile_layers(args: &Args, dir: &std::path::Path) -> anyhow::Result<()> {
+    if !args.json {
+        println!(
+            "profiling every orangu, orangu-coordinator and orangu-server for {}s — drive the \
+             workload now",
+            args.flamegraph_duration
+        );
+    }
+    let recorder = profile::SystemRecorder::start(
+        dir,
+        args.flamegraph_freq,
+        &args.flamegraph_call_graph,
+        args.flamegraph_png,
+    )?;
+    std::thread::sleep(std::time::Duration::from_secs(args.flamegraph_duration));
+    let mut profiles = recorder.finish(layer_of_comm)?;
+    if profiles.is_empty() {
+        anyhow::bail!(
+            "no orangu, orangu-coordinator or orangu-server was on a CPU during the window"
+        );
+    }
+    // Chain order, then pid, so a run with several clients reads as a list of
+    // clients followed by the one coordinator and its servers in the order
+    // they were started.
+    profiles.sort_by_key(|p| {
+        (
+            LAYERS
+                .iter()
+                .position(|l| *l == p.layer)
+                .unwrap_or(usize::MAX),
+            p.pid,
+        )
+    });
+    // A process forked by a client or a server carries its parent's name
+    // until it execs — every `git` an `orangu` runs is an `orangu` for a few
+    // samples — and a server swapped away before the window began contributes
+    // a handful of idle samples. Their graphs are written (a graph is cheap),
+    // but the report is for the processes that did the work.
+    const REPORTED_MIN_SAMPLES: u64 = 100;
+    const LISTED_MIN_SAMPLES: u64 = 10;
+    for p in profiles
+        .iter()
+        .filter(|p| p.summary.samples >= REPORTED_MIN_SAMPLES)
+    {
+        if !args.json {
+            println!("\n=== {} (pid {})", p.layer, p.pid);
+        }
+        report_profile(&p.summary, args);
+    }
+    if !args.json {
+        // The one table that puts the layers beside each other, which is the
+        // question the mode exists to answer: where, across the whole chain,
+        // the CPU went.
+        println!("\n   layer                  pid   samples   cores   gpu-wait  pool-idle");
+        let mut omitted = 0usize;
+        for p in &profiles {
+            let s = &p.summary;
+            if s.samples < LISTED_MIN_SAMPLES {
+                omitted += 1;
+                continue;
+            }
+            println!(
+                "   {:<19} {:>7} {:>9} {:>7.2} {:>9.1}% {:>9.1}%",
+                p.layer, p.pid, s.samples, s.cores_busy, s.gpu_wait, s.pool_idle
+            );
+        }
+        if omitted > 0 {
+            println!(
+                "   ({omitted} short-lived process{} under {LISTED_MIN_SAMPLES} samples omitted; \
+                 their graphs are in {})",
+                if omitted == 1 { "" } else { "es" },
+                dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Begin a flamegraph capture of whichever process is answering `--url`.
 fn start_profile(
     client: &reqwest::blocking::Client,
@@ -3513,7 +3655,14 @@ fn run_streams(
                             // cache entry and get a free ride.
                             let prompt =
                                 format!("Stream {i}: tell a long, continuous story, do not stop:");
-                            run_once(client, &args.url, &prompt, args.n_gen, &args.model)
+                            run_once(
+                                client,
+                                &args.url,
+                                &prompt,
+                                args.n_gen,
+                                &args.model,
+                                args.temperature,
+                            )
                         })
                     })
                     .collect();

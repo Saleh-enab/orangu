@@ -381,3 +381,76 @@ pub(super) fn argmax_split_bind_group_layout(device: &wgpu::Device) -> wgpu::Bin
         ],
     })
 }
+
+/// Bind group layout for `vulkan_shaders::KV_EPILOGUE_SHADER`: the key and
+/// value projections (read-write, processed in place), the K norm weight
+/// and the RoPE divisors (read-only), the key and value regions of the KV
+/// mirror (read-write), and the meta.
+pub(super) fn kv_epilogue_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let storage = |read_only: bool| wgpu::BindingType::Buffer {
+        ty: wgpu::BufferBindingType::Storage { read_only },
+        has_dynamic_offset: false,
+        min_binding_size: None,
+    };
+    let entry = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty,
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("orangu-server kv epilogue bind group layout"),
+        entries: &[
+            entry(0, storage(false)),
+            entry(1, storage(false)),
+            entry(2, storage(true)),
+            entry(3, storage(true)),
+            entry(4, storage(false)),
+            entry(5, storage(false)),
+            entry(
+                6,
+                wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+            ),
+        ],
+    })
+}
+
+/// Bind group layout for `vulkan_shaders::shader_source_rmsnorm_add_norm_wide`:
+/// `x`, `w1`, `residual`, `w2` read-only, `y1` and `y2` read-write, and the
+/// meta.
+pub(super) fn norm_pair_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let storage = |read_only: bool| wgpu::BindingType::Buffer {
+        ty: wgpu::BufferBindingType::Storage { read_only },
+        has_dynamic_offset: false,
+        min_binding_size: None,
+    };
+    let entry = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty,
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("orangu-server norm pair bind group layout"),
+        entries: &[
+            entry(0, storage(true)),
+            entry(1, storage(true)),
+            entry(2, storage(true)),
+            entry(3, storage(true)),
+            entry(4, storage(false)),
+            entry(5, storage(false)),
+            entry(
+                6,
+                wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+            ),
+        ],
+    })
+}

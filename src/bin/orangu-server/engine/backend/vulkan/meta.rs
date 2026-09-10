@@ -248,6 +248,27 @@ pub(super) struct FusedNormRopeMeta {
     pub(super) yarn: RopeYarn,
 }
 
+/// `KvEpilogueMeta` in `vulkan_shaders::KV_EPILOGUE_SHADER`, field for
+/// field: the K/V shape and RoPE parameters `FusedNormRopeMeta` carries, plus
+/// which of the two rows are normalized and where in the mirror this token's
+/// row goes (an element offset, the cast kernel's `offset`).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(super) struct KvEpilogueMeta {
+    pub(super) n_head_kv: u32,
+    pub(super) head_dim: u32,
+    pub(super) rope_dim: u32,
+    pub(super) pos: u32,
+    pub(super) freq_base: f32,
+    pub(super) eps: f32,
+    pub(super) pairing: u32,
+    pub(super) k_norm: u32,
+    pub(super) v_norm: u32,
+    pub(super) dst_offset: u32,
+    pub(super) _pad: [u32; 2],
+    pub(super) yarn: RopeYarn,
+}
+
 /// `SampleMeta` in `vulkan_shaders::ARGMAX_PENALTY_SHADER` —
 /// `#[repr(C)]` so its layout matches WGSL's `struct SampleMeta {
 /// n_vocab: u32, n_recent: u32, repeat_penalty: f32, logit_softcap: f32 }`
@@ -292,6 +313,9 @@ pub(super) struct ArgmaxSplitMeta {
 /// (written once at build). Rebuilt when `n_vocab` changes or a call needs a
 /// larger recent-token window than the cached `recent_cap`.
 pub(super) struct ArgmaxSampleResources {
+    /// The slot's device top-k, built on its first *sampled* step — see
+    /// `VulkanBackend::record_topk_sample`.
+    pub(super) topk: Option<TopkResources>,
     pub(super) n_vocab: usize,
     pub(super) recent_cap: usize,
     pub(super) logits_buf: wgpu::Buffer,
@@ -300,5 +324,19 @@ pub(super) struct ArgmaxSampleResources {
     pub(super) sample_meta_buf: wgpu::Buffer,
     pub(super) penalty_bind_group: wgpu::BindGroup,
     pub(super) split_bind_group: wgpu::BindGroup,
+    pub(super) reduce_bind_group: wgpu::BindGroup,
+}
+
+/// The buffers and bind groups of one slot's device top-k
+/// (`VulkanBackend::record_topk_sample`), sized for
+/// `vulkan_shaders::TOPK_MAX` candidates and however many slices the
+/// vocabulary needs. The merge's output buffer holds `2 * TOPK_MAX` floats:
+/// the values, then the indices as bits.
+pub(super) struct TopkResources {
+    pub(super) n_split: u32,
+    pub(super) out: wgpu::Buffer,
+    pub(super) meta_buf: wgpu::Buffer,
+    pub(super) split_bind_group: wgpu::BindGroup,
+    pub(super) reduce_meta_buf: wgpu::Buffer,
     pub(super) reduce_bind_group: wgpu::BindGroup,
 }

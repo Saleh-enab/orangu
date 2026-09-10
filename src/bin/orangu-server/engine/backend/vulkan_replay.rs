@@ -59,6 +59,40 @@ type Vulkan = wgpu::hal::api::Vulkan;
 /// and `VkQueue`/`VkPhysicalDevice` are `Copy`, so we clone everything out of
 /// the transient `as_hal` guard once and drop the guard — the `wgpu::Device`
 /// keeps the underlying `VkDevice` alive for the whole session.
+/// Whether the device executes the packed 8-bit integer dot
+/// (`dot4I8Packed`) as a native instruction, from the driver's own
+/// `VkPhysicalDeviceShaderIntegerDotProductProperties` — `None` when the
+/// device is not Vulkan or the query is unavailable.
+///
+/// The kernels built on that builtin are only worth building where it is
+/// accelerated: a driver that declines to accelerate it still compiles the
+/// shader, to a sequence of byte extractions and multiplies, and the
+/// integer-dot GEMM then loses to the float one on the same device. The
+/// two devices on the machine that established this answer differently —
+/// the discrete card accelerates it, the integrated one does not — so the
+/// property has to be read per device rather than assumed per machine.
+#[cfg(not(target_vendor = "apple"))]
+pub fn integer_dot_accelerated(device: &wgpu::Device) -> Option<bool> {
+    let hal = unsafe { device.as_hal::<Vulkan>()? };
+    let instance = hal.shared_instance().raw_instance().clone();
+    let phys = hal.raw_physical_device();
+    let api_version = unsafe { instance.get_physical_device_properties(phys) }.api_version;
+    // The properties struct is core in 1.3 and the extension below that;
+    // `get_physical_device_properties2` itself needs 1.1.
+    if vk::api_version_major(api_version) < 1 || vk::api_version_minor(api_version) < 1 {
+        return None;
+    }
+    let mut dot = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
+    let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut dot);
+    unsafe { instance.get_physical_device_properties2(phys, &mut props) };
+    Some(dot.integer_dot_product4x8_bit_packed_signed_accelerated == vk::TRUE)
+}
+
+#[cfg(target_vendor = "apple")]
+pub fn integer_dot_accelerated(_device: &wgpu::Device) -> Option<bool> {
+    None
+}
+
 pub struct ReplayContext {
     pub instance: ash::Instance,
     pub device: ash::Device,
@@ -3111,6 +3145,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             stop_at_ffn_norm: false,
             yarn: crate::engine::backend::vulkan::RopeYarn::IDENTITY,
             normalize_v: true,
+            attn_gate: None,
             q_bias: None,
             pairing: crate::engine::tensor::RopeLayout::Neox,
             activation: crate::engine::backend::vulkan::FfnActivation::Geglu,
@@ -3146,6 +3181,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             ffn_post_norm: Some(&ffn_post_norm),
             ple: None,
             layer_output_scale: None,
+            post_norm_eps: None,
             batch_slot: 0,
             attn_ts: None,
         });
@@ -3399,6 +3435,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 stop_at_ffn_norm: false,
                 yarn: crate::engine::backend::vulkan::RopeYarn::IDENTITY,
                 normalize_v: true,
+                attn_gate: None,
                 q_bias: None,
                 pairing: crate::engine::tensor::RopeLayout::Neox,
                 activation: crate::engine::backend::vulkan::FfnActivation::Geglu,
@@ -3434,6 +3471,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 ffn_post_norm: Some(&ffn_post_norm),
                 ple: None,
                 layer_output_scale: None,
+                post_norm_eps: None,
                 batch_slot: 0,
                 attn_ts: None,
             });

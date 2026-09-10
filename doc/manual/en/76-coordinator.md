@@ -117,8 +117,11 @@ the pure, unit-tested `select_entry` (`process.rs`):
    to `all` when nothing is active yet.
 
 Once an entry is chosen, `ensure_active` (also `process.rs`) does the actual
-lifecycle work: if it's already the active entry and its process is still
-alive (checked via `try_wait`), reuse it; otherwise stop whatever's running
+lifecycle work: if it's already the active entry — or a different entry the
+running process already serves, which is any entry differing from it in
+nothing but `role` (`CoordinatorLlmEntry::serves_same_process_as`) — and its
+process is still alive (checked via `try_wait`), reuse it; otherwise stop
+whatever's running
 (clearing `current_pid` *before* reaping, so a concurrent `shutdown` never
 targets a stale, possibly-recycled PID) and `start` the requested entry —
 write that profile's own generated `orangu-server.conf`
@@ -147,6 +150,40 @@ convention, and no manual `~` expansion left to reproduce — `orangu-server`
 being a sibling process built from the same source, not an
 independently-installed external tool, is what makes this simplification
 possible.
+
+### Which role a client asks for
+
+A client reaches a role by naming it in `model` — `/auto_review` sends
+`model: "review"`, and `select_entry` matches that against each profile's role
+before anything else. That only happens once the client has *confirmed* it is
+talking to a coordinator, and confirmation is a probe (`GET /v1/coordinator`)
+whose result the status refresh fills in on a timer.
+
+So the review path resolves it at the point of use rather than reading the
+header's copy. Reading the copy meant a review started in the first seconds of
+a session — before the first refresh — was sent with `orangu.conf`'s own model
+id, which matches no profile, so routing fell through to `all` and the review
+was answered by a *reasoning* role: a response cap spent on thought instead of
+findings, and the one thing `--review` exists to prevent.
+
+### One process, several roles
+
+A role is not a property of the process it used to require one for. It picks
+the sampling defaults a request starts from and whether reasoning is
+suppressed; it does not change which weights are loaded. So profiles that
+name the same model, listener, backend, `slots` and `web` port share one
+`orangu-server`, and `proxy::send_upstream` names the resolved role in an
+`x-orangu-role` header on every forwarded request.
+
+`http::openai::request_role` reads it, and only ever narrows within what the
+process can already do: an unrecognised value, or one asking a
+generation-incapable server (`--embedding`) to answer chat, falls back to the
+process's own role rather than failing the request.
+
+What this is worth is not the swap latency alone — though a role switch goes
+from a full model load to nothing — but the prefix cache on the far side of
+it, which used to die with the process every time a review followed a chat
+turn.
 
 ### Recovering a profile that stopped
 

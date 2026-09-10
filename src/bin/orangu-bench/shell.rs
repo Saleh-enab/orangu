@@ -56,7 +56,7 @@ _orangu_bench() {
             COMPREPLY=( $(compgen -W "all 0.0.0.0 127.0.0.1" -- "$cur") )
             return 0
             ;;
-        --url|--depths|--pp|--pp-continue|--pg|--streams|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--cap|--chart-scale|--chart-y-label|--chart-x-label|--flamegraph-pid|--flamegraph-freq|--sweep|--sweep-cmd|--sweep-env|--sweep-start-timeout|--port|--delay)
+        --url|--depths|--pp|--pp-continue|--pg|--streams|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--cap|--chart-scale|--chart-y-label|--chart-x-label|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--sweep|--sweep-cmd|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature)
             return 0
             ;;
     esac
@@ -68,8 +68,9 @@ _orangu_bench() {
              --timeout --model --json --history --label --chart --chart-only --storage-probe --storage-file \
              --storage-span --storage-ramp --cap --chart-png --chart-scale --chart-y-label --chart-x-label \
              --flamegraph --flamegraph-pid --flamegraph-freq --flamegraph-call-graph --flamegraph-png \
+             --flamegraph-layers --flamegraph-duration \
              --compare-profiles --bundle --read-bundle --sweep --sweep-cmd --sweep-env --sweep-start-timeout \
-             --render-profile --report --web --host --port --delay -s --shell-completions -h --help -V --version" -- "$cur") )
+             --render-profile --report --web --host --port --delay --temperature -s --shell-completions -h --help -V --version" -- "$cur") )
         return 0
     fi
 }
@@ -128,6 +129,8 @@ _orangu_bench() {
         '--flamegraph-freq[Sampling frequency in Hz for --flamegraph]:hz:' \
         '--flamegraph-call-graph[Call-graph mode for --flamegraph]:mode:(fp dwarf)' \
         '--flamegraph-png[Also render a PNG beside the flamegraph SVG]' \
+        '--flamegraph-layers[Profile every running orangu, orangu-coordinator and orangu-server while you drive the workload; one flamegraph per process in DIR]:dir:_files -/' \
+        '--flamegraph-duration[Seconds to keep sampling under --flamegraph-layers]:seconds:' \
         '--compare-profiles[Compare already-collapsed .folded profiles side by side; measure nothing]:list:_files' \
         '--bundle[Write the whole run — measurements, configuration, host — to one JSON file]:path:_files' \
         '--read-bundle[Read bundles and report them side by side; measure nothing]:list:_files' \
@@ -141,6 +144,7 @@ _orangu_bench() {
         '--host[Address the web console binds: all (or *) for every interface]:host:(all 0.0.0.0 127.0.0.1)' \
         '--port[Port the web console listens on]:port:' \
         '--delay[Seconds to wait between measured points, for a card that heats up]:seconds:' \
+        '--temperature[Sampling temperature for the timed decode; 0 is greedy]:t:' \
         '(-s --shell-completions)'{-s,--shell-completions}'[Print shell completion script for the detected shell and exit]' \
         '(-h --help)'{-h,--help}'[Print help]' \
         '(-V --version)'{-V,--version}'[Print version]'
@@ -197,6 +201,8 @@ complete -c orangu-bench -l flamegraph-pid         -x -d 'Process to profile (de
 complete -c orangu-bench -l flamegraph-freq        -x -d 'Sampling frequency in Hz for --flamegraph'
 complete -c orangu-bench -l flamegraph-call-graph  -x -a 'fp dwarf' -d 'Call-graph mode for --flamegraph'
 complete -c orangu-bench -l flamegraph-png            -d 'Also render a PNG beside the flamegraph SVG'
+complete -c orangu-bench -l flamegraph-layers      -r -d 'Profile every running orangu, orangu-coordinator and orangu-server while you drive the workload; one flamegraph per process in DIR'
+complete -c orangu-bench -l flamegraph-duration    -x -d 'Seconds to keep sampling under --flamegraph-layers'
 complete -c orangu-bench -l compare-profiles       -r -d 'Compare already-collapsed .folded profiles side by side; measure nothing'
 complete -c orangu-bench -l bundle                 -r -d 'Write the whole run — measurements, configuration, host — to one JSON file'
 complete -c orangu-bench -l read-bundle            -r -d 'Read bundles and report them side by side; measure nothing'
@@ -210,6 +216,7 @@ complete -c orangu-bench -l web                       -d 'Serve the web console 
 complete -c orangu-bench -l host                   -x -a 'all 0.0.0.0 127.0.0.1' -d 'Address the web console binds: all (or *) for every interface'
 complete -c orangu-bench -l port                   -x -d 'Port the web console listens on'
 complete -c orangu-bench -l delay                  -x -d 'Seconds to wait between measured points, for a card that heats up'
+complete -c orangu-bench -l temperature            -x -d 'Sampling temperature for the timed decode; 0 is greedy'
 complete -c orangu-bench -s s -l shell-completions    -d 'Print shell completion script for the detected shell and exit'
 complete -c orangu-bench -s h -l help                 -d 'Print help'
 complete -c orangu-bench -s V -l version              -d 'Print version'
@@ -275,6 +282,8 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--flamegraph-freq', 'Sampling frequency in Hz for --flamegraph'),
         @('--flamegraph-call-graph', 'Call-graph mode for --flamegraph: fp or dwarf'),
         @('--flamegraph-png', 'Also render a PNG beside the flamegraph SVG'),
+        @('--flamegraph-layers', 'Profile every running orangu, orangu-coordinator and orangu-server while you drive the workload; one flamegraph per process in DIR'),
+        @('--flamegraph-duration', 'Seconds to keep sampling under --flamegraph-layers'),
         @('--compare-profiles', 'Compare already-collapsed .folded profiles side by side; measure nothing'),
         @('--bundle', 'Write the whole run - measurements, configuration, host - to one JSON file'),
         @('--read-bundle', 'Read bundles and report them side by side; measure nothing'),
@@ -288,6 +297,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--host', 'Address the web console binds: all (or *) for every interface'),
         @('--port', 'Port the web console listens on'),
         @('--delay', 'Seconds to wait between measured points, for a card that heats up'),
+        @('--temperature', 'Sampling temperature for the timed decode; 0 is greedy'),
         @('-s', '--shell-completions', 'Print shell completion script for the detected shell and exit'),
         @('-h', '--help', 'Print help'),
         @('-V', '--version', 'Print version')
@@ -306,7 +316,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         { $_ -in '--history', '--chart', '--storage-file', '--flamegraph', '--compare-profiles', '--bundle', '--read-bundle', '--render-profile', '--report' } { return }
         '--flamegraph-call-graph' { return Offer @('fp', 'dwarf') }
         '--host' { return Offer @('all', '0.0.0.0', '127.0.0.1') }
-        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--flamegraph-pid', '--flamegraph-freq', '--sweep', '--sweep-cmd', '--sweep-env', '--sweep-start-timeout', '--port', '--delay' } { return }
+        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--sweep', '--sweep-cmd', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature' } { return }
     }
 
     if ($wordToComplete.StartsWith('-')) {

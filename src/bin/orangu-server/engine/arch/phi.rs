@@ -414,7 +414,7 @@ impl PhiModel {
         with_tail: bool,
     ) -> Option<(wgpu::CommandEncoder, wgpu::Buffer, u64)> {
         use crate::engine::backend::vulkan::{
-            FfnActivation, FusedAttnProjection, FusedLayerInput, GpuInput,
+            FfnActivation, FusedAttnProjection, FusedLayerInput, GpuInput, PassCursor,
         };
 
         if crate::engine::arch::llama::no_fused_qkv()
@@ -455,7 +455,7 @@ impl PhiModel {
                 None => GpuInput::Cpu(x_in),
             };
             let out = vulkan.record_fused_layer(
-                &mut encoder,
+                &mut PassCursor::new(&mut encoder),
                 FusedLayerInput {
                     stop_at_ffn_norm: false,
                     x: x_input,
@@ -502,6 +502,8 @@ impl PhiModel {
                     ffn_post_norm: None,
                     ple: None,
                     layer_output_scale: None,
+                    attn_gate: None,
+                    post_norm_eps: None,
                     batch_slot: slot_id,
                     attn_ts: ts.attn_slot(il, n_layer),
                 },
@@ -883,6 +885,9 @@ impl ModelForward for PhiModel {
     ) -> Result<super::ForwardOutcome> {
         if tokens.len() == 1
             && let Some(params) = &greedy_sample
+            // A `top_k > 0` asks for candidates, which only the device top-k
+            // path answers; this architecture has the greedy path alone.
+            && params.top_k == 0
             && let Some(vulkan) = self.backend.as_wgpu()
             && vulkan.gpu_sample()
             && let Some((mut encoder, logits_buf, logits_offset)) =

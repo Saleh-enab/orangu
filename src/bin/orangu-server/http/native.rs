@@ -34,8 +34,18 @@ use crate::engine::chat_template::{ChatMessage, ChatTemplate};
 use crate::engine::generate::{FinishReason, GenerateRequest, StreamEvent};
 use crate::engine::sampling::SamplingParams;
 
+/// `GET /health` — this process is alive.
+///
+/// `pid` is the process answering, and it is here because a port says nothing
+/// about *who* is behind it. A supervisor that starts a server and then probes
+/// its address cannot otherwise tell "the child I just started is up" from
+/// "something else was already listening there": both answer `200`, and the
+/// second is how an `orangu-coordinator` came to record a swap that never
+/// happened and proxy every request to a stranger serving another model. The
+/// pid is what makes the two distinguishable, and it survives the one identity
+/// change this process can make — `reexec` is an `execve`, which keeps it.
 pub async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({"status": "ok"}))
+    Json(serde_json::json!({"status": "ok", "pid": std::process::id()}))
 }
 
 /// Whether this server should be sent traffic *right now*.
@@ -116,6 +126,12 @@ pub async fn props(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         // `null` on a machine with no NPU — see `npu_tool::npu_props`.
         "npu": crate::npu_tool::npu_props(),
         "architecture": cfg.architecture,
+        // Which of `--all`/`--code`/`--review`/`--explorer`/`--embedding`
+        // this process came up as — the same thing the startup banner's
+        // `Mode` row reports, where a client can read it. A coordinator uses
+        // it to decide whether a server it finds already listening can serve
+        // the profile it was about to start one for.
+        "role": state.engine.role.label(),
         "n_ctx": cfg.n_ctx_train,
         "n_vocab": state.engine.tokenizer.vocab_size(),
         "n_embd": cfg.n_embd,
@@ -355,7 +371,8 @@ pub async fn slot_action(
         return (
             StatusCode::BAD_REQUEST,
             format!(
-                "id_slot {id_slot} out of range (server has {} slots)\n",
+                "id_slot {id_slot} {} {} slots)\n",
+                orangu::llm::SLOT_OUT_OF_RANGE_MARKER,
                 state.engine.slots.total()
             ),
         )
@@ -508,6 +525,7 @@ fn default_n_predict() -> usize {
 
 pub async fn completion(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<CompletionRequest>,
 ) -> axum::response::Response {
     if !state.engine.role.allows_generation() {
@@ -524,7 +542,11 @@ pub async fn completion(
         return rejection;
     }
     let tokens = state.engine.tokenizer.encode(&req.prompt, true);
-    let sampling = sampling_from(&req, state.engine.role);
+    if let Some(rejection) = super::reject_oversized_context(tokens.len()) {
+        return rejection;
+    }
+    let role = super::openai::request_role(&state, &headers);
+    let sampling = sampling_from(&req, role);
     let stop_token_ids = state.engine.tokenizer.stop_token_ids();
     let mut rx = state
         .engine
@@ -538,6 +560,7 @@ pub async fn completion(
             cache_prompt: req.cache_prompt,
             id_slot: req.id_slot,
             timings_per_token: false,
+            role: Some(role),
         })
         .await;
 
@@ -676,8 +699,12 @@ pub struct ApplyTemplateResponse {
 
 pub async fn apply_template(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ApplyTemplateRequest>,
 ) -> axum::response::Response {
+    // Same role as a real request would be served under, or this endpoint
+    // would report a prompt the server does not build.
+    let role = super::openai::request_role(&state, &headers);
     let Some(source) = &state.engine.chat_template_source else {
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -686,17 +713,13 @@ pub async fn apply_template(
             .into_response();
     };
     let template = ChatTemplate::new(source.clone());
-    match template.render(&req.messages, true, "", "", state.engine.reasoning()) {
+    match template.render(&req.messages, true, "", "", state.engine.reasoning_as(role)) {
         Ok(mut prompt) => {
             // Mirror `openai::chat_completions`'s own reasoning-suppression
             // prefill, so this endpoint's whole point — showing exactly
             // what will be sent to the model — stays accurate for `Role::
             // Review`.
-            super::openai::append_reasoning_suppression(
-                &mut prompt,
-                state.engine.role,
-                &state.engine.tokenizer,
-            );
+            super::openai::append_reasoning_suppression(&mut prompt, role, &state.engine.tokenizer);
             Json(ApplyTemplateResponse { prompt }).into_response()
         }
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),

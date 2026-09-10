@@ -386,6 +386,32 @@ pub(crate) async fn detect_embeddings_server(
         let Some(profile) = config.llms.get(active_model) else {
             return String::new();
         };
+        // Asked, not tried. A coordinator states which roles it has profiles
+        // for, and an embeddings *request* to one is a model swap: it stops
+        // the chat server, loads the embedding model, and the next request
+        // loads the chat model back — measured at ~25s per client launch, with
+        // the KV cache discarded on the way through, purely to learn something
+        // the answer above already contains.
+        //
+        // The trade is that an `embeddings` profile pointing at a model that
+        // cannot embed is discovered at the first `/search` rather than at
+        // startup. That is the right place for it: a capability nobody used is
+        // not worth two model loads to rule out.
+        if let Some(roles) = orangu::llm::probe_coordinator_roles(
+            &reqwest::Client::new(),
+            &profile.endpoint,
+            profile.api_key.as_deref(),
+        )
+        .await
+        {
+            return if roles.iter().any(|role| role == "embeddings") {
+                active_model.to_string()
+            } else {
+                String::new()
+            };
+        }
+        // An older coordinator reports no roles; establish it the way that
+        // always worked.
         let mut embeddings_profile = profile.clone();
         embeddings_profile.model = "embeddings".to_string();
         return match orangu::embeddings::probe_endpoint(&embeddings_profile).await {

@@ -319,6 +319,240 @@ impl Recorder {
     }
 }
 
+/// A system-wide capture, split into one profile per process afterwards.
+///
+/// The per-pid [`Recorder`] has one blind spot it documents itself: `perf
+/// record -p` attaches to the threads that exist at that instant. That is
+/// survivable for one server that has already served a request. It is not
+/// survivable for a *chain* under a real workload — a coordinator replaces its
+/// `orangu-server` on a model swap, and an `/auto_review` opens with one, so
+/// the process worth profiling is one that did not exist when sampling began.
+/// A second `orangu` started mid-window is the same case.
+///
+/// `perf record -a` has no such instant: every thread on the machine is
+/// sampled from the moment it runs. What comes back is one stream for the
+/// whole machine, and the split into processes is done here, from each
+/// sample's own `comm` and `pid` — so a process that lived for ten seconds of
+/// a sixty-second window gets a graph of exactly those ten seconds.
+///
+/// Costlier than `-p` in what it records, not in what it perturbs: the
+/// sampling rate is per CPU either way.
+pub struct SystemRecorder {
+    perf: Child,
+    data: PathBuf,
+    stderr_log: PathBuf,
+    dir: PathBuf,
+    freq: u32,
+    call_graph: String,
+    png: bool,
+    started: Instant,
+}
+
+/// One process's share of a system-wide capture.
+pub struct ProcessProfile {
+    /// The name the caller's filter gave this process — its layer.
+    pub layer: &'static str,
+    pub pid: u32,
+    pub summary: Summary,
+}
+
+impl SystemRecorder {
+    /// Start sampling every CPU. `dir` is where the per-process profiles go.
+    pub fn start(dir: &Path, freq: u32, call_graph: &str, png: bool) -> anyhow::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        let data = dir.join("system.perf.data");
+        let stderr_log = dir.join("system.perf.log");
+        let log = std::fs::File::create(&stderr_log)?;
+        let mut command = Command::new("perf");
+        command
+            .args(["record", "-a", "-F"])
+            .arg(freq.to_string())
+            .arg("-g")
+            .arg("--call-graph")
+            .arg(call_graph)
+            .arg("-o")
+            .arg(&data)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log));
+        // See `Recorder::start` for why `perf` must not outlive this process.
+        #[cfg(target_os = "linux")]
+        crate::child::die_with_parent(&mut command, libc::SIGINT);
+        let perf = command
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("could not run `perf record -a`: {e}"))?;
+        let mut rec = Self {
+            perf,
+            data,
+            stderr_log,
+            dir: dir.to_path_buf(),
+            freq,
+            call_graph: call_graph.to_string(),
+            png,
+            started: Instant::now(),
+        };
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        if let Ok(Some(status)) = rec.perf.try_wait() {
+            let why = std::fs::read_to_string(&rec.stderr_log).unwrap_or_default();
+            anyhow::bail!(
+                "`perf record -a` exited immediately ({status}): {} — system-wide sampling \
+                 needs kernel.perf_event_paranoid <= 0, or CAP_PERFMON",
+                why.trim().replace('\n', " ")
+            );
+        }
+        Ok(rec)
+    }
+
+    /// Stop sampling and render one flamegraph per process `layer_of` names.
+    ///
+    /// `layer_of` maps a sample's `comm` to a layer name, or `None` to drop
+    /// the process. `comm` is the kernel's 15-byte thread-group name, so a
+    /// caller matching `orangu-coordinator` has to match `orangu-coordina`.
+    pub fn finish(
+        mut self,
+        layer_of: impl Fn(&str) -> Option<&'static str>,
+    ) -> anyhow::Result<Vec<ProcessProfile>> {
+        let seconds = self.started.elapsed().as_secs_f64();
+        let pid = self.perf.id().to_string();
+        let _ = Command::new("kill").args(["-INT", &pid]).status();
+        let status = self.perf.wait()?;
+        if !status.success() && !self.data.exists() {
+            let why = std::fs::read_to_string(&self.stderr_log).unwrap_or_default();
+            anyhow::bail!("`perf record -a` failed: {}", why.trim().replace('\n', " "));
+        }
+        // An explicit field list, so the header has the one shape
+        // `flamegraph::collapse` documents (`comm pid/tid [cpu] time: …`)
+        // regardless of what this `perf` prints by default for `-a`.
+        let script = Command::new("perf")
+            .args([
+                "script",
+                "--no-inline",
+                "-F",
+                "comm,pid,tid,cpu,time,period,event,ip,sym,dso",
+                "-i",
+            ])
+            .arg(&self.data)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|e| anyhow::anyhow!("could not run `perf script`: {e}"))?;
+        if !script.status.success() {
+            anyhow::bail!("`perf script` failed on {}", self.data.display());
+        }
+        let text = String::from_utf8_lossy(&script.stdout);
+
+        // Split the stream by process. Each sample is a header line in column
+        // zero followed by indented frames and a blank line; the header's
+        // `comm` and `pid` say whose it is. The frames are kept verbatim so the
+        // existing collapser sees exactly what it would have seen from `-p`.
+        let mut per_process: std::collections::BTreeMap<(&'static str, u32), String> =
+            std::collections::BTreeMap::new();
+        let mut current: Option<(&'static str, u32)> = None;
+        for line in text.lines() {
+            if !line.starts_with([' ', '\t']) && !line.trim().is_empty() {
+                current = sample_identity(line)
+                    .and_then(|(comm, pid)| layer_of(comm).map(|layer| (layer, pid)));
+                if let Some(key) = current {
+                    per_process.entry(key).or_default().push_str(line);
+                    per_process.get_mut(&key).unwrap().push('\n');
+                }
+                continue;
+            }
+            if let Some(key) = current {
+                let buf = per_process.get_mut(&key).unwrap();
+                buf.push_str(line);
+                buf.push('\n');
+            }
+        }
+        let _ = std::fs::remove_file(&self.data);
+        let _ = std::fs::remove_file(&self.stderr_log);
+
+        let mut out = Vec::new();
+        for ((layer, pid), script) in per_process {
+            let folded = flamegraph::to_folded(&flamegraph::collapse(&script));
+            if folded.trim().is_empty() {
+                continue;
+            }
+            let opts = Options {
+                svg: self.dir.join(format!("{layer}-{pid}.svg")),
+                pid,
+                freq: self.freq,
+                call_graph: self.call_graph.clone(),
+                png: self.png,
+                title: format!("{layer} (pid {pid})"),
+            };
+            let folded_path = sibling(&opts.svg, "folded");
+            std::fs::write(&folded_path, &folded)?;
+            let svg = render(&folded, &opts, seconds, attribution_samples(&folded))?;
+            let png = if self.png { render_png(&svg)? } else { None };
+            let attribution = summarize(&folded);
+            let cores_busy = attribution.samples as f64 / (f64::from(self.freq) * seconds);
+            let meta = sibling(&opts.svg, "meta.json");
+            let _ = std::fs::write(
+                &meta,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "title": opts.title,
+                    "pid": pid,
+                    "freq_hz": self.freq,
+                    "call_graph": self.call_graph,
+                    "seconds": seconds,
+                    "samples": attribution.samples,
+                    "cores_busy": cores_busy,
+                    "gpu_wait_pct": attribution.gpu_wait,
+                    "pool_idle_pct": attribution.pool_idle,
+                    "system_wide": true,
+                }))
+                .unwrap_or_default(),
+            );
+            out.push(ProcessProfile {
+                layer,
+                pid,
+                summary: Summary {
+                    svg,
+                    folded: folded_path,
+                    png,
+                    samples: attribution.samples,
+                    seconds,
+                    cores_busy,
+                    // System-wide sampling has no attach instant to miss
+                    // threads at, which is what the `/proc` cross-check exists
+                    // to catch; and a process that ended mid-window has no
+                    // `/proc` entry left to ask.
+                    cores_from_proc: None,
+                    gpu_wait: attribution.gpu_wait,
+                    pool_idle: attribution.pool_idle,
+                    buckets: attribution.buckets,
+                    leaves: attribution.leaves,
+                },
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// `(comm, pid)` from a `perf script` sample header of the form
+/// `comm pid/tid [cpu] time: …` — the comm may contain spaces, so it is
+/// everything before the first field that looks like a pid.
+fn sample_identity(header: &str) -> Option<(&str, u32)> {
+    let fields: Vec<&str> = header.split_whitespace().collect();
+    let pid_at = fields.iter().position(|f| {
+        let core = f.split_once('/').map_or(*f, |(a, _)| a);
+        !core.is_empty() && core.bytes().all(|b| b.is_ascii_digit())
+    })?;
+    if pid_at == 0 {
+        return None;
+    }
+    let pid_field = fields[pid_at];
+    let pid: u32 = pid_field
+        .split_once('/')
+        .map_or(pid_field, |(a, _)| a)
+        .parse()
+        .ok()?;
+    // Borrow the comm out of the header itself rather than joining.
+    let comm_end = header.find(pid_field)?;
+    Some((header[..comm_end].trim(), pid))
+}
+
 /// One already-collapsed profile, read back off disk.
 pub struct Profile {
     pub name: String,
@@ -907,6 +1141,26 @@ pub fn pid_listening_on(port: u16) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    /// The split that turns one system-wide capture into one profile per
+    /// process rides on reading `comm` and `pid` off every sample header,
+    /// including a comm with a space in it.
+    #[test]
+    fn sample_identity_reads_comm_and_pid_from_a_header() {
+        assert_eq!(
+            super::sample_identity("orangu-server 1234/1250 [003] 98.7654:  250000 cycles:ppp:"),
+            Some(("orangu-server", 1234))
+        );
+        assert_eq!(
+            super::sample_identity("tokio-rt worker 77/78 [000] 1.0: 1 cycles:"),
+            Some(("tokio-rt worker", 77))
+        );
+        // A frame line, or anything without a pid, is nobody's header.
+        assert_eq!(
+            super::sample_identity("        7f0a dot_avx2+0x1c (orangu-server)"),
+            None
+        );
+        assert_eq!(super::sample_identity("1234 [000] 1.0: cycles"), None);
+    }
 
     /// `/proc/<pid>/stat`'s `comm` field is an arbitrary string in parens and
     /// may contain spaces *and* `)`. Counting fields from the start of the line

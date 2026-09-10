@@ -49,6 +49,18 @@ pub async fn coordinator_info(State(coordinator): State<Arc<Coordinator>>) -> Js
         "orangu_coordinator": true,
         "version": crate::VERSION,
         "models": models,
+        // The roles a profile is actually *configured* for, which `models`
+        // cannot express: every conventional role resolves to something there,
+        // falling back to the `all` default, so a client reading it can only
+        // learn that routing will not fail — never that the role exists.
+        //
+        // The difference matters for `embeddings`, because the only other way
+        // to establish it is to send an embeddings request, and through a
+        // coordinator that is not a question — it is a **model swap**. A
+        // client asking it at startup made every session begin by loading the
+        // embedding model and then loading the chat model back, ~25s and a
+        // discarded KV cache, to learn something this field states.
+        "roles": coordinator.configured_roles(),
     }))
 }
 
@@ -133,17 +145,32 @@ pub(crate) fn implied_role_for_path(path: &str) -> Option<&'static str> {
     path.ends_with("/v1/embeddings").then_some("embeddings")
 }
 
+/// The header `orangu-server` reads a request's role from.
+///
+/// The role travels with the request rather than with the process because one
+/// `orangu-server` now serves every profile that names the same model file —
+/// see `CoordinatorLlmEntry::serves_same_process_as`. What a role decides
+/// (sampling defaults, whether reasoning is suppressed) is per request; what a
+/// process decides (which weights are loaded) is not.
+const ROLE_HEADER: &str = "x-orangu-role";
+
 /// One attempt at forwarding the request to `target`, with every header
-/// that isn't hop-by-hop carried over unchanged.
+/// that isn't hop-by-hop carried over unchanged, plus the resolved `role`.
 ///
 /// Split out of [`proxy`] so the same attempt can be made twice — see its
 /// retry path — from one description of what "forward it" means, rather
 /// than two copies that could drift apart in which headers they pass on.
+///
+/// The role is set last and overwrites, so a client that sent its own
+/// `x-orangu-role` cannot pick a role its `model` did not route to: routing is
+/// the coordinator's decision, and this header is how that decision is
+/// carried, not a second way to make it.
 async fn send_upstream(
     coordinator: &Coordinator,
     method: &Method,
     target: &str,
     headers: &HeaderMap,
+    role: &str,
     body: Bytes,
 ) -> Result<reqwest::Response, reqwest::Error> {
     let mut request = coordinator
@@ -151,12 +178,12 @@ async fn send_upstream(
         .request(method.clone(), target)
         .body(body);
     for (name, value) in headers.iter() {
-        if is_hop_by_hop(name) {
+        if is_hop_by_hop(name) || name.as_str() == ROLE_HEADER {
             continue;
         }
         request = request.header(name, value);
     }
-    request.send().await
+    request.header(ROLE_HEADER, role).send().await
 }
 
 pub async fn proxy(
@@ -206,7 +233,15 @@ pub async fn proxy(
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let target = format!("{origin}{path_and_query}");
 
-    let upstream = match send_upstream(&coordinator, &method, &target, &headers, body.clone()).await
+    let upstream = match send_upstream(
+        &coordinator,
+        &method,
+        &target,
+        &headers,
+        &entry.role,
+        body.clone(),
+    )
+    .await
     {
         Ok(response) => response,
         // The child was alive when `ensure_active` checked and gone by the
@@ -232,7 +267,7 @@ pub async fn proxy(
                     .into_response();
             };
             let target = format!("{origin}{path_and_query}");
-            match send_upstream(&coordinator, &method, &target, &headers, body).await {
+            match send_upstream(&coordinator, &method, &target, &headers, &entry.role, body).await {
                 Ok(response) => response,
                 Err(retry) => {
                     return (

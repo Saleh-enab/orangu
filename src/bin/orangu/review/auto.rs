@@ -1503,6 +1503,44 @@ fn auto_review_code_window(workspace: &Path, path: &str, line: usize) -> (usize,
 /// cache to that much text would cost more than the extra context is worth.
 const AUTO_REVIEW_FULL_FILE_MAX_LINES: usize = 4000;
 
+/// The other bound on the "Full file" section, and the one that binds in
+/// practice: **bytes**, not lines.
+///
+/// A line count says nothing about a prompt's size. A 3,588-line C file sits
+/// comfortably inside the line rule and is 109 KiB — about 28k tokens before
+/// its diff is added, and more context than many local deployments will hold
+/// for one request at all.
+///
+/// 32 KiB is about 8k tokens, and 8k is where a prompt stops being cheap.
+/// Attention is quadratic, so prefill rate *falls* as a prompt gets longer and
+/// the last tokens of a long one are the expensive ones. Measured against a
+/// local server, prompt length versus prefill rate and the time one such
+/// request takes:
+///
+/// | tokens | rate | one prefill |
+/// | --: | --: | --: |
+/// | 4k | 170 tok/s | 26 s |
+/// | 8k | 180 | 49 s |
+/// | 12k | 165 | 81 s |
+/// | 16k | 134 | 132 s |
+/// | 20k | 95 | 233 s |
+///
+/// Rate and absolute times differ per machine; the shape does not, and neither
+/// does what it implies — a prompt twice as long costs far more than twice as
+/// much, and past some point a local server declines it outright rather than
+/// spend a context it cannot hold.
+///
+/// This is a per-file cost paid once (the six category requests share the
+/// prefix, so the server prefills it once and reuses it), which is what makes
+/// the file section worth capping rather than the run worth shortening: on a
+/// 37-file change set the cap is the difference between 311k prompt tokens and
+/// 146k, most of it whole files nobody asked to have re-read.
+///
+/// A file over the cap is not reviewed with less care — it is reviewed from
+/// its diff, which is what `auto_review_read_full_file` returning `None` has
+/// always meant, and what the review was before whole-file context existed.
+pub(crate) const AUTO_REVIEW_FULL_FILE_MAX_BYTES: usize = 32 * 1024;
+
 /// Convert `repo_relative_path` — the convention every `/auto_review` file
 /// path uses (relative to the git repo root) — into the path the knowledge
 /// graph indexes by (relative to `workspace`, wherever orangu was actually
@@ -1576,15 +1614,67 @@ pub(crate) fn auto_review_graph_context(
     Some(out)
 }
 
+/// How much diff a retry keeps when the first attempt was refused for length.
+///
+/// Only ever reached on the retry, never on the first attempt, and that is the
+/// point: how much context a server can hold is a property of the machine it
+/// runs on, so the first attempt sends what the review wants and the server
+/// says whether it fits. A cap applied up front would have to assume the
+/// smallest plausible machine and would take context away from every larger
+/// one.
+///
+/// A file whose *diff* alone is over this is a file being added — a few
+/// thousand lines of new code arriving as one hunk, which the diff compressor
+/// cannot shorten because there is no unchanged context in it to drop. The
+/// alternative to keeping a bounded part of it is reviewing none of it.
+const AUTO_REVIEW_RETRY_DIFF_MAX_BYTES: usize = 32 * 1024;
+
+/// `patch` cut to at most `max_bytes`, on a line boundary, with a marker
+/// naming what was left out. Returns it untouched when it already fits.
+///
+/// The marker matters as much as the cut. A model handed a diff that simply
+/// stops has no way to tell "this is the whole change" from "the rest was
+/// withheld", and will happily report the absence of something as a finding —
+/// a missing free, an unclosed branch — that is only missing from what it was
+/// shown.
+fn auto_review_truncate_diff(patch: &str, max_bytes: usize) -> String {
+    if patch.len() <= max_bytes {
+        return patch.to_string();
+    }
+    let mut kept = String::with_capacity(max_bytes + 128);
+    let mut dropped = 0usize;
+    for line in patch.lines() {
+        // `+ 1` for the newline this line will be written with.
+        // `<`, not `<= max_bytes - 1`: the line still needs its newline.
+        if kept.len() + line.len() < max_bytes {
+            kept.push_str(line);
+            kept.push('\n');
+        } else {
+            dropped += 1;
+        }
+    }
+    kept.push_str(&format!(
+        "\n... [{dropped} further diff lines omitted: this change is longer than the server \
+         will accept in one request; the lines above are the part under review] ...\n"
+    ));
+    kept
+}
+
 /// The whole content of `path` (the reviewed, i.e. new, version), read from
 /// `workspace`, for the "Full file" section of a category prompt — the
 /// surrounding context a diff alone doesn't carry. `None` when the file no
-/// longer exists (a deletion), isn't valid UTF-8, or exceeds
-/// `AUTO_REVIEW_FULL_FILE_MAX_LINES`; the diff alone still carries the review
-/// in that case.
-fn auto_review_read_full_file(workspace: &Path, path: &str) -> Option<String> {
+/// longer exists (a deletion), isn't valid UTF-8, or is too big to send —
+/// either too many lines (`AUTO_REVIEW_FULL_FILE_MAX_LINES`) or too many bytes
+/// (`AUTO_REVIEW_FULL_FILE_MAX_BYTES`, the one that binds on real source
+/// files); the diff alone still carries the review in that case.
+pub(crate) fn auto_review_read_full_file(workspace: &Path, path: &str) -> Option<String> {
     let resolved = orangu::tools::resolve_workspace_path(workspace, path).ok()?;
     let content = std::fs::read_to_string(&resolved).ok()?;
+    // Bytes first: it is the cheaper question and the one that usually
+    // answers, and it needs no pass over the content to ask.
+    if content.len() > AUTO_REVIEW_FULL_FILE_MAX_BYTES {
+        return None;
+    }
     if content.lines().count() > AUTO_REVIEW_FULL_FILE_MAX_LINES {
         return None;
     }
@@ -1855,10 +1945,24 @@ pub(crate) fn parse_auto_review_category_response(
 
 /// The per-file, per-category prompt: ask for a verdict plus findings for one
 /// category only, in a fixed plain-text format that
-/// `parse_auto_review_category_response` understands. The full file (when
-/// `file_content` is given) leads, the diff follows, then the cross-file
-/// graph context (Deep mode, when `graph_context` is given), and the category
-/// instruction comes last, so a file's category requests share their prefix
+/// `parse_auto_review_category_response` understands.
+///
+/// **Everything that does not vary comes first.** The full file (when
+/// `file_content` is given) leads, the diff follows, then the cross-file graph
+/// context (Deep mode, when `graph_context` is given), then the guidelines and
+/// the response format — and only then the one paragraph that names the
+/// category. That ordering is worth stating because it was wrong: the category
+/// used to be named *before* the guidelines and the format block, which put
+/// ~280 tokens of text identical across all six categories behind the first
+/// word that differed. A shared prefix ends at the first difference, so those
+/// 280 tokens were re-processed once per category — 2.2s each on a prompt
+/// whose other 960 tokens were already cached — for a paragraph that could
+/// simply have gone last.
+///
+/// The category is now the last thing the model reads before answering, which
+/// is also where an instruction is least likely to be lost.
+///
+/// The requests share their prefix
 /// and — pinned to the same orangu-server slot (`run_auto_review_mode` attaches
 /// one `ChatSession` per file to a single `id_slot`) — the server's KV cache
 /// can reuse the processed file and diff across them instead of
@@ -1904,8 +2008,6 @@ pub(crate) fn build_auto_review_category_prompt_with_stats(
              ```diff\n{}\n```\n\
              \n\
              {graph_section}\
-             Review only the changes — the added, removed, and modified lines — for {category} issues ({focus}), and judge how the changes fit into the surrounding context. Do not review pre-existing content the change does not touch.\n\
-             \n\
              GUIDELINES:\n\
              1. It meaningfully impacts the accuracy, performance, security, or maintainability of the code.\n\
              2. The bug is discrete and actionable (not pedantic nitpicks).\n\
@@ -1918,7 +2020,9 @@ pub(crate) fn build_auto_review_category_prompt_with_stats(
              FINDINGS:\n\
              - <line>: [Score: <0-100>] <finding, or None>\n\
              \n\
-             List at most five findings, one short line each, prefixed with the affected line number — or range, as `<start>-<end>` — in the new version of the file (the right side of the diff, the lines marked with `+` or unchanged). Only report real {category} issues introduced by the changes. Answer REJECT only when a finding must be fixed before merging; otherwise answer APPROVE.",
+             List at most five findings, one short line each, prefixed with the affected line number — or range, as `<start>-<end>` — in the new version of the file (the right side of the diff, the lines marked with `+` or unchanged). Answer REJECT only when a finding must be fixed before merging; otherwise answer APPROVE.\n\
+             \n\
+             Review only the changes — the added, removed, and modified lines — for {category} issues ({focus}), and judge how the changes fit into the surrounding context. Do not review pre-existing content the change does not touch. Only report real {category} issues introduced by the changes.",
             context.content
         ),
         stats,
@@ -2233,7 +2337,9 @@ pub(crate) async fn run_auto_review_mode(
             continue;
         }
         state.selected = Some(index);
-        let (path, patch) = {
+        // `mut patch`: a server that refuses the prompt for length gets a
+        // shorter one — see the retry below.
+        let (path, mut patch) = {
             let file = &state.files[index];
             (file.path.clone(), file.patch.clone())
         };
@@ -2242,7 +2348,12 @@ pub(crate) async fn run_auto_review_mode(
         // `AUTO_REVIEW_FULL_FILE_MAX_LINES`), read once per file and folded
         // into every category prompt below, so the model sees more than just
         // the changed lines.
-        let file_content = auto_review_read_full_file(workspace, &path);
+        // `mut`: a server can still refuse a prompt this builds — its device
+        // holds less context than `AUTO_REVIEW_FULL_FILE_MAX_BYTES` assumes,
+        // or the diff is itself enormous — and the answer to that is to drop
+        // the whole-file section and review the file from its diff, for this
+        // category and every one after it. See the retry below.
+        let mut file_content = auto_review_read_full_file(workspace, &path);
         let deep = state.is_deep(index);
         // Deep mode: never truncate the diff, and fold in the changed
         // symbols' cross-file callers/callees from the knowledge graph — the
@@ -2266,6 +2377,11 @@ pub(crate) async fn run_auto_review_mode(
         let session_start = scratch.checkpoint();
         let mut any_rejected = false;
         let mut any_failed = false;
+        // Whether this file's prompt has already been shrunk once for length.
+        // One retry, not a loop: if the smaller prompt is refused too, the
+        // request has failed for a reason retrying cannot fix, and the run
+        // records it and moves on rather than bisecting its way down.
+        let mut shrunk = false;
         for (section, focus) in *categories {
             let section = *section;
             let category = AUTO_REVIEW_CATEGORIES[section];
@@ -2289,7 +2405,7 @@ pub(crate) async fn run_auto_review_mode(
                 metrics.record(&stats);
             }
             let llm_start = std::time::Instant::now();
-            let outcome = run_auto_review_request(
+            let mut outcome = run_auto_review_request(
                 &mut scratch,
                 &prompt,
                 prompt_profile,
@@ -2300,6 +2416,49 @@ pub(crate) async fn run_auto_review_mode(
                 print_screen_fn,
             )
             .await?;
+            // A prompt the server's device cannot hold is the one failure this
+            // run can answer by itself, and how much it can hold is a property
+            // of the machine — so the size is discovered rather than assumed:
+            // send what the review wants, and shrink only if this server says
+            // it does not fit. Both the whole-file section (almost all of an
+            // oversized prompt) and, for a file being *added*, the diff go —
+            // the second because a few thousand lines of new code arrive as
+            // one unshortenable hunk, and dropping the file section alone
+            // leaves that untouched.
+            //
+            // Kept for the rest of this file's categories, so the retry
+            // happens once per file rather than once per category.
+            if let AutoReviewRequestOutcome::Completed(Err(err)) = &outcome
+                && !shrunk
+                && orangu::llm::is_context_too_long(&format!("{err:#}"))
+            {
+                shrunk = true;
+                file_content = None;
+                patch = auto_review_truncate_diff(&patch, AUTO_REVIEW_RETRY_DIFF_MAX_BYTES);
+                scratch.rollback(session_start);
+                let (retry, _) = build_auto_review_category_prompt_with_stats(
+                    &path,
+                    None,
+                    graph_context.as_deref(),
+                    category,
+                    focus,
+                    &patch,
+                    file_compression_enabled,
+                    diff_file_cap,
+                    Some(compression_store.as_ref()),
+                );
+                outcome = run_auto_review_request(
+                    &mut scratch,
+                    &retry,
+                    prompt_profile,
+                    &mut state,
+                    viewport,
+                    chrome,
+                    feedback,
+                    print_screen_fn,
+                )
+                .await?;
+            }
             // Reset to just the system message: the next category's request
             // starts fresh (no growing chat history, no cross-category
             // contamination), while `scratch`'s pinned `id_slot` — a property
@@ -4156,6 +4315,78 @@ mod tests {
         // The category-specific instruction only appears after the diff.
         assert!(code[diff_end..].contains("Code issues"));
         assert!(security[diff_end..].contains("Security issues"));
+
+        // And the shared part runs much further than the diff: everything
+        // that does not vary — guidelines, response format, the findings
+        // rules — precedes the one paragraph that names the category.
+        //
+        // This is the property the server's prefix cache is paid in. When the
+        // category came first, the ~280 tokens behind it were identical and
+        // re-processed for every category; the assertion is that the common
+        // prefix now reaches the *last* few percent of the prompt rather than
+        // stopping two thirds of the way in.
+        let common = code
+            .bytes()
+            .zip(security.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        assert!(
+            common > diff_end,
+            "the guidelines are no longer shared: common {common}, diff ends {diff_end}"
+        );
+        // Stated as *what* is shared rather than as a fraction, which a
+        // synthetic one-hunk patch would make meaningless: on a real file the
+        // diff dwarfs everything here.
+        assert!(
+            code[..common].contains("GUIDELINES:"),
+            "the guidelines fall outside the shared prefix"
+        );
+        assert!(
+            code[..common].contains("VERDICT: APPROVE or REJECT"),
+            "the response format falls outside the shared prefix"
+        );
+        // And what is left is the one paragraph that names the category.
+        assert!(code[common..].contains("Code"));
+        assert!(
+            !code[common..].contains("GUIDELINES:"),
+            "something invariant is still being re-sent per category"
+        );
+    }
+
+    /// The whole-file section is bounded by **bytes**, and the line rule alone
+    /// does not bound it: a source file can sit well inside 4,000 lines and
+    /// still be a six-figure prompt, which is what made a 37-file review 311k
+    /// prompt tokens and put four of its files past what the server would
+    /// serve at all.
+    #[test]
+    fn a_large_file_is_reviewed_from_its_diff_alone() {
+        use crate::review::{AUTO_REVIEW_FULL_FILE_MAX_BYTES, auto_review_read_full_file};
+
+        let dir = std::env::temp_dir().join(format!(
+            "orangu-review-cap-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Few lines, many bytes — exactly the shape the line rule misses.
+        let wide = format!("{}\n", "x".repeat(AUTO_REVIEW_FULL_FILE_MAX_BYTES + 1));
+        std::fs::write(dir.join("wide.c"), &wide).unwrap();
+        assert_eq!(
+            auto_review_read_full_file(&dir, "wide.c"),
+            None,
+            "two lines, and still too much prompt to send"
+        );
+
+        let ordinary = "int main(void) { return 0; }\n";
+        std::fs::write(dir.join("small.c"), ordinary).unwrap();
+        assert_eq!(
+            auto_review_read_full_file(&dir, "small.c").as_deref(),
+            Some(ordinary),
+            "an ordinary source file still gets its whole-file context"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

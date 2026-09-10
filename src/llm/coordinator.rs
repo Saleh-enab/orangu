@@ -46,6 +46,54 @@ pub async fn probe_coordinator(
     parse_coordinator_body(&body)
 }
 
+/// The roles an orangu-coordinator at `endpoint` has a **configured profile**
+/// for (`GET /v1/coordinator`'s `roles`), or `None` when the endpoint is not a
+/// coordinator or is too old to report them.
+///
+/// The point of asking is to learn what a coordinator can do *without making
+/// it do it*. Establishing embeddings support by sending an embeddings request
+/// is a model swap: the coordinator stops the chat server, loads the embedding
+/// model, and the next request loads the chat model back — twice the load time
+/// of a cold start and a discarded KV cache, at every client launch, to answer
+/// a question the coordinator can simply state.
+pub async fn probe_coordinator_roles(
+    http_client: &reqwest::Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+) -> Option<Vec<String>> {
+    let url = format!("{}/v1/coordinator", normalized_openai_endpoint(endpoint));
+    let mut request = http_client.get(url);
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+    let response = request.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body: Value = response.json().await.ok()?;
+    parse_coordinator_roles(&body)
+}
+
+/// Parses `roles` out of a `GET /v1/coordinator` body, or `None` when the body
+/// is not a coordinator's or carries no `roles` — an older coordinator, whose
+/// caller then falls back to establishing the capability the expensive way.
+fn parse_coordinator_roles(body: &Value) -> Option<Vec<String>> {
+    if !body
+        .get("orangu_coordinator")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let roles: Vec<String> = body
+        .get("roles")?
+        .as_array()?
+        .iter()
+        .filter_map(|role| role.as_str().map(str::to_string))
+        .collect();
+    (!roles.is_empty()).then_some(roles)
+}
+
 /// Parses a `GET /v1/coordinator` response body: `Some(models)` — every
 /// distinct model named in its `models` map, deduplicated — when
 /// `orangu_coordinator` is `true`, `None` otherwise. Split out of
@@ -94,6 +142,37 @@ mod tests {
             models,
             vec!["org/gemma".to_string(), "org/qwen".to_string()]
         );
+    }
+
+    /// The field exists so a client can learn what a coordinator can do
+    /// without making it do it — an embeddings *request* through a
+    /// coordinator is a model swap, not a question.
+    #[test]
+    fn roles_are_read_only_from_a_coordinators_own_answer() {
+        use serde_json::json;
+        let body = json!({
+            "orangu_coordinator": true,
+            "models": {"all": "org/chat", "embeddings": "org/chat"},
+            "roles": ["all", "code", "embeddings"],
+        });
+        assert_eq!(
+            super::parse_coordinator_roles(&body),
+            Some(vec![
+                "all".to_string(),
+                "code".to_string(),
+                "embeddings".to_string()
+            ])
+        );
+
+        // An older coordinator names no roles: `None`, so the caller falls
+        // back to establishing the capability rather than concluding it has
+        // none.
+        let older = json!({"orangu_coordinator": true, "models": {"all": "org/chat"}});
+        assert_eq!(super::parse_coordinator_roles(&older), None);
+
+        // And a plain server's body is never read as a coordinator's.
+        let plain = json!({"roles": ["all"]});
+        assert_eq!(super::parse_coordinator_roles(&plain), None);
     }
 
     #[test]

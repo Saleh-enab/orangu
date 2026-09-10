@@ -89,6 +89,37 @@ pub const KNOWN_ROLES: &[&str] = &["all", "code", "review", "explorer", "embeddi
 /// own flag is `--embedding` (singular) — every other role's flag matches
 /// its role name exactly. Returns `None` for anything not in
 /// [`KNOWN_ROLES`].
+/// Whether two roles can be served by one `orangu-server` process.
+///
+/// The four generation roles can: what separates them is sampling defaults
+/// and reasoning suppression, and both travel with the request. `embeddings`
+/// cannot be one of them, in either direction, however identical the rest of
+/// the profile is — an `--embedding` server refuses the generation endpoints
+/// outright, so sharing a process with a chat role would answer chat requests
+/// with `501` instead of swapping to something that can serve them.
+///
+/// An unknown role only shares with itself. Config loading rejects those
+/// (`parse_llm_profiles`), so this is the conservative reading of a value that
+/// should not exist rather than a case with behaviour to define.
+pub fn roles_share_a_process(a: &str, b: &str) -> bool {
+    // `review` is **not** in this set, by operator decision: a review is run
+    // by an `orangu-server --review`, a real process in that role, not by
+    // another process answering a request labelled `review`. The two are
+    // behaviourally the same — every effect of the role travels per request —
+    // but which of them is running is a thing an operator reads off the
+    // startup banner's `Mode` row and expects to be true.
+    //
+    // What it costs is a model load each way when a session alternates chat
+    // and review. `all`, `code` and `explorer` still share, so ordinary work
+    // never pays it.
+    //
+    // `embeddings` is excluded for a stronger reason: an `--embedding` server
+    // refuses the generation endpoints outright, so sharing a process with a
+    // chat role would answer chat with `501` instead of swapping.
+    const SHARED: [&str; 3] = ["all", "code", "explorer"];
+    a == b || (SHARED.contains(&a) && SHARED.contains(&b))
+}
+
 pub fn role_server_flag(role: &str) -> Option<&'static str> {
     match role {
         "all" => Some("--all"),
@@ -215,6 +246,32 @@ pub struct CoordinatorLlmEntry {
 }
 
 impl CoordinatorLlmEntry {
+    /// Whether an `orangu-server` started for `other` is already serving what
+    /// this profile asks for — the same model file under the same listener and
+    /// the same device settings, differing at most in `role`.
+    ///
+    /// A role is not a property of the process it needs to be. It selects
+    /// sampling defaults and whether reasoning is suppressed, both of which
+    /// `orangu-server` will take per request (`x-orangu-role`). Everything
+    /// else here *is* baked into the process: the model it loaded, the address
+    /// it bound, the backend it chose, the slots it sized its pools for.
+    ///
+    /// What this saves is not a nicety. A `code` and a `review` profile that
+    /// name the same file used to cost a full stop-and-reload to move between
+    /// — gigabytes of identical weights re-read, ~11s each way on a small
+    /// model — and every cached prefix on the old process died with it. An
+    /// `/auto_review` run alternating with ordinary chat paid that twice per
+    /// turn, for nothing that changes an answer.
+    pub fn serves_same_process_as(&self, other: &Self) -> bool {
+        roles_share_a_process(&self.role, &other.role)
+            && self.model == other.model
+            && self.host == other.host
+            && self.port == other.port
+            && self.backend == other.backend
+            && self.slots == other.slots
+            && self.web == other.web
+    }
+
     /// The origin (`http://host:port`) requests are proxied to once this
     /// entry's `orangu-server` is active, with [`HOST_ALL`] (and its `*`
     /// alias) resolved to loopback — see [`resolve_connect_host`] for why a
@@ -797,6 +854,90 @@ mod tests {
         assert_eq!(models["code"], "org/gemma");
         assert_eq!(models["review"], "org/gemma");
         assert_eq!(models["embeddings"], "org/gemma");
+    }
+
+    /// The distinction the coordinator now turns a model reload on: two
+    /// profiles that differ only in role are one process, and anything that
+    /// changes what the process *is* — the model above all — is not.
+    #[test]
+    fn only_the_role_may_differ_for_two_profiles_to_share_a_process() {
+        let base = CoordinatorLlmEntry {
+            name: "all".to_string(),
+            role: "all".to_string(),
+            model: "org/model:Q4_K_M".to_string(),
+            host: "all".to_string(),
+            port: 8100,
+            backend: None,
+            slots: None,
+            web: None,
+        };
+
+        // `all` and `code` differ in nothing a process can express, so they
+        // are one.
+        let code = CoordinatorLlmEntry {
+            name: "code".to_string(),
+            role: "code".to_string(),
+            ..base.clone()
+        };
+        assert!(base.serves_same_process_as(&code));
+        assert!(code.serves_same_process_as(&base), "and both ways round");
+
+        // `review` is not, by operator decision: a review runs on an
+        // `orangu-server --review`, which is what the banner then says.
+        let review = CoordinatorLlmEntry {
+            name: "review".to_string(),
+            role: "review".to_string(),
+            ..base.clone()
+        };
+        assert!(!base.serves_same_process_as(&review));
+        assert!(!review.serves_same_process_as(&base));
+
+        // An embedding server refuses the generation endpoints, so it is not
+        // interchangeable with a chat role however identical the rest is.
+        let embeddings = CoordinatorLlmEntry {
+            name: "embeddings".to_string(),
+            role: "embeddings".to_string(),
+            ..base.clone()
+        };
+        assert!(!base.serves_same_process_as(&embeddings));
+        assert!(!embeddings.serves_same_process_as(&base));
+        assert!(
+            embeddings.serves_same_process_as(&CoordinatorLlmEntry {
+                name: "embeddings-2".to_string(),
+                ..embeddings.clone()
+            }),
+            "two embedding profiles on one model are still one process"
+        );
+
+        // Everything else is a different process.
+        for different in [
+            CoordinatorLlmEntry {
+                model: "org/other:Q4_K_M".to_string(),
+                ..code.clone()
+            },
+            CoordinatorLlmEntry {
+                port: 8101,
+                ..code.clone()
+            },
+            CoordinatorLlmEntry {
+                backend: Some("cpu".to_string()),
+                ..code.clone()
+            },
+            CoordinatorLlmEntry {
+                slots: Some(4),
+                ..code.clone()
+            },
+            CoordinatorLlmEntry {
+                web: Some(8200),
+                ..code.clone()
+            },
+        ] {
+            assert!(
+                !base.serves_same_process_as(&different),
+                "'{}' differs in more than its role",
+                different.name
+            );
+        }
     }
 
     #[test]

@@ -2313,6 +2313,14 @@ pub fn read_reference_fixture(name: &str) -> Option<String> {
 pub struct GreedySampleParams<'a> {
     pub recent_tokens: &'a [u32],
     pub repeat_penalty: f32,
+    /// `0` asks for the greedy token. `k > 0` asks for the `k` largest
+    /// penalized logits instead ([`ForwardOutcome::Candidates`]), for a
+    /// *sampled* step whose sampler only ever looks at its top `k` — the
+    /// whole-vocabulary readback and host scan it replaces were a tenth of a
+    /// token. An architecture without the device path returns `Logits` as
+    /// before; one with the greedy path only must not answer a `k > 0` with
+    /// an argmax.
+    pub top_k: u32,
 }
 
 /// [`ModelForward::forward_maybe_sampling`]'s result: either the callee
@@ -2324,10 +2332,38 @@ pub struct GreedySampleParams<'a> {
 pub enum ForwardOutcome {
     Token(u32),
     Logits(Vec<f32>),
+    /// The `top_k` largest `(token, logit)` after the repeat penalty,
+    /// largest first — see [`GreedySampleParams::top_k`].
+    Candidates(Vec<(u32, f32)>),
+}
+
+/// One sequence's share of a batched decode step — its cache, the position
+/// its next token takes, and the slot whose per-slot device resources it
+/// uses.
+pub struct DecodeRow<'a> {
+    pub cache: &'a mut KvCache,
+    pub pos: usize,
+    pub slot: usize,
 }
 
 pub trait ModelForward: Send + Sync {
     fn config(&self) -> &ModelConfig;
+
+    /// One decode step for several sequences at once — `tokens[i]` at
+    /// `rows[i].pos` into `rows[i].cache` — returning each row's next-token
+    /// logits, with the weights read once for all of them. `Ok(None)` means
+    /// the architecture (or this backend, or this batch's shape) does not
+    /// batch, and the caller steps the sequences one by one. An
+    /// architecture that supports it advances every row's cache exactly as
+    /// its own `forward` would have.
+    fn forward_decode_batch(
+        &self,
+        rows: &mut [DecodeRow<'_>],
+        tokens: &[u32],
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        let _ = (rows, tokens);
+        Ok(None)
+    }
 
     /// How many layers the forward pass actually runs.
     ///

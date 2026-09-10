@@ -1294,7 +1294,21 @@ fn softcap_slice(x: &mut [f32], cap: f32) {
     unsafe {
         softcap_neon(x, cap)
     };
-    #[cfg(not(target_arch = "aarch64"))]
+    // Runtime-detected, like `dot`: what the build was compiled for says
+    // nothing about the machine it is running on.
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: guarded by the checks above; the helper reads and
+            // writes only within `x`.
+            unsafe { softcap_avx2(x, cap) };
+            return;
+        }
+        for v in x.iter_mut() {
+            *v = (*v / cap).tanh() * cap;
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     for v in x.iter_mut() {
         *v = (*v / cap).tanh() * cap;
     }
@@ -1352,7 +1366,19 @@ fn gelu_slice(x: &mut [f32]) {
     unsafe {
         gelu_neon(x)
     };
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: guarded by the checks above; the helper reads and
+            // writes only within `x`.
+            unsafe { gelu_avx2(x) };
+            return;
+        }
+        for v in x.iter_mut() {
+            *v = gelu(*v);
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     for v in x.iter_mut() {
         *v = gelu(*v);
     }
@@ -1383,6 +1409,109 @@ unsafe fn exp_neon(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::fl
             23,
         ));
         vmulq_f32(p, scale)
+    }
+}
+
+/// `e^x` for eight lanes on AVX2 — [`exp_neon`]'s twin, same range reduction
+/// (`x = n*ln2 + r`), same degree-5 polynomial, same clamp.
+///
+/// Two implementations of one approximation, because the alternative is a
+/// library call per element and this is applied a quarter of a million times
+/// per generated token. They are written to the same recipe deliberately: a
+/// second approximation would be a second set of numerics for a model to be
+/// subtly different under, and the tests hold both to the same scalar form.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn exp_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    {
+        let x = _mm256_min_ps(
+            _mm256_max_ps(x, _mm256_set1_ps(-88.0)),
+            _mm256_set1_ps(88.0),
+        );
+        // Round-to-nearest, matching `vrndnq_f32`.
+        let n = _mm256_round_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(
+            _mm256_mul_ps(x, _mm256_set1_ps(std::f32::consts::LOG2_E)),
+        );
+        let r = _mm256_fmadd_ps(n, _mm256_set1_ps(-0.693_359_4), x);
+        let r = _mm256_fmadd_ps(n, _mm256_set1_ps(2.121_944_4e-4), r);
+        let mut p = _mm256_fmadd_ps(r, _mm256_set1_ps(1.0 / 120.0), _mm256_set1_ps(1.0 / 24.0));
+        p = _mm256_fmadd_ps(r, p, _mm256_set1_ps(1.0 / 6.0));
+        p = _mm256_fmadd_ps(r, p, _mm256_set1_ps(0.5));
+        p = _mm256_fmadd_ps(r, p, _mm256_set1_ps(1.0));
+        p = _mm256_fmadd_ps(r, p, _mm256_set1_ps(1.0));
+        // `2^n`, built straight into the exponent field.
+        let scale = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(
+            _mm256_cvtps_epi32(n),
+            _mm256_set1_epi32(127),
+        )));
+        _mm256_mul_ps(p, scale)
+    }
+}
+
+/// `tanh(t)` for eight lanes, written `1 - 2/(e^{2t} + 1)` — the same
+/// rearrangement both NEON paths use, so one exponential replaces a library
+/// call.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn tanh_avx2(t: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let e = exp_avx2(_mm256_add_ps(t, t));
+        _mm256_sub_ps(
+            _mm256_set1_ps(1.0),
+            _mm256_div_ps(_mm256_set1_ps(2.0), _mm256_add_ps(e, _mm256_set1_ps(1.0))),
+        )
+    }
+}
+
+/// [`softcap_slice`] on AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn softcap_avx2(x: &mut [f32], cap: f32) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let inv = _mm256_set1_ps(1.0 / cap);
+        let capv = _mm256_set1_ps(cap);
+        let n = x.len();
+        let mut i = 0;
+        while i + 8 <= n {
+            let v = _mm256_loadu_ps(x.as_ptr().add(i));
+            let tanh = tanh_avx2(_mm256_mul_ps(v, inv));
+            _mm256_storeu_ps(x.as_mut_ptr().add(i), _mm256_mul_ps(tanh, capv));
+            i += 8;
+        }
+        for v in x[i..].iter_mut() {
+            *v = (*v / cap).tanh() * cap;
+        }
+    }
+}
+
+/// [`gelu_slice`] on AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn gelu_avx2(x: &mut [f32]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let n = x.len();
+        let mut i = 0;
+        while i + 8 <= n {
+            let v = _mm256_loadu_ps(x.as_ptr().add(i));
+            // `t = sqrt(2/pi) * v * (1 + A v^2)`
+            let vv = _mm256_mul_ps(v, v);
+            let inner = _mm256_fmadd_ps(vv, _mm256_set1_ps(GELU_COEF_A), _mm256_set1_ps(1.0));
+            let t = _mm256_mul_ps(_mm256_mul_ps(v, _mm256_set1_ps(SQRT_2_OVER_PI)), inner);
+            let tanh = tanh_avx2(t);
+            let out = _mm256_mul_ps(
+                _mm256_mul_ps(v, _mm256_set1_ps(0.5)),
+                _mm256_add_ps(_mm256_set1_ps(1.0), tanh),
+            );
+            _mm256_storeu_ps(x.as_mut_ptr().add(i), out);
+            i += 8;
+        }
+        for v in x[i..].iter_mut() {
+            *v = gelu(*v);
+        }
     }
 }
 

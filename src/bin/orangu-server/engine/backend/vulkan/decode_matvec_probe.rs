@@ -42,6 +42,14 @@
 //! own numbers are made of, and it is reported per call in microseconds so it
 //! can be multiplied by a token's call count directly.
 //!
+//! **Two clocks.** The wall-clock columns are the call as the host sees it,
+//! fixed cost included; the `kernel us` column is the dispatch alone, from
+//! the device's own timestamps around a burst of back-to-back dispatches
+//! (`VulkanBackend::dispatch_kernel_us`). At a decode shape the two differ
+//! by more than the kernel itself, and a short burst is read at whatever
+//! clock the device idles at — `ORANGU_SWEEP_KERNEL_REPS` lengthens it.
+//! A kernel change is judged by the second clock, never the first.
+//!
 //! `cargo test --release --bin orangu-server decode_matvec -- --ignored --nocapture`
 
 use super::*;
@@ -354,6 +362,11 @@ fn decode_matvec_fixed_cost_gpu_versus_cpu() {
 /// `block_hoisted_suffix`. A change to the block-hoisted family should move
 /// the middle of this list and leave the ends alone.
 const SWEEP_FORMATS: &[(&str, u32)] = &[
+    // `F32` is not a format a weight is *stored* in for size, but real files
+    // carry it for small per-layer tensors — gemma 4's per-layer-embedding
+    // gate and projection are F32, 3 MiB a layer — and a decode step reads
+    // every one of them. Its rate is the one that says what those cost.
+    ("F32", crate::engine::quant::GGML_TYPE_F32),
     ("F16", crate::engine::quant::GGML_TYPE_F16),
     ("Q4_0", crate::engine::quant::GGML_TYPE_Q4_0),
     ("Q4_1", crate::engine::quant::GGML_TYPE_Q4_1),
@@ -391,13 +404,27 @@ fn decode_matvec_format_sweep_gpu_versus_cpu() {
     // quarter of the width is ~440 MiB for the whole sweep, under the point
     // where the stall begins, and every weight here is still far larger than
     // any cache, which is all a bandwidth measurement needs.
-    let (in_dim, out_dim) = (2048usize, 32768usize);
+    // `ORANGU_SWEEP_SHAPE=in,out` puts the sweep at another shape — the one
+    // the reference engine's own op benchmark uses (`14336,4096`), so the two
+    // kernels can be read at the same bytes, or a model's FFN (`1536,6144`).
+    let (in_dim, out_dim) = std::env::var("ORANGU_SWEEP_SHAPE")
+        .ok()
+        .and_then(|v| {
+            let (a, b) = v.split_once(',')?;
+            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+        })
+        .unwrap_or((2048usize, 32768usize));
     let x = vec![0.05f32; in_dim];
 
     println!("\n== one shape [1 x {in_dim}] x [{in_dim} x {out_dim}], every format ==");
+    // `kernel us` is the dispatch alone, from the device's own timestamps
+    // around a run of back-to-back dispatches (`matmul_kernel_us`); `GPU us`
+    // is the whole call as the host sees it. At a decode shape the two differ
+    // by the call's fixed cost, which is what a kernel change must not be
+    // read through.
     println!(
-        "{:>8} {:>9} {:>11} {:>11} {:>9} {:>9}",
-        "type", "MiB", "GPU us", "CPU us", "GPU GB/s", "CPU GB/s"
+        "{:>8} {:>9} {:>11} {:>11} {:>9} {:>11} {:>11} {:>9}",
+        "type", "MiB", "GPU us", "CPU us", "GPU GB/s", "CPU GB/s", "kernel us", "kern GB/s"
     );
     // Two passes over the whole list, each format keeping its better pass.
     // Within a format `median_us` already defends against a single hiccup,
@@ -416,7 +443,15 @@ fn decode_matvec_format_sweep_gpu_versus_cpu() {
     // per process removes that entirely — every run measures the same thing
     // from the same starting state.
     let only = std::env::var("ORANGU_SWEEP_ONLY").ok();
-    let mut best: std::collections::HashMap<&str, (f64, f64)> = std::collections::HashMap::new();
+    // Dispatches per timed pass for the kernel column. A short burst is read
+    // at whatever clock the device idles at; `ORANGU_SWEEP_KERNEL_REPS` makes
+    // the burst long enough to be read at the clock a decode runs at.
+    let kernel_reps: u32 = std::env::var("ORANGU_SWEEP_KERNEL_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(reps as u32);
+    let mut best: std::collections::HashMap<&str, (f64, f64, f64)> =
+        std::collections::HashMap::new();
     for _ in 0..2 {
         for &(label, ggml_type) in SWEEP_FORMATS {
             if only.as_deref().is_some_and(|want| want != label) {
@@ -439,25 +474,37 @@ fn decode_matvec_format_sweep_gpu_versus_cpu() {
             let cpu_us = median_us(reps, || {
                 let _ = cpu.matmul(&x, 1, &w);
             });
-            let seen = best.entry(label).or_insert((f64::MAX, f64::MAX));
+            // The median of `reps` runs of `reps` dispatches: one warm-up
+            // dispatch already happened in `gpu.matmul` above, so every
+            // dispatch here reads a resident weight.
+            let kernel_us = {
+                let mut runs: Vec<f64> = (0..reps)
+                    .filter_map(|_| gpu.matmul_kernel_us(&x, &w, kernel_reps))
+                    .collect();
+                runs.sort_by(|a, b| a.total_cmp(b));
+                runs.get(runs.len() / 2).copied().unwrap_or(f64::NAN)
+            };
+            let seen = best.entry(label).or_insert((f64::MAX, f64::MAX, f64::MAX));
             seen.0 = seen.0.min(gpu_us);
             seen.1 = seen.1.min(cpu_us);
+            seen.2 = seen.2.min(kernel_us);
         }
     }
     for &(label, ggml_type) in SWEEP_FORMATS {
         let Some((bytes_per_block, block)) = crate::engine::quant::block_layout(ggml_type) else {
             continue;
         };
-        let Some(&(gpu_us, cpu_us)) = best.get(label) else {
+        let Some(&(gpu_us, cpu_us, kernel_us)) = best.get(label) else {
             continue;
         };
         let bytes = in_dim * out_dim / block * bytes_per_block;
         let gbs = |us: f64| bytes as f64 / (us * 1e3);
         println!(
-            "{label:>8} {:>9.1} {gpu_us:>11.0} {cpu_us:>11.0} {:>9.1} {:>9.1}",
+            "{label:>8} {:>9.1} {gpu_us:>11.0} {cpu_us:>11.0} {:>9.1} {:>11.1} {kernel_us:>11.1} {:>9.1}",
             bytes as f64 / (1024.0 * 1024.0),
             gbs(gpu_us),
-            gbs(cpu_us)
+            gbs(cpu_us),
+            gbs(kernel_us)
         );
     }
 }
@@ -554,5 +601,262 @@ fn teardown_probe_holds_gpu_memory() {
         (out_dim * row_bytes) as f64 / (1024.0 * 1024.0),
         (out_dim * row_bytes * reps) as f64 / (1024.0 * 1024.0),
         at.elapsed().as_secs_f64() * 1e3,
+    );
+}
+
+/// **What does one whole-row norm cost as a decode step pays it?** A layer
+/// runs several single-workgroup RMSNorm-family dispatches over the model
+/// width, each a barrier-bounded dispatch of its own; this reads each at the
+/// device's clock, back to back, so a rewrite of the kernel can be judged
+/// against the floor a trivial dispatch already costs.
+///
+/// `ORANGU_NORM_PROBE_WIDTH=1536` picks the row width.
+///
+/// `cargo test --release --bin orangu-server norm_kernel_probe -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn norm_kernel_probe() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(gpu) = shared_test_backend() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let n_embd: usize = std::env::var("ORANGU_NORM_PROBE_WIDTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1536);
+    let reps = 2000;
+    println!("\n== whole-row norm dispatches at width {n_embd}, {reps} back to back ==");
+    for which in ["norm", "norm_add"] {
+        let mut runs: Vec<f64> = (0..21)
+            .filter_map(|_| gpu.norm_kernel_us(which, n_embd, reps))
+            .collect();
+        runs.sort_by(|a, b| a.total_cmp(b));
+        match runs.get(runs.len() / 2) {
+            Some(us) => println!("{which:>10} {us:>8.1} us"),
+            None => println!("{which:>10} (no timestamp query)"),
+        }
+    }
+}
+
+/// **What does one `queue.submit` cost the host?** Times an empty
+/// submission, then one carrying a single trivial dispatch — the floor a
+/// decode step pays per submission before any of its own commands.
+///
+/// `cargo test --release --bin orangu-server submit_cost_probe -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn submit_cost_probe() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(gpu) = shared_test_backend() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    // Warm: the first submissions pay one-time setup.
+    for _ in 0..5 {
+        let encoder = gpu.new_encoder("warm");
+        gpu.queue.submit(Some(encoder.finish()));
+    }
+    gpu.poll_blocking("submit probe warm-up");
+    let reps = 200;
+    let t = std::time::Instant::now();
+    for _ in 0..reps {
+        let encoder = gpu.new_encoder("empty");
+        gpu.queue.submit(Some(encoder.finish()));
+    }
+    let empty_us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+    gpu.poll_blocking("submit probe");
+    let t = std::time::Instant::now();
+    for _ in 0..reps {
+        let mut encoder = gpu.new_encoder("finish only");
+        {
+            let _pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+        }
+        let _ = encoder.finish();
+    }
+    let finish_us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+    println!("\n== queue.submit, host time per call ==");
+    println!("{:>28} {empty_us:>8.1} us", "empty submission");
+    println!("{:>28} {finish_us:>8.1} us", "record+finish, no submit");
+}
+
+/// The prefill GEMM on the device clock, at the served model's FFN shapes
+/// and the chunk widths a prefill dispatches — `dispatch_kernel_us` around a
+/// burst of the kernel `pipeline_for_named` picks for that width, so what is
+/// printed is the kernel and nothing else: no upload, no submission, no
+/// readback. `GFLOP/s` counts two per multiply-add. `ORANGU_SWEEP_SHAPE=in,out`
+/// moves the shape; `ORANGU_SWEEP_TOKENS=64,128,...` the widths.
+///
+/// `cargo test --release --bin orangu-server prefill_gemm_probe -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn prefill_gemm_probe() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(gpu) = shared_test_backend() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let shapes: Vec<(usize, usize)> = match std::env::var("ORANGU_SWEEP_SHAPE") {
+        Ok(v) => {
+            let (a, b) = v.split_once(',').expect("ORANGU_SWEEP_SHAPE=in,out");
+            vec![(a.trim().parse().unwrap(), b.trim().parse().unwrap())]
+        }
+        Err(_) => vec![(1536, 6144), (6144, 1536), (2048, 1536), (1536, 2048)],
+    };
+    let widths: Vec<usize> = std::env::var("ORANGU_SWEEP_TOKENS")
+        .ok()
+        .map(|v| v.split(',').map(|t| t.trim().parse().unwrap()).collect())
+        .unwrap_or_else(|| vec![32, 64, 128, 256, 512]);
+    let reps: u32 = std::env::var("ORANGU_SWEEP_KERNEL_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    for &(in_dim, out_dim) in &shapes {
+        for &ggml_type in &[
+            crate::engine::quant::GGML_TYPE_Q4_K,
+            crate::engine::quant::GGML_TYPE_Q6_K,
+            crate::engine::quant::GGML_TYPE_F32,
+        ] {
+            let w = weight_of(ggml_type, in_dim, out_dim);
+            println!(
+                "\n== [{{n}} x {in_dim}] x [{in_dim} x {out_dim}] {} ==",
+                quant_name(ggml_type)
+            );
+            println!(
+                "{:>6} {:>22} {:>11} {:>10} {:>10}",
+                "tokens", "kernel", "kernel us", "GFLOP/s", "us/token"
+            );
+            for &n in &widths {
+                let x = vec![0.05f32; in_dim * n];
+                let Some((us, name)) = gpu.matmul_kernel_us_tokens(&x, n, &w, reps) else {
+                    println!("  (no timestamp query on this adapter)");
+                    return;
+                };
+                let flops = 2.0 * (n * in_dim * out_dim) as f64;
+                // `ORANGU_SWEEP_GAP_MS=<ms>`: the same dispatch, one per
+                // submission, with the device left idle that long between
+                // them — a prefill's own rhythm, where every chain waits for
+                // a readback before the next is recorded. The difference
+                // between this column and the burst is what idling costs the
+                // clock.
+                let gapped = std::env::var("ORANGU_SWEEP_GAP_MS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|gap| {
+                        let mut samples: Vec<f64> = (0..9)
+                            .filter_map(|_| {
+                                std::thread::sleep(std::time::Duration::from_millis(gap));
+                                gpu.matmul_kernel_us_tokens(&x, n, &w, 1).map(|(us, _)| us)
+                            })
+                            .collect();
+                        samples.sort_by(|a, b| a.total_cmp(b));
+                        samples[samples.len() / 2]
+                    });
+                println!(
+                    "{n:>6} {name:>22} {us:>11.1} {:>10.0} {:>10.2}{}",
+                    flops / us / 1e3,
+                    us / n as f64,
+                    gapped.map_or(String::new(), |g| format!(
+                        "   gapped {g:>9.1} us ({:.0} GFLOP/s)",
+                        flops / g / 1e3
+                    ))
+                );
+                // The integer-dot GEMM at the same shape, where it applies.
+                if let Some(us) = gpu.mmq_kernel_us_tokens(&x, n, &w, reps) {
+                    println!(
+                        "{n:>6} {:>22} {us:>11.1} {:>10.0} {:>10.2}",
+                        "mmq-q4k",
+                        flops / us / 1e3,
+                        us / n as f64
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn weight_of(ggml_type: u32, in_dim: usize, out_dim: usize) -> crate::engine::loader::QuantMatrix {
+    let (bytes_per_block, block) =
+        crate::engine::quant::block_layout(ggml_type).expect("a probed format has a block layout");
+    let bytes = in_dim * out_dim / block * bytes_per_block;
+    test_quant_matrix(&vec![0x42u8; bytes], ggml_type, in_dim, out_dim)
+}
+
+fn quant_name(ggml_type: u32) -> &'static str {
+    match ggml_type {
+        crate::engine::quant::GGML_TYPE_Q4_K => "Q4_K",
+        crate::engine::quant::GGML_TYPE_Q6_K => "Q6_K",
+        crate::engine::quant::GGML_TYPE_F32 => "F32",
+        _ => "?",
+    }
+}
+
+/// The instruction rates the GEMM kernels are built on, measured in
+/// isolation: a register-only loop of `f32` fused multiply-adds against the
+/// same loop of packed 8-bit dots, each 4096 deep per thread, over enough
+/// workgroups to fill the device. Reports the device's achieved rate for
+/// each and their ratio — what an integer-dot kernel can hope for over a
+/// float one on this card, before memory enters.
+///
+/// `cargo test --release --bin orangu-server alu_rate_probe -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn alu_rate_probe() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(gpu) = shared_test_backend() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let body = |op: &str| -> String {
+        format!(
+            r#"
+struct ElemMeta {{ len: u32, aux: u32, extra: f32, out_scale: f32 }}
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> y: array<f32>;
+@group(0) @binding(2) var<uniform> em: ElemMeta;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    var a0: f32 = x[lid.x]; var a1: f32 = x[lid.x + 1u]; var a2: f32 = x[lid.x + 2u]; var a3: f32 = x[lid.x + 3u];
+    var i0: i32 = i32(gid.x); var i1: i32 = i0 + 1; var i2: i32 = i0 + 2; var i3: i32 = i0 + 3;
+    let w: u32 = gid.x * 0x01010101u + 0x03020100u;
+    let v: u32 = gid.x ^ 0x7F3F1F0Fu;
+    let m: f32 = x[4u] * 0.999;
+    var k: u32 = 0u;
+    loop {{
+        if (k >= 1024u) {{ break; }}
+        {op}
+        k = k + 1u;
+    }}
+    y[gid.x] = a0 + a1 + a2 + a3 + f32(i0 + i1 + i2 + i3);
+}}
+"#
+        )
+    };
+    let fma = body(
+        "a0 = fma(a0, m, 1.0); a1 = fma(a1, m, 1.0); a2 = fma(a2, m, 1.0); a3 = fma(a3, m, 1.0);",
+    );
+    let dot = body(
+        "i0 = dot4I8Packed(w, v ^ u32(i0)) + i0; i1 = dot4I8Packed(w, v ^ u32(i1)) + i1; i2 = dot4I8Packed(w, v ^ u32(i2)) + i2; i3 = dot4I8Packed(w, v ^ u32(i3)) + i3;",
+    );
+    let workgroups = 22 * 16;
+    let threads = (workgroups * 256) as f64;
+    let ops = threads * 4096.0;
+    let reps = 10;
+    let Some(fma_us) = gpu.adhoc_kernel_us(fma, workgroups, reps) else {
+        println!("  (no timestamp query on this adapter)");
+        return;
+    };
+    let dot_us = gpu.adhoc_kernel_us(dot, workgroups, reps).unwrap();
+    println!(
+        "\n  f32 fma:  {fma_us:>9.1} us  {:>8.0} GFLOP/s (2 per fma)",
+        2.0 * ops / fma_us / 1e3
+    );
+    println!(
+        "  int8 dot4: {dot_us:>8.1} us  {:>8.0} GMAC/s (4 per dot), {:.2}x the fma rate per instruction",
+        4.0 * ops / dot_us / 1e3,
+        fma_us / dot_us
     );
 }

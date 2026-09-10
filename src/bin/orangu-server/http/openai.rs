@@ -16,7 +16,12 @@
 //! OpenAI-compatible endpoints: `/v1/models`, `/v1/chat/completions`,
 //! `/v1/completions`, `/v1/embeddings`.
 
-use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
@@ -244,6 +249,25 @@ pub(crate) const EMPTY_THINK_BLOCK: &str = "<think>\n\n</think>\n\n";
 /// `<|content_thinking|>` — and a suppressing role drops it exactly (see
 /// `MessageHeader`) rather than trying to talk the model out of producing
 /// one.
+///
+/// **And it is only a marker where the vocabulary has one**
+/// (`Tokenizer::think_framing`). Appended to a model that tokenizes
+/// `<think>` as `<`, `think`, `>` — three ordinary tokens — this is not a
+/// closed reasoning block, it is a sentence in the prompt, and a model reads
+/// a sentence as an instruction. Measured on `gemma-4-E2B` at temperature 0,
+/// same prompt, the only difference being this block:
+///
+/// | | the answer opens |
+/// | :-- | :-- |
+/// | without | `This is a classic example of **undefined behavior** in C…` |
+/// | with | `Here's a thinking process for reviewing the code snippet…` |
+///
+/// So the approximation aimed at removing reasoning was *causing* it, in the
+/// one role that exists to be rid of it — and in prose, where nothing
+/// downstream can tell it from the answer and hide it. A vocabulary without
+/// the markers needs no suppression in the prompt: it has no reasoning
+/// channel to close, and `MessageHeader` still hides a marked block if one
+/// somehow appears.
 pub(crate) fn append_reasoning_suppression(
     prompt: &mut String,
     role: crate::config::Role,
@@ -252,6 +276,7 @@ pub(crate) fn append_reasoning_suppression(
     if role.suppresses_reasoning()
         && tokenizer.message_framing().is_none()
         && tokenizer.content_kinds().is_none()
+        && tokenizer.think_framing().is_some()
     {
         prompt.push_str(EMPTY_THINK_BLOCK);
     }
@@ -269,7 +294,8 @@ pub(crate) fn reject_unknown_slot(
         (
             StatusCode::BAD_REQUEST,
             format!(
-                "id_slot {index} out of range (server has {} slots)\n",
+                "id_slot {index} {} {} slots)\n",
+                orangu::llm::SLOT_OUT_OF_RANGE_MARKER,
                 state.engine.slots.total()
             ),
         )
@@ -308,10 +334,43 @@ fn tool_calls_json(calls: &[tool_calls::ParsedToolCall], created: u64) -> serde_
     tool_calls_json_from(calls, created, 0)
 }
 
+/// The header an `orangu-coordinator` names a request's role in.
+///
+/// One `orangu-server` process has one role, and for a long time that meant
+/// one process per role — so a coordinator whose `code` and `review` profiles
+/// name the *same model file* stopped and restarted the server, reloading
+/// gigabytes of identical weights and throwing away every cached prefix, to
+/// change two sampling defaults and whether reasoning is suppressed. Those are
+/// per-request facts. This is how they arrive per request.
+pub(crate) const ROLE_HEADER: &str = "x-orangu-role";
+
+/// The role this request is served under: the header's, when a coordinator
+/// set one, and this process's own otherwise.
+///
+/// **Only ever narrows within what this process can do.** A header cannot turn
+/// an `--embedding` server into one that answers chat: which endpoints work is
+/// a property of the model that was loaded, not of the request, and an
+/// unrecognised or unusable value falls back to the process role rather than
+/// being reported — a request must not fail because a proxy in front of it
+/// labelled it in a spelling this build does not know.
+pub(crate) fn request_role(state: &AppState, headers: &HeaderMap) -> crate::config::Role {
+    if !state.engine.role.allows_generation() {
+        return state.engine.role;
+    }
+    headers
+        .get(ROLE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| crate::config::Role::parse(value).ok())
+        .filter(|role| role.allows_generation())
+        .unwrap_or(state.engine.role)
+}
+
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> axum::response::Response {
+    let role = request_role(&state, &headers);
     if !state.engine.role.allows_generation() {
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -359,17 +418,17 @@ pub async fn chat_completions(
         true,
         bos,
         eos,
-        state.engine.reasoning(),
+        state.engine.reasoning_as(role),
         tools,
     ) {
         Ok(p) => p,
         Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
     };
-    append_reasoning_suppression(&mut prompt, state.engine.role, &state.engine.tokenizer);
+    append_reasoning_suppression(&mut prompt, role, &state.engine.tokenizer);
     let tokens = state.engine.tokenizer.encode(&prompt, false);
 
     let sampling = sampling_for(
-        state.engine.role,
+        role,
         RequestSampling {
             temperature: req.temperature,
             top_p: req.top_p,
@@ -380,6 +439,9 @@ pub async fn chat_completions(
         },
     );
     let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+    if let Some(rejection) = crate::http::reject_oversized_context(tokens.len()) {
+        return rejection;
+    }
     let stop_token_ids = state.engine.tokenizer.stop_token_ids();
     let created = unix_now();
     let model = state.model_label.clone();
@@ -395,6 +457,7 @@ pub async fn chat_completions(
             cache_prompt: req.cache_prompt,
             id_slot: req.id_slot,
             timings_per_token: req.stream && req.timings_per_token,
+            role: Some(role),
         })
         .await;
 
@@ -696,8 +759,10 @@ pub struct CompletionsRequest {
 
 pub async fn completions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(req): Json<CompletionsRequest>,
 ) -> axum::response::Response {
+    let role = request_role(&state, &headers);
     if !state.engine.role.allows_generation() {
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -713,7 +778,7 @@ pub async fn completions(
     }
     let tokens = state.engine.tokenizer.encode(&req.prompt, true);
     let sampling = sampling_for(
-        state.engine.role,
+        role,
         RequestSampling {
             temperature: req.temperature,
             top_p: req.top_p,
@@ -724,6 +789,9 @@ pub async fn completions(
         },
     );
     let max_tokens = req.max_tokens.unwrap_or(256);
+    if let Some(rejection) = crate::http::reject_oversized_context(tokens.len()) {
+        return rejection;
+    }
     // `ignore_eos` drops the EOS stop token so generation runs the full
     // `max_tokens` — the "measure decode, not content" contract benchmarks need.
     let stop_token_ids: Vec<u32> = if req.ignore_eos {
@@ -745,6 +813,7 @@ pub async fn completions(
             cache_prompt: req.cache_prompt,
             id_slot: req.id_slot,
             timings_per_token: false,
+            role: Some(role),
         })
         .await;
 

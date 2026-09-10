@@ -41,6 +41,10 @@ const MIN_SUPPORTED_VERSION: u32 = 2;
 /// to exist in the file.
 const MAX_STRING_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_ARRAY_ELEMENTS: u64 = 200_000_000;
+/// Arrays longer than this are skipped by [`GgufFile::open_summary`] — long
+/// enough for every per-layer table (a few hundred entries), far short of a
+/// vocabulary.
+const SUMMARY_ARRAY_LIMIT: u64 = 4096;
 
 /// Default alignment for the tensor-data section per the spec: used when
 /// `general.alignment` is absent from the metadata.
@@ -161,6 +165,25 @@ impl GgufFile {
         Self::open_at(path, 0)
     }
 
+    /// [`open`](Self::open) for a listing: the tensor table and every
+    /// metadata value except the large arrays, which are skipped without
+    /// being read into memory — and are then **absent** from
+    /// [`metadata`](Self::metadata), not present and empty.
+    ///
+    /// A model's vocabulary is a quarter of a million strings in three
+    /// arrays, and parsing them is nearly all of what opening a file costs:
+    /// a directory of a couple of hundred models took six seconds to scan
+    /// this way, twice per server start (`resolve_load_target`), so a
+    /// coordinator's model swap spent most of its time listing models it
+    /// was not about to load. A scan needs the architecture and the tensor
+    /// types, and nothing an array of that size holds.
+    pub fn open_summary(path: &Path) -> Result<GgufFile> {
+        let file =
+            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        Self::read_with(BufReader::new(file), Some(SUMMARY_ARRAY_LIMIT))
+            .with_context(|| format!("failed to parse GGUF file {}", path.display()))
+    }
+
     /// Reads the GGUF structure that begins `offset` bytes into `path`.
     ///
     /// `0` — [`open`](Self::open) — is the ordinary case: a `.gguf` file
@@ -200,13 +223,20 @@ impl GgufFile {
     /// Wrap `inner` in a [`BufReader`] unless it is already buffered: the
     /// parser issues many small reads.
     pub fn read_from<R: Read>(inner: R) -> Result<GgufFile> {
-        Self::read(inner)
+        Self::read(Streamed(inner))
     }
 
-    fn read<R: Read>(inner: R) -> Result<GgufFile> {
+    fn read<R: GgufSource>(inner: R) -> Result<GgufFile> {
+        Self::read_with(inner, None)
+    }
+
+    /// The parser; `skip_arrays_over` is the summary mode's array limit —
+    /// see [`open_summary`](Self::open_summary).
+    fn read_with<R: GgufSource>(inner: R, skip_arrays_over: Option<u64>) -> Result<GgufFile> {
         let mut reader = Reader {
             inner,
             bytes_read: 0,
+            pending_array: None,
         };
 
         let mut magic = [0u8; 4];
@@ -233,6 +263,11 @@ impl GgufFile {
         for _ in 0..metadata_kv_count {
             let key = reader.read_string()?;
             let value_type = reader.read_u32()?;
+            if let (Some(limit), 9) = (skip_arrays_over, value_type)
+                && reader.skip_array_over(limit)?
+            {
+                continue;
+            }
             let value = reader.read_value(value_type)?;
             metadata.push((key, value));
         }
@@ -301,9 +336,61 @@ impl GgufFile {
 struct Reader<R> {
     inner: R,
     bytes_read: u64,
+    /// An array header `skip_array_over` read and did not skip, for the
+    /// `read_value` that follows it.
+    pending_array: Option<(u32, u64)>,
 }
 
-impl<R: Read> Reader<R> {
+/// What the parser reads from: bytes, and a way to skip some — by seeking
+/// where the source is a file, by reading them into nothing where it is a
+/// stream.
+trait GgufSource: Read {
+    fn skip(&mut self, n: u64) -> std::io::Result<()>;
+}
+
+impl GgufSource for BufReader<File> {
+    fn skip(&mut self, n: u64) -> std::io::Result<()> {
+        self.seek_relative(n as i64)
+    }
+}
+
+impl<T: AsRef<[u8]>> GgufSource for std::io::Cursor<T> {
+    fn skip(&mut self, n: u64) -> std::io::Result<()> {
+        let remaining = (self.get_ref().as_ref().len() as u64).saturating_sub(self.position());
+        if n > remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("unexpected end of file while skipping {n} bytes"),
+            ));
+        }
+        self.set_position(self.position() + n);
+        Ok(())
+    }
+}
+
+/// A source with no seek — a network body — skips by reading.
+struct Streamed<R>(R);
+
+impl<R: Read> Read for Streamed<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl<R: Read> GgufSource for Streamed<R> {
+    fn skip(&mut self, n: u64) -> std::io::Result<()> {
+        let copied = std::io::copy(&mut (&mut self.0).take(n), &mut std::io::sink())?;
+        if copied != n {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("unexpected end of file while skipping {n} bytes"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<R: GgufSource> Reader<R> {
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
         self.inner
             .read_exact(buf)
@@ -374,6 +461,87 @@ impl<R: Read> Reader<R> {
         Ok(self.read_u8()? != 0)
     }
 
+    /// Skips the bytes of one value of `value_type` without building it.
+    fn skip_value(&mut self, value_type: u32) -> Result<()> {
+        let fixed: u64 = match value_type {
+            0 | 1 | 7 => 1,
+            2 | 3 => 2,
+            4..=6 => 4,
+            10..=12 => 8,
+            8 => {
+                let len = self.read_u64()?;
+                if len > MAX_STRING_BYTES {
+                    bail!(
+                        "string metadata value of {len} bytes exceeds the {MAX_STRING_BYTES}-byte limit"
+                    );
+                }
+                len
+            }
+            9 => {
+                let elem_type = self.read_u32()?;
+                let len = self.read_u64()?;
+                self.skip_array(elem_type, len)?;
+                0
+            }
+            other => bail!("unknown GGUF metadata value type {other}"),
+        };
+        self.skip_bytes(fixed)
+    }
+
+    /// Skips `len` values of `elem_type`: fixed-size elements as one skip
+    /// (a per-element seek is a system call each, and a vocabulary's score
+    /// table is a quarter of a million of them), strings one at a time,
+    /// since each carries its own length.
+    fn skip_array(&mut self, elem_type: u32, len: u64) -> Result<()> {
+        let fixed: Option<u64> = match elem_type {
+            0 | 1 | 7 => Some(1),
+            2 | 3 => Some(2),
+            4..=6 => Some(4),
+            10..=12 => Some(8),
+            _ => None,
+        };
+        match fixed {
+            Some(size) => self.skip_bytes(len.saturating_mul(size)),
+            None => {
+                for _ in 0..len {
+                    self.skip_value(elem_type)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn skip_bytes(&mut self, n: u64) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        self.inner
+            .skip(n)
+            .with_context(|| format!("skipping {n} bytes"))?;
+        self.bytes_read += n;
+        Ok(())
+    }
+
+    /// At an array value: reads its header and, when it holds more than
+    /// `limit` elements, skips the rest and returns `true`; otherwise reads
+    /// nothing further and returns `false`, leaving the header in
+    /// `pending_array` for the `read_value` that follows.
+    fn skip_array_over(&mut self, limit: u64) -> Result<bool> {
+        let elem_type = self.read_u32()?;
+        let len = self.read_u64()?;
+        if len > MAX_ARRAY_ELEMENTS {
+            bail!(
+                "array metadata value of {len} elements exceeds the {MAX_ARRAY_ELEMENTS}-element limit"
+            );
+        }
+        if len > limit {
+            self.skip_array(elem_type, len)?;
+            return Ok(true);
+        }
+        self.pending_array = Some((elem_type, len));
+        Ok(false)
+    }
+
     fn read_string(&mut self) -> Result<String> {
         let len = self.read_u64()?;
         if len > MAX_STRING_BYTES {
@@ -396,13 +564,20 @@ impl<R: Read> Reader<R> {
             7 => Ok(GgufValue::Bool(self.read_bool()?)),
             8 => Ok(GgufValue::String(self.read_string()?)),
             9 => {
-                let elem_type = self.read_u32()?;
-                let len = self.read_u64()?;
-                if len > MAX_ARRAY_ELEMENTS {
-                    bail!(
-                        "array metadata value of {len} elements exceeds the {MAX_ARRAY_ELEMENTS}-element limit"
-                    );
-                }
+                // The header, unless `skip_array_over` already consumed it.
+                let (elem_type, len) = match self.pending_array.take() {
+                    Some(header) => header,
+                    None => {
+                        let elem_type = self.read_u32()?;
+                        let len = self.read_u64()?;
+                        if len > MAX_ARRAY_ELEMENTS {
+                            bail!(
+                                "array metadata value of {len} elements exceeds the {MAX_ARRAY_ELEMENTS}-element limit"
+                            );
+                        }
+                        (elem_type, len)
+                    }
+                };
                 let mut items = Vec::new();
                 for _ in 0..len {
                     items.push(self.read_value(elem_type)?);
@@ -791,6 +966,88 @@ mod tests {
         let gguf = GgufFile::open(&path).expect("open");
         assert!(gguf.read_tensor(&path, "ragged").is_err());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The summary open skips an array longer than its limit — it is then
+    /// absent, not present and empty — keeps every other value, and reads
+    /// the tensor table behind the skipped bytes correctly; and its skipping
+    /// covers strings (one length each) and fixed-size elements (one seek)
+    /// alike. Built over both a file and an in-memory cursor, the two
+    /// sources with a skip of their own.
+    #[test]
+    fn the_summary_open_skips_large_arrays_and_keeps_the_rest() {
+        let limit = SUMMARY_ARRAY_LIMIT as usize;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&1u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&5u64.to_le_bytes()); // metadata_kv_count
+        write_string(&mut buf, "general.architecture");
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        write_string(&mut buf, "clip");
+        // A vocabulary-sized string array: skipped.
+        write_string(&mut buf, "tokenizer.ggml.tokens");
+        buf.extend_from_slice(&9u32.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        buf.extend_from_slice(&((limit + 1) as u64).to_le_bytes());
+        for i in 0..=limit {
+            write_string(&mut buf, &format!("tok{i}"));
+        }
+        // A score table of the same length: skipped in one seek.
+        write_string(&mut buf, "tokenizer.ggml.scores");
+        buf.extend_from_slice(&9u32.to_le_bytes());
+        buf.extend_from_slice(&6u32.to_le_bytes()); // F32
+        buf.extend_from_slice(&((limit + 1) as u64).to_le_bytes());
+        for i in 0..=limit {
+            buf.extend_from_slice(&(i as f32).to_le_bytes());
+        }
+        // A short array: kept.
+        write_string(&mut buf, "small.array");
+        buf.extend_from_slice(&9u32.to_le_bytes());
+        buf.extend_from_slice(&4u32.to_le_bytes()); // U32
+        buf.extend_from_slice(&3u64.to_le_bytes());
+        for v in [7u32, 8, 9] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        write_string(&mut buf, "general.alignment");
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&32u32.to_le_bytes());
+        write_string(&mut buf, "weight");
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&6u64.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // F16
+        buf.extend_from_slice(&0u64.to_le_bytes());
+
+        let check = |file: &GgufFile| {
+            let keys: Vec<&str> = file.metadata.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(
+                keys,
+                ["general.architecture", "small.array", "general.alignment"]
+            );
+            assert!(file.is_clip_projector());
+            assert!(matches!(
+                &file.metadata[1].1,
+                GgufValue::Array(items) if items.len() == 3
+            ));
+            assert_eq!(file.tensors.len(), 1);
+            assert_eq!(file.tensors[0].name, "weight");
+            assert_eq!(file.tensors[0].dims, vec![6]);
+            assert_eq!(file.tensors[0].ggml_type, 1);
+        };
+        let from_cursor =
+            GgufFile::read_with(Cursor::new(buf.clone()), Some(SUMMARY_ARRAY_LIMIT)).unwrap();
+        check(&from_cursor);
+
+        let dir = std::env::temp_dir().join("orangu-gguf-summary-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("summary.gguf");
+        std::fs::write(&path, &buf).expect("write");
+        let from_file = GgufFile::open_summary(&path).expect("open_summary");
+        check(&from_file);
+        // The full open still sees everything.
+        let full = GgufFile::open(&path).expect("open");
+        assert_eq!(full.metadata.len(), 5);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

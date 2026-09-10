@@ -94,7 +94,9 @@ pub fn scan_models_dir(dir: &Path) -> Result<Vec<ModelSummary>> {
         }
 
         let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        match GgufFile::open(&path) {
+        // The summary open: a listing needs the architecture and the tensor
+        // table, not the vocabulary.
+        match GgufFile::open_summary(&path) {
             Ok(gguf) => {
                 if gguf.is_clip_projector() {
                     continue;
@@ -220,7 +222,14 @@ pub fn resolve_or_fetch_model(models_dir: &Path, requested: &str) -> Result<Path
 /// [`resolve_or_fetch_model`] — a Hugging Face repo to fetch first — and
 /// keeps the spec as written, exactly as the CLI does.
 pub fn resolve_load_target(models_dir: &Path, requested: &str) -> Result<(PathBuf, String)> {
-    let Ok(group) = resolve_delete_target(models_dir, requested) else {
+    // One scan, shared with the ambiguity check below: each is a walk over
+    // every model's header, and this runs at every server start.
+    let groups = scan_models_dir(models_dir).map(|models| group_models(&models));
+    let Ok(group) = groups
+        .as_ref()
+        .map_err(|_| ())
+        .and_then(|groups| resolve_delete_target_in(models_dir, requested, groups).map_err(|_| ()))
+    else {
         return Ok((
             resolve_or_fetch_model(models_dir, requested)?,
             requested.to_string(),
@@ -239,7 +248,14 @@ pub fn resolve_load_target(models_dir: &Path, requested: &str) -> Result<(PathBu
     // So disambiguate, but only then: `<repo>:<quant>` is a spelling
     // `ModelGroup::matches_label` already accepts, so it resolves straight
     // back to this exact group.
-    let label = match ambiguous_label(models_dir, &group) {
+    let ambiguous = groups.as_ref().is_ok_and(|groups| {
+        groups
+            .iter()
+            .filter(|other| other.matches_label(&group.label))
+            .count()
+            > 1
+    });
+    let label = match ambiguous {
         true => group
             .quantization
             .as_ref()
@@ -248,19 +264,6 @@ pub fn resolve_load_target(models_dir: &Path, requested: &str) -> Result<(PathBu
         false => group.label,
     };
     Ok((group.representative_path, label))
-}
-
-/// Whether more than one model under `models_dir` answers to `group`'s own
-/// `MODEL` label — two quantizations of one repo, most commonly.
-fn ambiguous_label(models_dir: &Path, group: &ModelGroup) -> bool {
-    let Ok(models) = scan_models_dir(models_dir) else {
-        return false;
-    };
-    group_models(&models)
-        .iter()
-        .filter(|other| other.matches_label(&group.label))
-        .count()
-        > 1
 }
 
 /// Resolves whatever `delete` was given to a full [`ModelGroup`] — every
@@ -279,6 +282,16 @@ fn ambiguous_label(models_dir: &Path, group: &ModelGroup) -> bool {
 pub fn resolve_delete_target(models_dir: &Path, requested: &str) -> Result<ModelGroup> {
     let models = scan_models_dir(models_dir)?;
     let groups = group_models(&models);
+    resolve_delete_target_in(models_dir, requested, &groups)
+}
+
+/// [`resolve_delete_target`] over an already-scanned directory.
+fn resolve_delete_target_in(
+    models_dir: &Path,
+    requested: &str,
+    groups: &[ModelGroup],
+) -> Result<ModelGroup> {
+    let groups = groups.to_vec();
 
     if let Ok(path) = resolve_model_path(models_dir, requested) {
         if let Some(group) = groups.into_iter().find(|g| g.paths.contains(&path)) {
@@ -656,7 +669,7 @@ fn remove_empty_ancestors(path: &Path, stop_at: &Path) {
 
 /// One row of the `list` output: a model, collapsed from every shard file
 /// that makes it up.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ModelGroup {
     pub label: String,
     pub size_bytes: u64,

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 
-pub use coordinator::probe_coordinator;
+pub use coordinator::{probe_coordinator, probe_coordinator_roles};
 pub use openai::{OpenAiClient, normalized_openai_endpoint};
 pub use slots::{SaveRestoreOutcome, SlotRegistry};
 
@@ -35,6 +35,48 @@ pub use slots::{SaveRestoreOutcome, SlotRegistry};
 /// the other.
 pub const TRUNCATED_NOTICE: &str = "answer cut off at the server's response-length cap \
      — an unfinished tool call was not run; raise [orangu].code_max_tokens";
+
+/// The phrase `orangu-server` puts in the `400` it answers a request whose
+/// context is longer than its device can hold with, and that a client matches
+/// to recognise one.
+///
+/// A shared constant rather than each side spelling its own, because this is a
+/// contract between them: the server promises the phrase appears, the client
+/// promises to look for exactly it, and a rewording that broke the pairing
+/// would break it *silently* — the review would go on reporting oversized
+/// files as failed requests, which is what it did before this existed.
+///
+/// Matched on the message rather than the status code because a `400` on its
+/// own says nothing about *what* to shorten: a client that shrank its prompt
+/// on any bad request would also shrink it on a malformed one.
+pub const CONTEXT_TOO_LONG_MARKER: &str = "tokens of KV cache";
+
+/// Whether a failed request failed because its context was too long for the
+/// server's device — the one failure a caller can do something about by
+/// sending less. See [`CONTEXT_TOO_LONG_MARKER`].
+pub fn is_context_too_long(error: &str) -> bool {
+    error.contains(CONTEXT_TOO_LONG_MARKER)
+}
+
+/// The phrase `orangu-server` refuses an `id_slot` it has no slot for with.
+///
+/// Paired with the client the same way [`CONTEXT_TOO_LONG_MARKER`] is, and for
+/// a failure that is likewise the caller's to fix: it asked for a slot that
+/// does not exist and should ask for one that does.
+pub const SLOT_OUT_OF_RANGE_MARKER: &str = "out of range (server has";
+
+/// Whether a failed request failed because the `id_slot` it pinned does not
+/// exist on the server that answered.
+///
+/// This is *not* only a client bug. Behind an `orangu-coordinator` one
+/// endpoint fronts several `orangu-server` processes with different slot
+/// counts — an `embeddings` role defaults to more slots than a chat one — and
+/// `GET /props` carries no model, so it can only ever report whichever backend
+/// happened to be active when it was asked. A slot count learned from one
+/// backend and used against another is wrong through no fault of either.
+pub fn is_slot_out_of_range(error: &str) -> bool {
+    error.contains(SLOT_OUT_OF_RANGE_MARKER)
+}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StreamMetrics {
@@ -208,5 +250,48 @@ where
         other => Err(serde::de::Error::custom(format!(
             "unsupported tool call arguments payload: {other}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pairing that makes an oversized prompt recoverable: the server's
+    /// own refusal has to be one the client recognises. Two separate spellings
+    /// would compile, pass their own tests, and quietly turn every oversized
+    /// file in a review back into a failed request.
+    #[test]
+    fn the_servers_context_refusal_is_the_one_clients_match() {
+        let refusal = format!(
+            "prompt (41843 tokens) plus one generated token needs 41844 {CONTEXT_TOO_LONG_MARKER}, \
+             more than the 16384 this server has room for on its device"
+        );
+        assert!(is_context_too_long(&refusal));
+        // Wrapped in the client's own error context, which is how a caller
+        // actually meets it.
+        assert!(is_context_too_long(&format!(
+            "chat completion failed (status 400 Bad Request): {refusal}"
+        )));
+        // And not every failure: a caller that shortened its prompt on any
+        // error would shorten it on a broken server too.
+        assert!(!is_context_too_long(
+            "chat completion failed (status 500 Internal Server Error): model not loaded"
+        ));
+    }
+
+    /// The other half of the same contract, for the other refusal a caller can
+    /// act on. Both spellings live in `orangu-server`'s two slot-checking
+    /// paths, so this is what keeps the three in step.
+    #[test]
+    fn the_servers_slot_refusal_is_the_one_clients_match() {
+        let refusal = format!("id_slot 1 {SLOT_OUT_OF_RANGE_MARKER} 1 slots)");
+        assert!(is_slot_out_of_range(&refusal));
+        assert!(is_slot_out_of_range(&format!(
+            "chat completion failed (status 400 Bad Request): {refusal}"
+        )));
+        assert!(!is_slot_out_of_range(
+            "chat completion failed (status 400 Bad Request): prompt is too long"
+        ));
     }
 }

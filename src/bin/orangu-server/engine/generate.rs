@@ -124,6 +124,20 @@ pub struct GenerateRequest {
     /// channel message per token, which is nothing next to a forward pass but
     /// is pure waste for a caller that never reads it.
     pub timings_per_token: bool,
+    /// Serve this request under a role other than the process's own — the
+    /// `x-orangu-role` an `orangu-coordinator` sets when one `orangu-server`
+    /// answers for several profiles that name the same model.
+    ///
+    /// It reaches the engine because the role decides one thing the HTTP layer
+    /// cannot apply on its own: whether a reasoning message is **hidden or
+    /// marked** on the way out (`MessageHeader`). Rendering the prompt for a
+    /// suppressing role while filtering the output for a permissive one is not
+    /// half-right — it is the failure the whole role exists to prevent, since
+    /// what the caller sees is exactly the thinking it asked not to get.
+    ///
+    /// `None` means "this process's role", which is every request that arrives
+    /// without a coordinator in front of it.
+    pub role: Option<crate::config::Role>,
 }
 
 impl Default for GenerateRequest {
@@ -137,6 +151,7 @@ impl Default for GenerateRequest {
             cache_prompt: true,
             id_slot: None,
             timings_per_token: false,
+            role: None,
         }
     }
 }
@@ -253,6 +268,9 @@ pub struct Engine {
     /// just without even the pool's own mutex/lookup cost). See that
     /// module's own doc comment for what it does and doesn't cover.
     pub prefix_cache: Option<Arc<PrefixCache>>,
+    /// The rendezvous that batches concurrent slots' decode steps — see
+    /// `engine::decode_batch`.
+    pub decode_batcher: Arc<super::decode_batch::DecodeBatcher>,
     /// Durable per-slot KV-cache persistence (`engine::slot_store`) — `Some`
     /// by default (unless `ORANGU_NO_SLOT_SAVE` is set or the home directory
     /// can't be resolved). Backs the `POST /slots/{id}?action=save|restore` endpoints
@@ -329,8 +347,26 @@ impl Engine {
     /// stated value is held against the template if it rejects it — see
     /// `chat_template::Reasoning::effort_is_default`.
     pub fn reasoning(&self) -> crate::engine::chat_template::Reasoning<'_> {
+        self.reasoning_as(self.role)
+    }
+
+    /// The same, for a request being served under `role` rather than under
+    /// this process's own — see `http::openai::request_role`.
+    ///
+    /// `enable_thinking` is the *exact* mechanism a suppressing role has:
+    /// the template is told not to open a reasoning block at all, where
+    /// `append_reasoning_suppression` only talks the model out of one after
+    /// the fact. Reading the process role here while the rest of the request
+    /// read the header's was the difference between `--review` and something
+    /// that looked like it: the template kept rendering with thinking on, and
+    /// an `/auto_review` served by a process started for another role spent
+    /// its response cap on reasoning.
+    pub fn reasoning_as(
+        &self,
+        role: crate::config::Role,
+    ) -> crate::engine::chat_template::Reasoning<'_> {
         crate::engine::chat_template::Reasoning {
-            enabled: self.role.enable_thinking(),
+            enabled: role.enable_thinking(),
             effort: Some(
                 self.reasoning_effort
                     .as_deref()
@@ -363,6 +399,7 @@ impl Engine {
             return rx;
         }
         let model = self.model.clone();
+        let decode_batcher = self.decode_batcher.clone();
         let tokenizer = self.tokenizer.clone();
         let slots = self.slots.clone();
         let draft = self.draft.clone();
@@ -370,11 +407,14 @@ impl Engine {
         let prefix_cache = self.prefix_cache.clone();
         let slot_store = self.slot_store.clone();
         let paged_kv = self.paged_kv.clone();
-        // Whether a reasoning message reaches the client is this server's
-        // role's call, not the request's — the same place every other
-        // reasoning decision is made (`Role::enable_thinking`, which the
-        // HTTP layers pass to the chat template).
-        let role = self.role;
+        // Whether a reasoning message reaches the client is the *serving*
+        // role's call — this process's, unless a coordinator named another one
+        // for this request (`GenerateRequest::role`). It has to be the same
+        // role the prompt was rendered for: a prompt built to suppress
+        // reasoning and a stream filtered to show it disagree in the one
+        // direction that matters, and the caller gets the thinking anyway.
+        let process_role = self.role;
+        let role = req.role.unwrap_or(process_role);
         let metrics = self.metrics.clone();
         // Before the spawn, not inside it: what an operator means by "how long
         // did this request take" starts when the request arrives, and a task
@@ -429,9 +469,11 @@ impl Engine {
                         prefix_cache.as_deref(),
                         slot_store.as_deref(),
                         paged_kv.as_ref(),
+                        &decode_batcher,
                         &guard,
                         req,
                         role,
+                        process_role,
                         &metrics,
                         arrived,
                         task_tx.clone(),
@@ -517,9 +559,13 @@ fn run(
         Arc<super::kv_pool::KvPool>,
         Arc<super::prefix_index::PrefixIndex>,
     )>,
+    decode_batcher: &super::decode_batch::DecodeBatcher,
     guard: &super::scheduler::SlotGuard,
     req: GenerateRequest,
     role: crate::config::Role,
+    // This process's own role, for the one line that reports when a request
+    // was served under another — see the completion line below.
+    process_role: crate::config::Role,
     metrics: &super::metrics::ServerMetrics,
     arrived: Instant,
     tx: mpsc::UnboundedSender<StreamEvent>,
@@ -539,6 +585,29 @@ fn run(
         )));
         return Ok(());
     }
+    // The device's room bounds the capacity the same way the model's context
+    // length just did: `max_tokens` is a cap on the answer, and a cap that
+    // reaches past the room is shortened to it, not refused. The web console
+    // asks for 32768 on every turn and the API's own default is 8192 —
+    // neither knows the card, and a device whose room is 16384 tokens turned
+    // the console away on every prompt. Only a prompt that leaves no room to
+    // answer is refused — over the ceiling a contiguous cache grows its
+    // device mirror until the driver resets the card (see
+    // [`KV_DEVICE_TOKENS`]), and the paged pool cannot hold it either.
+    let capacity = match kv_device_token_ceiling() {
+        Some(ceiling) if !prompt_fits_device(req.prompt_tokens.len(), ceiling) => {
+            let _ = tx.send(StreamEvent::Error(format!(
+                "prompt ({} tokens) plus one generated token needs {} tokens of KV cache, \
+                 more than the {ceiling} this device has room for — send a shorter prompt, \
+                 or run the model on a device with more memory",
+                req.prompt_tokens.len(),
+                req.prompt_tokens.len().saturating_add(1),
+            )));
+            return Ok(());
+        }
+        Some(ceiling) => capacity.min(ceiling),
+        None => capacity,
+    };
 
     guard.set_prompt_tokens(req.prompt_tokens.len());
     // Reuse a previous request's already-computed KV cache for however
@@ -561,12 +630,28 @@ fn run(
     // request at a time, and the point of the pool is that a prefix has as many
     // holders as want it.
     let mut page_tags: Vec<u64> = Vec::new();
-    let mut new_cache;
     let mut reused_len = 0usize;
+    // The pool can only promise room it has. A request longer than the whole
+    // pool — a review prompt carrying a few thousand lines of source can be
+    // several times it — keeps the contiguous cache instead, which grows on
+    // demand and is what every request used before the pool existed. What that
+    // costs
+    // is page sharing for this one request. What asking anyway used to cost
+    // was the server: the sequence discovered the pool was full a page at a
+    // time, deep inside a forward pass with nowhere to report it.
+    //
+    // `try_into_paged` hands the cache back on refusal, so the fallback is the
+    // very cache that was already built rather than a second one.
+    let (mut new_cache, paged_kv) = match paged_kv {
+        Some((pool, index)) => match model.new_kv_cache(capacity).try_into_paged(pool.clone()) {
+            Ok(cache) => (cache, Some((pool, index))),
+            Err(cache) => (cache, None),
+        },
+        None => (model.new_kv_cache(capacity), None),
+    };
     if let Some((pool, index)) = paged_kv {
         // The architecture builds its own cache — recurrent state included —
         // and only its positional layers move into the pool.
-        new_cache = model.new_kv_cache(capacity).into_paged(pool.clone());
         if req.cache_prompt {
             // `keep_last`: a fully matched prompt still needs one page of real
             // work to produce fresh logits from — the same reason the
@@ -586,8 +671,6 @@ fn run(
         // even when nothing was adopted: this request is the one that makes the
         // prefix available to the next.
         new_cache.set_page_tags(&page_tags);
-    } else {
-        new_cache = model.new_kv_cache(capacity);
     }
     if paged_kv.is_none()
         && req.cache_prompt
@@ -751,6 +834,12 @@ fn run(
     // When the previous token was produced, so the gap to the next one can be
     // observed. `None` until there is a previous one to measure from.
     let mut last_token_at: Option<Instant> = None;
+    // This slot decodes with the others from here on — one forward for all
+    // of them per step (`engine::decode_batch`). Only the plain path: a
+    // draft or a multi-token head steps on its own schedule.
+    let batch_registration = (draft.is_none() && mtp.is_none())
+        .then(|| decode_batcher.register())
+        .flatten();
     loop {
         if generated >= req.max_tokens {
             finish_reason = FinishReason::Length;
@@ -924,10 +1013,16 @@ fn run(
             // the grammar, so a constrained request has to come back to the
             // CPU sampler for every step. It costs the fast path; the
             // alternative is a constraint that silently does not apply.
-            let greedy_sample =
-                (sampler.is_greedy() && !sampler.is_constrained()).then(|| GreedySampleParams {
+            // A sampled step whose sampler only looks at its top `k` can have
+            // the device find those `k` (`top_k` below) and read back a few
+            // dozen pairs instead of the whole vocabulary.
+            let device_top_k = sampler.device_top_k();
+            let greedy_sample = (!sampler.is_constrained()
+                && (sampler.is_greedy() || device_top_k > 0))
+                .then(|| GreedySampleParams {
                     recent_tokens: &history[recent_start..],
                     repeat_penalty: sampler.repeat_penalty(),
+                    top_k: if sampler.is_greedy() { 0 } else { device_top_k },
                 });
             // GPU submissions for this one decode step. `gemma.rs` had this
             // instrumentation privately; it belongs here, because the number it
@@ -948,11 +1043,13 @@ fn run(
             // breakdown is read against — is measured for all of them. See
             // `engine::decode_stages`.
             let outcome = crate::engine::decode_stages::pass(|| {
-                model.forward_maybe_sampling(
+                decode_batcher.step(
+                    batch_registration.as_ref(),
+                    model,
                     cache
                         .as_mut()
                         .expect("cache is always Some between iterations"),
-                    &[next],
+                    next,
                     start_pos,
                     greedy_sample,
                     guard.id(),
@@ -977,7 +1074,19 @@ fn run(
             }
             match outcome {
                 Ok(ForwardOutcome::Token(t)) => t,
-                Ok(ForwardOutcome::Logits(l)) => sampler.sample(&l, &history),
+                Ok(ForwardOutcome::Candidates(c)) => sampler.sample_from_candidates(c),
+                Ok(ForwardOutcome::Logits(l)) => {
+                    let t0 = std::time::Instant::now();
+                    let t = sampler.sample(&l, &history);
+                    if std::env::var_os("ORANGU_CPU_TIMESTAMPS").is_some() {
+                        eprintln!(
+                            "orangu-server: [cpu-trace] pos {start_pos}: host sampler {:.3}ms over {} logits",
+                            t0.elapsed().as_secs_f64() * 1000.0,
+                            l.len()
+                        );
+                    }
+                    t
+                }
                 Err(err) => {
                     let _ = tx.send(StreamEvent::Error(format!("{err:?}")));
                     return Ok(());
@@ -1075,8 +1184,18 @@ fn run(
     // The trailing \r + \x1b[K only matter if a live update above already
     // moved the cursor onto this line; harmless (a no-op) otherwise.
     let prefix = if reported { "\r" } else { "" };
+    // The serving role, named only when it is not the one the banner already
+    // reported — a coordinator can hand this process a request belonging to
+    // another of its profiles, and "did my `/auto_review` actually run in
+    // review mode" is otherwise a question the log cannot answer.
+    let served_as = match req.role {
+        Some(request_role) if request_role != process_role => {
+            format!(" as {}", request_role.label())
+        }
+        _ => String::new(),
+    };
     println!(
-        "{prefix}orangu-server: [slot {}] {}\x1b[K",
+        "{prefix}orangu-server: [slot {}{served_as}] {}\x1b[K",
         guard.id(),
         stats.log_line()
     );
@@ -1653,6 +1772,58 @@ impl Chunking {
     }
 }
 
+/// The longest KV context one **contiguous** request may hold on this device,
+/// recorded once at startup by [`set_kv_device_token_ceiling`]. `None` where
+/// there is no device to run out of, or where its capacity is unknown — which
+/// is not the same as zero, and must not be read as a refusal.
+///
+/// A request over this does not fail cleanly if it is allowed to run: the
+/// mirror grows through prefill until a submission stops finishing inside the
+/// driver's reset timeout, the driver resets the device and names this process
+/// as the guilty context, and every buffer on it dies — `exit 75`, the whole
+/// server, for one oversized request. An `/auto_review` prompt carrying a few
+/// thousand lines of source reaches that size wherever headroom is modest,
+/// which is why this is enforced rather than documented.
+///
+/// So the size is refused where a caller can still act on the answer. Paged
+/// requests are not subject to it: their rows live in the pool's pre-allocated
+/// device pages, which is a fixed footprint no request can grow.
+static KV_DEVICE_TOKENS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+
+/// Records the ceiling. Called once, from `main`, after the device, the model
+/// and the paged pool are all known — the pool's own device pages come out of
+/// the same headroom, so this cannot be answered before it is built.
+pub fn set_kv_device_token_ceiling(tokens: Option<usize>) {
+    let _ = KV_DEVICE_TOKENS.set(tokens);
+}
+
+pub(crate) fn kv_device_token_ceiling() -> Option<usize> {
+    *KV_DEVICE_TOKENS.get().unwrap_or(&None)
+}
+
+/// Whether a prompt of this many tokens leaves room for at least one generated
+/// token under `ceiling`. The one test both the HTTP layer and the engine ask,
+/// so a request the one lets through is never one the other refuses.
+pub(crate) fn prompt_fits_device(prompt_tokens: usize, ceiling: usize) -> bool {
+    prompt_tokens < ceiling
+}
+
+#[cfg(test)]
+mod device_ceiling_tests {
+    use super::prompt_fits_device;
+
+    /// A prompt needs the ceiling to hold it *and* one generated token; what
+    /// the client's `max_tokens` asked for beyond that is a cap, not a
+    /// requirement, and never a reason to refuse.
+    #[test]
+    fn the_prompt_alone_decides_whether_a_request_fits() {
+        assert!(prompt_fits_device(0, 1));
+        assert!(prompt_fits_device(16383, 16384));
+        assert!(!prompt_fits_device(16384, 16384));
+        assert!(!prompt_fits_device(usize::MAX, usize::MAX));
+    }
+}
+
 /// Whether the backend this process selected can lose its device to a
 /// submission timeout, recorded once at startup by [`set_chunk_policy`].
 ///
@@ -1923,9 +2094,11 @@ fn prefill_in_chunks(
     while done < tokens.len() {
         let n = width.min(tokens.len() - done);
         let started = Instant::now();
+        let submits_before = crate::engine::decode_stages::submissions_so_far();
         logits = chunk(model, cache, &tokens[done..done + n], pos)?;
         crate::engine::note_forward_pass();
         let elapsed = started.elapsed();
+        let submits = crate::engine::decode_stages::submissions_so_far() - submits_before;
         pos += n;
         done += n;
         // After the forward, not before: progress means work finished.
@@ -1934,7 +2107,7 @@ fn prefill_in_chunks(
             widths.push(n);
         }
         if policy == ChunkPolicy::Adaptive {
-            cost.observe(n, elapsed);
+            cost.observe(n, budget_elapsed(elapsed, submits));
             width = snap(cost.next_width(budget, batch));
         }
     }
@@ -1953,6 +2126,45 @@ fn prefill_in_chunks(
 
 /// Whether `ORANGU_PREFILL_CHUNKS=1` asked for one line per prefill naming the
 /// widths the sizer chose.
+/// What a chunk's wall time is worth against the budget, given how many
+/// device submissions it was.
+///
+/// The budget exists for one reason: a submission the driver runs for
+/// longer than its timeout resets the device. That is a bound on the
+/// **longest submission**, not on the chunk. On the device-resident stream
+/// a chunk is a handful of submissions and its wall time is a fair proxy
+/// for the longest of them; on a host-orchestrated model it is hundreds —
+/// one per matmul, the activations home between them — and the chunk's
+/// wall time says nothing about any one of them. Sized by wall time, a
+/// model whose 128-token chunk takes 34 seconds on an integrated GPU was
+/// cut to eleven-token chunks, each paying every layer's fixed cost, and
+/// its 572-token prompt ran at 1.5 tok/s where one chunk ran at 5.7.
+///
+/// So a chunk of `submits` submissions counts as `elapsed × spread /
+/// submits` — its mean submission time with a margin for the longest —
+/// and never more than `elapsed` itself. `spread` is
+/// `ORANGU_PREFILL_CHUNK_SPREAD` (default 4; `0` counts the whole wall
+/// time, the rule this replaces, for the control arm). A chunk with fewer
+/// submissions than the spread is unchanged, which keeps the stream where
+/// it was.
+fn budget_elapsed(elapsed: Duration, submits: u64) -> Duration {
+    let spread = chunk_submission_spread();
+    if spread == 0 || submits <= spread {
+        return elapsed;
+    }
+    elapsed.mul_f64(spread as f64 / submits as f64)
+}
+
+fn chunk_submission_spread() -> u64 {
+    static SPREAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SPREAD.get_or_init(|| {
+        std::env::var("ORANGU_PREFILL_CHUNK_SPREAD")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(4)
+    })
+}
+
 fn chunk_widths_reported() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_PREFILL_CHUNKS"))
@@ -3563,6 +3775,7 @@ mod tests {
             cache_prompt: true,
             id_slot: None,
             timings_per_token: false,
+            role: None,
         };
         let draft = DraftModel {
             model: draft,
@@ -3577,8 +3790,10 @@ mod tests {
             None,
             None,
             None,
+            &crate::engine::decode_batch::DecodeBatcher::new(),
             &guard,
             req,
+            crate::config::Role::default(),
             crate::config::Role::default(),
             &crate::engine::metrics::ServerMetrics::new(),
             Instant::now(),
@@ -3610,6 +3825,7 @@ mod tests {
             cache_prompt,
             id_slot: None,
             timings_per_token: false,
+            role: None,
         };
         run(
             model,
@@ -3619,8 +3835,10 @@ mod tests {
             prefix_cache,
             None,
             None,
+            &crate::engine::decode_batch::DecodeBatcher::new(),
             &guard,
             req,
+            crate::config::Role::default(),
             crate::config::Role::default(),
             &crate::engine::metrics::ServerMetrics::new(),
             Instant::now(),
@@ -4836,6 +5054,7 @@ mod tests {
             chat_template_source: None,
             slots: SlotPool::new(1),
             prefix_cache: None,
+            decode_batcher: Arc::new(crate::engine::decode_batch::DecodeBatcher::new()),
             slot_store: None,
             role: crate::config::Role::default(),
             reasoning_effort: None,
@@ -4851,6 +5070,7 @@ mod tests {
                 cache_prompt: true,
                 id_slot: None,
                 timings_per_token: false,
+                role: None,
             })
             .await;
 
@@ -4924,6 +5144,7 @@ mod tests {
             None,
             None,
             None,
+            &crate::engine::decode_batch::DecodeBatcher::new(),
             &guard,
             GenerateRequest {
                 prompt_tokens: vec![1, 2, 3],
@@ -4931,6 +5152,7 @@ mod tests {
                 max_tokens,
                 ..Default::default()
             },
+            crate::config::Role::default(),
             crate::config::Role::default(),
             &crate::engine::metrics::ServerMetrics::new(),
             Instant::now(),

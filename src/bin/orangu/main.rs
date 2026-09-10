@@ -2057,14 +2057,23 @@ async fn run() -> Result<()> {
                 continue;
             }
             CommandOutcome::Review(launch) => {
-                if header_status.is_coordinator
+                // Resolved, not read off `header_status` — see the same call
+                // in `AutoReview` below for what a stale `false` costs.
+                let is_coordinator = is_active_connection_a_coordinator(
+                    &status_http_client,
+                    &config,
+                    &active_model,
+                    current_endpoint.as_deref(),
+                )
+                .await;
+                if is_coordinator
                     && let Some(endpoint) = current_endpoint.as_deref()
                     && let Some(profile) = review_prompt_profile(
                         &config,
                         &active_model,
                         &active_model_id,
                         endpoint,
-                        header_status.is_coordinator,
+                        is_coordinator,
                     )
                 {
                     spawn_coordinator_activation_hint(
@@ -2266,12 +2275,33 @@ async fn run() -> Result<()> {
                     output_state.reset_scroll();
                     continue;
                 };
+                // Asked here rather than read off `header_status`. That field
+                // is filled by the status refresh, which runs on a timer and
+                // starts out `false` while the startup resolution is still in
+                // flight — so a review begun in the first seconds of a session
+                // was sent as if there were no coordinator at all: `model`
+                // carried orangu.conf's own model id, nothing matched it, the
+                // coordinator fell through to the `all` profile, and the
+                // review was answered by a *reasoning* role. The visible
+                // symptom is the one thing `--review` exists to prevent —
+                // "Thinking", and a response cap spent on thought rather than
+                // findings.
+                //
+                // One probe (memoized per endpoint) against a run that is
+                // about to make hundreds of requests.
+                let is_coordinator = is_active_connection_a_coordinator(
+                    &status_http_client,
+                    &config,
+                    &active_model,
+                    Some(endpoint.as_str()),
+                )
+                .await;
                 let Some(prompt_profile) = review_prompt_profile(
                     &config,
                     &active_model,
                     &active_model_id,
                     &endpoint,
-                    header_status.is_coordinator,
+                    is_coordinator,
                 ) else {
                     output_state.push_text(&format!("Error: unknown server '{active_model}'"));
                     output_state.reset_scroll();
@@ -2281,7 +2311,7 @@ async fn run() -> Result<()> {
                 // now, in parallel with the prestart screen / per-file setup
                 // run_auto_review_mode is about to do, instead of only
                 // starting the swap once the first real request fires.
-                if header_status.is_coordinator {
+                if is_coordinator {
                     spawn_coordinator_activation_hint(
                         status_http_client.clone(),
                         prompt_profile.endpoint.clone(),

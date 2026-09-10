@@ -82,6 +82,16 @@ its own run reports a falling curve that looks exactly like the effect these
 sweeps are run to find. The clock and DPM state printed in the header make the
 cause visible after the fact; this is what avoids it.
 
+#### Measuring the sampled path (`--temperature`)
+
+`--temperature <T>` sets the sampling temperature of the timed decode; the
+default `0` is greedy. A server takes a different path for a sampled step —
+the device hands back the sampler's candidates instead of one token, and the
+host draws from them — and a client that sends no temperature gets the
+server's own default, which is sampled. So a decode number for the path such
+a client actually runs is taken with `--temperature 0.8` (or whatever the
+server's default is), not with the greedy default.
+
 > The depth padding is approximate — it appends `~depth` filler words
 > (≈ one BPE token each) rather than exact tokens, because the tool has no
 > tokenizer and talks only HTTP. It is close enough to compare *slopes*
@@ -896,6 +906,8 @@ Options:
       --flamegraph-freq <HZ>           Sampling frequency in Hz for `--flamegraph` [default: 999]
       --flamegraph-call-graph <MODE>   Call-graph mode for `--flamegraph`: `fp` or `dwarf` [default: fp]
       --flamegraph-png                 Also render a PNG beside the flamegraph SVG
+      --flamegraph-layers <DIR>        Profile every running orangu, orangu-coordinator and orangu-server for `--flamegraph-duration` while you drive the workload; one flamegraph per process in DIR. Measures nothing itself.
+      --flamegraph-duration <SECONDS>  Seconds to keep sampling under `--flamegraph-layers` [default: 60]
       --compare-profiles <LIST>        Compare already-collapsed `.folded` profiles side by side; measure nothing
       --bundle <PATH>                  Write the whole run — measurements, configuration, host — to one JSON file
       --read-bundle <LIST>             Read bundles and report them side by side; measure nothing
@@ -909,6 +921,7 @@ Options:
       --host <HOST>                    Address the web console binds: "all" (or "*") for every interface [default: 127.0.0.1]
       --port <PORT>                    Port the web console listens on [default: 8300]
       --delay <SECONDS>                Seconds to wait between measured points, for a card that heats up [default: 0]
+      --temperature <T>                Sampling temperature for the timed decode; `0` is greedy [default: 0]
   -s, --shell-completions              Print the shell completion script for the detected shell and exit
   -h, --help                           Print help
   -V, --version                        Print version
@@ -1136,6 +1149,64 @@ Everything below that line is a heuristic over symbol names, and anything it
 cannot name stays visible as `app/other` rather than being dropped — which is
 what the leaf table beside it is for: a residual you can read is a claim you can
 check.
+
+### Profiling the whole chain (`--flamegraph-layers`)
+
+`--flamegraph` profiles the process answering `--url` while this tool drives
+its own workload. That answers "where does the *server* spend its CPU on a
+benchmark". It cannot answer the question a slow `/auto_review` raises, which
+is where a request's time goes across **three** processes — the `orangu` that
+renders it, the `orangu-coordinator` that routes it, and the `orangu-server`
+that computes it — under the real client's real traffic.
+
+`--flamegraph-layers DIR` does that. It measures nothing itself: it samples the
+machine for `--flamegraph-duration` seconds while *you* drive the workload in
+a real `orangu`, then writes one flamegraph per orangu-family process that ran
+during the window, named by layer and pid — `orangu-1311063.svg`,
+`orangu-coordinator-1310966.svg`, `orangu-server-1311286.svg` — with
+`--flamegraph-png` giving each its PNG.
+
+```
+$ orangu-bench --flamegraph-layers perf/review --flamegraph-duration 90 --flamegraph-png
+profiling every orangu, orangu-coordinator and orangu-server for 90s — drive the workload now
+    (in another terminal: orangu, then /auto_review src/admin.c)
+
+=== orangu (pid 1311063)
+  profile  perf/review/orangu-1311063.svg (2178 samples over 110s — 0.02 cores busy)
+           …
+=== orangu-server (pid 1311286)
+  profile  perf/review/orangu-server-1311286.svg (40683 samples over 110s — 0.37 cores busy)
+           …
+
+   layer                  pid   samples   cores   gpu-wait  pool-idle
+   orangu              1311063      2178    0.02       0.0%       1.2%
+   orangu-coordinator  1310966         1    0.00       0.0%     100.0%
+   orangu-server       1310985         3    0.00       0.0%      33.3%
+   orangu-server       1311286     40683    0.37       0.0%      25.1%
+```
+
+Two things about how it samples are the reason it exists as its own mode:
+
+- **System-wide, not attached per pid.** `perf record -p` sees only the threads
+  that exist at the instant it attaches (the warmup rule below). A coordinator
+  replaces its `orangu-server` on every model swap, and an `/auto_review`
+  begins with one — so the process worth profiling did not exist when
+  sampling started. `perf record -a` sees every thread from the moment it
+  runs, and the split into processes is done afterwards from each sample's
+  own `comm` and `pid`. It needs `kernel.perf_event_paranoid <= 0` (or
+  `CAP_PERFMON`), one step more than `-p` does.
+- **Every process that ran gets a graph.** The table above shows two servers
+  because the review swapped one for another mid-window; a run with several
+  clients lists each. A process that forked and exec'd something else
+  (`orangu` running `git`) is a few samples under its parent's name; those are
+  written but kept out of the report.
+
+The final table is the one to read first: it is the only place the layers sit
+beside each other in the same units. In the run above it says what the
+individual graphs then explain — the client is 0.02 cores of terminal
+redrawing, the coordinator is one sample in a hundred seconds, and the server
+is 0.37 cores because it is waiting on the GPU, which is where the tokens per
+second are decided.
 
 ### Why `--flamegraph` needs the warmup
 

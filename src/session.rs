@@ -163,6 +163,34 @@ impl ChatSession {
         self.assigned_slot
     }
 
+    /// Reacts to a server rejecting this session's pinned `id_slot`: forget
+    /// what the endpoint was thought to have, re-resolve, and report the slot
+    /// to retry with.
+    ///
+    /// `None` when there is nothing to retry differently — no registry, or the
+    /// re-probe landed on the same slot — and the caller should let the error
+    /// stand rather than send the same request twice.
+    ///
+    /// Behind an `orangu-coordinator` this is not a rare correction: one
+    /// endpoint fronts several servers whose slot counts differ, `GET /props`
+    /// answers for whichever was active when it was asked, and the *rejection*
+    /// is the only statement of fact about the server actually serving this
+    /// request. Left uncorrected it fails one request per session — for
+    /// `/auto_review`, that was its whole-change conclusion, every run.
+    async fn reassign_slot_after_rejection(
+        &mut self,
+        profile: &LlmConfiguration,
+        previous: Option<u32>,
+    ) -> Option<u32> {
+        let slots = self.slots.clone()?;
+        slots.forget(&profile.endpoint);
+        self.assigned_slot = None;
+        self.assigned_slot_endpoint = None;
+        let probe_client = self.probe_client.clone();
+        let next = self.ensure_slot_assigned(profile, &probe_client).await;
+        (next != previous).then_some(next).flatten()
+    }
+
     /// Replace this session's system prompt, in the system message where it
     /// belongs.
     ///
@@ -351,15 +379,35 @@ impl ChatSession {
             .with_id_slot(id_slot);
         let checkpoint = self.checkpoint();
         self.messages.push(ChatMessage::user(user_input));
-        match client
+        let mut outcome = client
             .chat(
                 &self.messages,
                 &[],
                 &mut on_text_delta,
                 &mut on_stream_metrics,
             )
-            .await
+            .await;
+        // A slot this server does not have is the one failure worth resending
+        // for: nothing was generated, the request is untouched, and the server
+        // has just said what is wrong with it. See
+        // `reassign_slot_after_rejection`.
+        if let Err(err) = &outcome
+            && crate::llm::is_slot_out_of_range(&format!("{err:#}"))
+            && let Some(retry_slot) = self.reassign_slot_after_rejection(profile, id_slot).await
         {
+            let client = OpenAiClient::from_profile(profile)?
+                .with_max_tokens(max_response_tokens)
+                .with_id_slot(Some(retry_slot));
+            outcome = client
+                .chat(
+                    &self.messages,
+                    &[],
+                    &mut on_text_delta,
+                    &mut on_stream_metrics,
+                )
+                .await;
+        }
+        match outcome {
             Ok(LlmResponse::Text(text)) => {
                 self.messages.push(ChatMessage::assistant(&text));
                 Ok(text)
@@ -421,6 +469,13 @@ impl ChatSession {
         let checkpoint = self.checkpoint();
         self.messages.push(ChatMessage::user(user_input));
 
+        // `mut`: a server that rejects this session's pinned slot gets one
+        // more attempt through a client pinned to a slot it does have — see
+        // `reassign_slot_after_rejection`. Only the first round can hit it (a
+        // rejection generates nothing, so no round is ever completed by one),
+        // and the flag makes that literal rather than incidental.
+        let mut client = client;
+        let mut slot_retried = false;
         for _ in 0..profile.max_tool_rounds {
             match client
                 .chat(
@@ -467,6 +522,19 @@ impl ChatSession {
                     }
                 },
                 Err(err) => {
+                    // A slot this server does not have: nothing was
+                    // generated, the conversation is untouched, and the
+                    // server has just said what is wrong with the request.
+                    // Re-resolve and send it once more.
+                    if !slot_retried
+                        && crate::llm::is_slot_out_of_range(&format!("{err:#}"))
+                        && let Some(retry_slot) =
+                            self.reassign_slot_after_rejection(profile, id_slot).await
+                    {
+                        slot_retried = true;
+                        client = client.with_id_slot(Some(retry_slot));
+                        continue;
+                    }
                     self.rollback(checkpoint);
                     return Err(err);
                 }
