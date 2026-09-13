@@ -105,6 +105,7 @@ Puts the prompt in **committer mode**: landing a reviewed pull request. The prom
 
 ```text
 pull <PR_NUMBER>
+rebase                          (only while the branch is behind the base branch)
 build | review | auto review    (optional, on the pulled branch)
 switch to main|master
 merge <BRANCH_NAME>
@@ -117,7 +118,14 @@ close issue <ISSUE_NUMBER>      (only after a rebase, when a commit names an iss
 
 `pull` remembers the request number and the branch it checked out, so the following steps are hinted with the real names — `merge pr-231`, not a placeholder. Each step advances only when the command it hints actually succeeds, so a failed merge keeps the merge on offer.
 
-A request that needs a rebase (`pull` says so) gets two more steps once `rebase` has been run on its branch: rebasing rewrites the commits, so the forge no longer recognises the merge as the request's and leaves it open. After the comment the flow therefore hints `close pr <PR_NUMBER>`, and — when the request refers to an issue, as `[#45]`, `#45`, or `issue 45` in the subject of one of its commits or, failing that, in its title — `close issue 45` after that. A request merged as it was pulled ends with the comment, as the forge closes it itself.
+A request that needs a rebase (`pull` says so: the branch is behind the base branch) opens with `rebase` as its first step, ahead of `switch to main`. It also gets the closing steps once `rebase` has been run on its branch: rebasing rewrites the commits, so the forge no longer recognises the merge as the request's and leaves it open, and it will not close the issue the request was for either. After the comment the flow therefore hints:
+
+- `close pr <PR_NUMBER>` — the request itself;
+- `close issue <ISSUE_NUMBER>` — after that, when the request refers to an issue.
+
+Whether it does, and which issue, is decided when the request is pulled. The **subject of each commit** the branch adds on top of the base branch is checked first, newest commit first, and then the **request's title**, so a request whose title says nothing but whose commit is `[#58] Leave room for the terminator` closes issue 58. A reference is `#` followed by the number, in any bracketing or punctuation — `[#58] …`, `… (#58)`, `Fixes #58:` — or the word `issue` followed by the number, as in `issue 58` or `Issue #58`. The first reference found is the one closed; a request with none in any subject or in its title ends with `close pr`.
+
+A request merged as it was pulled ends with the comment: the forge closes it itself, and neither `close` step is offered.
 
 Once the last step has run, the request is dropped from the open requests the empty prompt offers to `pull`, and the list is fetched again in the background.
 
