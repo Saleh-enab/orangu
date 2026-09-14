@@ -421,9 +421,9 @@ impl ToolExecutor {
         ));
         defs.push(tool(
             "graph_lookup",
-            "Query the workspace Knowledge Graph by symbol name. Returns the matching \n\
-             node(s) together with their callers (in-edges) and callees (out-edges). \n\
-             Use this to understand what calls a function, what a struct depends on, \n\
+            "Query the workspace Knowledge Graph by symbol name. Returns the matching \
+             node(s) together with their callers (in-edges) and callees (out-edges). \
+             Use this to understand what calls a function, what a struct depends on, \
              or whether there are circular dependencies — without reading files manually.",
             json!({
                 "type": "object",
