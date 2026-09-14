@@ -46,4 +46,5 @@ form (`commit "..."`, `push`) works just as well.
 | `/schedule` | Run a command on a cron-style schedule, unattended. |
 | `#` `\` | A line starting with `#` stays local and is never sent; one starting with `\` is ignored entirely. |
 | `Tab` | Completes commands, paths and branch names, previewed as an inline ghost. |
+| Mouse drag, double-click | Select text and copy it to the clipboard on release; copy the word under the pointer. `Shift` for the terminal's own selection. |
 | `/reload` `/restart` | Undo the session's `/model` and `/server` switches; restart orangu in place, same workspace and session. |

@@ -93,7 +93,7 @@ A fifth, `orangu-gguf`, builds the model files the server runs: it pretrains one
 - Persistent terminal UI with workspace, server, and model status in the header, refreshed every minute while idle
 - Six built-in themes (`classic`, `modern_dark`, `modern_light`, `oranguday`, `tokyonight`, `rosepine-moon`), a `random` selector, and user themes from `~/.orangu/themes/*.theme` — set globally in `orangu.conf`, per run with `-t`, or per session with `/theme` (the override is stored with the session and restored on resume)
 - Shell-style prompt editing, history with bash-style `Ctrl+R` reverse search (the match is ghosted inline, Tab completes it), scrolling, and context-sensitive Tab completion, with grey inline command hints (Tab accepts, Shift+Tab cycles between matches) and a slash-command dropdown
-- Mouse scroll and double-click, on by default and switchable off (hold **Shift** for the terminal's own text selection)
+- Mouse support, on by default and switchable off: the wheel scrolls, a drag selects text and copies it to the clipboard on release, a double-click copies the word under the pointer or folds a collapsible section (hold **Shift** for the terminal's own selection instead)
 - Natural-language aliases for nearly every command — e.g. `review`, `auto review`, `open README.md`, `list models`, `pull 58`, `commit "[#42] My feature"`, `rebase`, `merge feature/foo`, `get comments for issue 51`, `export review`
 - The licence generated files are written under, detected from the project and switchable per session with `/license` (the choice is stored with the session and restored on resume)
 - Streaming responses with live footer status such as `Thinking (...)` and native `Working @ X.Y t/s (...)`

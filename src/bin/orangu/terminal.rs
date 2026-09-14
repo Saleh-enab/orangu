@@ -78,6 +78,101 @@ impl TerminalUiGuard {
             mouse_capture,
         })
     }
+
+    /// Draw one frame. Every screen goes through here so the mouse selection
+    /// is painted over whatever was drawn and its cells are kept for the copy
+    /// on release.
+    pub(crate) fn draw(
+        &mut self,
+        render: impl FnOnce(&mut ratatui::Frame),
+    ) -> std::io::Result<ratatui::CompletedFrame<'_>> {
+        self.terminal.draw(|frame| {
+            render(frame);
+            orangu::tui::selection::finish_frame(frame.buffer_mut());
+        })
+    }
+}
+
+/// What the mouse selection made of an event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectionOutcome {
+    /// Not the selection's business.
+    Untouched,
+    /// The selection changed under an event the caller still handles (a press
+    /// that dropped the old highlight, a key or scroll that cleared it).
+    Changed,
+    /// A drag or release: the event was the selection's alone.
+    Consumed,
+}
+
+impl SelectionOutcome {
+    pub(crate) fn consumed(self) -> bool {
+        self == Self::Consumed
+    }
+
+    pub(crate) fn redraw(self) -> bool {
+        self != Self::Untouched
+    }
+}
+
+/// Feed an event to the mouse selection before the screen's own handling: a
+/// left press anchors a new selection, a drag extends it, and the release
+/// copies its text to the clipboard. Anything that moves what is under the
+/// highlight — a key, the wheel, a resize — drops it. Every event loop calls
+/// this first, so selecting works the same on every screen.
+pub(crate) fn mouse_selection(event: &Event) -> SelectionOutcome {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use orangu::tui::selection;
+
+    match event {
+        Event::Mouse(MouseEvent {
+            kind, column, row, ..
+        }) => match kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if selection::press((*column, *row)) {
+                    SelectionOutcome::Changed
+                } else {
+                    SelectionOutcome::Untouched
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                selection::drag((*column, *row));
+                SelectionOutcome::Consumed
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(text) = selection::release() {
+                    copy_selection(&text);
+                }
+                SelectionOutcome::Consumed
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => cleared(),
+            _ => SelectionOutcome::Untouched,
+        },
+        Event::Key(_) | Event::Resize(..) => cleared(),
+        _ => SelectionOutcome::Untouched,
+    }
+}
+
+fn cleared() -> SelectionOutcome {
+    if orangu::tui::selection::clear() {
+        SelectionOutcome::Changed
+    } else {
+        SelectionOutcome::Untouched
+    }
+}
+
+/// Copy selected text to the clipboard and say so on the status line.
+pub(crate) fn copy_selection(text: &str) {
+    use orangu::tui::selection;
+
+    let notice = match crate::review::copy_to_clipboard(text) {
+        Ok(()) => match text.lines().count() {
+            1 => "Copied 1 line to the clipboard".to_string(),
+            lines => format!("Copied {lines} lines to the clipboard"),
+        },
+        Err(err) => format!("Could not copy to the clipboard: {err:#}"),
+    };
+    selection::set_notice(notice);
 }
 
 impl Drop for TerminalUiGuard {
@@ -206,7 +301,7 @@ impl TerminalUiGuard {
             valid_command_len,
         };
 
-        if let Err(err) = self.terminal.draw(|f| {
+        if let Err(err) = self.draw(|f| {
             orangu::tui::renderer::render(f, &args);
         }) {
             eprintln!("failed to draw terminal screen: {err}");

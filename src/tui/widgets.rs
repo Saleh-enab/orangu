@@ -337,6 +337,15 @@ fn status_line(
     let mut spans = Vec::new();
     let mut left_visible_width = 0;
 
+    // A `Copied …` notice from the mouse selection takes the activity slot
+    // while nothing else claims it, on every screen that has a status line.
+    let notice = left_status
+        .is_none()
+        .then(crate::tui::selection::notice)
+        .flatten()
+        .map(StatusFragment::plain);
+    let left_status = left_status.or(notice.as_ref());
+
     if let Some(branch) = branch.filter(|branch| !branch.trim().is_empty()) {
         let label = format!("{branch}  ");
         left_visible_width += label.chars().count();

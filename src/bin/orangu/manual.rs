@@ -585,11 +585,15 @@ pub fn run_manual_mode(
         let left_width = viewport.actual_width.saturating_sub(right_width + 1).max(1);
         state.clamp(text_height, left_width);
 
-        terminal_guard.terminal.draw(|f| {
+        terminal_guard.draw(|f| {
             draw_manual_screen(f, &state, viewport, chrome, &theme);
         })?;
 
-        let (code, modifiers) = match event::read()? {
+        let event = event::read()?;
+        if crate::terminal::mouse_selection(&event).consumed() {
+            continue;
+        }
+        let (code, modifiers) = match event {
             Event::Resize(width, height) => {
                 viewport.on_resize(usize::from(width), usize::from(height));
                 continue;

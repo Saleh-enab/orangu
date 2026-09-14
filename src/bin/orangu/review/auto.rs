@@ -2551,7 +2551,11 @@ pub(crate) fn run_auto_review_prestart(
         );
         std::io::stdout().flush()?;
 
-        let (code, modifiers) = match event::read()? {
+        let event = event::read()?;
+        if crate::terminal::mouse_selection(&event).consumed() {
+            continue;
+        }
+        let (code, modifiers) = match event {
             Event::Resize(width, height) => {
                 viewport.on_resize(usize::from(width), usize::from(height));
                 continue;
@@ -2819,7 +2823,11 @@ pub(crate) async fn run_auto_review_request(
                     viewport.actual_width,
                 );
                 while event::poll(std::time::Duration::ZERO)? {
-                    let (code, modifiers) = match event::read()? {
+                    let event = event::read()?;
+                    if crate::terminal::mouse_selection(&event).consumed() {
+                        continue;
+                    }
+                    let (code, modifiers) = match event {
                         Event::Resize(width, height) => {
                             viewport.on_resize(usize::from(width), usize::from(height));
                             continue;
@@ -3077,7 +3085,11 @@ pub(crate) fn run_auto_review_browse(
         );
         std::io::stdout().flush()?;
 
-        let (code, modifiers) = match event::read()? {
+        let event = event::read()?;
+        if crate::terminal::mouse_selection(&event).consumed() {
+            continue;
+        }
+        let (code, modifiers) = match event {
             Event::Resize(width, height) => {
                 viewport.on_resize(usize::from(width), usize::from(height));
                 continue;

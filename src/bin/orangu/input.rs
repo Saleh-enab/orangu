@@ -959,7 +959,13 @@ pub fn read_input(
     let refresh_deadline = Instant::now() + max_idle;
 
     loop {
+        // A `Copied …` notice on the status line has to go away on time, so
+        // its expiry caps the wait: the timeout falls through to a refresh.
         let timeout = idle_status_refresh_timeout(refresh_deadline, Instant::now());
+        let timeout = match orangu::tui::selection::notice_remaining() {
+            Some(remaining) => timeout.min(remaining),
+            None => timeout,
+        };
         if !event::poll(timeout)? {
             return Ok(InputResult::Refresh);
         }
@@ -1040,7 +1046,16 @@ pub fn handle_input_event_with_status(
     input_context: InputContext<'_>,
     pending_count: usize,
 ) -> InputEventResult {
-    let mut redraw = false;
+    // The mouse selection sees every event first: a drag or a release is its
+    // alone, and a press, key, wheel, or resize may have dropped its highlight.
+    let selection = crate::terminal::mouse_selection(&event);
+    if selection.consumed() {
+        return InputEventResult {
+            redraw: true,
+            outcome: None,
+        };
+    }
+    let mut redraw = selection.redraw();
 
     match event {
         Event::Resize(w, h) => {
@@ -1365,6 +1380,7 @@ pub fn handle_input_event_with_status(
         }
         Event::Mouse(crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column,
             row,
             ..
         }) => {
@@ -1378,13 +1394,16 @@ pub fn handle_input_event_with_status(
                     is_double_click = true;
                     input_state.last_mouse_click = None;
                 } else {
-                    input_state.last_mouse_click = Some((now, row, 0));
+                    input_state.last_mouse_click = Some((now, row, column));
                 }
             } else {
-                input_state.last_mouse_click = Some((now, row, 0));
+                input_state.last_mouse_click = Some((now, row, column));
             }
 
+            // A double-click folds or unfolds a collapsible; anywhere else it
+            // selects the word under the pointer and copies it.
             if is_double_click {
+                let mut toggled = false;
                 let layout = orangu::tui::main_screen_layout(
                     input_context.render.actual_width,
                     input_context.render.actual_height,
@@ -1406,8 +1425,13 @@ pub fn handle_input_event_with_status(
                         pending_count > 0,
                     ) && output_state.toggle_collapse(id)
                     {
+                        toggled = true;
                         redraw = true;
                     }
+                }
+                if !toggled && let Some(word) = orangu::tui::selection::select_word((column, row)) {
+                    crate::terminal::copy_selection(&word);
+                    redraw = true;
                 }
             }
         }

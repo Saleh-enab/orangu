@@ -911,7 +911,11 @@ pub(crate) fn run_review_mode(
         );
         std::io::stdout().flush()?;
 
-        let (code, modifiers) = match event::read()? {
+        let event = event::read()?;
+        if crate::terminal::mouse_selection(&event).consumed() {
+            continue;
+        }
+        let (code, modifiers) = match event {
             Event::Resize(width, height) => {
                 viewport.on_resize(usize::from(width), usize::from(height));
                 continue;
@@ -1203,7 +1207,11 @@ pub(crate) async fn run_review_request(
             result = &mut future => return Ok(ReviewRequestOutcome::Completed(result)),
             _ = interval.tick() => {
                 while event::poll(std::time::Duration::ZERO)? {
-                    let (code, modifiers) = match event::read()? {
+                    let event = event::read()?;
+                    if crate::terminal::mouse_selection(&event).consumed() {
+                        continue;
+                    }
+                    let (code, modifiers) = match event {
                         Event::Resize(width, height) => {
                             viewport.on_resize(usize::from(width), usize::from(height));
                             continue;

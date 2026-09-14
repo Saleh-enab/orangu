@@ -339,6 +339,18 @@ Path-completion details:
 - The output scrollback buffer keeps the most recent 10,000 lines
 - Scrolling is limited to the output window; it does not replace the header or prompt area
 
+### Mouse
+
+With the `mouse` configuration key on (the default) the terminal hands the mouse to `orangu`, which does with it what the terminal would have done — plus a few things of its own:
+
+- The wheel scrolls the output window
+- A left-button drag selects text: the cells between the press and the pointer are highlighted in reverse video, and releasing the button copies them to the system clipboard. The selection runs across rows like a terminal's, not as a rectangle, and it is made of what is on screen, so it copies exactly what you see — wrapped, panned, or clipped as drawn, one line per screen row with trailing blanks trimmed. `Copied N lines to the clipboard` appears on the status line for a few seconds
+- A double-click on a word selects and copies the word. Letters, digits, and the characters paths and identifiers are made of (`_`, `-`, `.`, `/`, `~`, `@`) count as part of a word, so a double-click on `src/tui/screen.rs` takes the whole path
+- A double-click on a collapsible section (a tool call, a reasoning block) folds or unfolds it instead
+- A single click drops the highlight, as does any key, the wheel, or a resize — the content under it may have moved
+
+The selection and its copy work on every screen: the main window, `/review`, `/auto_review`, and `/manual`. The text lands on the clipboard the same way `/copy` and the review reports do, so it can be pasted anywhere. Hold **Shift** while clicking or dragging to bypass `orangu` and use the terminal's own selection; set `mouse = off` to leave the mouse to the terminal altogether.
+
 ### Horizontal panning
 
 `orangu` maintains a virtual canvas that can be wider than the visible terminal. Source files shown with `/show_file` may contain lines longer than the terminal width; those lines are laid out on the full virtual canvas and can be panned horizontally without reflowing.

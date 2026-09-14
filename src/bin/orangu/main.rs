@@ -2092,7 +2092,7 @@ async fn run() -> Result<()> {
                         &server_names,
                         &available_models,
                         &mut |args: orangu::tui::ReviewScreenArgs<'_>| {
-                            if let Err(err) = _terminal_ui_guard.terminal.draw(|f| {
+                            if let Err(err) = _terminal_ui_guard.draw(|f| {
                                 orangu::tui::review_native::draw_review_screen(f, args);
                             }) {
                                 eprintln!("failed to draw review screen: {err}");
@@ -2173,7 +2173,7 @@ async fn run() -> Result<()> {
                                 &mut viewport,
                                 chrome,
                                 &mut |args: orangu::tui::ReviewScreenArgs<'_>| {
-                                    if let Err(err) = _terminal_ui_guard.terminal.draw(|f| {
+                                    if let Err(err) = _terminal_ui_guard.draw(|f| {
                                         orangu::tui::review_native::draw_review_screen(f, args);
                                     }) {
                                         eprintln!("failed to draw review screen: {err}");
@@ -2319,7 +2319,7 @@ async fn run() -> Result<()> {
                     // chained `export auto review` can pick up the report.
                     current_chain.is_some(),
                     &mut |args: orangu::tui::AutoReviewScreenArgs<'_>| {
-                        if let Err(err) = _terminal_ui_guard.terminal.draw(|f| {
+                        if let Err(err) = _terminal_ui_guard.draw(|f| {
                             orangu::tui::auto_review_native::draw_auto_review_screen(f, args);
                         }) {
                             eprintln!("failed to draw auto-review screen: {err}");

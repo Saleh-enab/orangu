@@ -21,6 +21,7 @@ pub mod renderer;
 pub mod review;
 pub mod review_native;
 pub mod screen;
+pub mod selection;
 pub mod text;
 pub mod theme;
 pub mod widgets;

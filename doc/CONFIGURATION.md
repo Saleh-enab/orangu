@@ -71,7 +71,7 @@ theme = classic
 | `width` | No | Virtual terminal width for the output canvas. Source lines from `/show_file` are laid out at this width and can be panned horizontally. Defaults to `512` |
 | `word_wrap` | No | Wrap long lines in the main TUI, `/show_file`, `/review`, and `/auto_review` windows. Defaults to `off`; set it to `on` to wrap at the visible width. Options: `on`, `true`, `1`, `off`, `false`, `0` |
 | `drop_down` | No | Enable the autocomplete dropdown for slash commands. Defaults to `on`. Options: `on`, `true`, `1`, `off`, `false`, `0` |
-| `mouse` | No | Enable mouse capture, so the TUI handles scroll and double-click. Defaults to `on`; hold **Shift** while clicking or dragging for native text selection. Options: `on`, `true`, `1`, `off`, `false`, `0` |
+| `mouse` | No | Enable mouse capture, so the TUI handles the wheel, drag-to-select (copied to the clipboard on release), and double-click. Defaults to `on`; hold **Shift** while clicking or dragging for the terminal's own selection. Options: `on`, `true`, `1`, `off`, `false`, `0` |
 | `workspaces` | No | Placement of the workspace tabs. Defaults to `top`. Options: `top`, `bottom`, `left`, `right` |
 | `quotes` | No | Quote set shown while the model is thinking. Defaults to `none`. Options: `none`, `star_trek`, `star_wars`, `marco_pierre_white`, `gordon_ramsay`, `calvin_and_hobbes`, `sun_tzu_mandarin`, `sun_tzu_english`, `attila_the_hun`, `all` |
 | `feedback` | No | Show a green or red dot in the output window after each command to indicate success or failure, blink an `orangu ●` progress title and ring the terminal bell when a `/auto_review` finishes. Defaults to `off`. Options: `on`, `true`, `1`, `off`, `false`, `0` |
