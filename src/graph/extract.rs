@@ -457,7 +457,7 @@ mod ocaml_interface_queries {
     "#;
     pub const CALLS: &str = "";
     pub const IMPORTS: &str = r#"
-      (open_module module: (module_path (module_name) @import_path))
+      (open_module_signature module: (extended_module_path (module_name) @import_path))
     "#;
 }
 
