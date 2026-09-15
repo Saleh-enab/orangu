@@ -2799,6 +2799,8 @@ fn prepare_submitted_input(
     if trimmed.is_empty() || trimmed.starts_with('\\') {
         return Ok(None);
     }
+    // The greeting is for the first prompt only.
+    crate::mode::dismiss_greeting();
 
     history.push(trimmed.to_string());
     append_history_entry(history_path, trimmed)?;

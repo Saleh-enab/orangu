@@ -21,10 +21,11 @@
 //! Completion reads this on every keystroke, so it is a plain atomic rather
 //! than anything the prompt has to wait on.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-/// The greeting the developer prompt draws on an untouched line. Rendered like
-/// any other ghost, but it is not a command, so Tab never fills it in.
+/// The greeting the developer prompt draws on its first untouched line.
+/// Rendered like any other ghost, but it is not a command, so Tab never fills
+/// it in.
 pub const WELCOME_GHOST: &str = "Welcome, I'm orangu";
 
 /// What the prompt is for.
@@ -68,14 +69,32 @@ pub fn set(mode: PromptMode) {
     MODE.store(mode.repr(), Ordering::Relaxed);
 }
 
+/// Whether the greeting has had its turn: it is for the first prompt only, so
+/// once anything has been submitted — or a session that already greeted is
+/// resumed — the untouched line shows just the cursor.
+static GREETED: AtomicBool = AtomicBool::new(false);
+
+/// Retire the greeting for the rest of the run.
+pub fn dismiss_greeting() {
+    GREETED.store(true, Ordering::Relaxed);
+}
+
+/// Bring the greeting back — only tests need this, to start from a fresh run.
+#[cfg(test)]
+pub fn reset_greeting() {
+    GREETED.store(false, Ordering::Relaxed);
+}
+
 /// The greeting to draw on an untouched developer prompt, or `None` once
-/// something has been typed or the prompt is in committer mode — where the
-/// merge flow's next step has the line instead.
+/// something has been typed, the first prompt has been submitted (or the
+/// session resumed, which greeted last time), or the prompt is in committer
+/// mode — where the merge flow's next step has the line instead.
 ///
 /// This is a rendered hint only: it is deliberately kept out of the Tab and
 /// Shift+Tab candidates, since there is no command to accept.
 pub fn opening_ghost(input: &str) -> Option<&'static str> {
-    (input.is_empty() && current() == PromptMode::Developer).then_some(WELCOME_GHOST)
+    (input.is_empty() && !GREETED.load(Ordering::Relaxed) && current() == PromptMode::Developer)
+        .then_some(WELCOME_GHOST)
 }
 
 #[cfg(test)]
@@ -94,6 +113,20 @@ mod tests {
         assert_eq!(opening_ghost("p"), None);
         // The committer prompt has the merge flow to show instead.
         set(PromptMode::Committer);
+        assert_eq!(opening_ghost(""), None);
+    }
+
+    #[test]
+    fn the_greeting_is_for_the_first_prompt_only() {
+        let _guard = exclusive_prompt_state();
+        assert_eq!(opening_ghost(""), Some(WELCOME_GHOST));
+        // Once the first prompt is submitted (or a session that already
+        // greeted is resumed), the untouched line is just the cursor...
+        dismiss_greeting();
+        assert_eq!(opening_ghost(""), None);
+        // ...and switching modes does not bring it back.
+        set(PromptMode::Committer);
+        set(PromptMode::Developer);
         assert_eq!(opening_ghost(""), None);
     }
 

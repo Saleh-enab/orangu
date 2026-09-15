@@ -241,6 +241,9 @@ impl WorkspaceTab {
         let mut session = ChatSession::new(&enhanced_prompt).with_slots(slots);
         if is_resumed {
             session.restore(load_session_messages(&session_messages_path)?);
+            // A resumed session was greeted when it was first opened; its
+            // untouched prompt is just the cursor from here on.
+            crate::mode::dismiss_greeting();
         }
 
         let usage_stats = UsageStats::new()

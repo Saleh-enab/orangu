@@ -78,7 +78,7 @@ Lists the model-facing workspace tools — the file-lifecycle eight (`show_file`
 
 ## /developer
 
-Puts the prompt in **developer mode**, the default: writing code. The prompt keeps out of the way — an untouched line opens with the greeting `Welcome, I'm orangu`, and from there only what you type is hinted (slash commands, natural-language bindings, and argument completion, exactly as described in the Terminal chapter).
+Puts the prompt in **developer mode**, the default: writing code. The prompt keeps out of the way — the first untouched line opens with the greeting `Welcome, I'm orangu` — after the first prompt is submitted, or on a resumed session, an untouched line is just the cursor — and from there only what you type is hinted (slash commands, natural-language bindings, and argument completion, exactly as described in the Terminal chapter).
 
 The greeting is a label, not a suggestion: it is drawn in grey like any other hint, but it is deliberately kept out of the `Tab` and `Shift+Tab` candidates, so it can never be completed into the line.
 

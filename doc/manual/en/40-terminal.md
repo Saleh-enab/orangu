@@ -264,7 +264,7 @@ The natural-language hint takes priority over generic filename completion, so `c
 
 ### The merge flow
 
-The prompt has two modes, selected with `/developer` and `/committer` (see the Core tools chapter). In **developer mode** — the default — an untouched line opens with the greeting `Welcome, I'm orangu` and nothing else is suggested until you type. Everything in this section is what **committer mode** adds.
+The prompt has two modes, selected with `/developer` and `/committer` (see the Core tools chapter). In **developer mode** — the default — the first untouched line opens with the greeting `Welcome, I'm orangu` and nothing else is suggested until you type; once the first prompt has been submitted (or a session is resumed, which was greeted when it was first opened), an untouched line shows just the cursor. Everything in this section is what **committer mode** adds.
 
 Merging a reviewed pull request is the same six commands every time, so in committer mode the prompt hints them for you, in order, starting from the empty line:
 

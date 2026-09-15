@@ -29,6 +29,7 @@ impl Drop for PromptStateGuard {
         crate::completion::flow::test_support::reset();
         crate::completion::set_active_pull_requests(&[]);
         crate::mode::set(crate::mode::PromptMode::default());
+        crate::mode::reset_greeting();
     }
 }
 
@@ -42,6 +43,7 @@ pub(crate) fn exclusive_prompt_state() -> PromptStateGuard {
     crate::completion::flow::test_support::reset();
     crate::completion::set_active_pull_requests(&[]);
     crate::mode::set(crate::mode::PromptMode::default());
+    crate::mode::reset_greeting();
     PromptStateGuard(guard)
 }
 
