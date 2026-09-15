@@ -258,6 +258,8 @@ pub const NATURAL_LANGUAGE_BINDINGS: &[&str] = &[
     // --- restore ---
     "restore ",
     "git restore ",
+    // --- add repository ---
+    "add repository ",
     // --- add (folded into create file: creating a file is writing it and
     // staging it, so these reach /create_file) ---
     "git add ",
@@ -894,6 +896,13 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
                 return Some(LocalCommand::DeleteDirectory(Some(Cow::Borrowed(path))));
             }
         }
+    }
+    // Before the bare "add " below, which would otherwise stage a file named
+    // `repository`.
+    if let Some(rest) = strip_ascii_prefix(input, "add repository ")
+        && let Some(args) = parse_add_repository_args(rest)
+    {
+        return Some(LocalCommand::AddRepository(Some(args)));
     }
     // "Create myfile.txt with 0644" — the mode is optional, and the bare
     // "create " form comes last so it never shadows "create branch"/"create

@@ -28,6 +28,7 @@ pub(crate) async fn wait_for_response(
     tools: &ToolExecutor,
     llm_start: std::time::Instant,
     tool_time_before: std::time::Duration,
+    after_turn: Option<crate::commands::AfterTurn>,
     wait_context: WaitContext<'_>,
     print_screen_fn: &mut impl FnMut(RenderContext<'_>, ScreenState<'_>),
 ) -> Result<WaitResult> {
@@ -103,6 +104,7 @@ pub(crate) async fn wait_for_response(
             llm_start,
             tool_time_before,
             saved_messages,
+            after_turn,
         },
         wait_context,
         print_screen_fn,
@@ -138,6 +140,7 @@ async fn drive_handle(
         llm_start,
         tool_time_before,
         saved_messages,
+        after_turn,
     } = pr;
     let WaitContext {
         mut render,
@@ -264,6 +267,7 @@ async fn drive_handle(
                         return Ok(WaitResult::Response {
                             answer: response,
                             truncated: final_state.metrics.truncated,
+                            after_turn,
                         });
                     }
                 }
@@ -422,6 +426,7 @@ async fn drive_handle(
                                     llm_start,
                                     tool_time_before,
                                     saved_messages,
+                                    after_turn,
                                 }));
                             }
                         }
@@ -901,6 +906,20 @@ pub(crate) fn push_answer(output_state: &mut OutputState, answer: &str, truncate
     output_state.push_markdown(answer);
     if truncated {
         output_state.push_text(&truncated_notice_line());
+    }
+}
+
+/// Run the step a command asked to follow its model turn and show the result
+/// under the answer — `git rebase --continue` after `/create_patch`, say.
+pub(crate) fn push_after_turn(
+    output_state: &mut OutputState,
+    step: crate::commands::AfterTurn,
+    workspace: &std::path::Path,
+    answer: &str,
+) {
+    match crate::dispatch::run_after_turn(step, workspace, answer) {
+        Ok(text) => output_state.push_text(&text),
+        Err(err) => output_state.push_text(&format!("Error: {err:#}")),
     }
 }
 

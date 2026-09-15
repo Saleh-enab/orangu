@@ -495,6 +495,96 @@ fn completes_restore_modified_files() {
 }
 
 #[test]
+fn add_repository_completion_offers_known_users_then_branches() {
+    let workspace = tempdir().expect("workspace");
+    init_test_git_repo(workspace.path());
+    let git = |args: &[&str]| {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(workspace.path())
+                .status()
+                .expect("git")
+                .success(),
+            "git {args:?}"
+        );
+    };
+    git(&["commit", "--allow-empty", "-m", "base"]);
+    for (name, url) in [
+        ("origin", "https://github.com/alice/pgmoneta.git"),
+        ("bob", "https://github.com/bob/pgmoneta.git"),
+        ("carol", "https://github.com/carol/pgmoneta.git"),
+    ] {
+        git(&["remote", "add", name, url]);
+    }
+    // bob has been fetched before: a `muse` branch is known for him.
+    git(&["update-ref", "refs/remotes/bob/muse", "HEAD"]);
+    let skills = orangu::skills::SkillRegistry::discover(std::path::Path::new("/"));
+
+    // The first word: every remote but origin, so `add repository` and its
+    // slash form reach the users already added.
+    for input in ["/add_repository ", "add repository "] {
+        let (start, _, candidates) =
+            completion_candidates(input, input.len(), workspace.path(), &[], &[], &skills)
+                .expect("user completion");
+        assert_eq!(start, input.len(), "{input}");
+        assert_eq!(candidates, vec!["bob", "carol"], "{input}");
+    }
+    let (start, _, narrowed) = completion_candidates(
+        "/add_repository c",
+        "/add_repository c".len(),
+        workspace.path(),
+        &[],
+        &[],
+        &skills,
+    )
+    .expect("user completion");
+    assert_eq!(start, "/add_repository ".len());
+    assert_eq!(narrowed, vec!["carol"]);
+
+    // The second word: the branches known for that user, then main/master.
+    let (start, _, branches) = completion_candidates(
+        "/add_repository bob ",
+        "/add_repository bob ".len(),
+        workspace.path(),
+        &[],
+        &[],
+        &skills,
+    )
+    .expect("branch completion");
+    assert_eq!(start, "/add_repository bob ".len());
+    assert_eq!(branches, vec!["muse", "main", "master"]);
+    let (_, _, branches) = completion_candidates(
+        "add repository nobody ma",
+        "add repository nobody ma".len(),
+        workspace.path(),
+        &[],
+        &[],
+        &skills,
+    )
+    .expect("branch completion");
+    assert_eq!(branches, vec!["main", "master"]);
+    assert_eq!(
+        completion_ghost_suffix(
+            "/add_repository bob m",
+            "/add_repository bob m".len(),
+            workspace.path(),
+            &[],
+            &[],
+            &skills
+        )
+        .as_deref(),
+        Some("use")
+    );
+
+    // A bare `add ` still completes files, not users.
+    let (_, _, files) =
+        completion_candidates("add ", "add ".len(), workspace.path(), &[], &[], &skills)
+            .expect("file completion");
+    assert!(!files.iter().any(|f| f == "bob"), "{files:?}");
+}
+
+#[test]
 fn completes_fetch_remotes_with_origin_first() {
     let workspace = tempdir().expect("workspace");
     init_test_git_repo(workspace.path());

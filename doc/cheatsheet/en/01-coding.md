@@ -15,6 +15,7 @@ form (`commit "..."`, `push`) works just as well.
 | `/show_file README.md` | Print a file — syntax-highlighted when `bat` is installed. |
 | `/create_file` `/move_file old.rs new.rs` `/delete_file` | File lifecycle, staged with `git add`, `git mv` and `git rm` as it happens. |
 | `/grep <pattern>` | Search the workspace, without spending a token on it. |
+| `/add_repository Jubilee101 muse` | Another user's copy of the project, found from `origin`, as the local tracking branch `Jubilee101/muse`. |
 
 ## Let the model work
 

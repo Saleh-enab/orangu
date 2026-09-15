@@ -692,6 +692,57 @@ fn parses_fetch_commands() {
 }
 
 #[test]
+fn parses_add_repository_commands() {
+    // The user alone: their default branch.
+    for input in ["/add_repository Jubilee101", "add repository Jubilee101"] {
+        assert!(
+            matches!(
+                parse_local_command(input),
+                Some(LocalCommand::AddRepository(Some((ref user, None)))) if user == "Jubilee101"
+            ),
+            "{input}"
+        );
+    }
+    // User and branch.
+    for input in [
+        "/add_repository Jubilee101 muse",
+        "/add_repository  Jubilee101   muse ",
+        "add repository Jubilee101 muse",
+        "Add Repository Jubilee101 muse",
+    ] {
+        assert!(
+            matches!(
+                parse_local_command(input),
+                Some(LocalCommand::AddRepository(Some((ref user, Some(ref branch)))))
+                    if user == "Jubilee101" && branch == "muse"
+            ),
+            "{input}"
+        );
+    }
+    // Missing or surplus arguments are a usage error for the slash form.
+    for input in [
+        "/add_repository",
+        "/add_repository ",
+        "/add_repository a b c",
+    ] {
+        assert!(
+            matches!(
+                parse_local_command(input),
+                Some(LocalCommand::AddRepository(None))
+            ),
+            "{input}"
+        );
+    }
+    // The natural form with too many words is a sentence for the model, and
+    // `add repository` never stages a file called `repository`.
+    assert!(parse_local_command("add repository a b c").is_none());
+    assert!(matches!(
+        parse_local_command("add repository"),
+        Some(LocalCommand::CreateFile(Some(ref args))) if args.path == "repository"
+    ));
+}
+
+#[test]
 fn parses_comment_commands() {
     assert!(matches!(
         parse_local_command("/comment 51 \"My comment\""),

@@ -23,11 +23,15 @@ use crate::render::{
     ANSI_FG_SUBTLE,
 };
 
+/// Every branch, local and remote-tracking, by the name after `refs/heads/`
+/// or `refs/remotes/` (`main`, `origin/main`). Not `%(refname:short)`: that
+/// spells a local branch `heads/bob/main` once a remote `bob` also has a
+/// `main`, which is exactly what `/add_repository` sets up.
 pub fn git_branch_names(repo_root: &Path) -> Vec<String> {
     let Ok(output) = std::process::Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["branch", "--all", "--format=%(refname:short)"])
+        .args(["branch", "--all", "--format=%(refname:lstrip=2)"])
         .output()
     else {
         return Vec::new();
@@ -50,7 +54,7 @@ pub fn git_local_branch_names(repo_root: &Path) -> Vec<String> {
     let Ok(output) = std::process::Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["branch", "--format=%(refname:short)"])
+        .args(["branch", "--format=%(refname:lstrip=2)"])
         .output()
     else {
         return Vec::new();
@@ -62,6 +66,37 @@ pub fn git_local_branch_names(repo_root: &Path) -> Vec<String> {
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    branches.sort();
+    branches.dedup();
+    branches
+}
+
+/// The branches known for `remote` — the names under `refs/remotes/<remote>/`
+/// without that prefix (so `main`, not `origin/main`), `HEAD` excluded, sorted.
+/// Empty when nothing has been fetched from it or the command fails.
+pub fn git_remote_branch_names(repo_root: &Path, remote: &str) -> Vec<String> {
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("refs/remotes/{remote}/"),
+        ])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let prefix = format!("refs/remotes/{remote}/");
+    let mut branches: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix(prefix.as_str()))
+        .filter(|name| !name.is_empty() && *name != "HEAD")
         .map(str::to_string)
         .collect();
     branches.sort();
@@ -159,17 +194,160 @@ pub fn git_remote_names(repo_root: &Path) -> Vec<String> {
 /// PDF carries the repository's name even when it was cloned into a differently
 /// named directory.
 pub fn git_repository_name(repo_root: &Path) -> Option<String> {
+    repository_name_from_url(&git_remote_url(repo_root, "origin")?)
+}
+
+/// The URL of the configured remote `remote` (`git remote get-url`), trimmed.
+/// `None` when the remote does not exist or the command fails.
+pub fn git_remote_url(repo_root: &Path, remote: &str) -> Option<String> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["remote", "get-url", "origin"])
+        .args(["remote", "get-url", remote])
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
-    let url = String::from_utf8_lossy(&output.stdout);
-    repository_name_from_url(url.trim())
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Where a repository's `origin` lives — the layouts `/add_repository` knows
+/// how to find another user's copy of the same project in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepositoryHost {
+    /// `github.com` or a `github.*` instance: forks live directly under the
+    /// user.
+    GitHub,
+    /// `gitlab.com` or a `gitlab.*` instance: forks live directly under the
+    /// user, whatever group the original sits in.
+    GitLab,
+    /// Any other host reached over the network: the other user's copy is the
+    /// sibling directory named after them.
+    Network,
+    /// A filesystem path (or `file://` URL): likewise the sibling directory.
+    Local,
+}
+
+impl RepositoryHost {
+    /// The name shown in `/add_repository`'s report.
+    pub fn name(self) -> &'static str {
+        match self {
+            RepositoryHost::GitHub => "GitHub",
+            RepositoryHost::GitLab => "GitLab",
+            RepositoryHost::Network => "network",
+            RepositoryHost::Local => "local",
+        }
+    }
+
+    /// Whether the copy is found by replacing the whole owner path with the
+    /// user (a forge fork) rather than only the directory the project sits in.
+    fn is_forge(self) -> bool {
+        matches!(self, RepositoryHost::GitHub | RepositoryHost::GitLab)
+    }
+}
+
+/// Another user's copy of the project behind an `origin` URL, as
+/// [`sibling_repository`] derives it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SiblingRepository {
+    pub host: RepositoryHost,
+    /// The project name, e.g. `pgmoneta` — the last path segment of `origin`
+    /// without `.git`.
+    pub project: String,
+    /// The URL to fetch the other user's copy from: `origin`'s scheme, host and
+    /// project with the owner replaced.
+    pub url: String,
+}
+
+/// Locate `user`'s copy of the project that `origin_url` points at: the same
+/// host, reached the same way (HTTPS, SSH, or a filesystem path), the same
+/// project name, and `user` in place of the owner. So
+/// `https://github.com/alice/pgmoneta.git` yields
+/// `https://github.com/bob/pgmoneta.git` for `bob`, `git@gitlab.com:group/sub/pgmoneta.git`
+/// yields `git@gitlab.com:bob/pgmoneta.git` (a forge fork lives directly under
+/// the user), while `/srv/git/alice/pgmoneta.git` and
+/// `ssh://git.example.com/srv/git/alice/pgmoneta.git` yield the same path with
+/// `bob` in place of `alice` (only the directory the project sits in is
+/// renamed).
+///
+/// `github.com`/`github.*` and `gitlab.com`/`gitlab.*` are recognised by name;
+/// any other host is a plain network host and a path-less URL is local. Errors
+/// when the URL has no owner segment to replace, since there is then nowhere
+/// to look.
+pub fn sibling_repository(origin_url: &str, user: &str) -> Result<SiblingRepository> {
+    let url = origin_url.trim();
+    if url.is_empty() {
+        return Err(anyhow!("the 'origin' remote has no URL"));
+    }
+    // Split the URL into what comes before the path (scheme and authority, or
+    // the scp-style `user@host:`), the path itself, and the host it names —
+    // `None` for a filesystem path.
+    let (prefix, path, host): (String, &str, Option<&str>) =
+        if let Some(rest) = url.strip_prefix("file://") {
+            ("file://".to_string(), rest, None)
+        } else if let Some((scheme, rest)) = url.split_once("://") {
+            let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
+            (format!("{scheme}://{authority}/"), path, Some(host))
+        } else if let Some((authority, path)) = url.split_once(':')
+            && !authority.contains('/')
+            && !authority.is_empty()
+            && !url.starts_with('.')
+            && !url.starts_with('/')
+            && !url.starts_with('~')
+        {
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            (format!("{authority}:"), path, Some(host))
+        } else {
+            (String::new(), url, None)
+        };
+
+    let host = match host {
+        None => RepositoryHost::Local,
+        Some(host) => {
+            let host = host.to_ascii_lowercase();
+            let host = host.strip_prefix("www.").unwrap_or(&host);
+            if host == "github.com" || host.starts_with("github.") {
+                RepositoryHost::GitHub
+            } else if host == "gitlab.com" || host.starts_with("gitlab.") {
+                RepositoryHost::GitLab
+            } else {
+                RepositoryHost::Network
+            }
+        }
+    };
+
+    let path = path.trim_end_matches('/');
+    let (path, suffix) = match path.strip_suffix(".git") {
+        Some(path) => (path, ".git"),
+        None => (path, ""),
+    };
+    let mut segments: Vec<&str> = path.split('/').collect();
+    let project = segments.pop().filter(|p| !p.is_empty()).ok_or_else(|| {
+        anyhow!("could not read a project name from the 'origin' URL '{origin_url}'")
+    })?;
+    let owner = segments.last().copied().filter(|o| !o.is_empty());
+    if owner.is_none() {
+        return Err(anyhow!(
+            "the 'origin' URL '{origin_url}' names no owner to replace with '{user}'"
+        ));
+    }
+    // A forge fork lives directly under the user, whatever group nesting the
+    // original had; any other copy keeps the directories above the owner.
+    let mut rebuilt: Vec<&str> = if host.is_forge() {
+        Vec::new()
+    } else {
+        segments[..segments.len() - 1].to_vec()
+    };
+    rebuilt.push(user);
+    rebuilt.push(project);
+    Ok(SiblingRepository {
+        host,
+        project: project.to_string(),
+        url: format!("{prefix}{}{suffix}", rebuilt.join("/")),
+    })
 }
 
 /// A repository's web home on a known forge, derived from its `origin` remote.
@@ -205,16 +383,7 @@ impl ForgeWeb {
 /// instances are not assumed) — callers then leave source references as plain
 /// text.
 pub fn forge_web_from_origin(repo_root: &Path) -> Option<ForgeWeb> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["remote", "get-url", "origin"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    forge_web_from_url(String::from_utf8_lossy(&output.stdout).trim())
+    forge_web_from_url(&git_remote_url(repo_root, "origin")?)
 }
 
 /// Parse a remote URL into a [`ForgeWeb`]. Handles HTTPS (`https://host/owner/repo`),
@@ -772,6 +941,135 @@ mod tests {
             );
         }
         assert_eq!(repository_name_from_url(""), None);
+    }
+
+    #[test]
+    fn sibling_repository_replaces_the_owner_and_keeps_the_rest() {
+        use RepositoryHost::*;
+        for (origin, host, url) in [
+            // Forge forks live directly under the user; scheme and `.git` stay.
+            (
+                "https://github.com/alice/pgmoneta.git",
+                GitHub,
+                "https://github.com/bob/pgmoneta.git",
+            ),
+            (
+                "https://github.com/alice/pgmoneta",
+                GitHub,
+                "https://github.com/bob/pgmoneta",
+            ),
+            (
+                "git@github.com:alice/pgmoneta.git",
+                GitHub,
+                "git@github.com:bob/pgmoneta.git",
+            ),
+            (
+                "ssh://git@github.com/alice/pgmoneta.git",
+                GitHub,
+                "ssh://git@github.com/bob/pgmoneta.git",
+            ),
+            (
+                "https://GitHub.com/alice/pgmoneta/",
+                GitHub,
+                "https://GitHub.com/bob/pgmoneta",
+            ),
+            (
+                "https://github.example.com/alice/pgmoneta.git",
+                GitHub,
+                "https://github.example.com/bob/pgmoneta.git",
+            ),
+            // GitLab group nesting collapses to the user.
+            (
+                "git@gitlab.com:group/sub/pgmoneta.git",
+                GitLab,
+                "git@gitlab.com:bob/pgmoneta.git",
+            ),
+            (
+                "https://gitlab.example.com:8443/group/pgmoneta.git",
+                GitLab,
+                "https://gitlab.example.com:8443/bob/pgmoneta.git",
+            ),
+            // Any other network host and the local filesystem rename only the
+            // directory the project sits in.
+            (
+                "ssh://git.example.com/srv/git/alice/pgmoneta.git",
+                Network,
+                "ssh://git.example.com/srv/git/bob/pgmoneta.git",
+            ),
+            (
+                "git@codeberg.org:alice/pgmoneta.git",
+                Network,
+                "git@codeberg.org:bob/pgmoneta.git",
+            ),
+            (
+                "/srv/git/alice/pgmoneta.git",
+                Local,
+                "/srv/git/bob/pgmoneta.git",
+            ),
+            (
+                "file:///srv/git/alice/pgmoneta",
+                Local,
+                "file:///srv/git/bob/pgmoneta",
+            ),
+            ("../../alice/pgmoneta", Local, "../../bob/pgmoneta"),
+            ("~/src/alice/pgmoneta", Local, "~/src/bob/pgmoneta"),
+        ] {
+            let sibling =
+                sibling_repository(origin, "bob").unwrap_or_else(|e| panic!("{origin}: {e}"));
+            assert_eq!(sibling.host, host, "{origin}");
+            assert_eq!(sibling.project, "pgmoneta", "{origin}");
+            assert_eq!(sibling.url, url, "{origin}");
+        }
+    }
+
+    #[test]
+    fn sibling_repository_needs_an_owner_to_replace() {
+        for origin in [
+            "",
+            "pgmoneta.git",
+            "/pgmoneta",
+            "https://github.com/pgmoneta.git",
+        ] {
+            assert!(
+                sibling_repository(origin, "bob").is_err(),
+                "{origin:?} should have no owner"
+            );
+        }
+    }
+
+    #[test]
+    fn git_remote_branch_names_lists_one_remote_without_its_prefix() {
+        let workspace = tempdir().expect("workspace");
+        init_git_for_test(workspace.path());
+        git_run(workspace.path(), &["checkout", "-B", "main"]);
+        git_run(workspace.path(), &["commit", "--allow-empty", "-m", "one"]);
+        // A remote-tracking ref for `bob` and one for `origin`; only `bob`'s
+        // is listed, and without the `bob/` prefix.
+        git_run(
+            workspace.path(),
+            &["update-ref", "refs/remotes/bob/muse", "HEAD"],
+        );
+        git_run(
+            workspace.path(),
+            &["update-ref", "refs/remotes/bob/main", "HEAD"],
+        );
+        git_run(
+            workspace.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        git_run(
+            workspace.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/bob/HEAD",
+                "refs/remotes/bob/main",
+            ],
+        );
+        assert_eq!(
+            git_remote_branch_names(workspace.path(), "bob"),
+            vec!["main", "muse"]
+        );
+        assert!(git_remote_branch_names(workspace.path(), "nobody").is_empty());
     }
 
     #[test]

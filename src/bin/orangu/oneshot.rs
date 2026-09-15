@@ -38,10 +38,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 
 use crate::commands::{
-    CommandContext, CommandOutcome, CommandState, ExportTarget, LocalCommand, McpSubcommand,
-    current_terminal_width, parse_local_command, system_prompt,
+    AfterTurn, CommandContext, CommandOutcome, CommandState, ExportTarget, LocalCommand,
+    McpSubcommand, current_terminal_width, parse_local_command, system_prompt,
 };
-use crate::dispatch::{handle_command, run_duplicates_scan};
+use crate::dispatch::{handle_command, run_after_turn, run_duplicates_scan};
 use crate::export;
 use crate::git::{Forge, ReviewReports, fetch_pull_request_details};
 use crate::models::{
@@ -92,6 +92,9 @@ enum Resolution {
     Handled,
     /// Text for the model — the prompt as typed, or a skill's expansion of it.
     Prompt(String),
+    /// Text for the model, and a step orangu runs itself once the model has
+    /// answered.
+    PromptThen(String, AfterTurn),
 }
 
 /// Where a one-shot's own output goes — the terminal, or under `-q` nowhere at
@@ -248,7 +251,7 @@ impl OneshotSession {
 
         // Anything orangu answers on its own is answered here, before a single
         // byte goes to the server.
-        let prompt = match run_local_command(
+        let (prompt, after_turn) = match run_local_command(
             input,
             LocalRun {
                 config: &self.config,
@@ -264,7 +267,8 @@ impl OneshotSession {
         .await?
         {
             Resolution::Handled => return Ok(()),
-            Resolution::Prompt(text) => text,
+            Resolution::Prompt(text) => (text, None),
+            Resolution::PromptThen(text, step) => (text, Some(step)),
         };
 
         let metrics = Arc::new(Mutex::new(StreamMetrics::default()));
@@ -302,7 +306,13 @@ impl OneshotSession {
         let metrics = metrics.lock().ok().map(|state| state.clone());
         report_timings(console, elapsed, first_delta, metrics.as_ref());
 
-        result.map(|_| ())
+        let answer = result?;
+        // The command's own tail, once the model has answered — a failure
+        // here is the one-shot's failure, so a script sees it.
+        if let Some(step) = after_turn {
+            console.block(&run_after_turn(step, &self.workspace, &answer)?);
+        }
+        Ok(())
     }
 }
 
@@ -563,6 +573,9 @@ async fn run_outcome(
         CommandOutcome::Unhandled => Ok(Resolution::Prompt(input.to_string())),
         CommandOutcome::SkillInvoked { prompt, .. } => Ok(Resolution::Prompt(prompt)),
         CommandOutcome::ModelPrompt(prompt) => Ok(Resolution::Prompt(prompt)),
+        CommandOutcome::ModelPromptThen { prompt, then } => {
+            Ok(Resolution::PromptThen(prompt, then))
+        }
         CommandOutcome::Quiet => Ok(Resolution::Handled),
         CommandOutcome::Output(text)
         | CommandOutcome::MarkdownOutput(text)
@@ -749,7 +762,7 @@ mod tests {
 
         match resolution {
             Resolution::Prompt(prompt) => assert_eq!(prompt, "explain the prefill path"),
-            Resolution::Handled => panic!("expected the prompt to reach the model"),
+            _ => panic!("expected the prompt to reach the model"),
         }
     }
 
@@ -771,7 +784,7 @@ mod tests {
 
         match resolution {
             Resolution::Prompt(prompt) => assert_eq!(prompt, "Review focus: auth"),
-            Resolution::Handled => panic!("expected the skill prompt to reach the model"),
+            _ => panic!("expected the skill prompt to reach the model"),
         }
     }
 

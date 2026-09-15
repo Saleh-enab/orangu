@@ -87,6 +87,9 @@ pub struct PendingResponse {
     /// Snapshot of session messages taken before the spawn so we can restore a
     /// clean session if the user later presses Escape to cancel the response.
     pub(crate) saved_messages: Vec<ChatMessage>,
+    /// What orangu runs itself once this turn completes, if the command that
+    /// started it asked for something (see `CommandOutcome::ModelPromptThen`).
+    pub(crate) after_turn: Option<crate::commands::AfterTurn>,
 }
 
 pub enum WaitResult {
@@ -98,6 +101,8 @@ pub enum WaitResult {
         /// has rendered the answer. Pushing it from inside the loop would put
         /// the notice above the text it is about.
         truncated: bool,
+        /// The step the starting command asked to have run after the turn.
+        after_turn: Option<crate::commands::AfterTurn>,
     },
     Cancelled(String),
     Failed {

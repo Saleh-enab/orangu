@@ -115,6 +115,17 @@ pub fn shell_words(input: &str) -> Result<Vec<String>> {
     Ok(words)
 }
 
+/// What orangu does on its own after a model turn started by a command; see
+/// [`CommandOutcome::ModelPromptThen`]. It runs only when the turn completed
+/// (not when it was cancelled or failed), and is carried with the response
+/// so it survives the turn being backgrounded by a tab switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AfterTurn {
+    /// Finish the in-progress rebase, merge, or cherry-pick with its
+    /// `--continue` — once Git reports no unmerged paths.
+    FinishGitOperation,
+}
+
 pub enum CommandOutcome {
     Unhandled,
     /// The input was intercepted locally and should be replaced with the
@@ -127,6 +138,14 @@ pub enum CommandOutcome {
     /// model. Unlike [`Self::SkillInvoked`], this is a built-in workflow and
     /// does not count as an Agent Skill invocation.
     ModelPrompt(String),
+    /// A [`Self::ModelPrompt`] with a step orangu runs itself once the model's
+    /// turn has completed — the deterministic tail of a workflow that the
+    /// model is told not to perform, such as continuing the rebase whose
+    /// conflicts `/create_patch` had it resolve.
+    ModelPromptThen {
+        prompt: String,
+        then: AfterTurn,
+    },
     Quiet,
     /// Command ran and produced informational output (success).
     Output(String),
@@ -486,6 +505,11 @@ pub enum LocalCommand<'a> {
     /// defaults to `HEAD`.
     Show(Option<Cow<'a, str>>),
     Fetch(Option<Cow<'a, str>>),
+    /// `/add_repository <user> [<branch>]`: add another user's copy of this
+    /// project — found from `origin` — as the local tracking branch
+    /// `<user>/<branch>`, defaulting to the copy's default branch. `None` is a
+    /// usage error (the user is required).
+    AddRepository(Option<(Cow<'a, str>, Option<Cow<'a, str>>)>),
     Pull(Option<u64>),
     Comment(Option<(u64, CommentBody<'a>)>),
     Close(Option<CloseTarget>),

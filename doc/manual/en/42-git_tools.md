@@ -517,6 +517,47 @@ git fetch upstream
 
 \newpage
 
+## /add_repository
+
+Adds another user's copy of this project as a local tracking branch.
+
+`/add_repository <user> [<branch>]` looks the copy up from the `origin` remote: the host and the project name are read from its URL, and the owner is replaced with `<user>`. So in a repository whose `origin` is `https://github.com/alice/pgmoneta.git`, `/add_repository Jubilee101` finds `https://github.com/Jubilee101/pgmoneta.git`. The host is recognised as one of:
+
+- **GitHub** (`github.com`, or a `github.*` instance) and **GitLab** (`gitlab.com`, or a `gitlab.*` instance): the copy lives directly under the user, whatever group the original sits in, so `git@gitlab.com:group/sub/pgmoneta.git` becomes `git@gitlab.com:Jubilee101/pgmoneta.git`.
+- **Network**: any other host reached over the network, where only the directory the project sits in is renamed — `ssh://git.example.com/srv/git/alice/pgmoneta.git` becomes `ssh://git.example.com/srv/git/Jubilee101/pgmoneta.git`.
+- **Local**: a filesystem path or `file://` URL, treated the same way — `/srv/git/alice/pgmoneta` becomes `/srv/git/Jubilee101/pgmoneta`.
+
+The URL keeps `origin`'s scheme (HTTPS, SSH, or a path), so it is reached the same way `origin` is. It is added as the remote `<user>` — reused when the remote already exists and points there, refused when it points somewhere else — and `<branch>` is fetched from it. Without a branch the copy's default branch is used, asked of the remote itself and falling back to `main` then `master`. Only that branch is fetched, and the local branch `<user>/<branch>` is created tracking `<user>/<branch>`; the working tree stays on the branch it was on. An existing local branch of that name is an error rather than being reset. Run it again with another branch name to add a second branch of the same copy.
+
+Because the local branch and the remote-tracking branch share a name, Git itself may note that `Jubilee101/main` is ambiguous when it is used on the command line; the local branch is what it picks, and orangu's own branch listing and completion always show the local name.
+
+Tab completion after `/add_repository ` offers the users already added (every configured remote but `origin`), and after the user the branches already fetched from that copy, then `main` and `master`.
+
+**Examples**
+
+Add `Jubilee101`'s default branch as `Jubilee101/main`:
+
+```text
+/add_repository Jubilee101
+```
+
+Add their `muse` branch as `Jubilee101/muse`:
+
+```text
+/add_repository Jubilee101 muse
+```
+
+Then switch to it with `/branch Jubilee101/muse`, or review it with `/diff Jubilee101/muse`.
+
+Natural-language forms:
+
+```text
+add repository Jubilee101
+add repository Jubilee101 muse
+```
+
+\newpage
+
 ## /merge
 
 Merges a branch into the current branch.

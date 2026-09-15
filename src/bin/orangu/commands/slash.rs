@@ -88,6 +88,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/log" => Some(LocalCommand::Log(None)),
         "/show" => Some(LocalCommand::Show(None)),
         "/fetch" => Some(LocalCommand::Fetch(None)),
+        "/add_repository" => Some(LocalCommand::AddRepository(None)),
         "/merge" => Some(LocalCommand::Merge(None)),
         "/move_file" => Some(LocalCommand::MoveFile(None)),
         "/pull" => Some(LocalCommand::Pull(None)),
@@ -265,6 +266,9 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                 } else {
                     Some(Cow::Borrowed(remote))
                 }));
+            }
+            if let Some(args) = input.strip_prefix("/add_repository ") {
+                return Some(LocalCommand::AddRepository(parse_add_repository_args(args)));
             }
             if let Some(args) = input.strip_prefix("/pull ") {
                 return Some(LocalCommand::Pull(args.trim().parse::<u64>().ok()));
@@ -475,6 +479,21 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
             parse_open_file_target(input, "/open_file ", false).map(LocalCommand::OpenFile)
         }
     }
+}
+
+/// `<user> [<branch>]` — what `/add_repository` and its natural-language form
+/// (`add repository <user> [<branch>]`) take. `None` for no user, or for more
+/// than the two words the command has a meaning for.
+pub(crate) fn parse_add_repository_args(
+    args: &str,
+) -> Option<(Cow<'_, str>, Option<Cow<'_, str>>)> {
+    let mut words = args.split_whitespace();
+    let user = words.next()?;
+    let branch = words.next();
+    if words.next().is_some() {
+        return None;
+    }
+    Some((Cow::Borrowed(user), branch.map(Cow::Borrowed)))
 }
 
 /// Parse the text after `/bisect ` into a [`BisectSubcommand`].

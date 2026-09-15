@@ -40,6 +40,7 @@ pub enum SlashCommand {
     Log,
     Show,
     Fetch,
+    AddRepository,
     Pull,
     Comment,
     Close,
@@ -117,6 +118,9 @@ impl SlashCommand {
             SlashCommand::Log => "Shows git log",
             SlashCommand::Show => "Shows a commit (git show)",
             SlashCommand::Fetch => "Fetches from remote",
+            SlashCommand::AddRepository => {
+                "Adds another user's copy of this project as a tracking branch"
+            }
             SlashCommand::Pull => "Pulls from remote",
             SlashCommand::Comment => "Creates a comment",
             SlashCommand::Close => "Closes an issue or PR",

@@ -90,6 +90,139 @@ pub fn git_fetch(repo_root: &Path, remote: &str) -> Result<String> {
     })
 }
 
+/// `/add_repository <user> [<branch>]`: bring another user's copy of this
+/// project in as the local branch `<user>/<branch>`.
+///
+/// The copy is located from `origin` — see [`sibling_repository`] for how the
+/// host (GitHub, GitLab, another network host, or a local path) and project
+/// name are read from it —
+/// and added as the remote `<user>` (reused when it already points there). With
+/// no `branch` the copy's default branch is used, asked of the remote itself
+/// and falling back to `main` then `master`. Only that branch is fetched, and
+/// the local branch is created tracking `<user>/<branch>`; the working tree is
+/// left where it was. An existing local branch of that name is an error rather
+/// than silently reset.
+pub fn add_repository_output(workspace: &Path, user: &str, branch: Option<&str>) -> Result<String> {
+    let repo_root = discover_git_root(workspace)
+        .ok_or_else(|| anyhow!("add_repository is only available inside a Git repository"))?;
+    if user.is_empty() || user.contains('/') || user.contains(char::is_whitespace) {
+        return Err(anyhow!("'{user}' is not a user name"));
+    }
+    let origin = git_remote_url(&repo_root, "origin").ok_or_else(|| {
+        anyhow!("no 'origin' remote is configured, so there is no project to look up")
+    })?;
+    let sibling = sibling_repository(&origin, user)?;
+
+    match git_remote_url(&repo_root, user) {
+        Some(existing) if existing == sibling.url => {}
+        Some(existing) => {
+            return Err(anyhow!(
+                "remote '{user}' already exists and points at '{existing}', not '{}'",
+                sibling.url
+            ));
+        }
+        None => git_output(&repo_root, &["remote", "add", user, &sibling.url])
+            .map(drop)
+            .with_context(|| format!("failed to add remote '{user}'"))?,
+    }
+
+    let branch = match branch {
+        Some(branch) => branch.to_string(),
+        None => remote_head_branch(&repo_root, user).ok_or_else(|| {
+            anyhow!(
+                "could not determine the default branch of {} ({}); pass one explicitly",
+                sibling.url,
+                sibling.host.name()
+            )
+        })?,
+    };
+    let local = format!("{user}/{branch}");
+    if git_ref_exists(&repo_root, &format!("refs/heads/{local}")) {
+        return Err(anyhow!("branch '{local}' already exists"));
+    }
+
+    git_output(&repo_root, &["fetch", user, &branch])
+        .with_context(|| format!("failed to fetch '{branch}' from {}", sibling.url))?;
+    git_output(
+        &repo_root,
+        &[
+            "branch",
+            "--track",
+            &local,
+            &format!("refs/remotes/{user}/{branch}"),
+        ],
+    )
+    .with_context(|| format!("failed to create branch '{local}'"))?;
+
+    Ok(format!("Added branch '{local}' from {}", sibling.url))
+}
+
+/// Run `git <args>` in `repo_root`, returning its stdout on success and an
+/// error carrying whatever it printed on failure.
+fn git_output(repo_root: &Path, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run git {}", args[0]))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if output.status.success() {
+        return Ok(stdout);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let detail = [stdout, stderr]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(anyhow!(
+        "git {} failed{}",
+        args[0],
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        }
+    ))
+}
+
+/// Whether the fully qualified ref (`refs/heads/...`) exists.
+fn git_ref_exists(repo_root: &Path, reference: &str) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["show-ref", "--verify", "--quiet", reference])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// The branch a remote's `HEAD` points at, asked of the remote itself with
+/// `git ls-remote --symref`, so it needs no prior fetch; falls back to
+/// [`remote_default_branch`]'s probe for `main` then `master`. `None` when
+/// neither can be found.
+fn remote_head_branch(repo_root: &Path, remote: &str) -> Option<String> {
+    if let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["ls-remote", "--symref", remote, "HEAD"])
+        .output()
+        && output.status.success()
+    {
+        // The line looks like `ref: refs/heads/main\tHEAD`.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(branch) = stdout.lines().find_map(|line| {
+            line.strip_prefix("ref: refs/heads/")
+                .and_then(|rest| rest.split('\t').next())
+        }) && !branch.is_empty()
+        {
+            return Some(branch.to_string());
+        }
+    }
+    remote_default_branch(repo_root, remote)
+}
+
 /// Rebase the current branch. With no `target` it rebases onto the repository
 /// default branch (the original `/rebase` behaviour); with a `target` it rebases
 /// onto that explicit branch — see [`git_rebase_target`] for how local branches,
@@ -1473,6 +1606,120 @@ mod tests {
             msg.contains("behind main") && msg.contains("/rebase"),
             "error should explain the branch is behind and to rebase: {msg}"
         );
+    }
+
+    /// Two users' copies of `pgmoneta` side by side on disk — `origin` is
+    /// alice's, so bob's is the sibling directory — and a workspace cloned
+    /// from alice's. Returns the directory holding all three.
+    fn two_users_and_a_workspace() -> tempfile::TempDir {
+        let root = tempdir().expect("root");
+        let alice = root.path().join("alice").join("pgmoneta");
+        let bob = root.path().join("bob").join("pgmoneta");
+        for repo in [&alice, &bob] {
+            std::fs::create_dir_all(repo).expect("mkdir");
+            init_git_for_test(repo);
+            git_run(repo, &["checkout", "-B", "main"]);
+            git_run(repo, &["commit", "--allow-empty", "-m", "base"]);
+        }
+        // bob's copy has its own commit on main and a `muse` branch on top.
+        git_run(&bob, &["commit", "--allow-empty", "-m", "bob main"]);
+        git_run(&bob, &["checkout", "-b", "muse"]);
+        git_run(&bob, &["commit", "--allow-empty", "-m", "bob muse"]);
+        git_run(&bob, &["checkout", "main"]);
+
+        let workspace = root.path().join("workspace");
+        git_run(
+            root.path(),
+            &[
+                "clone",
+                "--quiet",
+                alice.to_str().expect("utf-8"),
+                workspace.to_str().expect("utf-8"),
+            ],
+        );
+        root
+    }
+
+    #[test]
+    fn add_repository_adds_the_sibling_copy_as_a_tracking_branch() {
+        let root = two_users_and_a_workspace();
+        let workspace = root.path().join("workspace");
+        let bob_url = root.path().join("bob").join("pgmoneta");
+
+        // No branch named: bob's default branch, learned from the remote.
+        let report = add_repository_output(&workspace, "bob", None).expect("add bob");
+        assert_eq!(
+            report,
+            format!("Added branch 'bob/main' from {}", bob_url.display())
+        );
+        assert_eq!(
+            git_remote_url(&workspace, "bob").as_deref(),
+            Some(bob_url.to_str().expect("utf-8"))
+        );
+        assert!(git_local_branch_names(&workspace).contains(&"bob/main".to_string()));
+        // It tracks bob's main and carries bob's commit, not just alice's.
+        let config = |key: &str| {
+            let output = std::process::Command::new("git")
+                .args(["config", "--get", key])
+                .current_dir(&workspace)
+                .output()
+                .expect("git config");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        assert_eq!(config("branch.bob/main.remote"), "bob");
+        assert_eq!(config("branch.bob/main.merge"), "refs/heads/main");
+        assert_eq!(rev_count(&workspace, "refs/heads/bob/main"), 2);
+        // The working tree stayed where it was.
+        assert_eq!(git_current_branch(&workspace).expect("branch"), "main");
+
+        // A second branch of the same copy reuses the remote.
+        let report = add_repository_output(&workspace, "bob", Some("muse")).expect("add muse");
+        assert!(report.contains("Added branch 'bob/muse'"), "{report}");
+        assert_eq!(rev_count(&workspace, "refs/heads/bob/muse"), 3);
+        assert_eq!(git_remote_names(&workspace), vec!["origin", "bob"]);
+
+        // Asking again is refused rather than resetting the branch.
+        let err = add_repository_output(&workspace, "bob", Some("muse")).expect_err("exists");
+        assert!(
+            err.to_string().contains("branch 'bob/muse' already exists"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn add_repository_reports_what_it_cannot_find() {
+        let root = two_users_and_a_workspace();
+        let workspace = root.path().join("workspace");
+
+        // No such user: the fetch fails and nothing is left half done except
+        // the remote, which names where it looked.
+        let err = add_repository_output(&workspace, "carol", None).expect_err("no carol");
+        assert!(err.to_string().contains("default branch"), "{err}");
+
+        // A branch bob does not have.
+        let err = add_repository_output(&workspace, "bob", Some("nope")).expect_err("no branch");
+        assert!(err.to_string().contains("failed to fetch 'nope'"), "{err}");
+
+        // A remote of that name that points elsewhere is not silently reused.
+        git_run(
+            &workspace,
+            &["remote", "add", "dave", "https://example.com/elsewhere.git"],
+        );
+        let err = add_repository_output(&workspace, "dave", None).expect_err("dave");
+        assert!(
+            err.to_string().contains("remote 'dave' already exists"),
+            "{err}"
+        );
+
+        // Not a user name at all.
+        let err = add_repository_output(&workspace, "a/b", None).expect_err("slash");
+        assert!(err.to_string().contains("not a user name"), "{err}");
+
+        // Without an origin there is no project to look up.
+        let lone = tempdir().expect("lone");
+        init_git_for_test(lone.path());
+        let err = add_repository_output(lone.path(), "bob", None).expect_err("no origin");
+        assert!(err.to_string().contains("no 'origin' remote"), "{err}");
     }
 
     #[test]

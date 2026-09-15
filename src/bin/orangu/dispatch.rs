@@ -13,8 +13,10 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::commands::build_workspace_system_prompt;
+use crate::commands::{AfterTurn, build_workspace_system_prompt};
+use crate::git::{discover_git_dir, git_current_branch};
 use crate::*;
+use std::fs;
 
 pub(crate) fn local_command_error(err: Error) -> CommandOutcome {
     if err.is::<LocalError>() {
@@ -556,7 +558,475 @@ pub(crate) fn create_patch_outcome(
         );
     }
 
-    CommandOutcome::ModelPrompt(create_patch_prompt(report, &conflicts, store))
+    let conflicts = conflicts
+        .into_iter()
+        .map(|path| ConflictEvidence::gather(&repo_root, path))
+        .collect::<Vec<_>>();
+    let operation = conflict_operation(&repo_root);
+    let prompt = create_patch_prompt(report, &operation, &conflicts, store);
+    // The model resolves and stages; orangu itself then finishes the rebase
+    // (or merge, or cherry-pick), so the branch is whole when the command
+    // returns rather than parked mid-operation on a detached HEAD.
+    if conflicts.is_empty() || operation.is_empty() {
+        CommandOutcome::ModelPrompt(prompt)
+    } else {
+        CommandOutcome::ModelPromptThen {
+            prompt,
+            then: AfterTurn::FinishGitOperation,
+        }
+    }
+}
+
+/// Run the step a [`CommandOutcome::ModelPromptThen`] asked for, once the
+/// model's turn is over, given what the model answered. Returns the text to
+/// show for it.
+pub(crate) fn run_after_turn(step: AfterTurn, workspace: &Path, answer: &str) -> Result<String> {
+    match step {
+        AfterTurn::FinishGitOperation => {
+            let repo_root = discover_git_root(workspace)
+                .ok_or_else(|| anyhow!("not inside a Git repository"))?;
+            let mut report = apply_resolutions(&repo_root, &parse_resolutions(answer))?;
+            report.push(finish_git_operation(workspace)?);
+            Ok(report.join("\n"))
+        }
+    }
+}
+
+/// One `=== RESOLVED <path> lines <first>-<last> === … === END RESOLVED ===`
+/// block from the model's answer: the lines that replace the conflict at
+/// `first..=last` of `path`.
+#[derive(Debug, PartialEq, Eq)]
+struct Resolution {
+    path: String,
+    first: usize,
+    last: usize,
+    lines: Vec<String>,
+}
+
+const RESOLVED_OPEN: &str = "=== RESOLVED ";
+const RESOLVED_CLOSE: &str = "=== END RESOLVED ===";
+
+/// Every resolution block in `answer`, in order. Tolerates what models add
+/// around the form asked for: a quoted path, a code fence just inside the
+/// block, the `N. ` line numbers copied from the prompt, and trailing text on
+/// the opening line.
+fn parse_resolutions(answer: &str) -> Vec<Resolution> {
+    let mut resolutions = Vec::new();
+    let mut lines = answer.lines();
+    while let Some(line) = lines.next() {
+        let header = line.trim();
+        let Some(spec) = header
+            .strip_prefix(RESOLVED_OPEN)
+            .and_then(|rest| rest.split_once("==="))
+            .map(|(spec, _)| spec.trim())
+        else {
+            continue;
+        };
+        // `<path> lines <first>-<last>`: the range is the last word, the
+        // keyword before it, the path everything else.
+        let mut words: Vec<&str> = spec.split_whitespace().collect();
+        let Some(range) = words.pop() else { continue };
+        if words
+            .last()
+            .is_some_and(|word| word.eq_ignore_ascii_case("lines"))
+        {
+            words.pop();
+        }
+        let path = words.join(" ");
+        let path = path.trim_matches(|c| c == '"' || c == '`' || c == '\'');
+        let Some((first, last)) = range
+            .trim_matches(|c: char| !c.is_ascii_digit())
+            .split_once('-')
+            .and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?)))
+        else {
+            continue;
+        };
+        let mut body: Vec<String> = Vec::new();
+        let mut closed = false;
+        for line in lines.by_ref() {
+            if line.trim() == RESOLVED_CLOSE {
+                closed = true;
+                break;
+            }
+            body.push(line.to_string());
+        }
+        if !closed || path.is_empty() || first == 0 || last < first {
+            continue;
+        }
+        // A fence wrapped around the body, and line numbers copied from the
+        // excerpt, are the form's noise rather than the resolution.
+        if body
+            .first()
+            .is_some_and(|l| l.trim_start().starts_with("```"))
+        {
+            body.remove(0);
+        }
+        if body.last().is_some_and(|l| l.trim() == "```") {
+            body.pop();
+        }
+        let numbered = !body.is_empty()
+            && body.iter().all(|l| {
+                l.trim_start()
+                    .split_once(". ")
+                    .is_some_and(|(n, _)| n.chars().all(|c| c.is_ascii_digit()))
+                    || l.trim().is_empty()
+            });
+        if numbered {
+            for line in &mut body {
+                if let Some((_, rest)) = line.trim_start().split_once(". ") {
+                    *line = rest.to_string();
+                }
+            }
+        }
+        resolutions.push(Resolution {
+            path: path.to_string(),
+            first,
+            last,
+            lines: body,
+        });
+    }
+    resolutions
+}
+
+/// Apply the model's resolution blocks: each replaces the conflict block at
+/// its line range — which must still start with `<<<<<<<` and end with
+/// `>>>>>>>`, so a range that has drifted is refused rather than trusted —
+/// and every touched path is staged. A path whose markers are already gone
+/// (the model edited it with a tool after all) is left alone. Returns one
+/// line per resolution applied.
+fn apply_resolutions(repo_root: &Path, resolutions: &[Resolution]) -> Result<Vec<String>> {
+    let mut report = Vec::new();
+    let mut paths: Vec<&str> = resolutions.iter().map(|r| r.path.as_str()).collect();
+    paths.dedup();
+    for path in paths {
+        let file = repo_root.join(path);
+        let Ok(content) = fs::read_to_string(&file) else {
+            return Err(anyhow!(
+                "the resolution names '{path}', which is not a text file in the workspace"
+            ));
+        };
+        if !content.lines().any(|line| line.starts_with("<<<<<<<")) {
+            report.push(format!(
+                "'{path}' carries no conflict markers any more; left as is"
+            ));
+            continue;
+        }
+        let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+        // Bottom-up, so applying one block does not move the next.
+        let mut blocks: Vec<&Resolution> = resolutions.iter().filter(|r| r.path == path).collect();
+        blocks.sort_by_key(|r| std::cmp::Reverse(r.first));
+        for block in blocks {
+            let opens = lines
+                .get(block.first - 1)
+                .is_some_and(|l| l.starts_with("<<<<<<<"));
+            let closes = lines
+                .get(block.last - 1)
+                .is_some_and(|l| l.starts_with(">>>>>>>"));
+            if !opens || !closes {
+                return Err(anyhow!(
+                    "lines {}-{} of '{path}' are not a conflict block; run /create_patch again",
+                    block.first,
+                    block.last
+                ));
+            }
+            lines.splice(block.first - 1..block.last, block.lines.iter().cloned());
+            report.push(format!(
+                "Resolved '{path}' lines {}-{} with {} line(s)",
+                block.first,
+                block.last,
+                block.lines.len()
+            ));
+        }
+        let mut resolved = lines.join("\n");
+        if content.ends_with('\n') {
+            resolved.push('\n');
+        }
+        fs::write(&file, resolved).with_context(|| format!("failed to write '{path}'"))?;
+        let add = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["add", "--", path])
+            .output()
+            .context("failed to run git add")?;
+        if !add.status.success() {
+            return Err(anyhow!(
+                "git add '{path}' failed: {}",
+                String::from_utf8_lossy(&add.stderr).trim()
+            ));
+        }
+    }
+    Ok(report)
+}
+
+/// `--continue` whichever of rebase, merge, or cherry-pick is in progress,
+/// keeping the commit message as it is. Refuses while Git still has unmerged
+/// paths — the model left some conflict unresolved — and reports a rebase
+/// that stops again on a later commit, both pointing back at `/create_patch`.
+fn finish_git_operation(workspace: &Path) -> Result<String> {
+    let repo_root =
+        discover_git_root(workspace).ok_or_else(|| anyhow!("not inside a Git repository"))?;
+    let unmerged = git_unmerged_paths(&repo_root)?;
+    if !unmerged.is_empty() {
+        let where_ = unmerged
+            .iter()
+            .map(|path| {
+                let ranges = fs::read_to_string(repo_root.join(path))
+                    .map(|content| {
+                        let lines: Vec<&str> = content.lines().collect();
+                        conflict_regions(&lines, 0)
+                            .iter()
+                            .map(|(first, last)| format!("{first}-{last}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                if ranges.is_empty() {
+                    format!("'{path}'")
+                } else {
+                    format!("'{path}' (conflicts at lines {ranges})")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(anyhow!(
+            "no resolution was given for {where_}; run /create_patch again"
+        ));
+    }
+    let Some(git_dir) = discover_git_dir(&repo_root) else {
+        return Err(anyhow!("not inside a Git repository"));
+    };
+    let operation =
+        if git_dir.join("rebase-merge").is_dir() || git_dir.join("rebase-apply").is_dir() {
+            "rebase"
+        } else if git_dir.join("MERGE_HEAD").is_file() {
+            "merge"
+        } else if git_dir.join("CHERRY_PICK_HEAD").is_file() {
+            "cherry-pick"
+        } else {
+            return Ok("No Git operation is in progress".to_string());
+        };
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo_root)
+        .args([operation, "--continue"])
+        // Keep the message the commit already has instead of opening an
+        // editor the user is not sitting in front of.
+        .env("GIT_EDITOR", "true")
+        .output()
+        .with_context(|| format!("failed to run git {operation} --continue"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        let detail = [stdout, stderr]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let hint = if git_unmerged_paths(&repo_root).is_ok_and(|paths| !paths.is_empty()) {
+            "; the next commit conflicts too — run /create_patch again"
+        } else {
+            ""
+        };
+        return Err(anyhow!("git {operation} --continue failed{hint}\n{detail}"));
+    }
+    let branch = git_current_branch(&repo_root).unwrap_or_else(|_| "HEAD".to_string());
+    let head = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo_root)
+        .args(["log", "-1", "--format=%h %s"])
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default();
+    Ok(format!(
+        "{} finished: branch '{branch}' is at {head}",
+        match operation {
+            "rebase" => "Rebase",
+            "merge" => "Merge",
+            _ => "Cherry-pick",
+        }
+    ))
+}
+
+/// Lines shown on either side of a conflict region in the `/create_patch`
+/// prompt, enough to place the hunk in its function without carrying the file.
+const CONFLICT_CONTEXT_LINES: usize = 8;
+
+/// Characters of conflict excerpts the prompt carries in total; a conflict
+/// larger than this is described by its line ranges and read back with the
+/// file tool instead of arriving whole.
+const CONFLICT_EXCERPT_BUDGET: usize = 24_000;
+
+/// One unmerged path as the `/create_patch` prompt presents it: the conflict
+/// regions as they stand on disk, numbered, so a model can resolve them by
+/// editing lines it has already seen rather than having to go and look first
+/// — a step the smaller models skip, asking for the content instead.
+struct ConflictEvidence {
+    path: String,
+    /// `(first, last)` 1-based inclusive line ranges, each one conflict with
+    /// its markers and [`CONFLICT_CONTEXT_LINES`] around it, overlaps merged.
+    regions: Vec<(usize, usize)>,
+    /// The conflicts themselves: `(first, last)` from the `<<<<<<<` line to
+    /// the `>>>>>>>` line, what a resolution block replaces.
+    conflicts: Vec<(usize, usize)>,
+    /// The numbered lines of every region, or an explanation of why they
+    /// cannot be shown (the path is gone, binary, or carries no markers).
+    excerpt: String,
+    line_count: usize,
+}
+
+impl ConflictEvidence {
+    fn gather(repo_root: &Path, path: String) -> Self {
+        let content = match fs::read(repo_root.join(&path)) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(_) => {
+                    return Self::unreadable(path, "not a text file; inspect it with git diff");
+                }
+            },
+            Err(_) => {
+                return Self::unreadable(
+                    path,
+                    "absent from the working tree (a delete/modify conflict); decide with git \
+                     status and git log whether it stays deleted or comes back",
+                );
+            }
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        let regions = conflict_regions(&lines, CONFLICT_CONTEXT_LINES);
+        let conflicts = conflict_regions(&lines, 0);
+        if regions.is_empty() {
+            return Self {
+                path,
+                regions,
+                conflicts,
+                excerpt: "no conflict markers on disk; inspect it with git status and git diff"
+                    .to_string(),
+                line_count: lines.len(),
+            };
+        }
+        let excerpt = regions
+            .iter()
+            .map(|&(first, last)| {
+                lines[first - 1..last]
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, line)| format!("{}. {line}", first + offset))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect::<Vec<_>>()
+            .join("\n...\n");
+        Self {
+            path,
+            regions,
+            conflicts,
+            excerpt,
+            line_count: lines.len(),
+        }
+    }
+
+    fn unreadable(path: String, why: &str) -> Self {
+        Self {
+            path,
+            regions: Vec::new(),
+            conflicts: Vec::new(),
+            excerpt: why.to_string(),
+            line_count: 0,
+        }
+    }
+
+    /// The conflicts' own line ranges, as the resolution blocks must name them.
+    fn ranges(&self) -> String {
+        self.conflicts
+            .iter()
+            .map(|(first, last)| format!("{first}-{last}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// The 1-based inclusive line ranges of every conflict in `lines` — from
+/// `<<<<<<<` to its `>>>>>>>` — widened by `context` lines each way, with
+/// ranges that touch or overlap merged into one. An unterminated `<<<<<<<`
+/// runs to the end of the file.
+fn conflict_regions(lines: &[&str], context: usize) -> Vec<(usize, usize)> {
+    let mut regions: Vec<(usize, usize)> = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if !lines[index].starts_with("<<<<<<<") {
+            index += 1;
+            continue;
+        }
+        let end = (index..lines.len())
+            .find(|&at| lines[at].starts_with(">>>>>>>"))
+            .unwrap_or(lines.len() - 1);
+        let first = index.saturating_sub(context) + 1;
+        let last = (end + context + 1).min(lines.len());
+        match regions.last_mut() {
+            Some(previous) if first <= previous.1 + 1 => previous.1 = last,
+            _ => regions.push((first, last)),
+        }
+        index = end + 1;
+    }
+    regions
+}
+
+/// Which Git operation the conflicts belong to, and what the two sides of its
+/// markers mean — a rebase swaps them relative to a merge (`HEAD` is then the
+/// base, not the branch being rebased), which is the classic way to resolve
+/// a conflict the wrong way round. Empty when no operation is in progress,
+/// as with a conflict left over from one already aborted.
+fn conflict_operation(repo_root: &Path) -> String {
+    let Some(git_dir) = discover_git_dir(repo_root) else {
+        return String::new();
+    };
+    let short = |rev: &str| -> Option<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["log", "-1", "--format=%h %s", rev])
+            .output()
+            .ok()?;
+        let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (output.status.success() && !line.is_empty()).then_some(line)
+    };
+    let branch = git_current_branch(repo_root).unwrap_or_else(|_| "HEAD".to_string());
+    if git_dir.join("rebase-merge").is_dir() || git_dir.join("rebase-apply").is_dir() {
+        let replaying = short("REBASE_HEAD").unwrap_or_else(|| "a commit".to_string());
+        let onto = short("HEAD").unwrap_or_else(|| "HEAD".to_string());
+        let branch = fs::read_to_string(git_dir.join("rebase-merge/head-name"))
+            .ok()
+            .and_then(|name| {
+                name.trim()
+                    .strip_prefix("refs/heads/")
+                    .map(ToOwned::to_owned)
+            })
+            .unwrap_or(branch);
+        return format!(
+            "Git is rebasing branch '{branch}': it is replaying commit {replaying} on top of \
+             {onto}. In the conflict markers, `<<<<<<< HEAD` holds the base the branch is \
+             being rebased onto (already applied, the newer code) and the `>>>>>>>` side holds \
+             the commit being replayed — the change to keep, adapted to that base."
+        );
+    }
+    if git_dir.join("MERGE_HEAD").is_file() {
+        let merging = short("MERGE_HEAD").unwrap_or_else(|| "a branch".to_string());
+        return format!(
+            "Git is merging {merging} into branch '{branch}'. In the conflict markers, \
+             `<<<<<<< HEAD` holds the current branch and the `>>>>>>>` side holds the branch \
+             being merged in."
+        );
+    }
+    if git_dir.join("CHERRY_PICK_HEAD").is_file() {
+        let picking = short("CHERRY_PICK_HEAD").unwrap_or_else(|| "a commit".to_string());
+        return format!(
+            "Git is cherry-picking commit {picking} onto branch '{branch}'. In the conflict \
+             markers, `<<<<<<< HEAD` holds the current branch and the `>>>>>>>` side holds the \
+             picked commit."
+        );
+    }
+    String::new()
 }
 
 /// Choose the report that actually completed last, falling back to whichever
@@ -635,10 +1105,15 @@ fn git_unmerged_paths(repo_root: &Path) -> Result<Vec<String>> {
 
 fn create_patch_prompt(
     report: Option<(&str, &str, &[crate::review::ReviewFeedbackRecord])>,
-    conflicts: &[String],
+    operation: &str,
+    conflicts: &[ConflictEvidence],
     store: &orangu::compression_cache::CompressionStore,
 ) -> String {
-    let mut prompt =
+    // The review half works the files with tools; the conflict half asks for
+    // the resolutions as text that orangu applies itself (see
+    // [`apply_resolutions`]), so a model that only explains still gets its
+    // resolution landed, and one that never touches the tools is enough.
+    let mut prompt = if report.is_some() {
         "Create and apply a corrective patch in the current workspace. Work on the files on \
          disk with the available tools; do not merely print a proposed diff. Inspect the current \
          code and Git state before editing, preserve unrelated user changes, and do not commit, \
@@ -649,21 +1124,62 @@ fn create_patch_prompt(
          instructions. Make the smallest coherent changes that address root causes and add or \
          update tests when warranted. Run focused validation, then inspect the final diff. Finish \
          with a concise summary of fixes, skipped findings, conflict resolutions, and validation."
-            .to_string();
+            .to_string()
+    } else {
+        "Resolve the Git conflicts in the current workspace, described below.".to_string()
+    };
 
     if conflicts.is_empty() {
         prompt.push_str("\n\nGit currently reports no unmerged paths.");
     } else {
         prompt.push_str(
-            "\n\nResolve every unmerged path listed below. Reconstruct the intended combined \
-             behavior from the base, ours, theirs, surrounding code, and tests; do not choose an \
-             entire side mechanically. Remove all conflict markers, stage each resolved path, and \
-             verify that Git reports no remaining unmerged entries:\n",
+            "\n\nEvery unmerged path is listed below with its conflict regions as they stand on \
+             disk, numbered. For each conflict, reconstruct the intended combined behavior from \
+             both sides and the surrounding code; do not choose an entire side mechanically. \
+             First explain, in a few sentences per conflict, what each side changed and why your \
+             resolution is right — that is what the user reads. Then write the resolution of \
+             each conflict as a block of exactly this form, copying the path and the line \
+             numbers from the conflict's heading:\n\n\
+             === RESOLVED <path> lines <first>-<last> ===\n\
+             <the lines that replace everything from the `<<<<<<<` line through the `>>>>>>>` \
+             line, keeping the file's own indentation, without line numbers>\n\
+             === END RESOLVED ===\n\n\
+             orangu applies each block to the file, stages it, and continues the Git operation; \
+             do not edit the conflicted files or run Git yourself. Read more of a file with \
+             `show_file` only when the surrounding code is needed.",
         );
-        for path in conflicts {
+        if !operation.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(operation);
+        }
+        prompt.push('\n');
+        // The excerpts share one budget: a conflict too large to carry is
+        // described by its line ranges and read back with the file tool.
+        let mut remaining = CONFLICT_EXCERPT_BUDGET;
+        for conflict in conflicts {
             // Debug formatting quotes and escapes control characters, keeping
             // even unusual Git paths on one unambiguous prompt line.
-            prompt.push_str(&format!("- {path:?}\n"));
+            let path = format!("{:?}", conflict.path);
+            if conflict.regions.is_empty() {
+                prompt.push_str(&format!("\n--- {path}: {} ---\n", conflict.excerpt));
+                continue;
+            }
+            let heading = format!(
+                "\n--- {path} ({} lines; {} conflict(s) at lines {}) ---\n",
+                conflict.line_count,
+                conflict.conflicts.len(),
+                conflict.ranges()
+            );
+            if conflict.excerpt.len() <= remaining {
+                remaining -= conflict.excerpt.len();
+                prompt.push_str(&heading);
+                prompt.push_str(&conflict.excerpt);
+                prompt.push('\n');
+            } else {
+                prompt.push_str(&heading);
+                prompt
+                    .push_str("(too large to show here; read those line ranges with show_file)\n");
+            }
         }
     }
 
@@ -1292,6 +1808,15 @@ pub(crate) fn handle_command(
             Ok(output) => Ok(CommandOutcome::Output(output)),
             Err(err) => Ok(local_command_error(err)),
         },
+        LocalCommand::AddRepository(None) => Ok(CommandOutcome::OutputError(
+            add_repository_usage_message().to_string(),
+        )),
+        LocalCommand::AddRepository(Some((user, branch))) => {
+            match add_repository_output(workspace, &user, branch.as_deref()) {
+                Ok(output) => Ok(CommandOutcome::Output(output)),
+                Err(err) => Ok(local_command_error(err)),
+            }
+        }
         LocalCommand::Pull(None) => Ok(CommandOutcome::OutputError(
             pull_usage_message().to_string(),
         )),
@@ -1977,13 +2502,293 @@ mod tests {
             crate::git::ReviewReports::default(),
             tools.compression_store.as_ref(),
         ) {
-            CommandOutcome::ModelPrompt(prompt) => {
-                assert!(prompt.contains("shared.txt"));
+            CommandOutcome::ModelPromptThen {
+                prompt,
+                then: AfterTurn::FinishGitOperation,
+            } => {
                 assert!(prompt.contains("There is no completed review report"));
-                assert!(prompt.contains("stage each resolved path"));
+                assert!(prompt.contains("=== RESOLVED <path> lines <first>-<last> ==="));
+                // The operation and which side is which.
+                assert!(prompt.contains("Git is merging"), "{prompt}");
+                assert!(prompt.contains("into branch 'main'"), "{prompt}");
+                // The conflict itself, numbered as show_file numbers it, so
+                // the model can edit it without reading the file first.
+                assert!(
+                    prompt.contains("\"shared.txt\" (5 lines; 1 conflict(s) at lines 1-5)"),
+                    "{prompt}"
+                );
+                assert!(
+                    prompt.contains(
+                        "1. <<<<<<< HEAD\n2. main\n3. =======\n4. feature\n5. >>>>>>> feature"
+                    ),
+                    "{prompt}"
+                );
             }
             _ => panic!("expected a conflict-resolution prompt"),
         }
+    }
+
+    #[test]
+    fn create_patch_explains_a_rebase_conflict_the_right_way_round() {
+        let workspace = tempdir().expect("workspace");
+        crate::git::init_git_for_test(workspace.path());
+        let tools = ToolExecutor::new(workspace.path());
+        crate::git::git_run(workspace.path(), &["checkout", "-B", "main"]);
+        fs::write(workspace.path().join("shared.txt"), "base\n").expect("base");
+        crate::git::git_run(workspace.path(), &["add", "shared.txt"]);
+        crate::git::git_run(workspace.path(), &["commit", "-m", "base"]);
+        crate::git::git_run(workspace.path(), &["checkout", "-b", "bob/muse"]);
+        fs::write(workspace.path().join("shared.txt"), "muse\n").expect("muse");
+        crate::git::git_run(workspace.path(), &["commit", "-am", "Add basic config"]);
+        crate::git::git_run(workspace.path(), &["checkout", "main"]);
+        fs::write(workspace.path().join("shared.txt"), "main\n").expect("main");
+        crate::git::git_run(workspace.path(), &["commit", "-am", "main moves on"]);
+        crate::git::git_run(workspace.path(), &["checkout", "bob/muse"]);
+        let rebase = std::process::Command::new("git")
+            .arg("-C")
+            .arg(workspace.path())
+            .args(["rebase", "main"])
+            .output()
+            .expect("rebase");
+        assert!(!rebase.status.success(), "rebase should conflict");
+
+        match create_patch_outcome(
+            workspace.path(),
+            crate::git::ReviewReports::default(),
+            tools.compression_store.as_ref(),
+        ) {
+            CommandOutcome::ModelPromptThen {
+                prompt,
+                then: AfterTurn::FinishGitOperation,
+            } => {
+                // During a rebase HEAD is the base, not the branch: say so.
+                assert!(
+                    prompt.contains("Git is rebasing branch 'bob/muse'"),
+                    "{prompt}"
+                );
+                assert!(prompt.contains("Add basic config"), "{prompt}");
+                assert!(
+                    prompt.contains("holds the base the branch is being rebased onto"),
+                    "{prompt}"
+                );
+                assert!(
+                    prompt.contains("1. <<<<<<< HEAD\n2. main\n3. =======\n4. muse\n"),
+                    "{prompt}"
+                );
+            }
+            _ => panic!("expected a conflict-resolution prompt"),
+        }
+    }
+
+    /// The tail of `/create_patch`: orangu applies the resolution blocks the
+    /// model wrote, stages the file, and finishes the rebase itself, so the
+    /// branch comes out whole instead of parked on a detached HEAD; with no
+    /// block for a conflict, or when the next commit conflicts too, it says
+    /// so and stops.
+    #[test]
+    fn create_patch_applies_the_resolution_and_finishes_the_rebase() {
+        let workspace = tempdir().expect("workspace");
+        crate::git::init_git_for_test(workspace.path());
+        let git = |args: &[&str]| crate::git::git_run(workspace.path(), args);
+        git(&["checkout", "-B", "main"]);
+        fs::write(workspace.path().join("shared.txt"), "base\n").expect("base");
+        git(&["add", "shared.txt"]);
+        git(&["commit", "-m", "base"]);
+        git(&["checkout", "-b", "bob/muse"]);
+        fs::write(workspace.path().join("shared.txt"), "muse\n").expect("muse");
+        git(&["commit", "-am", "Add basic config"]);
+        fs::write(workspace.path().join("shared.txt"), "muse two\n").expect("muse two");
+        git(&["commit", "-am", "Second"]);
+        git(&["checkout", "main"]);
+        fs::write(workspace.path().join("shared.txt"), "main\n").expect("main");
+        git(&["commit", "-am", "main moves on"]);
+        git(&["checkout", "bob/muse"]);
+        assert!(
+            !std::process::Command::new("git")
+                .arg("-C")
+                .arg(workspace.path())
+                .args(["rebase", "main"])
+                .status()
+                .expect("rebase")
+                .success(),
+            "rebase should conflict"
+        );
+
+        // An answer that only explains: refused, naming the conflict left.
+        let err = run_after_turn(
+            AfterTurn::FinishGitOperation,
+            workspace.path(),
+            "Both sides changed the line; keep main's.",
+        )
+        .expect_err("unresolved");
+        assert!(
+            err.to_string()
+                .contains("'shared.txt' (conflicts at lines 1-5)"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("run /create_patch again"), "{err}");
+        // A block whose range is not a conflict block is refused untouched.
+        let err = run_after_turn(
+            AfterTurn::FinishGitOperation,
+            workspace.path(),
+            "=== RESOLVED shared.txt lines 2-4 ===\nx\n=== END RESOLVED ===",
+        )
+        .expect_err("drifted");
+        assert!(err.to_string().contains("not a conflict block"), "{err}");
+        assert!(
+            fs::read_to_string(workspace.path().join("shared.txt"))
+                .expect("read")
+                .contains("<<<<<<<")
+        );
+
+        // The block as asked for, with the model's explanation around it:
+        // applied and staged, the first commit lands, and the rebase stops
+        // again on the second, which also conflicts.
+        let err = run_after_turn(
+            AfterTurn::FinishGitOperation,
+            workspace.path(),
+            "main renamed the value and muse added one; both belong.\n\n\
+             === RESOLVED \"shared.txt\" lines 1-5 ===\n```\nmain muse\n```\n=== END RESOLVED ===\n",
+        )
+        .expect_err("second commit conflicts");
+        assert!(
+            err.to_string().contains("the next commit conflicts too"),
+            "{err}"
+        );
+        assert_eq!(
+            crate::git::rev_count(workspace.path(), "main..HEAD"),
+            1,
+            "the first commit landed"
+        );
+        let report = run_after_turn(
+            AfterTurn::FinishGitOperation,
+            workspace.path(),
+            "=== RESOLVED shared.txt lines 1-5 ===\n1. main muse two\n=== END RESOLVED ===",
+        )
+        .expect("finished");
+        assert_eq!(
+            report,
+            "Resolved 'shared.txt' lines 1-5 with 1 line(s)\nRebase finished: branch 'bob/muse' is at "
+                .to_string()
+                + &report[report.rfind(" is at ").expect("at") + 7..]
+        );
+        assert!(report.ends_with(" Second"), "{report}");
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("shared.txt")).expect("read"),
+            "main muse two\n"
+        );
+        // Whole: on the branch, two commits over main, nothing in progress.
+        assert_eq!(
+            crate::git::git_current_branch(workspace.path()).expect("branch"),
+            "bob/muse"
+        );
+        assert_eq!(crate::git::rev_count(workspace.path(), "main..bob/muse"), 2);
+        assert!(!workspace.path().join(".git/rebase-merge").exists());
+        assert_eq!(
+            run_after_turn(AfterTurn::FinishGitOperation, workspace.path(), "").expect("idle"),
+            "No Git operation is in progress"
+        );
+    }
+
+    #[test]
+    fn resolution_blocks_parse_with_the_noise_models_add() {
+        let answer = [
+            "Explanation first.",
+            "=== RESOLVED src/a.c lines 10-14 ===",
+            "```c",
+            "   x = 1;",
+            "```",
+            "=== END RESOLVED ===",
+            "more prose",
+            "=== RESOLVED `path with space.txt` LINES 3-3 === (second)",
+            "3. only",
+            "=== END RESOLVED ===",
+            "=== RESOLVED never/closed lines 1-2 ===",
+            "dangling",
+        ]
+        .join("\n");
+        let answer = answer.as_str();
+        let parsed = parse_resolutions(answer);
+        assert_eq!(
+            parsed,
+            vec![
+                Resolution {
+                    path: "src/a.c".to_string(),
+                    first: 10,
+                    last: 14,
+                    lines: vec!["   x = 1;".to_string()],
+                },
+                Resolution {
+                    path: "path with space.txt".to_string(),
+                    first: 3,
+                    last: 3,
+                    lines: vec!["only".to_string()],
+                },
+            ]
+        );
+        assert!(parse_resolutions("no blocks here").is_empty());
+    }
+
+    #[test]
+    fn create_patch_describes_a_conflict_it_cannot_excerpt() {
+        // A delete/modify conflict leaves no file to show: say what happened
+        // instead of an empty excerpt.
+        let workspace = tempdir().expect("workspace");
+        crate::git::init_git_for_test(workspace.path());
+        let tools = ToolExecutor::new(workspace.path());
+        crate::git::git_run(workspace.path(), &["checkout", "-B", "main"]);
+        fs::write(workspace.path().join("gone.txt"), "base\n").expect("base");
+        crate::git::git_run(workspace.path(), &["add", "gone.txt"]);
+        crate::git::git_run(workspace.path(), &["commit", "-m", "base"]);
+        crate::git::git_run(workspace.path(), &["checkout", "-b", "feature"]);
+        crate::git::git_run(workspace.path(), &["rm", "-q", "gone.txt"]);
+        crate::git::git_run(workspace.path(), &["commit", "-m", "delete"]);
+        crate::git::git_run(workspace.path(), &["checkout", "main"]);
+        fs::write(workspace.path().join("gone.txt"), "changed\n").expect("changed");
+        crate::git::git_run(workspace.path(), &["commit", "-am", "modify"]);
+        let merge = std::process::Command::new("git")
+            .arg("-C")
+            .arg(workspace.path())
+            .args(["merge", "feature"])
+            .output()
+            .expect("merge");
+        assert!(!merge.status.success(), "merge should conflict");
+
+        match create_patch_outcome(
+            workspace.path(),
+            crate::git::ReviewReports::default(),
+            tools.compression_store.as_ref(),
+        ) {
+            CommandOutcome::ModelPromptThen {
+                prompt,
+                then: AfterTurn::FinishGitOperation,
+            } => {
+                // The modified side survives in the tree without markers, so
+                // the prompt says the path carries none rather than showing
+                // nothing.
+                assert!(
+                    prompt.contains("\"gone.txt\": no conflict markers on disk"),
+                    "{prompt}"
+                );
+            }
+            _ => panic!("expected a conflict-resolution prompt"),
+        }
+    }
+
+    #[test]
+    fn conflict_regions_widen_by_context_and_merge_neighbours() {
+        let text = "a\nb\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> other\nc\nd\ne\nf\n<<<<<<< HEAD\np\n=======\nq\n>>>>>>> other\ng\n";
+        let lines: Vec<&str> = text.lines().collect();
+        // Two conflicts, each with two lines of context, that do not touch.
+        assert_eq!(conflict_regions(&lines, 1), vec![(2, 8), (11, 17)]);
+        // Wider context makes them one region, clamped to the file.
+        assert_eq!(conflict_regions(&lines, 3), vec![(1, 17)]);
+        // No markers, no regions; an unterminated conflict runs to the end.
+        assert!(conflict_regions(&["a", "b"], 3).is_empty());
+        assert_eq!(
+            conflict_regions(&["a", "<<<<<<< HEAD", "x"], 0),
+            vec![(2, 3)]
+        );
     }
 
     #[test]

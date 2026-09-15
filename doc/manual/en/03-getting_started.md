@@ -200,6 +200,7 @@ Then start with:
 /commit "[#42] My feature"
 /restore README.md
 /diff
+/add_repository Jubilee101 muse
 /init_repo
 /log
 /log 5

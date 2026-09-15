@@ -410,6 +410,10 @@ fn structured_completion_candidates_unordered(
         return Some((start, cursor, candidates));
     }
 
+    if let Some((start, candidates)) = add_repository_completion_candidates(prefix, workspace) {
+        return Some((start, cursor, candidates));
+    }
+
     if let Some((start, candidates)) = create_file_completion_candidates(prefix, workspace) {
         return Some((start, cursor, candidates));
     }

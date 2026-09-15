@@ -53,6 +53,7 @@ impl OranguHelper {
                 "/status".to_string(),
                 "/log".to_string(),
                 "/fetch".to_string(),
+                "/add_repository".to_string(),
                 "/pull".to_string(),
                 "/rebase".to_string(),
                 "/merge".to_string(),

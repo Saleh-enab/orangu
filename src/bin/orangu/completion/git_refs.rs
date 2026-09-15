@@ -19,7 +19,8 @@ use std::path::Path;
 use super::*;
 use crate::commands::{shell_words, strip_ascii_prefix};
 use crate::git::{
-    discover_git_root, git_branch_names, git_local_branch_names, git_remote_names, git_tag_names,
+    discover_git_root, git_branch_names, git_local_branch_names, git_remote_branch_names,
+    git_remote_names, git_tag_names,
 };
 
 pub fn checkout_completion_candidates(
@@ -211,6 +212,57 @@ pub fn git_modified_candidates(repo_root: &Path, token: &str, staged: bool) -> V
     files.sort();
     files.dedup();
     files
+}
+
+/// Completion candidates for `/add_repository <user> [<branch>]` (and its
+/// natural-language form `add repository `). While the first word is typed,
+/// the users already added — every configured remote but `origin` — so a
+/// second branch of the same copy is a Tab away; once a user is named, the
+/// branches already fetched from that remote, then `main` and `master` when
+/// they are not among them. Returns `None` when the input is not an
+/// add-repository command. Checked before the create-file completion, whose
+/// bare `add ` form would otherwise claim the line.
+pub fn add_repository_completion_candidates(
+    prefix: &str,
+    workspace: &Path,
+) -> Option<(usize, Vec<String>)> {
+    let (args_start, args) = if let Some(rest) = prefix.strip_prefix("/add_repository ") {
+        ("/add_repository ".len(), rest)
+    } else {
+        let rest = strip_ascii_prefix(prefix, "add repository ")?;
+        (prefix.len() - rest.len(), rest)
+    };
+    let root = discover_git_root(workspace);
+    let candidates: Vec<String> = match args.split_once(' ') {
+        None => root
+            .map(|root| git_remote_names(&root))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|remote| remote != "origin" && remote.starts_with(args))
+            .collect(),
+        Some((user, rest)) => {
+            // Only the branch word completes; a third word has no meaning.
+            if rest.contains(' ') {
+                return None;
+            }
+            let mut branches = root
+                .map(|root| git_remote_branch_names(&root, user))
+                .unwrap_or_default();
+            for default in ["main", "master"] {
+                if !branches.iter().any(|branch| branch == default) {
+                    branches.push(default.to_string());
+                }
+            }
+            return Some((
+                prefix.len() - rest.len(),
+                branches
+                    .into_iter()
+                    .filter(|branch| branch.starts_with(rest))
+                    .collect(),
+            ));
+        }
+    };
+    Some((args_start, candidates))
 }
 
 pub fn create_file_completion_candidates(

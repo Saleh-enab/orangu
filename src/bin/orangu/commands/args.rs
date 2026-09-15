@@ -431,6 +431,10 @@ pub fn move_file_usage_message() -> &'static str {
     "Usage: /move_file <source> <destination>. Use /help to see available commands."
 }
 
+pub fn add_repository_usage_message() -> &'static str {
+    "Usage: /add_repository <user> [<branch>]. Use /help to see available commands."
+}
+
 pub fn cherry_pick_usage_message() -> &'static str {
     "Usage: /cherry_pick <commit>. Use /help to see available commands."
 }

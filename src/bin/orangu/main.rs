@@ -92,8 +92,8 @@ use commands::ReviewLaunch;
 use commands::{
     AutoReviewTarget, BisectSubcommand, BranchSubcommand, CommandContext, CommandOutcome,
     CommandState, ExportTarget, LocalCommand, LocalError, McpSubcommand, PruneTarget,
-    StashSubcommand, amend_usage_message, cherry_pick_usage_message, close_usage_message,
-    comment_usage_message, commit_usage_message, create_file_usage_message,
+    StashSubcommand, add_repository_usage_message, amend_usage_message, cherry_pick_usage_message,
+    close_usage_message, comment_usage_message, commit_usage_message, create_file_usage_message,
     delete_file_usage_message, get_comments_usage_message, grep_usage_message, issue_usage_message,
     mcp_usage_message, merge_usage_message, model_usage_message, move_file_usage_message,
     open_file_usage_message, parse_local_command, prune_usage_message, pull_usage_message,
@@ -101,17 +101,18 @@ use commands::{
 };
 use dispatch::*;
 use git::{
-    Forge, amend_output, bisect_bad_output, bisect_good_output, bisect_log_output,
-    bisect_reset_output, bisect_skip_output, bisect_start_output, bisect_status_output,
-    branch_create_output, branch_delete_output, branch_list_all_output, branch_list_output,
-    branch_rename_output, cherry_pick_output, close_output, collect_review_diff, comment_output,
-    commit_output, create_pull_request_output, discover_git_root, fetch_active_pull_requests,
-    fetch_issue_metadata, fetch_output, fetch_pull_request_details, get_comments_output,
-    git_checkout, git_diff_against_branch, git_workspace_diff, grep_output, init_repo_output,
-    issue_field_output, list_workspace_files_tree, log_output, merge_output, open_in_editor,
-    pull_request_output, push_output, rebase_output, restore_output, show_output, squash_output,
-    stash_drop_output, stash_list_output, stash_output, stash_pop_output, status_output,
-    sync_default_branch, workspace_branch_name,
+    Forge, add_repository_output, amend_output, bisect_bad_output, bisect_good_output,
+    bisect_log_output, bisect_reset_output, bisect_skip_output, bisect_start_output,
+    bisect_status_output, branch_create_output, branch_delete_output, branch_list_all_output,
+    branch_list_output, branch_rename_output, cherry_pick_output, close_output,
+    collect_review_diff, comment_output, commit_output, create_pull_request_output,
+    discover_git_root, fetch_active_pull_requests, fetch_issue_metadata, fetch_output,
+    fetch_pull_request_details, get_comments_output, git_checkout, git_diff_against_branch,
+    git_workspace_diff, grep_output, init_repo_output, issue_field_output,
+    list_workspace_files_tree, log_output, merge_output, open_in_editor, pull_request_output,
+    push_output, rebase_output, restore_output, show_output, squash_output, stash_drop_output,
+    stash_list_output, stash_output, stash_pop_output, status_output, sync_default_branch,
+    workspace_branch_name,
 };
 use input::{
     EscapeCancelState, IDLE_STATUS_REFRESH_INTERVAL, InputContext, InputResult, InputState,
@@ -1218,13 +1219,20 @@ async fn run() -> Result<()> {
             )
             .await;
             match pr_result {
-                Ok(WaitResult::Response { answer, truncated }) => {
+                Ok(WaitResult::Response {
+                    answer,
+                    truncated,
+                    after_turn,
+                }) => {
                     let tool_delta = tools
                         .total_tool_duration()
                         .saturating_sub(pr_tool_time_before);
                     usage_stats.record_response(pr_llm_start.elapsed(), &answer, tool_delta);
                     last_assistant_response = Some(answer.clone());
                     push_answer(&mut output_state, &answer, truncated);
+                    if let Some(step) = after_turn {
+                        push_after_turn(&mut output_state, step, tools.workspace(), &answer);
+                    }
                     if config.feedback {
                         output_state.push_text(FEEDBACK_OK);
                     }
@@ -1514,6 +1522,8 @@ async fn run() -> Result<()> {
 
         let mut detect_model = false;
         let mut prompt_input = next_input.clone();
+        // Set by a command whose model turn has a deterministic tail.
+        let mut prompt_after_turn: Option<commands::AfterTurn> = None;
         let command_outcome = handle_command(
             &next_input,
             CommandState {
@@ -2465,6 +2475,10 @@ async fn run() -> Result<()> {
             CommandOutcome::ModelPrompt(prompt) => {
                 prompt_input = prompt;
             }
+            CommandOutcome::ModelPromptThen { prompt, then } => {
+                prompt_input = prompt;
+                prompt_after_turn = Some(then);
+            }
             CommandOutcome::Unhandled => {}
         }
 
@@ -2552,6 +2566,7 @@ async fn run() -> Result<()> {
             &tools,
             llm_start,
             tool_time_before,
+            prompt_after_turn,
             WaitContext {
                 render: RenderContext {
                     current_model: &active_model_id,
@@ -2591,11 +2606,18 @@ async fn run() -> Result<()> {
         )
         .await
         {
-            Ok(WaitResult::Response { answer, truncated }) => {
+            Ok(WaitResult::Response {
+                answer,
+                truncated,
+                after_turn,
+            }) => {
                 let tool_delta = tools.total_tool_duration().saturating_sub(tool_time_before);
                 usage_stats.record_response(llm_start.elapsed(), &answer, tool_delta);
                 last_assistant_response = Some(answer.clone());
                 push_answer(&mut output_state, &answer, truncated);
+                if let Some(step) = after_turn {
+                    push_after_turn(&mut output_state, step, tools.workspace(), &answer);
+                }
                 if config.feedback {
                     output_state.push_text(FEEDBACK_OK);
                 }

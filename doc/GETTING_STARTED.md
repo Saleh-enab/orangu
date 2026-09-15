@@ -230,6 +230,8 @@ cargo run --bin orangu -- --config ./orangu.conf
 - `/diff`
 - `/fetch`
 - `/fetch upstream`
+- `/add_repository Jubilee101`
+- `/add_repository Jubilee101 muse`
 - `/init_repo`
 - `/log`
 - `/log 5`
