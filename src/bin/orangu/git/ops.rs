@@ -1644,17 +1644,27 @@ mod tests {
     fn add_repository_adds_the_sibling_copy_as_a_tracking_branch() {
         let root = two_users_and_a_workspace();
         let workspace = root.path().join("workspace");
-        let bob_url = root.path().join("bob").join("pgmoneta");
+        // Git may store the clone's path with either separator; compare
+        // paths with one.
+        let slashes = |path: &str| path.replace('\\', "/");
+        let bob_url = slashes(
+            &root
+                .path()
+                .join("bob")
+                .join("pgmoneta")
+                .display()
+                .to_string(),
+        );
 
         // No branch named: bob's default branch, learned from the remote.
         let report = add_repository_output(&workspace, "bob", None).expect("add bob");
         assert_eq!(
-            report,
-            format!("Added branch 'bob/main' from {}", bob_url.display())
+            slashes(&report),
+            format!("Added branch 'bob/main' from {bob_url}")
         );
         assert_eq!(
-            git_remote_url(&workspace, "bob").as_deref(),
-            Some(bob_url.to_str().expect("utf-8"))
+            git_remote_url(&workspace, "bob").as_deref().map(slashes),
+            Some(bob_url)
         );
         assert!(git_local_branch_names(&workspace).contains(&"bob/main".to_string()));
         // It tracks bob's main and carries bob's commit, not just alice's.

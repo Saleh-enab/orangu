@@ -280,6 +280,15 @@ pub fn sibling_repository(origin_url: &str, user: &str) -> Result<SiblingReposit
     if url.is_empty() {
         return Err(anyhow!("the 'origin' remote has no URL"));
     }
+    // A Windows drive path (`C:\...` or `C:/...`) is a filesystem path even
+    // though it has the `x:` shape of an scp-style host.
+    let drive_path = {
+        let bytes = url.as_bytes();
+        bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes[2] == b'\\' || bytes[2] == b'/')
+    };
     // Split the URL into what comes before the path (scheme and authority, or
     // the scp-style `user@host:`), the path itself, and the host it names —
     // `None` for a filesystem path.
@@ -291,8 +300,10 @@ pub fn sibling_repository(origin_url: &str, user: &str) -> Result<SiblingReposit
             let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
             let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
             (format!("{scheme}://{authority}/"), path, Some(host))
-        } else if let Some((authority, path)) = url.split_once(':')
+        } else if !drive_path
+            && let Some((authority, path)) = url.split_once(':')
             && !authority.contains('/')
+            && !authority.contains('\\')
             && !authority.is_empty()
             && !url.starts_with('.')
             && !url.starts_with('/')
@@ -319,12 +330,23 @@ pub fn sibling_repository(origin_url: &str, user: &str) -> Result<SiblingReposit
         }
     };
 
-    let path = path.trim_end_matches('/');
+    // A local path keeps whichever separator it came with; everything reached
+    // over the network is `/`-separated.
+    let separator = if host == RepositoryHost::Local && path.contains('\\') && !path.contains('/') {
+        "\\"
+    } else {
+        "/"
+    };
+    let path = path.trim_end_matches(['/', '\\']);
     let (path, suffix) = match path.strip_suffix(".git") {
         Some(path) => (path, ".git"),
         None => (path, ""),
     };
-    let mut segments: Vec<&str> = path.split('/').collect();
+    let mut segments: Vec<&str> = if host == RepositoryHost::Local {
+        path.split(['/', '\\']).collect()
+    } else {
+        path.split('/').collect()
+    };
     let project = segments.pop().filter(|p| !p.is_empty()).ok_or_else(|| {
         anyhow!("could not read a project name from the 'origin' URL '{origin_url}'")
     })?;
@@ -346,7 +368,7 @@ pub fn sibling_repository(origin_url: &str, user: &str) -> Result<SiblingReposit
     Ok(SiblingRepository {
         host,
         project: project.to_string(),
-        url: format!("{prefix}{}{suffix}", rebuilt.join("/")),
+        url: format!("{prefix}{}{suffix}", rebuilt.join(separator)),
     })
 }
 
@@ -1013,6 +1035,23 @@ mod tests {
             ),
             ("../../alice/pgmoneta", Local, "../../bob/pgmoneta"),
             ("~/src/alice/pgmoneta", Local, "~/src/bob/pgmoneta"),
+            // Windows drive paths, with either separator, are local — not an
+            // scp-style host called `C`.
+            (
+                "C:\\Users\\me\\alice\\pgmoneta",
+                Local,
+                "C:\\Users\\me\\bob\\pgmoneta",
+            ),
+            (
+                "C:/Users/me/alice/pgmoneta.git",
+                Local,
+                "C:/Users/me/bob/pgmoneta.git",
+            ),
+            (
+                "file:///C:/Users/me/alice/pgmoneta",
+                Local,
+                "file:///C:/Users/me/bob/pgmoneta",
+            ),
         ] {
             let sibling =
                 sibling_repository(origin, "bob").unwrap_or_else(|e| panic!("{origin}: {e}"));
