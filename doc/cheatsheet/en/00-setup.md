@@ -31,7 +31,7 @@ Installs `orangu`, `orangu-coordinator`, `orangu-server`, `orangu-bench` and
 | `/metrics` `/ready` | Prometheus histograms and counters, no `api_key`. `/ready`: `503` on a full queue. |
 | `draft_model` | Speculative decoding: a small model guesses, the served one verifies. Greedy only, and measure it. |
 | `orangu -w /path/to/project` | Another tree. `-r` resumes, `-l` lists, `-a` reopens tabs, `-p` runs one prompt. |
-| `orangu -s` | Print the shell completions. |
+| `orangu -s` | Print the shell completions; every binary has `-s`. |
 | `/help` `/manual` `/model` | Every command, the full manual offline, and model switching. |
 | `/server` `/theme` `/tools` | The server and its capabilities, the colours, the model's tools. |
 | `/license` | The licence generated files carry. Detected from the project; `Tab` lists the rest. Per session. |

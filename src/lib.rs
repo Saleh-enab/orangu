@@ -46,6 +46,7 @@ pub mod profiling;
 
 pub mod session;
 pub mod shell;
+pub mod shell_completions;
 pub mod skills;
 pub mod tools;
 pub mod tui;

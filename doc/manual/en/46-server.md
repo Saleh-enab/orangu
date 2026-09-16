@@ -1882,8 +1882,9 @@ pass a CLI argument to or prompt on; the config and model are resolved, and
 both listeners bound, *before* detaching, so a bad config or a port already
 in use is still reported to the invoking terminal rather than silently lost.
 `-h`/`--help` and `-V`/`--version` are also available. `-s`/
-`--shell-completions` prints a bash/zsh/fish completion script for the
-shell detected from `$SHELL` — covering every flag above, the
+`--shell-completions` prints a bash/zsh/fish/PowerShell completion script for the
+shell detected from `$SHELL` (or, with no `$SHELL` as on Windows, from
+`$PSModulePath` — see the Shell completions chapter) — covering every flag above, the
 subcommand names, and the positional `model` argument plus `show`'s,
 `delete`'s and `refresh`'s own arguments, those four completed by shelling
 out to `orangu-server list` itself. `-w`/`--workspace` completes directories

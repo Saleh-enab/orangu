@@ -38,6 +38,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use orangu::gguf::{GgufFile, GgufValue};
 use orangu::profiling::profile;
+use orangu::shell_completions;
 use rayon::prelude::*;
 use std::{
     ffi::OsString,
@@ -53,6 +54,7 @@ mod manifest;
 mod model;
 mod pack;
 mod quant;
+mod shell;
 mod stages;
 mod train;
 mod vocab;
@@ -93,6 +95,7 @@ Options:
        --flamegraph-call-graph <MODE>
                                Call-graph mode for --flamegraph: fp or dwarf [default: fp]
        --flamegraph-png        Also render a PNG beside the flamegraph SVG
+  -s,  --shell-completions     Print shell completion script for the detected shell and exit
   -h,  --help                  Print help
   -V,  --version               Print version
 ";
@@ -161,10 +164,28 @@ struct Args {
     /// Also render a PNG beside the flamegraph SVG.
     #[arg(long = "flamegraph-png", default_value_t = false)]
     flamegraph_png: bool,
+
+    /// Print the shell completion script for the detected shell and exit.
+    #[arg(short = 's', long = "shell-completions")]
+    shell_completions: bool,
 }
+
+/// This binary's three completion scripts, for the shared
+/// `-s`/`--shell-completions` detection in `orangu::shell_completions`.
+const COMPLETION_SCRIPTS: shell_completions::Scripts = shell_completions::Scripts {
+    bash: shell::BASH,
+    zsh: shell::ZSH,
+    fish: shell::FISH,
+    powershell: shell::POWERSHELL,
+};
 
 fn main() -> Result<()> {
     let args = Args::parse_from(normalize(std::env::args_os()));
+
+    if args.shell_completions {
+        return shell_completions::print("orangu-gguf", &COMPLETION_SCRIPTS);
+    }
+
     stages::init();
 
     if args.list_quantizations {
@@ -1091,6 +1112,58 @@ fn bytes(count: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every flag clap parses is offered by all three hand-written
+    /// completion scripts — see `orangu::shell_completions::unoffered`.
+    /// The two-letter `-ts`/`-cs` are not clap's to know about, so they
+    /// are checked by name.
+    #[test]
+    fn every_flag_is_offered_by_every_completion_script() {
+        use clap::CommandFactory;
+        let missing = shell_completions::unoffered(&Args::command(), &COMPLETION_SCRIPTS);
+        assert!(missing.is_empty(), "not offered: {missing:?}");
+        for flag in ["-ts", "-cs"] {
+            assert!(
+                COMPLETION_SCRIPTS.bash.contains(&format!("{flag} ")),
+                "bash: {flag}"
+            );
+            assert!(
+                COMPLETION_SCRIPTS.zsh.contains(&format!("{{{flag},")),
+                "zsh: {flag}"
+            );
+            assert!(
+                COMPLETION_SCRIPTS
+                    .fish
+                    .contains(&format!("-o {} ", &flag[1..])),
+                "fish: {flag}"
+            );
+            assert!(
+                COMPLETION_SCRIPTS
+                    .powershell
+                    .contains(&format!("@('{flag}', ")),
+                "powershell: {flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_script_detects_each_supported_shell() {
+        for (shell, marker) in [
+            ("/bin/bash", "bash completion for orangu-gguf"),
+            ("/usr/bin/zsh", "#compdef orangu-gguf"),
+            ("/usr/local/bin/fish", "fish completion for orangu-gguf"),
+            ("pwsh", "PowerShell completion for orangu-gguf"),
+            (
+                r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe",
+                "PowerShell completion for orangu-gguf",
+            ),
+        ] {
+            let script =
+                shell_completions::script("orangu-gguf", shell, false, &COMPLETION_SCRIPTS)
+                    .expect(shell);
+            assert!(script.contains(marker), "{shell} -> {marker}");
+        }
+    }
 
     fn normalized(args: &[&str]) -> Vec<String> {
         normalize(args.iter().map(OsString::from))

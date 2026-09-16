@@ -394,6 +394,7 @@ orangu-gguf -m ./my-model-BF16.gguf -q q4_k_m
 | `-cs`, `--context-size` | Override the declared context length |
 | `-o`, `--output` | Override where the model is written |
 | `--list-quantizations` | Print the weight formats and exit |
+| `-s`, `--shell-completions` | Print the shell completion script and exit |
 
 The four overrides exist for the one-off — trying `0.5b` before committing
 to `2b`, or writing a second quantization of a model you already have.
@@ -401,6 +402,24 @@ Anything you want to keep belongs in the manifest, where the next run will
 still find it. `-ts` and `-cs` are two letters behind a single dash, which
 most tools read as two separate short flags; they are accepted here anyway,
 in both the `-ts 1b` and `-ts=1b` spellings, alongside the long forms.
+
+`-s`/`--shell-completions` prints a bash/zsh/fish/PowerShell completion script for the
+shell detected from `$SHELL` — the same switch every orangu binary has (see
+the Shell completions chapter). It completes the manifest with `.json`
+files, `-m` with `.gguf` files, `-q` with the weight formats (by shelling
+back out to `orangu-gguf --list-quantizations`), `-o` and `--flamegraph`
+with files, and offers `-ts`/`-cs` alongside their long forms:
+
+```sh
+# bash — add to ~/.bashrc:
+eval "$(orangu-gguf -s)"
+# zsh — write once to your fpath directory:
+orangu-gguf -s > ~/.zsh/completions/_orangu-gguf
+# fish — add to ~/.config/fish/config.fish:
+orangu-gguf -s | source
+# PowerShell — add to $PROFILE:
+orangu-gguf -s | Out-String | Invoke-Expression
+```
 
 ## Sizes
 

@@ -31,6 +31,7 @@ mod config;
 mod init;
 mod process;
 mod proxy;
+mod shell;
 
 use anyhow::{Context, Result};
 use axum::{Router, extract::DefaultBodyLimit};
@@ -38,6 +39,7 @@ use clap::Parser;
 use config::{
     CoordinatorConfiguration, default_coordinator_config_path, load_coordinator_configuration,
 };
+use orangu::shell_completions;
 use process::Coordinator;
 use std::{path::PathBuf, process::ExitCode, sync::Arc};
 
@@ -87,10 +89,32 @@ struct Args {
     /// once detached there is no terminal left to print to. Unix-only.
     #[arg(short, long)]
     daemon: bool,
+    /// Print the shell completion script for the detected shell and exit.
+    #[arg(short = 's', long = "shell-completions")]
+    shell_completions: bool,
 }
+
+/// This binary's three completion scripts, for the shared
+/// `-s`/`--shell-completions` detection in `orangu::shell_completions`.
+const COMPLETION_SCRIPTS: shell_completions::Scripts = shell_completions::Scripts {
+    bash: shell::BASH,
+    zsh: shell::ZSH,
+    fish: shell::FISH,
+    powershell: shell::POWERSHELL,
+};
 
 fn main() -> ExitCode {
     let mut args = Args::parse();
+
+    if args.shell_completions {
+        return match shell_completions::print("orangu-coordinator", &COMPLETION_SCRIPTS) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("error: {err:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     if args.init {
         return match build_runtime().block_on(init::run_init()) {
@@ -334,4 +358,40 @@ async fn run(
 
     shutdown_coordinator.shutdown().await;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Every flag clap parses is offered by all three hand-written
+    /// completion scripts — see `orangu::shell_completions::unoffered`.
+    #[test]
+    fn every_flag_is_offered_by_every_completion_script() {
+        let missing = shell_completions::unoffered(&Args::command(), &COMPLETION_SCRIPTS);
+        assert!(missing.is_empty(), "not offered: {missing:?}");
+    }
+
+    #[test]
+    fn completion_script_detects_each_supported_shell() {
+        for (shell, marker) in [
+            ("/bin/bash", "bash completion for orangu-coordinator"),
+            ("/usr/bin/zsh", "#compdef orangu-coordinator"),
+            (
+                "/usr/local/bin/fish",
+                "fish completion for orangu-coordinator",
+            ),
+            ("pwsh", "PowerShell completion for orangu-coordinator"),
+            (
+                r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe",
+                "PowerShell completion for orangu-coordinator",
+            ),
+        ] {
+            let script =
+                shell_completions::script("orangu-coordinator", shell, false, &COMPLETION_SCRIPTS)
+                    .expect(shell);
+            assert!(script.contains(marker), "{shell} -> {marker}");
+        }
+    }
 }

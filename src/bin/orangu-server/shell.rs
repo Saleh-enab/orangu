@@ -20,7 +20,10 @@
 //! completed by shelling back out to `orangu-server list` itself and reading
 //! its first two columns (NR and MODEL). This only ever depends on
 //! `orangu-server` itself being on `$PATH` — no clap-generated completion
-//! machinery is involved.
+//! machinery is involved. The PowerShell script does the same through
+//! `Register-ArgumentCompleter -Native`, and is kept to ASCII: Windows
+//! PowerShell decodes a native command's output in the console's code
+//! page, which would garble a tooltip's dash.
 //!
 //! `prune`'s own argument is completed differently: directly against
 //! `~/.orangu/server/sessions/*` (each entry a UUID directory), newest
@@ -103,14 +106,18 @@ _orangu_server() {
             COMPREPLY=( $(compgen -W "size last-used" -- "$cur") )
             return 0
             ;;
-        -p|--port|--web)
+        --device-split)
+            COMPREPLY=( $(compgen -W "off auto all cpu" -- "$cur") )
+            return 0
+            ;;
+        -p|--port|--web|--device|--threads)
             return 0
             ;;
     esac
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            "-c --config -w --workspace --host -p --port --web -i --init -s --shell-completions -d --daemon \
+            "-c --config -w --workspace --host -p --port --web --device --device-split --threads -i --init -s --shell-completions -d --daemon \
              --all --code --review --explorer --embedding -o --output --binary --deep --sort -y --yes -h --help -V --version" -- "$cur") )
         return 0
     fi
@@ -177,6 +184,9 @@ _orangu_server() {
         '--host[Address to bind: all, 0.0.0.0, or a literal address (overrides the config file)]:host:(all 0.0.0.0 127.0.0.1)' \
         '(-p --port)'{-p,--port}'[Port the HTTP API listens on (overrides the config file)]:port:' \
         '--web[Port the web console listens on, 0 to disable it (overrides the config file)]:port:' \
+        '--device[GPU device to use exclusively: an index, part of its name, or auto]:device:' \
+        '--device-split[Spread the model'"'"'s layers across the selected devices: off, auto, all, cpu, or shares like 3,1]:mode:(off auto all cpu)' \
+        '--threads[Worker threads for every CPU path (default: one per logical core)]:n:' \
         '(-i --init)'{-i,--init}'[Interactively create ~/.orangu/orangu-server.conf and exit]' \
         '(-s --shell-completions)'{-s,--shell-completions}'[Print shell completion script for the detected shell and exit]' \
         '(-d --daemon)'{-d,--daemon}'[Run in the background, detached from the terminal]' \
@@ -265,6 +275,9 @@ complete -c orangu-server -s w -l workspace -x -a '(__fish_complete_directories)
 complete -c orangu-server      -l host                -x -a 'all 0.0.0.0 127.0.0.1' -d 'Address to bind (overrides the config file)'
 complete -c orangu-server -s p -l port                -x -d 'Port the HTTP API listens on (overrides the config file)'
 complete -c orangu-server      -l web                 -x -d 'Port the web console listens on, 0 to disable it (overrides the config file)'
+complete -c orangu-server      -l device              -x -d 'GPU device to use exclusively: an index, part of its name, or auto'
+complete -c orangu-server      -l device-split        -x -a 'off auto all cpu' -d 'Spread the model\'s layers across the selected devices: off, auto, all, cpu, or shares like 3,1'
+complete -c orangu-server      -l threads             -x -d 'Worker threads for every CPU path (default: one per logical core)'
 complete -c orangu-server -s i -l init                    -d 'Interactively create ~/.orangu/orangu-server.conf and exit'
 complete -c orangu-server -s s -l shell-completions       -d 'Print shell completion script for the detected shell and exit'
 complete -c orangu-server -s d -l daemon                  -d 'Run in the background, detached from the terminal'
@@ -280,4 +293,124 @@ complete -c orangu-server -n '__fish_seen_subcommand_from list' -l sort -x -a 's
 complete -c orangu-server -s y -l yes                     -d 'Skip a confirmation prompt (download/delete/bundle/prune)'
 complete -c orangu-server -s h -l help                    -d 'Print help'
 complete -c orangu-server -s V -l version                 -d 'Print version'
+"#;
+
+pub const POWERSHELL: &str = r#"# PowerShell completion for orangu-server
+#
+# Quick setup - add to your $PROFILE (notepad $PROFILE):
+#   orangu-server -s | Out-String | Invoke-Expression
+#
+# Or write once to a file and dot-source it from $PROFILE:
+#   orangu-server -s > "$HOME\orangu-server.ps1"
+#   # $PROFILE: . "$HOME\orangu-server.ps1"
+
+Register-ArgumentCompleter -Native -CommandName 'orangu-server' -ScriptBlock {
+    param($wordToComplete, $commandAst, $cursorPosition)
+
+    # Every word typed before the one under the cursor; $words[0] is the
+    # command itself, so $prev is that when nothing else has been typed.
+    $words = @($commandAst.CommandElements | ForEach-Object { $_.Extent.Text })
+    if ($wordToComplete -ne '' -and $words.Count -gt 1) {
+        $words = $words[0..($words.Count - 2)]
+    }
+    $prev = $words[-1]
+
+    $flags = @(
+        @('-c', '--config', 'Path to the configuration file (orangu-server.conf)'),
+        @('-w', '--workspace', 'Root directory the server operates in (default: the current directory)'),
+        @('--host', 'Address to bind: all, 0.0.0.0, or a literal address (overrides the config file)'),
+        @('-p', '--port', 'Port the HTTP API listens on (overrides the config file)'),
+        @('--web', 'Port the web console listens on, 0 to disable it (overrides the config file)'),
+        @('--device', 'GPU device to use exclusively: an index, part of its name, or auto'),
+        @('--device-split', 'Spread the model''s layers across the selected devices: off, auto, all, cpu, or shares like 3,1'),
+        @('--threads', 'Worker threads for every CPU path (default: one per logical core)'),
+        @('-i', '--init', 'Interactively create ~/.orangu/orangu-server.conf and exit'),
+        @('-s', '--shell-completions', 'Print shell completion script for the detected shell and exit'),
+        @('-d', '--daemon', 'Run in the background, detached from the terminal'),
+        @('--all', 'General-purpose role (default)'),
+        @('--code', 'Coding role'),
+        @('--review', 'Code review role'),
+        @('--explorer', 'Exploration role'),
+        @('--embedding', 'Embeddings-only role'),
+        @('-o', '--output', 'Where bundle writes the bundled executable'),
+        @('--binary', 'The executable bundle embeds the model into'),
+        @('--deep', 'Also verify plan''s shards and architecture'),
+        @('--sort', 'Order list rows while preserving their NR'),
+        @('-y', '--yes', 'Skip a confirmation prompt (download/delete/bundle/prune)'),
+        @('-h', '--help', 'Print help'),
+        @('-V', '--version', 'Print version')
+    )
+    $subcommands = @(
+        @('system', 'Detect the machine''s CPU and GPU(s)'),
+        @('suggest', 'Suggest a GGUF model size for this machine''s hardware'),
+        @('list', 'List every .gguf file under the models directory'),
+        @('show', 'Print a GGUF file''s full metadata'),
+        @('plan', 'Report what a model needs to run here, without loading it'),
+        @('download', 'Download a GGUF model from Hugging Face'),
+        @('delete', 'Delete a GGUF model from disk'),
+        @('refresh', 'Delete a GGUF model and download it again'),
+        @('bundle', 'Write a self-contained executable carrying the server and a model'),
+        @('prune', 'Delete chat sessions'),
+        @('help', 'Print this message or the help of the given subcommand(s)')
+    )
+
+    function Offer([string[]]$candidates) {
+        foreach ($candidate in $candidates) {
+            if ($candidate -like "$wordToComplete*") {
+                [System.Management.Automation.CompletionResult]::new($candidate, $candidate, 'ParameterValue', $candidate)
+            }
+        }
+    }
+
+    # The positional MODEL argument (and show's/plan's/delete's/refresh's/
+    # bundle's own arguments): every NR and MODEL from `orangu-server list`.
+    function Models {
+        & orangu-server list 2>$null | Select-Object -Skip 1 | ForEach-Object {
+            $columns = -split $_
+            if ($columns.Count -ge 2) { $columns[0]; $columns[1] }
+        }
+    }
+
+    # prune's own argument: every session UUID under
+    # ~/.orangu/server/sessions, newest first, plus the literal "all".
+    function Sessions {
+        'all'
+        $dir = "$HOME/.orangu/server/sessions"
+        if (Test-Path $dir) {
+            Get-ChildItem $dir -Directory | Sort-Object LastWriteTime -Descending | ForEach-Object { $_.Name }
+        }
+    }
+
+    switch ($prev) {
+        { $_ -in 'show', 'plan', 'delete', 'bundle' } { return Offer (Models) }
+        'refresh' { return Offer (@('--all') + @(Models)) }
+        'prune' { return Offer (Sessions) }
+        { $_ -in '-c', '--config', '-o', '--output', '--binary', '-w', '--workspace' } { return }   # a path: PowerShell's own completion takes over
+        '--host' { return Offer @('all', '0.0.0.0', '127.0.0.1') }
+        '--sort' { return Offer @('size', 'last-used') }
+        '--device-split' { return Offer @('off', 'auto', 'all', 'cpu') }
+        { $_ -in '-p', '--port', '--web', '--device', '--threads' } { return }
+    }
+
+    if ($wordToComplete.StartsWith('-')) {
+        foreach ($flag in $flags) {
+            $tooltip = $flag[-1]
+            foreach ($name in $flag[0..($flag.Count - 2)]) {
+                if ($name -like "$wordToComplete*") {
+                    [System.Management.Automation.CompletionResult]::new($name, $name, 'ParameterName', $tooltip)
+                }
+            }
+        }
+        return
+    }
+
+    if ($words.Count -eq 1) {
+        Offer (Models)
+        foreach ($subcommand in $subcommands) {
+            if ($subcommand[0] -like "$wordToComplete*") {
+                [System.Management.Automation.CompletionResult]::new($subcommand[0], $subcommand[0], 'ParameterValue', $subcommand[1])
+            }
+        }
+    }
+}
 "#;

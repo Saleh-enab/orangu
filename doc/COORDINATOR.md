@@ -280,6 +280,22 @@ silently in the background. There is no PID file: find the process with
 `pgrep -f orangu-coordinator` (or similar) and stop it with `kill -INT
 <pid>` for the same graceful shutdown `Ctrl+C` triggers in the foreground.
 
+Pass `-s`/`--shell-completions` to print a bash/zsh/fish/PowerShell completion script
+for the shell detected from `$SHELL` and exit — the same switch every orangu
+binary has. It covers every flag above, with `-c`/`--config` completing
+files:
+
+```sh
+# bash — add to ~/.bashrc:
+eval "$(orangu-coordinator -s)"
+# zsh — write once to your fpath directory:
+orangu-coordinator -s > ~/.zsh/completions/_orangu-coordinator
+# fish — add to ~/.config/fish/config.fish:
+orangu-coordinator -s | source
+# PowerShell — add to $PROFILE:
+orangu-coordinator -s | Out-String | Invoke-Expression
+```
+
 ### Interactive setup
 
 ```sh

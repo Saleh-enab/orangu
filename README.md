@@ -222,7 +222,7 @@ curl -fsSL https://mnemosyne-systems.github.io/orangu/install.sh | INSTALL_DIR=/
 set "INSTALL_DIR=C:\Tools" && install.cmd
 ```
 
-**Shell completions:** after installing, run `orangu -s` to print the completion script for your shell:
+**Shell completions:** after installing, run `orangu -s` to print the completion script for your shell (bash, zsh, fish, or PowerShell). Every binary has the same switch — `orangu-server -s`, `orangu-coordinator -s`, `orangu-bench -s` and `orangu-gguf -s` print their own:
 
 ```sh
 # bash
@@ -235,7 +235,11 @@ orangu -s >> ~/.zshrc && source ~/.zshrc
 orangu -s | source
 ```
 
-On Windows, add `Invoke-Expression (orangu -s)` to your PowerShell `$PROFILE`.
+On Windows — or wherever PowerShell is the shell — add this to your `$PROFILE`:
+
+```powershell
+orangu -s | Out-String | Invoke-Expression
+```
 
 ### Build from source
 
@@ -349,7 +353,7 @@ orangu -q -p "/export pr"         # writes the PDF, says nothing, exit code is t
 orangu -p "show git status"       # the natural-language form of a command
 ```
 
-Shell completion scripts (bash, zsh, fish) for these flags live in [`contrib/shell/`](contrib/shell/README.md).
+Shell completion scripts (bash, zsh, fish, PowerShell) for these flags are built in: `orangu -s` prints the one for your shell, and so does every other binary (`orangu-server -s`, `orangu-coordinator -s`, `orangu-bench -s`, `orangu-gguf -s`) — see the [Shell completions](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/74-completions.md) chapter.
 
 Useful first commands:
 

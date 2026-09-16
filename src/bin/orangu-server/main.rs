@@ -85,6 +85,7 @@ use engine::placement::{self, SplitMode, SplitPlan};
 use engine::scheduler::SlotPool;
 use engine::tokenizer::Tokenizer;
 use orangu::gguf::{GgufFile, GgufValue, ggml_type_name};
+use orangu::shell_completions;
 use std::{
     io::{IsTerminal, Write},
     path::{Path, PathBuf},
@@ -576,28 +577,14 @@ impl Args {
     }
 }
 
-fn print_shell_completions() -> Result<()> {
-    let shell = std::env::var("SHELL").unwrap_or_default();
-    let script = if shell.ends_with("/bash") || shell == "bash" {
-        shell::BASH
-    } else if shell.ends_with("/zsh") || shell == "zsh" {
-        shell::ZSH
-    } else if shell.ends_with("/fish") || shell == "fish" {
-        shell::FISH
-    } else {
-        return Err(anyhow!(
-            "could not detect shell from $SHELL ({shell:?}).\n\
-             Supported shells: bash, zsh, fish.\n\
-             \n\
-             Usage:\n\
-             \x20 bash: eval \"$(orangu-server -s)\"\n\
-             \x20 zsh:  orangu-server -s > ~/.zsh/completions/_orangu-server\n\
-             \x20 fish: orangu-server -s > ~/.config/fish/completions/orangu-server.fish"
-        ));
-    };
-    print!("{script}");
-    Ok(())
-}
+/// This binary's three completion scripts, for the shared
+/// `-s`/`--shell-completions` detection in `orangu::shell_completions`.
+const COMPLETION_SCRIPTS: shell_completions::Scripts = shell_completions::Scripts {
+    bash: shell::BASH,
+    zsh: shell::ZSH,
+    fish: shell::FISH,
+    powershell: shell::POWERSHELL,
+};
 
 fn main() -> ExitCode {
     panic_capture::install();
@@ -622,7 +609,7 @@ fn main() -> ExitCode {
     let mut args = Args::parse();
 
     if args.shell_completions {
-        return match print_shell_completions() {
+        return match shell_completions::print("orangu-server", &COMPLETION_SCRIPTS) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 eprintln!("error: {err:#}");
@@ -4933,8 +4920,33 @@ mod tests {
                     Some(after.split_whitespace().next()?.to_string())
                 })
                 .collect(),
+            // The `$subcommands = @(` array, one `@('<name>', '...')` per line.
+            "powershell" => {
+                let marker = "$subcommands = @(";
+                let start = script.find(marker).expect("powershell subcommand list") + marker.len();
+                script[start..]
+                    .lines()
+                    .take_while(|line| line.trim() != ")")
+                    .filter_map(|line| {
+                        let entry = line.trim_start().strip_prefix("@('")?;
+                        Some(entry[..entry.find('\'')?].to_string())
+                    })
+                    .collect()
+            }
             other => panic!("no parser for {other}"),
         }
+    }
+
+    /// Every flag clap parses is offered by all three hand-written
+    /// completion scripts — see `orangu::shell_completions::unoffered`.
+    #[test]
+    fn every_flag_is_offered_by_every_completion_script() {
+        use clap::CommandFactory;
+        let missing = super::shell_completions::unoffered(
+            &super::Args::command(),
+            &super::COMPLETION_SCRIPTS,
+        );
+        assert!(missing.is_empty(), "not offered: {missing:?}");
     }
 
     /// Every subcommand clap parses is offered by all three completion
@@ -4961,6 +4973,7 @@ mod tests {
             ("bash", crate::shell::BASH),
             ("zsh", crate::shell::ZSH),
             ("fish", crate::shell::FISH),
+            ("powershell", crate::shell::POWERSHELL),
         ] {
             let offered = offered_subcommands(shell, script);
             for name in &parsed {
@@ -4989,6 +5002,11 @@ mod tests {
                 "fish",
                 crate::shell::FISH,
                 "complete -c orangu-server -n '__fish_use_subcommand' -a plan     -d 'Report what a model needs to run here, without loading it'",
+            ),
+            (
+                "powershell",
+                crate::shell::POWERSHELL,
+                "        @('plan', 'Report what a model needs to run here, without loading it'),",
             ),
         ] {
             assert!(

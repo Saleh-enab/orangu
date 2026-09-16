@@ -65,6 +65,7 @@ use orangu::{
     },
     llm::{ChatMessage, StreamMetrics, normalized_openai_endpoint},
     session::ChatSession,
+    shell_completions,
     tools::ToolExecutor,
     tui::{
         AutoReviewDiffView, AutoReviewFileMode, AutoReviewRejectView, AutoReviewScreenArgs,
@@ -245,27 +246,19 @@ enum CliCommand {
     Clear,
 }
 
-/// Pick the completion script for a `$SHELL` value. Separate from printing it
-/// so the detection — including the shell it refuses — can be checked without
-/// a process to read stdout from.
+/// This binary's three completion scripts, for the shared
+/// `-s`/`--shell-completions` detection in `orangu::shell_completions`.
+const COMPLETION_SCRIPTS: shell_completions::Scripts = shell_completions::Scripts {
+    bash: shell::BASH,
+    zsh: shell::ZSH,
+    fish: shell::FISH,
+    powershell: shell::POWERSHELL,
+};
+
+/// Pick the completion script for a `$SHELL` value — see
+/// [`shell_completions::script`].
 fn completion_script(shell: &str) -> Result<&'static str> {
-    if shell.ends_with("/bash") || shell == "bash" {
-        Ok(shell::BASH)
-    } else if shell.ends_with("/zsh") || shell == "zsh" {
-        Ok(shell::ZSH)
-    } else if shell.ends_with("/fish") || shell == "fish" {
-        Ok(shell::FISH)
-    } else {
-        Err(anyhow!(
-            "could not detect shell from $SHELL ({shell:?}).\n\
-             Supported shells: bash, zsh, fish.\n\
-             \n\
-             Usage:\n\
-             \x20 bash: eval \"$(orangu -s)\"\n\
-             \x20 zsh:  orangu -s > ~/.zsh/completions/_orangu\n\
-             \x20 fish: orangu -s > ~/.config/fish/completions/orangu.fish"
-        ))
-    }
+    shell_completions::script("orangu", shell, false, &COMPLETION_SCRIPTS)
 }
 
 /// Detect the shell and print its completion script. `-q` silences the script
@@ -2870,6 +2863,18 @@ mod tests {
         assert!(init.contains("--init"), "{init}");
     }
 
+    /// Every flag clap parses is offered by all three hand-written
+    /// completion scripts — see `orangu::shell_completions::unoffered`.
+    #[test]
+    fn every_flag_is_offered_by_every_completion_script() {
+        use clap::CommandFactory;
+        let missing = super::shell_completions::unoffered(
+            &super::Args::command(),
+            &super::COMPLETION_SCRIPTS,
+        );
+        assert!(missing.is_empty(), "not offered: {missing:?}");
+    }
+
     #[test]
     fn completion_script_detects_each_supported_shell() {
         for (shell, marker) in [
@@ -2877,6 +2882,11 @@ mod tests {
             ("bash", "bash completion"),
             ("/usr/bin/zsh", "#compdef"),
             ("/usr/local/bin/fish", "fish completion"),
+            ("pwsh", "PowerShell completion"),
+            (
+                r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe",
+                "PowerShell completion",
+            ),
         ] {
             let script = completion_script(shell).expect(shell);
             assert!(script.contains(marker), "{shell} -> {marker}");
@@ -2891,7 +2901,7 @@ mod tests {
             .expect_err("an unsupported shell must not yield a script")
             .to_string();
         assert!(err.contains("nonesuch"), "{err}");
-        assert!(err.contains("bash, zsh, fish"), "{err}");
+        assert!(err.contains("bash, zsh, fish, PowerShell"), "{err}");
         assert!(completion_script("").is_err());
     }
 

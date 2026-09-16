@@ -108,7 +108,7 @@ esac
 
 echo ""
 echo "Run 'orangu --help' to get started."
-echo "Run 'orangu -s' to set up shell completions."
+echo "Run 'orangu -s' to set up shell completions (every binary has -s: orangu-server, orangu-coordinator, orangu-bench, orangu-gguf)."
 if [ -n "$CHEATSHEET_INSTALLED" ]; then
     echo "Setup, coding, review, merge and push on four pages: ${DOC_DIR}/${CHEATSHEET}"
 fi

@@ -52,7 +52,7 @@ dependency on any C or C++ inference library.
   section is there to take precedence over it.
 - `suggest.rs` — `suggest`: a hardware-based model-size estimate built on
   top of `orangu::hardware`'s own detection; see below.
-- `shell.rs` — hand-written bash/zsh/fish completion scripts.
+- `shell.rs` — hand-written bash/zsh/fish/PowerShell completion scripts.
 - `engine/loader.rs` — memory-maps a GGUF file, reads `<arch>.*`
   hyperparameters, resolves tensor byte ranges.
 - `engine/quant.rs` — dequantization for every supported `ggml_type`.
@@ -1045,9 +1045,17 @@ GPU: excluded from both budgets, since its real ceiling is system RAM, which
 ### Shell completions (`shell.rs`)
 
 Mirrors `orangu`'s own `-s`/`--shell-completions` (`src/bin/orangu/
-shell.rs`, `print_shell_completions` in `main.rs`): hand-written bash/zsh/
-fish scripts embedded as `&str` constants, selected by inspecting `$SHELL`,
-rather than clap-generated completions. The positional `model` argument,
+shell.rs`): hand-written bash/zsh/fish scripts embedded as `&str`
+constants, selected by inspecting `$SHELL`, rather than clap-generated
+completions. The selection — and the error naming the supported shells
+when `$SHELL` is none of them — is `orangu::shell_completions` in the
+library, shared by all five binaries (`orangu-coordinator`, `orangu-bench`
+and `orangu-gguf` each carry a `shell.rs` of the same shape); each
+binary's `COMPLETION_SCRIPTS` hands its three scripts to it. The same
+module's `unoffered` is what each binary's
+`every_flag_is_offered_by_every_completion_script` test runs, so a flag
+added to clap and forgotten in the scripts fails the build rather than
+Tab. The positional `model` argument,
 and `show`'s, `delete`'s and `refresh`'s own arguments, complete the same way `orangu`'s
 own scripts complete session UUIDs — the shell function shells back out to
 `orangu-server list` itself (`2>/dev/null`, so a missing config yields no
@@ -1078,6 +1086,17 @@ itself the way model completion shells out to `list` isn't an option here:
 stdin, so piping its output into a completion function would risk the
 completion hanging on that prompt — `list` never reads stdin, which is
 exactly why it's safe to use as a completion source and `prune` isn't.
+
+The PowerShell script registers a native argument completer
+(`Register-ArgumentCompleter -Native`) whose script block does what the
+three Unix scripts do — the model list from `orangu-server list`, the
+session UUIDs from the sessions directory, fixed value lists for `--host`,
+`--sort` and `--device-split`, and nothing at all for a path-taking flag,
+since a native completer that returns nothing hands the word to
+PowerShell's own file completion. It is kept to ASCII on purpose: Windows
+PowerShell decodes a native command's output in the console's code page,
+and `orangu-server -s | Out-String | Invoke-Expression` would otherwise
+garble every dash in a tooltip.
 
 ### GGUF loading and dequantization
 

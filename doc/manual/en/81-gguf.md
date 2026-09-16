@@ -21,6 +21,7 @@ user-facing chapter is *Building a model*.
 | `train.rs` | AdamW, the schedule, the loop, and the checkpoint. |
 | `quant.rs` | Float encodings, block quantizations, and the per-tensor type rules. |
 | `write.rs` | The GGUF writer. |
+| `shell.rs` | The bash/zsh/fish/PowerShell completion scripts `-s` prints. |
 
 Each stage's output is a file in the work directory, and each stage reads
 the previous stage's file rather than a value passed to it. That is what

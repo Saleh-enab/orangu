@@ -72,7 +72,7 @@ _orangu() {
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            "-c --config -t --theme -w --workspace -r --resume -a --all -p --prompt --workflow --dry-run -q --quiet -l --list -i --init -s --shell-completions -h --help" -- "$cur") )
+            "-c --config -t --theme -w --workspace -r --resume -a --all -p --prompt --workflow --dry-run -q --quiet -l --list -i --init -s --shell-completions -h --help -V --version" -- "$cur") )
         return 0
     fi
     COMPREPLY=( $(compgen -W "status pause resume clear" -- "$cur") )
@@ -132,6 +132,7 @@ _orangu() {
         '(-i --init)'{-i,--init}'[Interactively create ~/.orangu/orangu.conf and exit]' \
         '(-s --shell-completions)'{-s,--shell-completions}'[Print shell completion script for the detected shell and exit]' \
         '(-h --help)'{-h,--help}'[Print help]' \
+        '(-V --version)'{-V,--version}'[Print version]' \
         '1:command:(status pause resume clear)'
 }
 
@@ -175,12 +176,114 @@ complete -c orangu -s l -l list                                           -d 'Li
 complete -c orangu -s i -l init                                           -d 'Interactively create ~/.orangu/orangu.conf and exit'
 complete -c orangu -s s -l shell-completions                              -d 'Print shell completion script for the detected shell and exit'
 complete -c orangu -s h -l help                                           -d 'Print help'
+complete -c orangu -s V -l version                                        -d 'Print version'
 complete -c orangu -f -a 'status pause resume clear'                      -d 'Manage the saved workflow loops'
+"#;
+
+pub const POWERSHELL: &str = r#"# PowerShell completion for orangu
+#
+# Quick setup - add to your $PROFILE (notepad $PROFILE):
+#   orangu -s | Out-String | Invoke-Expression
+#
+# Or write once to a file and dot-source it from $PROFILE:
+#   orangu -s > "$HOME\orangu.ps1"
+#   # $PROFILE: . "$HOME\orangu.ps1"
+
+Register-ArgumentCompleter -Native -CommandName 'orangu' -ScriptBlock {
+    param($wordToComplete, $commandAst, $cursorPosition)
+
+    # Every word typed before the one under the cursor; $words[0] is the
+    # command itself, so $prev is that when nothing else has been typed.
+    $words = @($commandAst.CommandElements | ForEach-Object { $_.Extent.Text })
+    if ($wordToComplete -ne '' -and $words.Count -gt 1) {
+        $words = $words[0..($words.Count - 2)]
+    }
+    $prev = $words[-1]
+
+    $flags = @(
+        @('-c', '--config', 'Path to the configuration file (orangu.conf)'),
+        @('-t', '--theme', 'Override the TUI theme with a name or .theme file'),
+        @('-w', '--workspace', 'Workspace root for local tools'),
+        @('-r', '--resume', 'Resume a session by UUID'),
+        @('-a', '--all', 'Reopen the workspace tabs from the previous run'),
+        @('-p', '--prompt', 'Run one prompt or command, print the result and exit'),
+        @('--workflow', 'Validate and execute every job in a YAML workflow'),
+        @('--dry-run', 'Validate the workflow without executing it'),
+        @('-q', '--quiet', 'Print nothing on success; the exit code is the result'),
+        @('-l', '--list', 'List all stored sessions as a table and exit'),
+        @('-i', '--init', 'Interactively create ~/.orangu/orangu.conf and exit'),
+        @('-s', '--shell-completions', 'Print shell completion script for the detected shell and exit'),
+        @('-h', '--help', 'Print help'),
+        @('-V', '--version', 'Print version')
+    )
+    $subcommands = @(
+        @('status', 'Show the saved loop state for every job in a workflow'),
+        @('pause', 'Pause every active loop in a workflow at its next safe boundary'),
+        @('resume', 'Resume every paused or failed loop in a workflow'),
+        @('clear', 'Cancel every saved loop in a workflow')
+    )
+
+    function Offer([string[]]$candidates) {
+        foreach ($candidate in $candidates) {
+            if ($candidate -like "$wordToComplete*") {
+                [System.Management.Automation.CompletionResult]::new($candidate, $candidate, 'ParameterValue', $candidate)
+            }
+        }
+    }
+
+    # Session UUIDs from ~/.orangu/sessions, newest first.
+    function Sessions {
+        $dir = "$HOME/.orangu/sessions"
+        if (Test-Path $dir) {
+            Get-ChildItem $dir -Directory | Sort-Object LastWriteTime -Descending | ForEach-Object { $_.Name }
+        }
+    }
+
+    # Unique workspace roots from past sessions in ~/.orangu/sessions,
+    # extracted from each session's metadata.
+    function Workspaces {
+        $dir = "$HOME/.orangu/sessions"
+        if (Test-Path $dir) {
+            Get-ChildItem $dir -Directory | ForEach-Object {
+                $metadata = Join-Path $_.FullName 'metadata'
+                if (Test-Path $metadata) {
+                    Select-String -Path $metadata -Pattern '"workspace":"([^"]*)"' | ForEach-Object { $_.Matches[0].Groups[1].Value }
+                }
+            } | Sort-Object -Unique
+        }
+    }
+
+    switch ($prev) {
+        { $_ -in '-c', '--config', '--workflow' } { return }   # a file: PowerShell's own completion takes over
+        { $_ -in '-w', '--workspace' } { return Offer (Workspaces) }
+        { $_ -in '-r', '--resume' } { return Offer (Sessions) }
+        { $_ -in '-t', '--theme' } { return Offer @('classic', 'modern_dark', 'modern_light', 'oranguday', 'tokyonight', 'rosepine-moon', 'random') }
+        { $_ -in '-p', '--prompt' } { return }
+    }
+
+    if ($wordToComplete.StartsWith('-')) {
+        foreach ($flag in $flags) {
+            $tooltip = $flag[-1]
+            foreach ($name in $flag[0..($flag.Count - 2)]) {
+                if ($name -like "$wordToComplete*") {
+                    [System.Management.Automation.CompletionResult]::new($name, $name, 'ParameterName', $tooltip)
+                }
+            }
+        }
+        return
+    }
+
+    foreach ($subcommand in $subcommands) {
+        if ($subcommand[0] -like "$wordToComplete*") {
+            [System.Management.Automation.CompletionResult]::new($subcommand[0], $subcommand[0], 'ParameterValue', $subcommand[1])
+        }
+    }
+}
 "#;
 
 #[cfg(test)]
 mod tests {
-    use super::{BASH, FISH, ZSH};
+    use super::{BASH, FISH, POWERSHELL, ZSH};
 
     /// The scripts are hand-written, so a new command-line option reaches them
     /// only if someone remembers. Ask clap what the options actually are.
@@ -198,11 +301,12 @@ mod tests {
             let Some(long) = argument.get_long() else {
                 continue;
             };
-            // fish spells the long form `-l <name>`; bash and zsh spell it out.
+            // fish spells the long form `-l <name>`; the others spell it out.
             for (shell, script, needle) in [
                 ("bash", BASH, format!("--{long}")),
                 ("zsh", ZSH, format!("--{long}")),
                 ("fish", FISH, format!("-l {long}")),
+                ("powershell", POWERSHELL, format!("'--{long}'")),
             ] {
                 assert!(
                     script.contains(&needle),
@@ -224,6 +328,11 @@ mod tests {
             for (shell, script, needle) in [
                 ("zsh", ZSH, format!("{{-{short},--{long}}}")),
                 ("fish", FISH, format!("-s {short} ")),
+                (
+                    "powershell",
+                    POWERSHELL,
+                    format!("@('-{short}', '--{long}'"),
+                ),
             ] {
                 assert!(
                     script.contains(&needle),
@@ -239,7 +348,12 @@ mod tests {
         // place that can silently fall behind `BUILT_IN_THEMES`. Adding a
         // shipped theme must add it here too.
         for theme in orangu::tui::Theme::built_in_theme_names() {
-            for (shell, script) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+            for (shell, script) in [
+                ("bash", BASH),
+                ("zsh", ZSH),
+                ("fish", FISH),
+                ("powershell", POWERSHELL),
+            ] {
                 assert!(
                     script.contains(&theme),
                     "{shell} completion omits the built-in theme: {theme}"
@@ -253,7 +367,12 @@ mod tests {
         // `loop` is a workflow-language step, not a CLI subcommand: the only
         // positional commands are the `orangu --workflow FILE <action>`
         // lifecycle actions.
-        for (shell, script) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+        for (shell, script) in [
+            ("bash", BASH),
+            ("zsh", ZSH),
+            ("fish", FISH),
+            ("powershell", POWERSHELL),
+        ] {
             assert!(
                 !script.contains("__orangu_using_loop") && !script.contains("--until"),
                 "{shell} completion still mentions the removed loop interface"

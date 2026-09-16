@@ -56,9 +56,11 @@ mod moe;
 mod points;
 use orangu::profiling::profile;
 mod report;
+mod shell;
 mod storage;
 mod sweep;
 mod web;
+use orangu::shell_completions;
 
 /// Measure decode (token-generation) throughput of an OpenAI-compatible
 /// server over HTTP, at one or more context depths.
@@ -314,7 +316,20 @@ struct Args {
     /// Seconds to wait between measured points, for a card that heats up.
     #[arg(long, default_value_t = 0, value_name = "SECONDS")]
     delay: u64,
+
+    /// Print the shell completion script for the detected shell and exit.
+    #[arg(short = 's', long = "shell-completions")]
+    shell_completions: bool,
 }
+
+/// This binary's three completion scripts, for the shared
+/// `-s`/`--shell-completions` detection in `orangu::shell_completions`.
+const COMPLETION_SCRIPTS: shell_completions::Scripts = shell_completions::Scripts {
+    bash: shell::BASH,
+    zsh: shell::ZSH,
+    fish: shell::FISH,
+    powershell: shell::POWERSHELL,
+};
 
 impl Args {
     /// Turn every list flag's text into the numbers it names, once, before
@@ -997,6 +1012,15 @@ fn stream_and_time(
 
 fn main() {
     let mut args = Args::parse();
+    // Before the list flags are expanded: the script is all `-s` asks for,
+    // and a mistyped range on the same command line is not its concern.
+    if args.shell_completions {
+        if let Err(e) = shell_completions::print("orangu-bench", &COMPLETION_SCRIPTS) {
+            eprintln!("orangu-bench: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Err(e) = args.expand_lists() {
         eprintln!("orangu-bench: {e}");
         std::process::exit(1);
@@ -4978,6 +5002,40 @@ fn run_curve(
 
 #[cfg(test)]
 mod tests {
+    /// Every flag clap parses is offered by all three hand-written
+    /// completion scripts — see `orangu::shell_completions::unoffered`.
+    #[test]
+    fn every_flag_is_offered_by_every_completion_script() {
+        use clap::CommandFactory;
+        let missing = super::shell_completions::unoffered(
+            &super::Args::command(),
+            &super::COMPLETION_SCRIPTS,
+        );
+        assert!(missing.is_empty(), "not offered: {missing:?}");
+    }
+
+    #[test]
+    fn completion_script_detects_each_supported_shell() {
+        for (shell, marker) in [
+            ("/bin/bash", "bash completion for orangu-bench"),
+            ("/usr/bin/zsh", "#compdef orangu-bench"),
+            ("/usr/local/bin/fish", "fish completion for orangu-bench"),
+            ("pwsh", "PowerShell completion for orangu-bench"),
+            (
+                r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe",
+                "PowerShell completion for orangu-bench",
+            ),
+        ] {
+            let script = super::shell_completions::script(
+                "orangu-bench",
+                shell,
+                false,
+                &super::COMPLETION_SCRIPTS,
+            )
+            .expect(shell);
+            assert!(script.contains(marker), "{shell} -> {marker}");
+        }
+    }
 
     /// `--cap` has to keep the server the *last* thing on the command line,
     /// after `--`, or `systemd-run` swallows the server's own flags as its

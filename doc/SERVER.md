@@ -1283,7 +1283,7 @@ bad config or a port already in use is still reported to the invoking
 terminal rather than silently lost. `-h`/`--help` and `-V`/`--version` are
 also available.
 
-`-s`/`--shell-completions` prints a bash/zsh/fish completion script for the
+`-s`/`--shell-completions` prints a bash/zsh/fish/PowerShell completion script for the
 shell detected from `$SHELL`:
 
 ```sh
@@ -1293,6 +1293,8 @@ eval "$(orangu-server -s)"
 orangu-server -s > ~/.zsh/completions/_orangu-server
 # fish — add to ~/.config/fish/config.fish:
 orangu-server -s | source
+# PowerShell — add to $PROFILE:
+orangu-server -s | Out-String | Invoke-Expression
 ```
 
 Covers every flag above, the subcommand names, and the positional

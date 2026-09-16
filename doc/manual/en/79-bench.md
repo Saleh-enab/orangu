@@ -909,6 +909,7 @@ Options:
       --host <HOST>                    Address the web console binds: "all" (or "*") for every interface [default: 127.0.0.1]
       --port <PORT>                    Port the web console listens on [default: 8300]
       --delay <SECONDS>                Seconds to wait between measured points, for a card that heats up [default: 0]
+  -s, --shell-completions              Print the shell completion script for the detected shell and exit
   -h, --help                           Print help
   -V, --version                        Print version
 ```
@@ -919,6 +920,25 @@ Notes: `--url` is the server base URL (the tool appends `/v1/completions`);
 best (fastest) run with mean ± standard deviation alongside; warmup (one short
 generation) is on unless `--no-warmup`; `--json` emits one JSON object per depth
 instead of the table.
+
+`-s`/`--shell-completions` prints a bash/zsh/fish/PowerShell completion script for the
+shell detected from `$SHELL` and exits — the same switch every orangu binary
+has (see the Shell completions chapter). It offers every flag above; the
+path-taking ones (`--history`, `--chart`, `--storage-file`, `--flamegraph`,
+`--compare-profiles`, `--bundle`, `--read-bundle`, `--render-profile`,
+`--report`) complete files, `--flamegraph-call-graph` its two modes and
+`--host` the usual bind addresses:
+
+```sh
+# bash — add to ~/.bashrc:
+eval "$(orangu-bench -s)"
+# zsh — write once to your fpath directory:
+orangu-bench -s > ~/.zsh/completions/_orangu-bench
+# fish — add to ~/.config/fish/config.fish:
+orangu-bench -s | source
+# PowerShell — add to $PROFILE:
+orangu-bench -s | Out-String | Invoke-Expression
+```
 
 #### Mixture-of-experts models, and models that do not fit
 
