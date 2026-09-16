@@ -84,14 +84,16 @@ fn plan(group: &ModelGroup, updates: &HashMap<String, RepoUpdateInfo>) -> Plan {
 }
 
 /// The subset `refresh --all` can prove needs work. Repositories that could
-/// not be reached are deliberately absent: unknown is not stale.
+/// not be reached are deliberately absent: unknown is not stale. So is a
+/// draft sidecar, behind or not — [`download_spec`] refuses one, and one
+/// refusal must not abort every model after it.
 fn refresh_targets<'a>(
     groups: &'a [ModelGroup],
     updates: &HashMap<String, RepoUpdateInfo>,
 ) -> Vec<&'a ModelGroup> {
     groups
         .iter()
-        .filter(|group| plan(group, updates) == Plan::Refresh)
+        .filter(|group| !group.is_draft_sidecar() && plan(group, updates) == Plan::Refresh)
         .collect()
 }
 
@@ -187,16 +189,10 @@ fn refresh_group(
     group: &ModelGroup,
     updates: &HashMap<String, RepoUpdateInfo>,
 ) -> Result<()> {
-    // A model outside the Hugging Face hub-cache layout — a `.gguf` copied
-    // in by hand, say — has no repo to download it again from, so there's
-    // nothing to refresh *to*. Bail before deleting anything: this is the
-    // one case where going ahead would destroy a model with no way back.
-    let spec = group.download_spec().ok_or_else(|| {
-        anyhow!(
-            "'{}' was not downloaded from Hugging Face (no models--<user>--<model> cache directory), so there is no repo to refresh it from",
-            group.label
-        )
-    })?;
+    // Decided before anything is deleted: a group with no spec to download
+    // again has nothing to refresh *to*, and going ahead would destroy it
+    // with no way back.
+    let spec = download_spec(group)?;
 
     match plan(group, updates) {
         Plan::Refresh => {}
@@ -229,6 +225,36 @@ fn refresh_group(
         .with_context(|| format!("'{spec}' was deleted but could not be downloaded again"))?;
     println!("Downloaded to {}", path.display());
     Ok(())
+}
+
+/// The `<user>/<model>[:tag]` spec whose download puts `group`'s files back
+/// on disk after they have been deleted — [`ModelGroup::download_spec`],
+/// checked before anything is deleted.
+///
+/// Errors for a model outside the Hugging Face hub-cache layout (a `.gguf`
+/// copied in by hand has no repo to download it again from) and for a
+/// draft sidecar such as a `dflash` file: `download` selects a model by its
+/// quant tag and fetches companions only *beside* one, never a draft by
+/// itself, so the `Q8_0` in the draft's own filename would delete the draft
+/// and download a model of that quantization in its place. Nothing here
+/// can bring a draft back, so nothing here deletes one.
+fn download_spec(group: &ModelGroup) -> Result<String> {
+    if group.is_draft_sidecar() {
+        bail!(
+            "'{}' is a draft sidecar, which `download` never fetches on its own, so a refresh could delete it but not download it again; nothing was changed",
+            group
+                .representative_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&group.label)
+        );
+    }
+    group.download_spec().ok_or_else(|| {
+        anyhow!(
+            "'{}' was not downloaded from Hugging Face (no models--<user>--<model> cache directory), so there is no repo to refresh it from",
+            group.label
+        )
+    })
 }
 
 /// Prints `list`'s table — greying every row that is *not* behind its repo,
@@ -417,6 +443,24 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![stale_repo]
         );
+    }
+
+    /// A draft's filename carries a quant tag (`dflash-…-Q8_0.gguf`), and
+    /// read as a model spec that tag would delete the draft and download a
+    /// whole model of that quantization in its place. Refused, before the
+    /// delete.
+    #[test]
+    fn a_draft_sidecar_is_refused_before_anything_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft = cached(dir.path(), REPO, "dflash-Llama-3.2-3B-Instruct-Q8_0.gguf", "draft-1");
+        let sidecar = group(REPO, draft.clone());
+
+        let err = download_spec(&sidecar).unwrap_err();
+        assert!(err.to_string().contains("draft sidecar"), "{err}");
+        assert!(draft.exists(), "nothing was deleted");
+
+        let model = group(REPO, cached(dir.path(), REPO, FILE, "model-1"));
+        assert_eq!(download_spec(&model).unwrap(), format!("{REPO}:Q4_K_M"));
     }
 
     #[test]

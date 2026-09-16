@@ -961,10 +961,13 @@ shows it in the next column — so two quantizations of one repo print the same
 against what's on disk, so `unsloth/gemma-4-E2B-it-GGUF` and
 `unsloth/gemma-4-E2B-it-GGUF:Q4_K_M` name the same local model; use the
 tagged form (or the row's `NR`) to pick one particular quantization of a repo
-that has several, and to ask for one that isn't downloaded yet. A
-multimodal projector ("mmproj") sidecar file doesn't count as its own
-model — it's meant to be loaded *alongside* a base model, not to stand in as
-one.
+that has several, and to ask for one that isn't downloaded yet. The
+companion files `download` fetches beside a model — a multimodal projector
+(`mmproj-*.gguf`) and a multi-token-prediction head (`MTP/mtp-*.gguf`, see
+**Multi-token-prediction heads** below) — don't count as models of their own:
+each is meant to be loaded *alongside* a base model, not to stand in as one,
+so neither gets a row, and both go with the repo once its last model is
+deleted.
 
 `SUPPORTED` says whether this build can actually load the model's
 architecture — `Yes (<arch>)` or `No (<arch>)`, where `<arch>` is the GGUF

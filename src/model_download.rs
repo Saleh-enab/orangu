@@ -584,7 +584,10 @@ fn authed_get(
 /// sidecar — excludes multimodal projectors, imatrix calibration data,
 /// multi-token-prediction draft heads, and draft sidecars such as
 /// `dflash`/`dspark`/`eagle3`.
-fn is_model_gguf(path: &str) -> bool {
+///
+/// Shared with `model_spec` so that what `list` treats as a sidecar on disk
+/// is exactly what a download never selects as "the model".
+pub(crate) fn is_model_gguf(path: &str) -> bool {
     if !path.to_lowercase().ends_with(".gguf") {
         return false;
     }
@@ -805,8 +808,10 @@ fn find_best_mtp(files: &[RepoFile]) -> Option<&RepoFile> {
 }
 
 /// Whether `path` names a multi-token-prediction draft head — the `mtp-`
-/// prefix [`is_model_gguf`] excludes from being "the model".
-fn is_mtp_head(path: &str) -> bool {
+/// prefix [`is_model_gguf`] excludes from being "the model". Public because
+/// the listing keeps heads out of `list` by the same rule the download
+/// fetched them by, so the two can never disagree about what a head is.
+pub fn is_mtp_head(path: &str) -> bool {
     let filename = path.rsplit('/').next().unwrap_or(path).to_lowercase();
     filename.ends_with(".gguf") && filename.starts_with("mtp-")
 }

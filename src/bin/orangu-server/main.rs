@@ -897,10 +897,10 @@ fn resolve_model_spec(
 /// Two kinds reach here and neither is servable on its own: a `dflash`/DSpark
 /// file, which has no token embeddings or output projection at all, and a
 /// multi-token-prediction head (`MTP/mtp-*.gguf`), which is one decoder block
-/// and no trunk. Both are ordinary `.gguf` files in the models directory, so
-/// both turn up in `list` and can be typed at the command line; serving the
-/// paired model is the only thing either request can sensibly mean, and it is
-/// what happens.
+/// and no trunk. A `dflash` file turns up in `list`, and a head — a companion
+/// `download` fetched beside a model, kept out of `list` like an mmproj — can
+/// still be typed as a path; serving the paired model is the only thing
+/// either request can sensibly mean, and it is what happens.
 fn auto_pair_dflash_target(
     models_dir: &Path,
     source: ModelSource,

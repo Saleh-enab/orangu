@@ -51,9 +51,15 @@ pub struct ModelSummary {
 ///   fetching it again. Resolving each candidate to its real, symlink-free
 ///   path and keeping only the first occurrence collapses these back down
 ///   to one entry per physical file.
-/// - **Multimodal projector ("mmproj") sidecars.** These accompany a base
-///   model rather than standing in for one; see
-///   [`GgufFile::is_clip_projector`].
+/// - **Companion sidecars.** A multimodal projector ("mmproj", see
+///   [`GgufFile::is_clip_projector`]) and a multi-token-prediction draft
+///   head (`MTP/mtp-*.gguf`, see [`crate::model_download::is_mtp_head`])
+///   accompany a base model rather than standing in for one: `download`
+///   fetches both beside the model, the server attaches whichever it finds
+///   next to what it serves, and neither has a download spec of its own.
+///   Listed as a row, a head printed its repo's `MODEL` and its own `Q8_0`
+///   under `QUANT` — the same pair as the repo's Q8_0 model — so it was
+///   `(Refresh)`-marked forever and made the model's own name ambiguous.
 pub fn scan_models_dir(dir: &Path) -> Result<Vec<ModelSummary>> {
     if !dir.is_dir() {
         anyhow::bail!("models directory {} does not exist", dir.display());
@@ -75,6 +81,7 @@ pub fn scan_models_dir(dir: &Path) -> Result<Vec<ModelSummary>> {
                 .and_then(|ext| ext.to_str())
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
         })
+        .filter(|path| !is_mtp_head_path(path))
         .collect();
     paths.sort();
 
@@ -109,6 +116,14 @@ pub fn scan_models_dir(dir: &Path) -> Result<Vec<ModelSummary>> {
     }
 
     Ok(summaries)
+}
+
+/// Whether `path` names a multi-token-prediction draft head, by the filename
+/// rule `download` selected it with — and the one the server attaches it by.
+fn is_mtp_head_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(crate::model_download::is_mtp_head)
 }
 
 /// Resolves a `show` target that names a file directly: used as-is if it
@@ -332,13 +347,13 @@ pub fn resolve_refresh_target(models_dir: &Path, requested: &str) -> Result<Mode
             return Ok(groups.swap_remove(index));
         }
         // A file that resolves but belongs to no group is a companion
-        // sidecar — an mmproj projector, which `scan_models_dir` deliberately
-        // keeps out of the listing. `delete` synthesizes a one-file group so
-        // it can still be removed on its own; `refresh` can't do the same,
-        // since `download` only ever fetches a sidecar *alongside* the base
-        // model it belongs to.
+        // sidecar — an mmproj projector or an MTP head, which
+        // `scan_models_dir` deliberately keeps out of the listing. `delete`
+        // synthesizes a one-file group so it can still be removed on its
+        // own; `refresh` can't do the same, since `download` only ever
+        // fetches a sidecar *alongside* the base model it belongs to.
         anyhow::bail!(
-            "'{requested}' is a companion file (mmproj), not a model of its own; refresh the model it was downloaded with instead"
+            "'{requested}' is a companion file (an mmproj projector or a multi-token-prediction head), not a model of its own; refresh the model it was downloaded with instead"
         );
     }
 
@@ -501,12 +516,13 @@ pub fn delete_model(models_dir: &Path, group: &ModelGroup) -> Result<()> {
 /// list as a model.
 ///
 /// **The same definition of "a model" the listing uses**, which means an
-/// mmproj sidecar does not count. A multimodal repo keeps its projector
-/// beside the weights, and deleting the model left a repo holding nothing
-/// but a companion file for a model that is no longer there — 815 MiB of
-/// `mmproj-BF16.gguf` under a `models--...--gemma-3-12b-it-GGUF` the
-/// operator had already deleted, listed by nothing and reachable by
-/// nothing.
+/// mmproj sidecar does not count, and nor does a multi-token-prediction
+/// head. A multimodal repo keeps its projector beside the weights, and
+/// deleting the model left a repo holding nothing but a companion file for
+/// a model that is no longer there — 815 MiB of `mmproj-BF16.gguf` under a
+/// `models--...--gemma-3-12b-it-GGUF` the operator had already deleted,
+/// listed by nothing and reachable by nothing. A 443 MiB `MTP/mtp-*.gguf`
+/// is the same leftover.
 ///
 /// Walked here rather than delegated to `scan_models_dir` because a
 /// snapshot entry is a symlink and the one just deleted may be gone while a
@@ -535,6 +551,9 @@ fn root_holds_a_model(root: &Path) -> bool {
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
         {
+            if is_mtp_head_path(&path) {
+                continue;
+            }
             match GgufFile::open(&path) {
                 Ok(gguf) if gguf.is_clip_projector() => {}
                 _ => return true,
@@ -686,7 +705,20 @@ impl ModelGroup {
     /// that has several on disk: those rows all print the same bare `MODEL`,
     /// so a bare request matches whichever comes first (an `NR` from `list`
     /// picks a row exactly, too).
+    ///
+    /// A draft sidecar ([`is_draft_sidecar`]) never matches. Both spellings
+    /// are download specs — the thing every caller here is about to serve,
+    /// delete or download again — and a draft has none: its row prints its
+    /// repo's `MODEL` and its own `Q8_0` under `QUANT`, the same pair as
+    /// the repo's Q8_0 model, and letting it answer to `<repo>:Q8_0` would
+    /// make that name ambiguous for a model it named exactly before the
+    /// draft arrived. A draft is named by its `NR` or its path.
+    ///
+    /// [`is_draft_sidecar`]: ModelGroup::is_draft_sidecar
     pub fn matches_label(&self, requested: &str) -> bool {
+        if self.is_draft_sidecar() {
+            return false;
+        }
         if self.label == requested {
             return true;
         }
@@ -694,6 +726,26 @@ impl ModelGroup {
             (Some(repo), Some(quant)) => requested == format!("{repo}:{quant}"),
             _ => false,
         }
+    }
+
+    /// Whether this row is a draft sidecar rather than a model — a
+    /// `dflash`/`dspark`/`eagle3` draft, which `list` shows (`orangu-server
+    /// <NR>` on one serves the model it drafts for) but `download` never
+    /// selects by a spec: it picks a model by quant tag and fetches
+    /// companions only beside one. `is_behind`, `matches_label` and
+    /// `refresh` have to know, because a draft's filename carries a quant
+    /// tag of its own, and read as a model's it names the wrong file.
+    ///
+    /// The same filename test [`crate::model_download`] keeps drafts out of
+    /// a download's model selection with, so the two can never disagree
+    /// about what is a model. The companions `download` *does* fetch — an
+    /// mmproj projector and an MTP head — never reach here at all:
+    /// [`scan_models_dir`] drops both before grouping.
+    pub fn is_draft_sidecar(&self) -> bool {
+        self.representative_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| !crate::model_download::is_model_gguf(name))
     }
 
     /// Whether this group's downloadable files differ from the latest repo
@@ -706,6 +758,15 @@ impl ModelGroup {
     /// Both what `list` marks `(Refresh)` and what `refresh` leaves
     /// un-greyed, so the two always agree on which rows are worth acting on.
     ///
+    /// A model row is compared against the files a download of its spec
+    /// would select today, so a resharded or renamed release counts as
+    /// behind. A draft sidecar row ([`is_draft_sidecar`]) has no spec of its
+    /// own to select by — its filename's `Q8_0` names the *draft's*
+    /// quantization, not a model's — so it is compared against the repo
+    /// entry at its own path, and is behind only when that file's content
+    /// changed or it is gone from the repo.
+    ///
+    /// [`is_draft_sidecar`]: ModelGroup::is_draft_sidecar
     /// [`local_commit`]: ModelGroup::local_commit
     pub fn is_behind(
         &self,
@@ -717,20 +778,25 @@ impl ModelGroup {
         let Some(update) = latest_updates.get(repo) else {
             return false;
         };
-        let stem = self
-            .representative_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        let tag = hf_tag_from_label(shard_group_label(stem));
-        let Ok(latest_files) =
-            crate::model_download::select_files_to_download(&update.files, tag.as_deref())
-        else {
-            return false;
+        let latest_files: Vec<&crate::model_download::RepoFile> = if self.is_draft_sidecar() {
+            update.files.iter().collect()
+        } else {
+            let stem = self
+                .representative_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            let tag = hf_tag_from_label(shard_group_label(stem));
+            let Ok(latest_files) =
+                crate::model_download::select_files_to_download(&update.files, tag.as_deref())
+            else {
+                return false;
+            };
+            if latest_files.len() != self.paths.len() {
+                return true;
+            }
+            latest_files
         };
-        if latest_files.len() != self.paths.len() {
-            return true;
-        }
         let latest_by_path: HashMap<&str, &str> = latest_files
             .iter()
             .map(|file| (file.path.as_str(), file.oid.as_str()))
@@ -1431,6 +1497,24 @@ mod tests {
 
         let models = scan_models_dir(dir.path()).unwrap();
         assert_eq!(models.len(), 2);
+    }
+
+    #[test]
+    fn excludes_mtp_heads_from_the_scan_by_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        write_minimal_gguf(&dir.path().join("model-Q8_0.gguf"), "gemma4", None);
+        std::fs::create_dir(dir.path().join("MTP")).unwrap();
+        write_minimal_gguf(&dir.path().join("MTP/mtp-model-Q8_0.gguf"), "gemma4-assistant", None);
+        // Only the `mtp-` prefix names a head; a model whose name merely
+        // contains the letters is a model.
+        write_minimal_gguf(&dir.path().join("my-mtp-model.gguf"), "llama", None);
+
+        let models = scan_models_dir(dir.path()).unwrap();
+        let names: Vec<_> = models
+            .iter()
+            .map(|m| m.path.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["model-Q8_0.gguf", "my-mtp-model.gguf"]);
     }
 
     #[test]
@@ -2230,6 +2314,62 @@ mod tests {
         assert!(!q8.contains("(Refresh)"));
     }
 
+    /// A draft sidecar's filename carries the *draft's* quantization. Read
+    /// as a model tag, that selected the repo's `…-Q8_0.gguf` to compare
+    /// against — a file the draft is not — so the row was marked `(Refresh)`
+    /// from the moment it landed, whatever the repo did.
+    #[cfg(unix)]
+    #[test]
+    fn a_draft_sidecar_is_compared_against_its_own_repo_entry_not_a_model_tag() {
+        let repo = "unsloth/gemma-4-12b-it-GGUF";
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir
+            .path()
+            .join("models--unsloth--gemma-4-12b-it-GGUF/snapshots/rev1");
+        write_cached_minimal_gguf(&snapshot.join("gemma-4-12b-it-Q8_0.gguf"), "gemma4", "model-1");
+        write_cached_minimal_gguf(
+            &snapshot.join("dflash-gemma-4-12b-it-Q8_0.gguf"),
+            "dflash",
+            "draft-1",
+        );
+        let groups = group_models(&scan_models_dir(dir.path()).unwrap());
+        let draft = groups
+            .iter()
+            .find(|group| group.is_draft_sidecar())
+            .expect("the draft is listed");
+        let model = groups
+            .iter()
+            .find(|group| !group.is_draft_sidecar())
+            .expect("the model is listed");
+        let updates = |draft_oid: Option<&str>| {
+            let mut files = vec![crate::model_download::RepoFile {
+                path: "gemma-4-12b-it-Q8_0.gguf".to_string(),
+                oid: "model-1".to_string(),
+                size: 1,
+            }];
+            if let Some(oid) = draft_oid {
+                files.push(crate::model_download::RepoFile {
+                    path: "dflash-gemma-4-12b-it-Q8_0.gguf".to_string(),
+                    oid: oid.to_string(),
+                    size: 1,
+                });
+            }
+            HashMap::from([(
+                repo.to_string(),
+                crate::model_download::RepoUpdateInfo {
+                    commit: "rev1".to_string(),
+                    files,
+                },
+            )])
+        };
+
+        assert!(!draft.is_behind(&updates(Some("draft-1"))), "same content");
+        assert!(draft.is_behind(&updates(Some("draft-2"))), "content changed");
+        assert!(draft.is_behind(&updates(None)), "gone from the repo");
+        // The model's own row never answers for the draft.
+        assert!(!model.is_behind(&updates(Some("draft-2"))));
+    }
+
     /// The marker is one space off the column before it, like every other
     /// column separator on the row — not the two it was first written with.
     #[cfg(unix)]
@@ -2370,6 +2510,76 @@ mod tests {
                 .as_deref(),
             Some("Q4_K_M")
         );
+    }
+
+    /// A draft beside a Q8_0 model prints the same `MODEL` and `QUANT` as
+    /// that model — its own filename's `Q8_0` — so until it stopped
+    /// answering to the name, `<repo>:Q8_0` named two rows and `refresh`
+    /// refused a spec that was unambiguous the day before.
+    #[cfg(unix)]
+    #[test]
+    fn a_draft_sidecar_never_answers_to_its_repo_s_model_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir
+            .path()
+            .join("models--unsloth--gemma-4-12b-it-GGUF/snapshots/rev1");
+        write_cached_minimal_gguf(&snapshot.join("gemma-4-12b-it-Q8_0.gguf"), "gemma4", "model-1");
+        write_cached_minimal_gguf(
+            &snapshot.join("dflash-gemma-4-12b-it-Q8_0.gguf"),
+            "dflash",
+            "draft-1",
+        );
+        let groups = group_models(&scan_models_dir(dir.path()).unwrap());
+        assert_eq!(groups.len(), 2);
+        let draft = groups.iter().find(|g| g.is_draft_sidecar()).unwrap();
+        assert_eq!(draft.quantization.as_deref(), Some("Q8_0"));
+        assert!(!draft.matches_label("unsloth/gemma-4-12b-it-GGUF"));
+        assert!(!draft.matches_label("unsloth/gemma-4-12b-it-GGUF:Q8_0"));
+
+        let group =
+            resolve_refresh_target(dir.path(), "unsloth/gemma-4-12b-it-GGUF:Q8_0").unwrap();
+        assert_eq!(group.paths, vec![snapshot.join("gemma-4-12b-it-Q8_0.gguf")]);
+        // By path, the draft is still reachable.
+        let draft_path = snapshot.join("dflash-gemma-4-12b-it-Q8_0.gguf");
+        let group = resolve_refresh_target(dir.path(), draft_path.to_str().unwrap()).unwrap();
+        assert!(group.is_draft_sidecar());
+    }
+
+    /// The MTP head `download` fetches beside a model is a companion, like
+    /// the mmproj it fetches the same way: not a row of its own (it printed
+    /// its repo's `MODEL` and its own `Q8_0` under `QUANT` — the Q8_0
+    /// model's pair — `(Refresh)`-marked forever and unservable), not a
+    /// `refresh` target, but still deletable by path, and gone with the
+    /// repo once no model is left in it.
+    #[cfg(unix)]
+    #[test]
+    fn an_mtp_head_is_a_companion_not_a_listed_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("models--unsloth--gemma-4-12b-it-GGUF");
+        let snapshot = repo.join("snapshots/rev1");
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::write(repo.join("refs/main"), "rev1").unwrap();
+        write_cached_minimal_gguf(&snapshot.join("gemma-4-12b-it-Q8_0.gguf"), "gemma4", "model-1");
+        let head = snapshot.join("MTP/mtp-gemma-4-12b-it-Q8_0.gguf");
+        write_cached_minimal_gguf(&head, "gemma4-assistant", "head-1");
+
+        let groups = group_models(&scan_models_dir(dir.path()).unwrap());
+        assert_eq!(groups.len(), 1, "the head is not a model of its own");
+        assert_eq!(groups[0].paths, vec![snapshot.join("gemma-4-12b-it-Q8_0.gguf")]);
+
+        let err = resolve_refresh_target(dir.path(), head.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("companion file"), "{err}");
+        assert!(head.exists());
+
+        let deletable = resolve_delete_target(dir.path(), head.to_str().unwrap()).unwrap();
+        assert_eq!(deletable.paths, vec![head.clone()]);
+
+        delete_model(dir.path(), &groups[0]).unwrap();
+        assert!(
+            !repo.exists(),
+            "a repo holding only a head for a model that is gone should go too"
+        );
+        assert!(dir.path().exists());
     }
 
     /// A companion sidecar is in no group: `delete` synthesizes a one-file
