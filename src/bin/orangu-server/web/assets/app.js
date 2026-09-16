@@ -1083,10 +1083,16 @@
               }
             }
             if (payload.type === "done") {
-              // Only once the answer is final: every token above reassigns
-              // `innerHTML`, which would wipe anything appended earlier, and
-              // an answer still mid-sentence hasn't yet had its chance to
-              // produce a diagram of its own.
+              // The live readout is its own element outside the panes, so
+              // the per-token `innerHTML` reassignments never touched it and
+              // it has to go explicitly — otherwise the final footer below
+              // would stack under a second, stale tokens-per-second line.
+              if (liveFooter) {
+                liveFooter.remove();
+                liveFooter = null;
+              }
+              // Only once the answer is final: an answer still mid-sentence
+              // hasn't yet had its chance to produce a diagram of its own.
               appendAttachedDiagramsToAnswer(assistantEl, turnAttachments);
               if (payload.truncated) {
                 const notice = document.createElement("p");
