@@ -284,7 +284,8 @@ pub async fn run_init() -> Result<()> {
 ///
 /// * `git lg` for `/log` — used when the `lg` alias is set in `~/.gitconfig`.
 /// * `delta` for `/diff` — used when it is the configured Git diff pager.
-/// * `bat` for `/show_file` — used automatically whenever it is installed.
+/// * `bat` for `/show_file` — used automatically whenever it is installed,
+///   under either the `bat` or the `batcat` name.
 /// * `gh`/`glab` for the forge commands — used for the selected `platform`.
 ///
 /// Each line reads `No` when the tool is absent, `Yes (Used)` when installed
@@ -292,7 +293,9 @@ pub async fn run_init() -> Result<()> {
 /// used.
 fn report_optional_tools(platform: &str) {
     let delta_installed = command_available("delta");
-    let bat_installed = command_available("bat");
+    let bat_installed = crate::render::BAT_COMMANDS
+        .iter()
+        .any(|command| command_available(command));
     let gh_installed = command_available("gh");
     let glab_installed = command_available("glab");
 
@@ -309,7 +312,8 @@ fn report_optional_tools(platform: &str) {
             delta_installed && delta_is_git_diff_pager()
         )
     );
-    // bat needs no configuration; orangu uses it whenever it is installed.
+    // bat needs no configuration; orangu uses it whenever it is installed
+    // (as `bat`, or as `batcat` on Debian/Ubuntu).
     println!("  bat:    {}", tool_status(bat_installed, bat_installed));
     // gh/glab are selected by `[orangu].platform`.
     println!(

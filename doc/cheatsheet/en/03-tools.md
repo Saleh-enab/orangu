@@ -8,7 +8,7 @@ uses it by itself — `orangu -i` reports each as `No`, `Yes (Used)` or
 | --- | --- |
 | `git lg` | A graph-formatted `/log`. Used when the `lg` alias is in `~/.gitconfig`: `git config --global alias.lg "log --color --graph --abbrev-commit"`. |
 | `delta` | A syntax-highlighted, side-by-side `/diff`. Used when it is your Git diff pager (`pager.diff`, then `core.pager`). |
-| `bat` | A syntax-highlighted `/show_file`. Used as soon as it is installed. |
+| `bat` | A syntax-highlighted `/show_file`. Used as soon as it is installed (as `bat` or `batcat`). |
 | `gh` | `/pull_request`, `/comment`, `/close` and `/issue` need it; `/pull`, `/merge` and `/rebase` improve with it. Used when `[orangu].platform = github`. |
 | `glab` | The same, for GitLab. Used when `[orangu].platform = gitlab`. |
 

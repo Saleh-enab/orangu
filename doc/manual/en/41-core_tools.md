@@ -783,7 +783,7 @@ Shows the contents of a workspace file, optionally at a specific Git ref and opt
 /show_file [--hash] [--author] <path> [<ref>]
 ```
 
-The command is workspace-scoped. Without a ref, the current workspace file is shown — when `bat` is installed it is used for the plain view, otherwise the built-in syntax-highlighted renderer is used. When a ref (commit hash, branch, or tag) is given, the file content at that ref is retrieved via `git show <ref>:<path>` and rendered with the built-in renderer.
+The command is workspace-scoped. Without a ref, the current workspace file is shown — when `bat` is installed (as `bat` or `batcat`) it is used for the plain view, otherwise the built-in syntax-highlighted renderer is used. When a ref (commit hash, branch, or tag) is given, the file content at that ref is retrieved via `git show <ref>:<path>` and rendered with the built-in renderer.
 
 `--hash` and `--author` add per-line blame columns sourced from `git blame`, using the same ref when one is provided.
 

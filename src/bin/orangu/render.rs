@@ -164,21 +164,36 @@ pub fn show_file_output(workspace: &Path, raw_args: &str, virtual_width: usize) 
     render_show_file_content(&resolved_path, &content, blame.as_deref(), options)
 }
 
+/// Binary names `bat` may be installed under, in the order they are tried.
+/// Debian and Ubuntu ship it as `batcat` because the name `bat` was already
+/// taken by another package.
+pub const BAT_COMMANDS: [&str; 2] = ["bat", "batcat"];
+
 pub fn show_file_output_with_bat(path: &Path, virtual_width: usize) -> Result<Option<String>> {
-    let output = match std::process::Command::new("bat")
-        .arg("--paging=never")
-        .arg("--color=always")
-        .arg("--style=numbers")
-        .arg("--terminal-width")
-        .arg(virtual_width.to_string())
-        .arg(path)
-        .output()
-    {
-        Ok(output) => output,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(err).with_context(|| format!("failed to run bat for {}", path.display()));
+    let mut output = None;
+    for command in BAT_COMMANDS {
+        match std::process::Command::new(command)
+            .arg("--paging=never")
+            .arg("--color=always")
+            .arg("--style=numbers")
+            .arg("--terminal-width")
+            .arg(virtual_width.to_string())
+            .arg(path)
+            .output()
+        {
+            Ok(result) => {
+                output = Some(result);
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to run {command} for {}", path.display()));
+            }
         }
+    }
+    let Some(output) = output else {
+        return Ok(None);
     };
 
     if !output.status.success() {
@@ -1006,6 +1021,37 @@ mod tests {
         assert!(output.contains("--color=always"));
         assert!(output.contains("--style=numbers"));
         assert!(output.contains("--terminal-width"));
+        assert!(output.contains(workspace.path().join("main.rs").to_string_lossy().as_ref()));
+    }
+
+    // Same Unix-only caveat as above. Debian and Ubuntu install `bat` as
+    // `batcat`, so `/show_file` must fall back to that name when `bat` is
+    // not on `PATH`.
+    #[cfg(unix)]
+    #[test]
+    fn show_file_falls_back_to_batcat_when_bat_is_missing() {
+        let _env_lock = process_env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let workspace = tempdir().expect("workspace");
+        std::fs::write(workspace.path().join("main.rs"), "fn main() {}\n").expect("source file");
+
+        let tools_dir = tempdir().expect("tools dir");
+        let batcat = tools_dir.path().join("batcat");
+        std::fs::write(&batcat, "#!/bin/sh\nprintf 'BATCAT:%s\\n' \"$*\"\n")
+            .expect("batcat script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&batcat)
+                .expect("batcat metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&batcat, permissions).expect("batcat permissions");
+        }
+        // Only the fake `batcat` is on PATH, so a real `bat` cannot be found.
+        let _path_guard = EnvVarGuard::set_value("PATH", &tools_dir.path().display().to_string());
+
+        let output = show_file_output(workspace.path(), "main.rs", 512).expect("show file");
+        assert!(output.contains("BATCAT:"));
+        assert!(output.contains("--style=numbers"));
         assert!(output.contains(workspace.path().join("main.rs").to_string_lossy().as_ref()));
     }
 

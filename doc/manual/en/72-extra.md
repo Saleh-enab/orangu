@@ -23,7 +23,7 @@ What "configured to be used" means for each tool:
 | :-- | :-- |
 | `git lg` | the `lg` alias is set in `~/.gitconfig` |
 | `delta` | it is installed and resolves as the Git diff pager (`pager.diff`, then `core.pager`) |
-| `bat` | it is installed (no further configuration needed) |
+| `bat` | it is installed as `bat` or `batcat` (no further configuration needed) |
 | `gh` | it is installed and `[orangu].platform` is `github` (the default) |
 | `glab` | it is installed and `[orangu].platform` is `gitlab` |
 
@@ -92,7 +92,9 @@ Please refer to the upstream documentation for full installation and configurati
 
 If it is installed, **orangu** will use it for plain `/show_file` output. No
 further configuration is required — installing `bat` is enough for it to be
-used.
+used. On systems where the binary is called `batcat` instead (Debian and
+Ubuntu, where the name `bat` was already taken by another package), **orangu**
+finds it under that name as well: `bat` is tried first, then `batcat`.
 
 **Installation**
 
@@ -102,6 +104,12 @@ On Fedora, for example:
 
 ```sh
 sudo dnf install bat
+```
+
+On Debian or Ubuntu, where the binary is installed as `batcat`:
+
+```sh
+sudo apt install bat
 ```
 
 Please refer to the upstream documentation for full installation and configuration details:
