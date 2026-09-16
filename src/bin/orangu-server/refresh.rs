@@ -452,7 +452,12 @@ mod tests {
     #[test]
     fn a_draft_sidecar_is_refused_before_anything_is_deleted() {
         let dir = tempfile::tempdir().unwrap();
-        let draft = cached(dir.path(), REPO, "dflash-Llama-3.2-3B-Instruct-Q8_0.gguf", "draft-1");
+        let draft = cached(
+            dir.path(),
+            REPO,
+            "dflash-Llama-3.2-3B-Instruct-Q8_0.gguf",
+            "draft-1",
+        );
         let sidecar = group(REPO, draft.clone());
 
         let err = download_spec(&sidecar).unwrap_err();

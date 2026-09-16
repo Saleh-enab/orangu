@@ -1504,7 +1504,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_minimal_gguf(&dir.path().join("model-Q8_0.gguf"), "gemma4", None);
         std::fs::create_dir(dir.path().join("MTP")).unwrap();
-        write_minimal_gguf(&dir.path().join("MTP/mtp-model-Q8_0.gguf"), "gemma4-assistant", None);
+        write_minimal_gguf(
+            &dir.path().join("MTP/mtp-model-Q8_0.gguf"),
+            "gemma4-assistant",
+            None,
+        );
         // Only the `mtp-` prefix names a head; a model whose name merely
         // contains the letters is a model.
         write_minimal_gguf(&dir.path().join("my-mtp-model.gguf"), "llama", None);
@@ -2326,7 +2330,11 @@ mod tests {
         let snapshot = dir
             .path()
             .join("models--unsloth--gemma-4-12b-it-GGUF/snapshots/rev1");
-        write_cached_minimal_gguf(&snapshot.join("gemma-4-12b-it-Q8_0.gguf"), "gemma4", "model-1");
+        write_cached_minimal_gguf(
+            &snapshot.join("gemma-4-12b-it-Q8_0.gguf"),
+            "gemma4",
+            "model-1",
+        );
         write_cached_minimal_gguf(
             &snapshot.join("dflash-gemma-4-12b-it-Q8_0.gguf"),
             "dflash",
@@ -2364,7 +2372,10 @@ mod tests {
         };
 
         assert!(!draft.is_behind(&updates(Some("draft-1"))), "same content");
-        assert!(draft.is_behind(&updates(Some("draft-2"))), "content changed");
+        assert!(
+            draft.is_behind(&updates(Some("draft-2"))),
+            "content changed"
+        );
         assert!(draft.is_behind(&updates(None)), "gone from the repo");
         // The model's own row never answers for the draft.
         assert!(!model.is_behind(&updates(Some("draft-2"))));
@@ -2523,7 +2534,11 @@ mod tests {
         let snapshot = dir
             .path()
             .join("models--unsloth--gemma-4-12b-it-GGUF/snapshots/rev1");
-        write_cached_minimal_gguf(&snapshot.join("gemma-4-12b-it-Q8_0.gguf"), "gemma4", "model-1");
+        write_cached_minimal_gguf(
+            &snapshot.join("gemma-4-12b-it-Q8_0.gguf"),
+            "gemma4",
+            "model-1",
+        );
         write_cached_minimal_gguf(
             &snapshot.join("dflash-gemma-4-12b-it-Q8_0.gguf"),
             "dflash",
@@ -2536,8 +2551,7 @@ mod tests {
         assert!(!draft.matches_label("unsloth/gemma-4-12b-it-GGUF"));
         assert!(!draft.matches_label("unsloth/gemma-4-12b-it-GGUF:Q8_0"));
 
-        let group =
-            resolve_refresh_target(dir.path(), "unsloth/gemma-4-12b-it-GGUF:Q8_0").unwrap();
+        let group = resolve_refresh_target(dir.path(), "unsloth/gemma-4-12b-it-GGUF:Q8_0").unwrap();
         assert_eq!(group.paths, vec![snapshot.join("gemma-4-12b-it-Q8_0.gguf")]);
         // By path, the draft is still reachable.
         let draft_path = snapshot.join("dflash-gemma-4-12b-it-Q8_0.gguf");
@@ -2559,13 +2573,20 @@ mod tests {
         let snapshot = repo.join("snapshots/rev1");
         std::fs::create_dir_all(repo.join("refs")).unwrap();
         std::fs::write(repo.join("refs/main"), "rev1").unwrap();
-        write_cached_minimal_gguf(&snapshot.join("gemma-4-12b-it-Q8_0.gguf"), "gemma4", "model-1");
+        write_cached_minimal_gguf(
+            &snapshot.join("gemma-4-12b-it-Q8_0.gguf"),
+            "gemma4",
+            "model-1",
+        );
         let head = snapshot.join("MTP/mtp-gemma-4-12b-it-Q8_0.gguf");
         write_cached_minimal_gguf(&head, "gemma4-assistant", "head-1");
 
         let groups = group_models(&scan_models_dir(dir.path()).unwrap());
         assert_eq!(groups.len(), 1, "the head is not a model of its own");
-        assert_eq!(groups[0].paths, vec![snapshot.join("gemma-4-12b-it-Q8_0.gguf")]);
+        assert_eq!(
+            groups[0].paths,
+            vec![snapshot.join("gemma-4-12b-it-Q8_0.gguf")]
+        );
 
         let err = resolve_refresh_target(dir.path(), head.to_str().unwrap()).unwrap_err();
         assert!(err.to_string().contains("companion file"), "{err}");
