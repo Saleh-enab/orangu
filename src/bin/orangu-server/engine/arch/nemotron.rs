@@ -67,6 +67,7 @@ use std::sync::Arc;
 
 use super::{ExpertGating, ExpertRouting, ModelForward};
 use crate::engine::backend::{Backend, MatmulOp};
+use crate::engine::decode_stages::{self, Stage};
 use crate::engine::kv_cache::{KvCache, RecurrentSpec};
 use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, ModelConfig, QuantMatrix};
 use crate::engine::moe_stats;
@@ -469,14 +470,17 @@ impl ModelForward for NemotronModel {
         let n_embd = self.config.n_embd;
 
         let mut x = vec![0f32; n_tokens * n_embd];
-        for (t, &tok) in tokens.iter().enumerate() {
-            let tok = tok as usize;
-            anyhow::ensure!(
-                tok < self.config.n_vocab,
-                "token id {tok} is out of vocab range"
-            );
-            x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
-        }
+        decode_stages::scope(Stage::Embed, || -> Result<()> {
+            for (t, &tok) in tokens.iter().enumerate() {
+                let tok = tok as usize;
+                anyhow::ensure!(
+                    tok < self.config.n_vocab,
+                    "token id {tok} is out of vocab range"
+                );
+                x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
+            }
+            Ok(())
+        })?;
 
         // Grown once and reused across layers rather than allocated per
         // block — see `tensor::rmsnorm_into`.
@@ -517,9 +521,11 @@ impl ModelForward for NemotronModel {
             tensor::add_inplace(&mut x, &sub_out);
         }
 
-        let mut last = x[(n_tokens - 1) * n_embd..].to_vec();
-        tensor::rmsnorm_inplace(&mut last, &self.output_norm, 1, n_embd, self.rms_eps);
-        Ok(self.backend.matmul(&last, 1, &self.output_weight))
+        decode_stages::scope(Stage::Head, || {
+            let mut last = x[(n_tokens - 1) * n_embd..].to_vec();
+            tensor::rmsnorm_inplace(&mut last, &self.output_norm, 1, n_embd, self.rms_eps);
+            Ok(self.backend.matmul(&last, 1, &self.output_weight))
+        })
     }
 
     fn forward_hidden_states(&self, _tokens: &[u32]) -> Result<Vec<f32>> {
@@ -549,8 +555,10 @@ impl NemotronModel {
         // How many heads share one `B`/`C` group vector.
         let heads_per_group = self.n_ssm_head / self.n_group;
         let projected = &mut block.projected;
-        self.backend
-            .matmul_into(projected, normed, n_tokens, &layer.in_proj);
+        decode_stages::scope(Stage::RecurrentProject, || {
+            self.backend
+                .matmul_into(projected, normed, n_tokens, &layer.in_proj)
+        });
         let projected = &*projected;
         let row = layer.in_proj.out_dim;
 
@@ -561,54 +569,73 @@ impl NemotronModel {
         // instead of one per token.
         let mut ys = vec![0f32; n_tokens * self.d_inner];
         let state = &mut cache.recurrent[layer.cache_index];
-        for t in 0..n_tokens {
-            let (z, x_bc, dt) = self.ssm_parts(&projected[t * row..(t + 1) * row]);
+        decode_stages::scope(Stage::RecurrentDelta, || {
+            for t in 0..n_tokens {
+                let (z, x_bc, dt) = self.ssm_parts(&projected[t * row..(t + 1) * row]);
 
-            let mut conv = state.conv_step(x_bc, &layer.conv1d);
-            for (v, bias) in conv.iter_mut().zip(&layer.conv1d_bias) {
-                *v = tensor::silu(*v + bias);
-            }
-            let (x, groups) = conv.split_at(self.d_inner);
-            let (b, c) = groups.split_at(self.n_group * d_state);
+                let mut conv = state.conv_step(x_bc, &layer.conv1d);
+                for (v, bias) in conv.iter_mut().zip(&layer.conv1d_bias) {
+                    *v = tensor::silu(*v + bias);
+                }
+                let (x, groups) = conv.split_at(self.d_inner);
+                let (b, c) = groups.split_at(self.n_group * d_state);
 
-            let y = &mut ys[t * self.d_inner..(t + 1) * self.d_inner];
-            for h in 0..self.n_ssm_head {
-                // `softplus` of the biased timestep both scales this
-                // token's contribution and, through `a`, decays the state.
-                let step = tensor::softplus(dt[h] + layer.dt_bias[h]);
-                let decay = (step * layer.a[h]).exp();
-                let group = h / heads_per_group;
-                let b_h = &b[group * d_state..(group + 1) * d_state];
-                let c_h = &c[group * d_state..(group + 1) * d_state];
-                let x_h = &x[h * head_dim..(h + 1) * head_dim];
-                let head_state = state.delta_state_mut(h);
-                for p in 0..head_dim {
-                    let x_dt = x_h[p] * step;
-                    let row_state = &mut head_state[p * d_state..(p + 1) * d_state];
-                    let mut sum = 0f32;
-                    for (s, (&b_s, &c_s)) in b_h.iter().zip(c_h).enumerate() {
-                        let updated = row_state[s] * decay + b_s * x_dt;
-                        row_state[s] = updated;
-                        sum += updated * c_s;
+                let y = &mut ys[t * self.d_inner..(t + 1) * self.d_inner];
+                // One task per head. Each head owns its own state matrix
+                // and its own `head_dim` of the output, and reads only its
+                // group's `B`/`C` and its own inputs, so the update is a
+                // fan-out with nothing to synchronize — the same shape the
+                // delta rule's fan-out has, and before it was one this loop
+                // ran every head on one core while the rest of the pool
+                // sat between two expert stages. Per head the arithmetic
+                // is `ssm_head_step`, serial or not, so the fan-out is
+                // bit-identical to the loop it replaces.
+                let (states, state_size) = state.delta_states_mut();
+                let step_head = |h: usize, head_state: &mut [f32], y_h: &mut [f32]| {
+                    let group = h / heads_per_group;
+                    ssm_head_step(
+                        head_state,
+                        &x[h * head_dim..(h + 1) * head_dim],
+                        &b[group * d_state..(group + 1) * d_state],
+                        &c[group * d_state..(group + 1) * d_state],
+                        tensor::softplus(dt[h] + layer.dt_bias[h]),
+                        layer.a[h],
+                        layer.d[h],
+                        y_h,
+                    );
+                };
+                if ssm_fanout() {
+                    use rayon::prelude::*;
+                    states
+                        .par_chunks_mut(state_size)
+                        .zip(y.par_chunks_mut(head_dim))
+                        .enumerate()
+                        .for_each(|(h, (head_state, y_h))| step_head(h, head_state, y_h));
+                } else {
+                    for (h, (head_state, y_h)) in states
+                        .chunks_mut(state_size)
+                        .zip(y.chunks_mut(head_dim))
+                        .enumerate()
+                    {
+                        step_head(h, head_state, y_h);
                     }
-                    // The per-head skip term is on the block's own
-                    // (convolved) input, not on the recurrence output.
-                    y[h * head_dim + p] = sum + x_h[p] * layer.d[h];
+                }
+
+                // Gate first, then normalize — each group of the gated result
+                // over its own `d_inner / n_group`-wide weight vector.
+                for (v, &g) in y.iter_mut().zip(z) {
+                    *v *= tensor::silu(g);
+                }
+                for (group, chunk) in y.chunks_mut(group_width).enumerate() {
+                    let weight = &layer.group_norm[group * group_width..(group + 1) * group_width];
+                    tensor::rmsnorm_inplace(chunk, weight, 1, group_width, self.rms_eps);
                 }
             }
-
-            // Gate first, then normalize — each group of the gated result
-            // over its own `d_inner / n_group`-wide weight vector.
-            for (v, &g) in y.iter_mut().zip(z) {
-                *v *= tensor::silu(g);
-            }
-            for (group, chunk) in y.chunks_mut(group_width).enumerate() {
-                let weight = &layer.group_norm[group * group_width..(group + 1) * group_width];
-                tensor::rmsnorm_inplace(chunk, weight, 1, group_width, self.rms_eps);
-            }
-        }
-        self.backend
-            .matmul_into(out, &ys, n_tokens, &layer.out_proj);
+        });
+        decode_stages::scope(Stage::RecurrentOut, || {
+            self.backend
+                .matmul_into(out, &ys, n_tokens, &layer.out_proj)
+        });
     }
 
     /// Unrotated causal GQA — no RoPE, no QK-norm, no biases.
@@ -753,16 +780,18 @@ impl NemotronModel {
         // token.
         let n_expert = layer.gate_inp.out_dim;
         let (logits, shared_up) = self.router_and_shared_up(layer, normed, n_tokens);
-        let mut selection: Vec<Vec<(usize, f32)>> = (0..n_tokens)
-            .map(|t| {
-                let (selected, weights) = self.routing.route(
-                    &logits[t * n_expert..(t + 1) * n_expert],
-                    Some(&layer.exp_probs_b),
-                    None,
-                );
-                selected.into_iter().zip(weights).collect()
-            })
-            .collect();
+        let mut selection: Vec<Vec<(usize, f32)>> = decode_stages::scope(Stage::FfnSelect, || {
+            (0..n_tokens)
+                .map(|t| {
+                    let (selected, weights) = self.routing.route(
+                        &logits[t * n_expert..(t + 1) * n_expert],
+                        Some(&layer.exp_probs_b),
+                        None,
+                    );
+                    selected.into_iter().zip(weights).collect()
+                })
+                .collect()
+        });
         // Trim to the expert budget *before* anything is recorded or read:
         // the counters should describe the work actually done, and a
         // dropped expert's weights must never be fetched.
@@ -838,9 +867,16 @@ impl NemotronModel {
         // matmul with nothing in common with the host-side routed branch, so
         // the two overlap. See `super::moe_overlap_min_tokens`.
         let shared_branch = || {
-            let mut shared = shared_up;
-            relu_squared(&mut shared);
-            super::matmul_host_fallback(self.backend.as_ref(), &shared, n_tokens, &layer.down_shexp)
+            decode_stages::scope(Stage::FfnShared, || {
+                let mut shared = shared_up;
+                relu_squared(&mut shared);
+                super::matmul_host_fallback(
+                    self.backend.as_ref(),
+                    &shared,
+                    n_tokens,
+                    &layer.down_shexp,
+                )
+            })
         };
         let overlap = super::moe_overlap(
             self.backend.as_ref(),
@@ -854,12 +890,14 @@ impl NemotronModel {
         };
         experts.loaded_once_per_distinct_expert();
 
-        for (t, picks) in contribs.iter().enumerate() {
-            let dst = &mut out[t * n_embd..(t + 1) * n_embd];
-            for contribution in picks {
-                tensor::add_inplace(dst, contribution);
+        decode_stages::scope(Stage::FfnCombine, || {
+            for (t, picks) in contribs.iter().enumerate() {
+                let dst = &mut out[t * n_embd..(t + 1) * n_embd];
+                for contribution in picks {
+                    tensor::add_inplace(dst, contribution);
+                }
             }
-        }
+        });
         experts.commit(n_tokens);
         out
     }
@@ -900,6 +938,52 @@ struct BlockScratch {
     qkv: Vec<Vec<f32>>,
 }
 
+/// `ORANGU_SSM_FANOUT=0` runs the state-space heads one after another on
+/// the calling thread — the control arm for the fan-out over heads. On
+/// unless `0`.
+fn ssm_fanout() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_SSM_FANOUT"))
+}
+
+/// One head of the selective state-space recurrence for one token.
+///
+/// `state` is the head's `[head_dim, d_state]` matrix, updated in place:
+/// every entry decays by `exp(step * a)` and takes `b * x[p] * step`, and the
+/// head's output is that updated row dotted with `c`, plus the skip term
+/// `x[p] * d` on the block's own (convolved) input rather than on the
+/// recurrence output. `step` is the already-softplus'd timestep: the caller
+/// pays that transcendental and this one pays the exponential.
+///
+/// The row sum is taken in ascending index order and the update is
+/// elementwise, so the result does not depend on which thread runs which
+/// head — the fan-out in `ssm_block_into` and the serial loop it replaced
+/// produce the same bits.
+#[allow(clippy::too_many_arguments)]
+fn ssm_head_step(
+    state: &mut [f32],
+    x_h: &[f32],
+    b_h: &[f32],
+    c_h: &[f32],
+    step: f32,
+    a: f32,
+    d: f32,
+    y_h: &mut [f32],
+) {
+    let d_state = b_h.len();
+    let decay = (step * a).exp();
+    for (p, (row_state, y)) in state.chunks_mut(d_state).zip(y_h.iter_mut()).enumerate() {
+        let x_dt = x_h[p] * step;
+        let mut sum = 0f32;
+        for (s, (&b_s, &c_s)) in b_h.iter().zip(c_h).enumerate() {
+            let updated = row_state[s] * decay + b_s * x_dt;
+            row_state[s] = updated;
+            sum += updated * c_s;
+        }
+        *y = sum + x_h[p] * d;
+    }
+}
+
 /// This architecture's FFN activation, in place: `max(0, x)^2`.
 ///
 /// Squaring after the clamp, not `x * |x|` or `x * relu(x)` — negatives are
@@ -913,7 +997,65 @@ fn relu_squared(x: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
-    use super::relu_squared;
+    use super::{relu_squared, ssm_head_step};
+
+    /// The fan-out over heads must produce the same bits as the serial
+    /// loop: every head's state and output, at model-shaped dimensions,
+    /// after several tokens so the recurrence has something to carry.
+    #[test]
+    fn ssm_heads_in_parallel_match_the_serial_sweep_bit_for_bit() {
+        use rayon::prelude::*;
+        let (n_head, head_dim, d_state, n_group) = (64usize, 64usize, 128usize, 8usize);
+        let heads_per_group = n_head / n_group;
+        let size = head_dim * d_state;
+        let mut seed = 0x9E37_79B9u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as f32 / u32::MAX as f32) - 0.5
+        };
+        let a: Vec<f32> = (0..n_head).map(|_| -next().abs() * 4.0).collect();
+        let d: Vec<f32> = (0..n_head).map(|_| next()).collect();
+        let mut serial = vec![0f32; n_head * size];
+        let mut parallel = vec![0f32; n_head * size];
+        for t in 0..5 {
+            let x: Vec<f32> = (0..n_head * head_dim).map(|_| next()).collect();
+            let b: Vec<f32> = (0..n_group * d_state).map(|_| next()).collect();
+            let c: Vec<f32> = (0..n_group * d_state).map(|_| next()).collect();
+            let step: Vec<f32> = (0..n_head).map(|_| next().abs() + 0.01).collect();
+            let mut y_serial = vec![0f32; n_head * head_dim];
+            let mut y_parallel = vec![0f32; n_head * head_dim];
+            let run = |h: usize, state: &mut [f32], y_h: &mut [f32]| {
+                let g = h / heads_per_group;
+                ssm_head_step(
+                    state,
+                    &x[h * head_dim..(h + 1) * head_dim],
+                    &b[g * d_state..(g + 1) * d_state],
+                    &c[g * d_state..(g + 1) * d_state],
+                    step[h],
+                    a[h],
+                    d[h],
+                    y_h,
+                );
+            };
+            for (h, (state, y_h)) in serial
+                .chunks_mut(size)
+                .zip(y_serial.chunks_mut(head_dim))
+                .enumerate()
+            {
+                run(h, state, y_h);
+            }
+            parallel
+                .par_chunks_mut(size)
+                .zip(y_parallel.par_chunks_mut(head_dim))
+                .enumerate()
+                .for_each(|(h, (state, y_h))| run(h, state, y_h));
+            assert_eq!(y_serial, y_parallel, "outputs differ at token {t}");
+            assert_eq!(serial, parallel, "states differ at token {t}");
+        }
+        assert!(serial.iter().any(|v| *v != 0.0), "the state never moved");
+    }
 
     #[test]
     fn relu_squared_drops_negatives_and_squares_the_rest() {

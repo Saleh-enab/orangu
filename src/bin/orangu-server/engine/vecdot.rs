@@ -1005,14 +1005,98 @@ fn unpack_block_q5_bits(qh: u32, qs: &[u8], bias: i8, w: &mut [i8; 32]) {
         // baseline on aarch64.
         unsafe { unpack_block_q5_bits_neon(qh, qs, bias, w) }
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
     {
-        for j in 0..16 {
-            let hi_lo = ((qh >> j) << 4) & 0x10;
-            let hi_hi = (qh >> (j + 12)) & 0x10;
-            w[j] = (((qs[j] & 0x0F) as u32 | hi_lo) as i32 - bias as i32) as i8;
-            w[16 + j] = (((qs[j] >> 4) as u32 | hi_hi) as i32 - bias as i32) as i8;
+        // The detection is cached by the standard library — one relaxed
+        // load per block against the sixteen scalar iterations it replaces.
+        // Callers that already know their ISA use
+        // [`unpack_block_q5_bits_isa`] and pay nothing.
+        if is_x86_feature_detected!("avx2") && q5_vector_unpack_on() {
+            // Safety: guarded by the runtime feature check; `qs` is >= 16
+            // bytes and `w` is exactly 32.
+            return unsafe { unpack_block_q5_bits_avx2(qh, qs, bias, w) };
         }
+        unpack_block_q5_bits_scalar(qh, qs, bias, w)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        unpack_block_q5_bits_scalar(qh, qs, bias, w)
+    }
+}
+
+/// [`unpack_block_q5_bits`] for a caller that has already chosen its ISA —
+/// the monomorphized dot kernels — so the choice costs nothing per block.
+#[inline(always)]
+fn unpack_block_q5_bits_isa<const ISA: u8>(qh: u32, qs: &[u8], bias: i8, w: &mut [i8; 32]) {
+    #[cfg(target_arch = "x86_64")]
+    if (ISA == ISA_AVX2 || ISA == ISA_VNNI) && q5_vector_unpack_on() {
+        // Safety: reachable only from a wrapper that declares avx2; `qs` is
+        // >= 16 bytes and `w` is exactly 32.
+        return unsafe { unpack_block_q5_bits_avx2(qh, qs, bias, w) };
+    }
+    unpack_block_q5_bits(qh, qs, bias, w)
+}
+
+/// `ORANGU_Q5_UNPACK_VECTOR=0` keeps the scalar bit loop for the `Q5_0`,
+/// `Q5_1` and `Q4_0` unpack on x86-64 — the control arm for the AVX2 form.
+/// On unless `0`; read once, so the branch it guards costs a cached load
+/// per block.
+#[cfg(target_arch = "x86_64")]
+fn q5_vector_unpack_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_Q5_UNPACK_VECTOR"))
+}
+
+/// The portable form of the `Q5` unpack, and the reference the vector forms
+/// are tested against.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn unpack_block_q5_bits_scalar(qh: u32, qs: &[u8], bias: i8, w: &mut [i8; 32]) {
+    for j in 0..16 {
+        let hi_lo = ((qh >> j) << 4) & 0x10;
+        let hi_hi = (qh >> (j + 12)) & 0x10;
+        w[j] = (((qs[j] & 0x0F) as u32 | hi_lo) as i32 - bias as i32) as i8;
+        w[16 + j] = (((qs[j] >> 4) as u32 | hi_hi) as i32 - bias as i32) as i8;
+    }
+}
+
+/// The AVX2 form: the scalar loop's per-lane `qh >> j` becomes one byte
+/// shuffle and one compare. `qh` is broadcast to every dword, a shuffle
+/// gives lane `j` the byte holding its bit (`j / 8`, in each 128-bit half
+/// from that half's own two bytes), a compare against the lane's own bit
+/// mask turns the bit into `0xFF` or `0`, and masking that to `0x10` is the
+/// fifth bit — thirty-two lanes in eight instructions.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn unpack_block_q5_bits_avx2(qh: u32, qs: &[u8], bias: i8, w: &mut [i8; 32]) {
+    use std::arch::x86_64::*;
+    debug_assert!(qs.len() >= 16);
+    unsafe {
+        let v = _mm_loadu_si128(qs.as_ptr() as *const __m128i);
+        let nibble = _mm_set1_epi8(0x0F);
+        let lo = _mm_and_si128(v, nibble);
+        let hi = _mm_and_si128(_mm_srli_epi16::<4>(v), nibble);
+        // Elements 0..16 are the low nibbles, 16..32 the high — the two
+        // halves of one 256-bit vector.
+        let nibbles = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(lo), hi);
+        let bits = _mm256_set1_epi32(qh as i32);
+        // Lane `j` reads byte `j / 8` of `qh`: bytes 0 and 1 in the low
+        // half, 2 and 3 in the high half (`shuffle_epi8` indexes within its
+        // own 128-bit half, where the broadcast has put every byte).
+        let byte_of_lane = _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
+            3, 3, 3,
+        );
+        let bytes = _mm256_shuffle_epi8(bits, byte_of_lane);
+        let bit_of_lane = _mm256_setr_epi8(
+            1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64,
+            -128, 1, 2, 4, 8, 16, 32, 64, -128,
+        );
+        let set = _mm256_cmpeq_epi8(_mm256_and_si256(bytes, bit_of_lane), bit_of_lane);
+        let fifth = _mm256_and_si256(set, _mm256_set1_epi8(0x10));
+        let out = _mm256_sub_epi8(_mm256_or_si256(nibbles, fifth), _mm256_set1_epi8(bias));
+        _mm256_storeu_si256(w.as_mut_ptr() as *mut __m256i, out);
     }
 }
 
@@ -1022,6 +1106,11 @@ fn unpack_block_q5_bits(qh: u32, qs: &[u8], bias: i8, w: &mut [i8; 32]) {
 #[inline(always)]
 fn unpack_block_q4_0(qs: &[u8], w: &mut [i8; 32]) {
     unpack_block_q5_bits(0, qs, 8, w);
+}
+
+#[inline(always)]
+fn unpack_block_q4_0_isa<const ISA: u8>(qs: &[u8], w: &mut [i8; 32]) {
+    unpack_block_q5_bits_isa::<ISA>(0, qs, 8, w);
 }
 
 /// `block_q5_1`: `{ d: f16, m: f16, qh: [u8; 4], qs: [u8; 16] }`, 32
@@ -1034,8 +1123,18 @@ fn unpack_block_q5_1(qh: u32, qs: &[u8], w: &mut [i8; 32]) {
 }
 
 #[inline(always)]
+fn unpack_block_q5_1_isa<const ISA: u8>(qh: u32, qs: &[u8], w: &mut [i8; 32]) {
+    unpack_block_q5_bits_isa::<ISA>(qh, qs, 0, w);
+}
+
+#[inline(always)]
 fn unpack_block_q5_0(qh: u32, qs: &[u8], w: &mut [i8; 32]) {
     unpack_block_q5_bits(qh, qs, 16, w);
+}
+
+#[inline(always)]
+fn unpack_block_q5_0_isa<const ISA: u8>(qh: u32, qs: &[u8], w: &mut [i8; 32]) {
+    unpack_block_q5_bits_isa::<ISA>(qh, qs, 16, w);
 }
 
 /// The scalar loop's per-lane `qh >> j` is what defeats autovectorization
@@ -1508,6 +1607,10 @@ pub fn dot_unpacked_multi(w: &UnpackedRow, acts: &[ActQ8], out: &mut [f32]) {
             // Safety: see `dot_row`.
             return unsafe { dot_unpacked_multi_vnni(w, acts, out) };
         }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") && tiled_dot_on() {
+            // Safety: both features checked at runtime.
+            return unsafe { dot_unpacked_multi_avx2_tiled(w, acts, out) };
+        }
         if is_x86_feature_detected!("avx2") {
             // Safety: guarded by the runtime feature check above.
             return unsafe { dot_unpacked_multi_avx2(w, acts, out) };
@@ -1526,6 +1629,114 @@ unsafe fn dot_unpacked_multi_vnni(w: &UnpackedRow, acts: &[ActQ8], out: &mut [f3
 #[target_feature(enable = "avx2")]
 unsafe fn dot_unpacked_multi_avx2(w: &UnpackedRow, acts: &[ActQ8], out: &mut [f32]) {
     dot_unpacked_multi_impl::<ISA_AVX2>(w, acts, out)
+}
+
+/// `ORANGU_EXPERT_DOT_TILED=0` keeps the per-block reduction
+/// ([`dot_unpacked_multi_avx2`]) — the control arm for the register-resident
+/// tile below. On unless `0`.
+fn tiled_dot_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_EXPERT_DOT_TILED"))
+}
+
+/// The AVX2 form of [`dot_unpacked_multi_impl`] with the reduction kept in
+/// registers: the tiled loop above called a 32-wide dot per (block, token)
+/// that ended in a **horizontal sum** — six shuffle-and-add instructions to
+/// fold eight lanes into one integer — and then a scalar epilogue, so of the
+/// dozen instructions a block cost per token, four were the multiply-adds.
+/// A prefill of a routed-expert model spends 87% of ten cores here.
+///
+/// Here the weight block is widened **once** per tile of tokens, each
+/// token's eight `i32` partial sums are converted to `f32` and folded into a
+/// per-token vector accumulator with one FMA against the block's `d × scale`,
+/// the asymmetric-min correction runs as a scalar beside it, and the eight
+/// lanes are reduced **once per row** at the end. Same integer sums, so the
+/// products are exact; the floating additions happen in a different order
+/// from the single-token path, which is why the cross-check against it is a
+/// tolerance rather than equality.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn dot_unpacked_multi_avx2_tiled(w: &UnpackedRow, acts: &[ActQ8], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+    let n = acts.len();
+    let mut t0 = 0;
+    // SAFETY: every pointer below is within the lengths the unpack and the
+    // quantizer established (`w.q` is `in_dim` bytes, each `a.q` too, the
+    // scale and sum tables per block/group of it).
+    unsafe {
+        while t0 + TOKEN_TILE <= n {
+            let mut accf = [_mm256_setzero_ps(); TOKEN_TILE];
+            let mut mins = [0f32; TOKEN_TILE];
+            if w.per32 {
+                for b in 0..w.scale.len() {
+                    let wp = w.q.as_ptr().add(b * 32);
+                    let w0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp as *const _));
+                    let w1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp.add(16) as *const _));
+                    let sc = w.scale[b];
+                    let mn = if w.has_min { w.min[b] } else { 0.0 };
+                    for k in 0..TOKEN_TILE {
+                        let a = &acts[t0 + k];
+                        let xp = a.q.as_ptr().add(b * 32);
+                        let x0 = _mm256_cvtepi8_epi16(_mm_loadu_si128(xp as *const _));
+                        let x1 = _mm256_cvtepi8_epi16(_mm_loadu_si128(xp.add(16) as *const _));
+                        let sum =
+                            _mm256_add_epi32(_mm256_madd_epi16(w0, x0), _mm256_madd_epi16(w1, x1));
+                        let d = a.d[b];
+                        accf[k] = _mm256_fmadd_ps(
+                            _mm256_cvtepi32_ps(sum),
+                            _mm256_set1_ps(d * sc),
+                            accf[k],
+                        );
+                        if w.has_min {
+                            mins[k] += d * mn * block_sum(a, b) as f32;
+                        }
+                    }
+                }
+            } else {
+                for g in 0..w.scale.len() {
+                    let wp = w.q.as_ptr().add(g * GROUP);
+                    let wv = _mm256_cvtepi8_epi16(_mm_loadu_si128(wp as *const _));
+                    let sc = w.scale[g];
+                    let mn = if w.has_min { w.min[g] } else { 0.0 };
+                    let b = g * GROUP / ACT_BLOCK;
+                    for k in 0..TOKEN_TILE {
+                        let a = &acts[t0 + k];
+                        let xv = _mm256_cvtepi8_epi16(_mm_loadu_si128(
+                            a.q.as_ptr().add(g * GROUP) as *const _
+                        ));
+                        let sum = _mm256_madd_epi16(wv, xv);
+                        let d = a.d[b];
+                        accf[k] = _mm256_fmadd_ps(
+                            _mm256_cvtepi32_ps(sum),
+                            _mm256_set1_ps(d * sc),
+                            accf[k],
+                        );
+                        if w.has_min {
+                            mins[k] += d * mn * a.sums[g] as f32;
+                        }
+                    }
+                }
+            }
+            for k in 0..TOKEN_TILE {
+                out[t0 + k] = hsum_ps_avx2(accf[k]) - mins[k];
+            }
+            t0 += TOKEN_TILE;
+        }
+    }
+    for t in t0..n {
+        out[t] = dot_unpacked_impl::<ISA_AVX2>(w, &acts[t]);
+    }
+}
+
+/// Horizontal sum of eight `f32` lanes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn hsum_ps_avx2(v: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    let s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    let s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 0b01));
+    _mm_cvtss_f32(s)
 }
 
 /// Like [`dot_unpacked_multi`] but for **two weight rows at once**, sharing
@@ -2860,7 +3071,7 @@ fn dot_q5_0<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     for (b, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let dw = read_f16(block, 0);
         let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
-        unpack_block_q5_0(qh, &block[6..], &mut w);
+        unpack_block_q5_0_isa::<ISA>(qh, &block[6..], &mut w);
         total += dw * act.d[b] * dot32::<ISA>(&w, &act.q[b * 32..]) as f32;
     }
     total
@@ -2874,7 +3085,7 @@ fn dot_q4_0<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     let mut w = [0i8; 32];
     for (b, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
         let dw = read_f16(block, 0);
-        unpack_block_q4_0(&block[2..], &mut w);
+        unpack_block_q4_0_isa::<ISA>(&block[2..], &mut w);
         total += dw * act.d[b] * dot32::<ISA>(&w, &act.q[b * 32..]) as f32;
     }
     total
@@ -2891,7 +3102,7 @@ fn dot_q5_1<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
         let dw = read_f16(block, 0);
         let m = read_f16(block, 2);
         let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
-        unpack_block_q5_1(qh, &block[8..], &mut w);
+        unpack_block_q5_1_isa::<ISA>(qh, &block[8..], &mut w);
         let isum = dot32::<ISA>(&w, &act.q[b * 32..]);
         total += act.d[b] * (dw * isum as f32 + m * block_sum(act, b) as f32);
     }
@@ -3728,10 +3939,17 @@ mod tests {
 
                 let mut got = vec![0f32; n_tokens];
                 dot_unpacked_multi(&w, &acts, &mut got);
-                assert_eq!(
-                    got, want,
-                    "dot_unpacked_multi disagrees: type {ggml_type}, {n_tokens} tokens"
-                );
+                // A tolerance, not equality: the tiled AVX2 form keeps its
+                // partial sums in eight lanes and reduces once per row, so
+                // its floating additions run in a different order from the
+                // single-token path's. The integer sums are the same.
+                for (t, (g, e)) in got.iter().zip(want.iter()).enumerate() {
+                    assert!(
+                        (g - e).abs() <= 1e-4 * e.abs().max(1.0),
+                        "dot_unpacked_multi disagrees: type {ggml_type}, {n_tokens} tokens, \
+                         token {t}: {g} vs {e}"
+                    );
+                }
 
                 // The same row down both lanes: each must reproduce the
                 // single-token result, which also pins the two lanes together.
@@ -3751,9 +3969,12 @@ mod tests {
     }
 
     /// The tiled multi-token path must agree with calling the single-token
-    /// path once per token. Both quantize identically and sum in the same
-    /// order per token, so this is an exact-equality check, not a tolerance —
-    /// any difference means the tiling got an index wrong.
+    /// path once per token. Both quantize identically and form the same
+    /// integer sums; the AVX2 tile then folds them into eight `f32` lanes
+    /// and reduces once per row, a different order of floating additions
+    /// from the single-token path's per-block scalar, so this is a tight
+    /// tolerance rather than equality — an index error shows as a difference
+    /// of order one, not 1e-5.
     ///
     /// Kept alongside the every-type test above for its `in_dim` of 896, which
     /// is *not* a multiple of 256 — the width that forced `Qwen2.5-0.5B` onto
@@ -3787,7 +4008,12 @@ mod tests {
                 let want: Vec<f32> = acts.iter().map(|a| dot_unpacked(&w, a)).collect();
                 let mut got = vec![0f32; n_tokens];
                 dot_unpacked_multi(&w, &acts, &mut got);
-                assert_eq!(got, want, "type {ggml_type}, {n_tokens} tokens");
+                for (t, (g, e)) in got.iter().zip(want.iter()).enumerate() {
+                    assert!(
+                        (g - e).abs() <= 1e-4 * e.abs().max(1.0),
+                        "type {ggml_type}, {n_tokens} tokens, token {t}: {g} vs {e}"
+                    );
+                }
             }
         }
     }
@@ -3855,6 +4081,40 @@ mod tests {
         for seed in [1, 7, 99] {
             check(GGML_TYPE_Q5_0, 896, seed);
             check(GGML_TYPE_Q5_0, 4864, seed);
+        }
+    }
+
+    /// The vector `Q5` unpack against the scalar reference, bit for bit,
+    /// over every single-bit `qh` (each lane's fifth bit set alone — the
+    /// case a wrong shuffle index or bit mask gets wrong for exactly one
+    /// lane), a spread of dense `qh` patterns, and all three biases the
+    /// wrappers use.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q5_block_unpack_avx2_is_exact_for_every_bit_and_bias() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let qs: Vec<u8> = (0..16u8)
+            .map(|j| j.wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let mut patterns: Vec<u32> = (0..32).map(|b| 1u32 << b).collect();
+        patterns.extend([
+            0,
+            u32::MAX,
+            0x8000_0001,
+            0xDEAD_BEEF,
+            0x0F0F_F0F0,
+            0xAAAA_5555,
+        ]);
+        for &qh in &patterns {
+            for bias in [0i8, 8, 16] {
+                let mut want = [0i8; 32];
+                let mut got = [0i8; 32];
+                unpack_block_q5_bits_scalar(qh, &qs, bias, &mut want);
+                unsafe { unpack_block_q5_bits_avx2(qh, &qs, bias, &mut got) };
+                assert_eq!(got, want, "qh = {qh:#010x}, bias = {bias}");
+            }
         }
     }
 
@@ -4698,9 +4958,12 @@ mod tests {
     }
 
     /// The strong claim: relaying the activations out changed *where* values
-    /// are read from, not the arithmetic or the order of it. Exact equality,
-    /// not a tolerance — anything else means the two paths disagree and the
-    /// weaker reference test below could hide it inside its 1% budget.
+    /// are read from, not the arithmetic. The generic path's trailing odd
+    /// row goes through the AVX2 tile, which reduces its eight lanes once per
+    /// row rather than per block, so the comparison is a tight tolerance
+    /// (1e-4) rather than equality — still far inside what an indexing
+    /// difference would produce, and far tighter than the reference test
+    /// below's 1% budget.
     ///
     /// `n_tokens` 8 is a whole number of tiles and 7 is not, so the
     /// tile-padding path is compared too (the old code handles that tail with
@@ -4716,10 +4979,13 @@ mod tests {
                     let flat = flat_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, n_tokens);
                     let generic =
                         generic_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, n_tokens);
-                    assert_eq!(
-                        flat, generic,
-                        "type {ggml_type} in_dim {in_dim} n_tokens {n_tokens}"
-                    );
+                    assert_eq!(flat.len(), generic.len());
+                    for (i, (f, g)) in flat.iter().zip(generic.iter()).enumerate() {
+                        assert!(
+                            (f - g).abs() <= 1e-4 * g.abs().max(1.0),
+                            "type {ggml_type} in_dim {in_dim} n_tokens {n_tokens} at {i}: {f} vs {g}"
+                        );
+                    }
                 }
             }
         }
