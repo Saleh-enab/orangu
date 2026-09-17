@@ -84,6 +84,8 @@ The greeting is a label, not a suggestion: it is drawn in grey like any other hi
 
 Switching mode changes only what the prompt suggests. Every command stays available in both modes, and nothing about the session, the model, or the workspace changes.
 
+`orangu --developer` opens the prompt in this mode. It is the default, so the flag only names it; `--committer` is the one that changes anything.
+
 **Examples**
 
 ```text
@@ -136,6 +138,8 @@ Within the mode the flow comes first everywhere the prompt suggests something: a
 The flow belongs to the workspace it was started in, so other workspace tabs are unaffected. Checking out a branch that is neither the request's nor the base ends it, as does its last step — the comment, or the closing steps after a rebase. Steps taken in developer mode are still tracked, so `/committer` picks up where the branch actually is.
 
 The comment body comes from `~/.orangu/comments/merged.md`, like any other `/comment` template.
+
+`orangu --committer` opens the prompt in this mode, so a session meant for merging starts on the flow rather than the greeting. It cannot be combined with `--developer`.
 
 **Examples**
 

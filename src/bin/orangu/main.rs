@@ -158,6 +158,14 @@ struct Args {
     /// Reopen the workspace tabs that were open at the end of the last run.
     #[arg(short = 'a', long = "all")]
     all: bool,
+    /// Open the prompt in developer mode (the default): writing code, as
+    /// `/developer` does.
+    #[arg(long = "developer", conflicts_with = "committer")]
+    developer: bool,
+    /// Open the prompt in committer mode: landing a reviewed pull request,
+    /// as `/committer` does.
+    #[arg(long = "committer")]
+    committer: bool,
     /// List all stored sessions as a table (SESSION, WORKSPACE, BRANCH) and exit.
     #[arg(short = 'l', long = "list")]
     list: bool,
@@ -177,6 +185,8 @@ struct Args {
             "workspace",
             "resume",
             "all",
+            "developer",
+            "committer",
             "list",
             "init",
             "prompt",
@@ -195,6 +205,8 @@ struct Args {
             "workspace",
             "resume",
             "all",
+            "developer",
+            "committer",
             "list",
             "init",
             "prompt",
@@ -301,6 +313,17 @@ fn quiet_refusal(args: &Args) -> Option<&'static str> {
     None
 }
 
+/// The prompt mode the interface opens in: `--committer` asks for the merge
+/// flow, `--developer` (or neither) for the default. clap already refuses the
+/// two together.
+fn startup_mode(args: &Args) -> mode::PromptMode {
+    if args.committer {
+        mode::PromptMode::Committer
+    } else {
+        mode::PromptMode::Developer
+    }
+}
+
 fn command_mode_refusal(args: &Args) -> Option<&'static str> {
     args.command.as_ref()?;
     let workflow_action = matches!(
@@ -315,6 +338,8 @@ fn command_mode_refusal(args: &Args) -> Option<&'static str> {
         || args.theme.is_some()
         || args.resume.is_some()
         || args.all
+        || args.developer
+        || args.committer
         || args.list
         || args.init
         || args.prompt.is_some()
@@ -362,6 +387,7 @@ async fn run() -> Result<()> {
     if let Some(refusal) = quiet_refusal(&args) {
         return Err(anyhow!(refusal));
     }
+    let startup_mode = startup_mode(&args);
     if args.shell_completions {
         return print_shell_completions(args.quiet);
     }
@@ -464,6 +490,10 @@ async fn run() -> Result<()> {
     // stdout and exit, and a terminal-title escape sequence in that output is
     // something a script or a pipe has to strip.
     let _terminal_title_guard = TerminalTitleGuard::new(TERMINAL_TITLE);
+    // `--committer` opens the prompt on the merge flow instead of the greeting;
+    // `--developer` is the default and names it. Both switch the same atomic
+    // `/committer` and `/developer` do, and only the interface reads it.
+    mode::set(startup_mode);
     let cli_theme_override = args.theme.clone();
     let requested_theme = cli_theme_override.as_deref().unwrap_or(&config.theme);
     if let Some(cli_theme) = cli_theme_override.as_deref() {
@@ -2857,7 +2887,7 @@ pub fn process_env_lock() -> &'static std::sync::Mutex<()> {
 mod tests {
     use super::{
         Args, command_mode_refusal, completion_script, llm_prompt_block_reason, load_workflow,
-        quiet_refusal,
+        quiet_refusal, startup_mode,
     };
     use clap::Parser;
 
@@ -2891,6 +2921,25 @@ mod tests {
 
         let init = quiet_refusal(&args(&["-q", "-i"])).expect("-q -i must be refused");
         assert!(init.contains("--init"), "{init}");
+    }
+
+    #[test]
+    fn the_prompt_opens_in_the_mode_named_on_the_command_line() {
+        use super::mode::PromptMode;
+        // Developer is the default, with or without saying so.
+        assert_eq!(startup_mode(&args(&[])), PromptMode::Developer);
+        assert_eq!(startup_mode(&args(&["--developer"])), PromptMode::Developer);
+        assert_eq!(startup_mode(&args(&["--committer"])), PromptMode::Committer);
+        // The two name opposite modes, so together they are a contradiction.
+        assert!(Args::try_parse_from(["orangu", "--developer", "--committer"]).is_err());
+        // Like the theme, a mode is for the interface: neither a workflow nor
+        // a lifecycle action has a prompt to put in it.
+        for argv in [
+            vec!["orangu", "--workflow", "run.yml", "--committer"],
+            vec!["orangu", "--workflow", "run.yml", "--developer", "status"],
+        ] {
+            assert!(Args::try_parse_from(argv.clone()).is_err(), "{argv:?}");
+        }
     }
 
     /// Every flag clap parses is offered by all three hand-written

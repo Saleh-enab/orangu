@@ -343,7 +343,7 @@ Or run it directly from the build tree:
 
 By default, local tools operate on the current working directory. Use `--workspace /path/to/project` (`-w`) to point **orangu** at another tree.
 
-The startup flags also have short forms: `-c` for `--config`, `-w` for `--workspace`, `-r` for `--resume`, `-a` for `--all` (reopen the last run's workspace tabs), `-t` for `--theme`, `-p` for `--prompt` (run one prompt or command and exit), `-q` for `--quiet` (print nothing on success; the exit code is the result), `-l` for `--list` (print every stored session as a table and exit), `-i` for `--init`, and `-s` for `--shell-completions`.
+The startup flags also have short forms: `-c` for `--config`, `-w` for `--workspace`, `-r` for `--resume`, `-a` for `--all` (reopen the last run's workspace tabs), `-t` for `--theme`, `-p` for `--prompt` (run one prompt or command and exit), `-q` for `--quiet` (print nothing on success; the exit code is the result), `-l` for `--list` (print every stored session as a table and exit), `-i` for `--init`, and `-s` for `--shell-completions`. `--developer` (the default) and `--committer` open the prompt in the mode `/developer` and `/committer` switch to.
 
 `-p` makes orangu usable from a script or a crontab, since a command is handled locally and never reaches the server:
 

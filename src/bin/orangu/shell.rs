@@ -72,7 +72,7 @@ _orangu() {
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            "-c --config -t --theme -w --workspace -r --resume -a --all -p --prompt --workflow --dry-run -q --quiet -l --list -i --init -s --shell-completions -h --help -V --version" -- "$cur") )
+            "-c --config -t --theme -w --workspace -r --resume -a --all --developer --committer -p --prompt --workflow --dry-run -q --quiet -l --list -i --init -s --shell-completions -h --help -V --version" -- "$cur") )
         return 0
     fi
     COMPREPLY=( $(compgen -W "status pause resume clear" -- "$cur") )
@@ -124,6 +124,8 @@ _orangu() {
         '(-w --workspace)'{-w,--workspace}'[Workspace root for local tools]:workspace:_orangu_workspaces' \
         '(-r --resume)'{-r,--resume}'[Resume a session by UUID]:session uuid:_orangu_sessions' \
         '(-a --all)'{-a,--all}'[Reopen the workspace tabs from the previous run]' \
+        '(--developer --committer)--developer[Open the prompt in developer mode (the default)]' \
+        '(--developer --committer)--committer[Open the prompt in committer mode]' \
         '(-p --prompt)'{-p,--prompt}'[Run one prompt or command, print the result and exit]:prompt:' \
         '--workflow[Validate and execute every job in a YAML workflow]:workflow file:_files' \
         '--dry-run[Validate the workflow without executing it]' \
@@ -168,6 +170,8 @@ complete -c orangu -s t -l theme             -r -a '(__fish_complete_path)' -d '
 complete -c orangu -s w -l workspace         -x -a '(__orangu_workspaces)' -d 'Workspace root for local tools'
 complete -c orangu -s r -l resume            -x -a '(__orangu_sessions)'   -d 'Resume a session by UUID'
 complete -c orangu -s a -l all                                            -d 'Reopen the workspace tabs from the previous run'
+complete -c orangu      -l developer                                      -d 'Open the prompt in developer mode (the default)'
+complete -c orangu      -l committer                                      -d 'Open the prompt in committer mode'
 complete -c orangu -s p -l prompt            -x                           -d 'Run one prompt or command, print the result and exit'
 complete -c orangu      -l workflow        -r -a '(__fish_complete_path)' -d 'Validate and execute every job in a YAML workflow'
 complete -c orangu      -l dry-run                                        -d 'Validate the workflow without executing it'
@@ -206,6 +210,8 @@ Register-ArgumentCompleter -Native -CommandName 'orangu' -ScriptBlock {
         @('-w', '--workspace', 'Workspace root for local tools'),
         @('-r', '--resume', 'Resume a session by UUID'),
         @('-a', '--all', 'Reopen the workspace tabs from the previous run'),
+        @('--developer', 'Open the prompt in developer mode (the default)'),
+        @('--committer', 'Open the prompt in committer mode'),
         @('-p', '--prompt', 'Run one prompt or command, print the result and exit'),
         @('--workflow', 'Validate and execute every job in a YAML workflow'),
         @('--dry-run', 'Validate the workflow without executing it'),

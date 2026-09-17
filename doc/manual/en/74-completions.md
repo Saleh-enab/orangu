@@ -30,6 +30,8 @@ Run `orangu -s` to print the completion script for the shell detected from
 | `-w`  | `--workspace`         | directories             |
 | `-r`  | `--resume`            | session UUIDs           |
 | `-a`  | `--all`               | —                       |
+|       | `--developer`         | —                       |
+|       | `--committer`         | —                       |
 | `-p`  | `--prompt`            | —                       |
 | `-q`  | `--quiet`             | —                       |
 | `-l`  | `--list`              | —                       |

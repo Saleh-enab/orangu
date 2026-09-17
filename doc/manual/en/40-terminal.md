@@ -20,6 +20,8 @@ The sync runs in the background so it never delays startup. Its progress and res
 | `-w`  | `--workspace` | Workspace root the local tools operate on. Defaults to `.`.   |
 | `-r`  | `--resume`    | Resume a stored session by UUID (`-l` prints them).           |
 | `-a`  | `--all`       | Reopen the workspace tabs that were open at the end of the last run. |
+|       | `--developer` | Open the prompt in developer mode, the default — what `/developer` does. |
+|       | `--committer` | Open the prompt in committer mode, on the merge flow — what `/committer` does. The two are mutually exclusive. |
 | `-t`  | `--theme`     | Apply a theme to the terminal interface for this run. Built-in names and paths to `.theme` files are accepted. |
 | `-p`  | `--prompt`    | Run a single prompt or command and exit — no terminal UI and no session on disk. See One-shot mode below. |
 |       | `--workflow FILE` | Validate and execute every job in a YAML workflow. |
@@ -264,7 +266,7 @@ The natural-language hint takes priority over generic filename completion, so `c
 
 ### The merge flow
 
-The prompt has two modes, selected with `/developer` and `/committer` (see the Core tools chapter). In **developer mode** — the default — the first untouched line opens with the greeting `Welcome, I'm orangu` and nothing else is suggested until you type; once the first prompt has been submitted (or a session is resumed, which was greeted when it was first opened), an untouched line shows just the cursor. Everything in this section is what **committer mode** adds.
+The prompt has two modes, selected with `/developer` and `/committer` (see the Core tools chapter), or at startup with `--developer` and `--committer`. In **developer mode** — the default — the first untouched line opens with the greeting `Welcome, I'm orangu` and nothing else is suggested until you type; once the first prompt has been submitted (or a session is resumed, which was greeted when it was first opened), an untouched line shows just the cursor. Everything in this section is what **committer mode** adds.
 
 Merging a reviewed pull request is the same six commands every time, so in committer mode the prompt hints them for you, in order, starting from the empty line:
 
