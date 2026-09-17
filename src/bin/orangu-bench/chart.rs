@@ -106,6 +106,11 @@ struct Chart {
 pub struct Labels {
     pub y: String,
     pub x: Option<String>,
+    /// The modes to draw, or empty for every mode the file holds. A
+    /// two-engine comparison records mechanism rows only one engine can
+    /// report — expert re-reads, bytes per token — and a document comparing
+    /// the two wants the panels both engines appear in.
+    pub panels: Vec<String>,
 }
 
 impl Default for Labels {
@@ -113,6 +118,7 @@ impl Default for Labels {
         Labels {
             y: "tok/s (log)".to_string(),
             x: None,
+            panels: Vec::new(),
         }
     }
 }
@@ -157,6 +163,19 @@ pub fn render_labelled(
         }
     }
     labels.truncate(SERIES_COLORS.len());
+
+    // The storage panels describe the streaming regime — a model larger than
+    // the page cache, read from disk on every token. When no row read a byte
+    // from disk they have nothing to say, and two panels of zeros under a
+    // comparison of two engines' throughput would be read as a difference
+    // between them (only one engine reports the figure at all). A panel earns
+    // its place only when it varies, so they are drawn only once something
+    // was actually read.
+    let mut io_rows = records
+        .iter()
+        .filter(|r| r.mode == "io_mb_per_token")
+        .peekable();
+    let nothing_read = io_rows.peek().is_some() && io_rows.all(|r| r.best == 0.0);
 
     let mut charts = Vec::new();
     for (mode, title, x_title) in [
@@ -264,6 +283,12 @@ pub fn render_labelled(
             "read request size (KiB)",
         ),
     ] {
+        if nothing_read && mode.starts_with("io_") {
+            continue;
+        }
+        if !axes.panels.is_empty() && !axes.panels.iter().any(|p| p == mode) {
+            continue;
+        }
         // `(label, date) -> context -> best`.
         let mut by_series: BTreeMap<(usize, &str, &str), BTreeMap<u32, f64>> = BTreeMap::new();
         for r in records.iter().filter(|r| r.mode == mode) {
@@ -700,6 +725,65 @@ mod tests {
                 svg.matches("<circle").count()
             );
         }
+    }
+
+    /// A fully cached model reads nothing from disk, and then the storage
+    /// panels are two plots of zero under the throughput ones. They are
+    /// left out — and drawn again the moment a row records a byte read.
+    #[test]
+    fn storage_panels_are_left_out_when_nothing_was_read_from_disk() {
+        let cached = [
+            rec("2026-09-17", "orangu", "tg", 0, 70.0),
+            rec("2026-09-17", "orangu", "io_mb_per_token", 0, 0.0),
+            rec("2026-09-17", "orangu", "io_majflt", 0, 12.0),
+        ];
+        let svg = render_labelled(&cached, "test", None, Labels::default());
+        assert!(svg.contains("Decode"), "{svg}");
+        assert!(
+            !svg.contains("MiB read from disk"),
+            "a zero panel was drawn"
+        );
+        assert!(
+            !svg.contains("major faults per repetition"),
+            "a zero panel was drawn"
+        );
+
+        let streamed = [
+            rec("2026-09-17", "orangu", "tg", 0, 7.0),
+            rec("2026-09-17", "orangu", "io_mb_per_token", 0, 640.0),
+            rec("2026-09-17", "orangu", "io_majflt", 0, 12000.0),
+        ];
+        let svg = render_labelled(&streamed, "test", None, Labels::default());
+        assert!(svg.contains("MiB read from disk"), "{svg}");
+        assert!(svg.contains("major faults per repetition"), "{svg}");
+    }
+
+    /// `--chart-panels pp,tg` keeps exactly those panels, whatever else the
+    /// file holds; empty keeps everything, which is what every chart drawn
+    /// before the option existed did.
+    #[test]
+    fn chart_panels_select_which_modes_are_drawn() {
+        let recs = [
+            rec("2026-09-17", "orangu", "tg", 0, 70.0),
+            rec("2026-09-17", "orangu", "pp", 512, 500.0),
+            rec("2026-09-17", "orangu", "moe_mb", 512, 2.0),
+        ];
+        let only = render_labelled(
+            &recs,
+            "test",
+            None,
+            Labels {
+                panels: vec!["pp".to_string(), "tg".to_string()],
+                ..Labels::default()
+            },
+        );
+        assert!(
+            only.contains("Prefill") && only.contains("Decode"),
+            "{only}"
+        );
+        assert!(!only.contains("dequantized per token"), "{only}");
+        let all = render_labelled(&recs, "test", None, Labels::default());
+        assert!(all.contains("dequantized per token"), "{all}");
     }
 
     fn rec(date: &str, label: &str, mode: &str, n: u32, best: f64) -> Record {

@@ -2420,6 +2420,22 @@ pub trait ModelForward: Send + Sync {
         slot_id: usize,
     ) -> Result<Vec<f32>>;
 
+    /// [`Self::forward`] for a prompt chunk whose logits nobody will read
+    /// — every chunk of a long prompt but the last. The default runs
+    /// `forward` and drops them; an architecture overrides it to skip the
+    /// output norm, the vocabulary projection and the residual readback
+    /// the last row needed, which on a device-resident prefill is the
+    /// host's whole turn between one chunk's chains and the next's.
+    fn forward_no_logits(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Result<()> {
+        self.forward(cache, tokens, start_pos, slot_id).map(|_| ())
+    }
+
     /// Like `forward`, but lets the implementor sample the next token
     /// itself when `greedy_sample` is `Some` — skipping the full
     /// `[n_vocab]` logits readback entirely when it can. The default

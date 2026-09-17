@@ -40,11 +40,13 @@
 //! - the port must be **free before** a child is launched, or the run stops;
 //! - no *accelerator* may be held by a process this sweep did not start, or
 //!   the run stops — see [`Baseline`];
-//! - the pid the server reports through `/props` must be the pid of **this
-//!   process's own child**, or the run stops;
+//! - the pid the server reports through `/props` — or, for a server that
+//!   reports none, the pid the kernel says holds the listening socket — must
+//!   be the pid of **this process's own child**, or the run stops;
 //! - the child is killed and reaped through a [`Server`] guard whose `Drop`
-//!   runs on every path, including the error one, and the port is waited back
-//!   to free before the next point starts.
+//!   runs on every path, including the error one, the port is waited back to
+//!   free, and each card's memory in use is waited back to what it was before
+//!   the first point, before the next one starts.
 //!
 //! None of that is defensive programming. Each check corresponds to a way one
 //! of these sweeps has previously produced a confident wrong answer.
@@ -65,6 +67,8 @@ use std::process::Child;
 #[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+use orangu::profiling::profile::pid_listening_on;
 
 /// A `VAR=v1,v2,v3` sweep specification.
 pub struct Spec {
@@ -246,6 +250,22 @@ pub fn start(
             holder.cmd
         );
     }
+    // A reaped process is not yet a released card. The driver frees its
+    // buffers on close, and normally has by now — this is what makes "the
+    // previous server's memory is gone" a checked fact for every point rather
+    // than an assumption, since a card with less of itself to give measures
+    // as the swept variable being slower.
+    let held = wait_for_vram_release(baseline, timeout);
+    if let Some((card, used, base)) = held.first() {
+        anyhow::bail!(
+            "{card} still has {:.2} GiB of device memory in use after {}s, against {:.2} GiB \
+             when this sweep started — the previous point's server did not release the card, \
+             and the next one would be measured on what it left",
+            *used as f64 / (1u64 << 30) as f64,
+            timeout.as_secs(),
+            *base as f64 / (1u64 << 30) as f64
+        );
+    }
     // `sh -c "exec …"` is the whole supervision mechanism: it is what makes
     // the spawned pid the *server's* pid, which is what the teardown kills
     // and what `wait_until_serving` checks `/props` against. Windows has no
@@ -349,13 +369,27 @@ pub fn wait_until_serving(
              owns the port, and every point of this sweep would have measured it",
             server.pid()
         ),
-        // A third-party server may report no pid. Sweeping `ORANGU_*` against it
-        // is meaningless anyway, so this is a mistake worth naming rather
-        // than a case to support.
-        None => anyhow::bail!(
-            "{url} did not report a pid, so this sweep cannot prove it is measuring the server \
-             it started — --sweep needs orangu-server"
-        ),
+        // A third-party server reports no pid, and the one sweep worth
+        // running against one — orangu against the reference engine, through
+        // the same harness — is exactly the comparison this tool exists for.
+        // The kernel knows who owns the port even when the server will not
+        // say, so the proof comes from there instead: the listening socket's
+        // owner must be the child this process spawned.
+        None => match pid_listening_on(server.port) {
+            Some(pid) if pid == server.pid() => Ok(()),
+            Some(pid) => anyhow::bail!(
+                "{url} reports no pid and port {} is held by pid {pid}, but this sweep started \
+                 pid {} — something else owns the port, and every point of this sweep would \
+                 have measured it",
+                server.port,
+                server.pid()
+            ),
+            None => anyhow::bail!(
+                "{url} did not report a pid and the owner of port {} could not be read from \
+                 /proc, so this sweep cannot prove it is measuring the server it started",
+                server.port
+            ),
+        },
     }
 }
 
@@ -421,6 +455,9 @@ fn wait_for(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
 #[derive(Debug, Default, Clone)]
 pub struct Baseline {
     pids: Vec<u32>,
+    /// Each card's device memory in use before the first point, in bytes —
+    /// what "released" means for the next one. See [`wait_for_vram_release`].
+    vram: Vec<(String, u64)>,
 }
 
 /// The accelerators in use right now, as the furniture this sweep runs
@@ -428,7 +465,82 @@ pub struct Baseline {
 pub fn accelerator_baseline() -> Baseline {
     Baseline {
         pids: accelerator_holders().into_iter().map(|h| h.pid).collect(),
+        vram: vram_in_use(),
     }
+}
+
+/// Device memory in use on every card that reports it, as `(card, bytes)`.
+///
+/// `mem_info_vram_used` under `/sys/class/drm/card*/device` — the amdgpu
+/// driver's own figure, the whole card and not one process. Empty where the
+/// driver does not expose it, which leaves the release check with nothing to
+/// wait for and the sweep behaving as it did before the check existed.
+#[cfg(target_os = "linux")]
+fn vram_in_use() -> Vec<(String, u64)> {
+    let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
+        return Vec::new();
+    };
+    let mut cards: Vec<_> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("card") && !n.contains('-'))
+        })
+        .collect();
+    cards.sort();
+    cards
+        .into_iter()
+        .filter_map(|card| {
+            let used = std::fs::read_to_string(card.join("device/mem_info_vram_used")).ok()?;
+            let name = card.file_name()?.to_str()?.to_string();
+            Some((name, used.trim().parse().ok()?))
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn vram_in_use() -> Vec<(String, u64)> {
+    Vec::new()
+}
+
+/// How much more device memory than the baseline still counts as released.
+///
+/// A desktop's own allocations drift — a compositor repaints, a browser tab
+/// opens — and a check that demanded the exact baseline back would refuse
+/// sweeps on the machine they are run on. A quarter of a gigabyte is well
+/// under the smallest model this tool measures and well over that drift.
+const VRAM_RELEASE_SLACK: u64 = 256 << 20;
+
+/// Wait until every card's memory in use is back to its baseline, within
+/// [`VRAM_RELEASE_SLACK`]. Returns the cards still above it when `timeout`
+/// runs out, as `(card, bytes now, bytes at baseline)`.
+///
+/// The previous server is reaped before this runs, so its allocations are
+/// normally gone already; the driver frees a process's buffers when its
+/// device handle closes. This is the check that makes that a fact rather than
+/// an assumption for each point — a server whose memory did *not* come back
+/// would leave the next point measuring a card with less of itself to give,
+/// and the number would be plausible.
+fn wait_for_vram_release(baseline: &Baseline, timeout: Duration) -> Vec<(String, u64, u64)> {
+    let mut held = Vec::new();
+    let released = wait_for(timeout, || {
+        held = vram_above_baseline(baseline, &vram_in_use());
+        held.is_empty()
+    });
+    if released { Vec::new() } else { held }
+}
+
+/// The cards in `now` holding more than their baseline plus the slack.
+/// Separated from the polling so the policy is testable without a card.
+fn vram_above_baseline(baseline: &Baseline, now: &[(String, u64)]) -> Vec<(String, u64, u64)> {
+    now.iter()
+        .filter_map(|(card, used)| {
+            let base = baseline.vram.iter().find(|(c, _)| c == card)?.1;
+            (*used > base.saturating_add(VRAM_RELEASE_SLACK)).then(|| (card.clone(), *used, base))
+        })
+        .collect()
 }
 
 /// A process holding an accelerator device open.
@@ -693,6 +805,47 @@ mod tests {
         let _ = std::fs::remove_file(&log);
     }
 
+    /// A server that reports no pid is identified by the kernel instead — the
+    /// pid holding the listening socket, through the same lookup the profiler
+    /// uses. This process is the listener here, so the answer has to be its
+    /// own pid, and a released port has to answer nothing rather than somebody.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_listening_socket_names_its_owner() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert_eq!(pid_listening_on(port), Some(std::process::id()));
+        drop(listener);
+        assert!(
+            wait_for(Duration::from_secs(5), || pid_listening_on(port).is_none()),
+            "a released port must have no owner"
+        );
+    }
+
+    /// Release is judged against the baseline with slack, per card: a card
+    /// that never had a baseline is ignored (nothing to compare), drift
+    /// under the slack is furniture, and a model's worth above it is a
+    /// leftover.
+    #[test]
+    fn vram_release_is_judged_per_card_against_the_baseline_with_slack() {
+        let baseline = Baseline {
+            pids: Vec::new(),
+            vram: vec![
+                ("card1".to_string(), 1 << 30),
+                ("card2".to_string(), 100 << 20),
+            ],
+        };
+        let now = vec![
+            ("card1".to_string(), (1 << 30) + (100 << 20)),
+            ("card2".to_string(), (100 << 20) + (2 << 30)),
+            ("card3".to_string(), 8 << 30),
+        ];
+        let held = vram_above_baseline(&baseline, &now);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].0, "card2");
+        assert!(vram_above_baseline(&Baseline::default(), &now).is_empty());
+    }
+
     /// The node list matches by prefix so it covers a whole driver's minor
     /// numbers, and it must not match its way onto the rest of `/dev` — a
     /// check that fires on `/dev/null` would stop every sweep on every
@@ -730,7 +883,10 @@ mod tests {
             pid,
             cmd: format!("proc-{pid}"),
         };
-        let baseline = Baseline { pids: vec![10, 20] };
+        let baseline = Baseline {
+            pids: vec![10, 20],
+            vram: Vec::new(),
+        };
         // Exactly the furniture: nothing to wait for.
         assert!(
             holders_outside(&baseline, vec![holder(10), holder(20)]).is_empty(),

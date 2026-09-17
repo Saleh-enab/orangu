@@ -714,12 +714,30 @@ fn prefill_gemm_probe() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(20);
+    // `ORANGU_SWEEP_ROTATE=N`: the integer-dot kernel over N distinct weight
+    // matrices in turn, one per repetition — a layer loop's cache
+    // behaviour rather than one matrix's.
+    let rotate: usize = std::env::var("ORANGU_SWEEP_ROTATE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+        .max(1);
     for &(in_dim, out_dim) in &shapes {
-        for &ggml_type in &[
-            crate::engine::quant::GGML_TYPE_Q4_K,
-            crate::engine::quant::GGML_TYPE_Q6_K,
-            crate::engine::quant::GGML_TYPE_F32,
-        ] {
+        // `ORANGU_SWEEP_TYPES=Q4_K,Q8_0,...` picks the weight types; the
+        // default is the pair every K-quant file's FFN is made of plus the
+        // float baseline.
+        let types: Vec<u32> = match std::env::var("ORANGU_SWEEP_TYPES") {
+            Ok(list) => list
+                .split(',')
+                .map(|t| quant_type_named(t.trim()).unwrap_or_else(|| panic!("unknown type {t}")))
+                .collect(),
+            Err(_) => vec![
+                crate::engine::quant::GGML_TYPE_Q4_K,
+                crate::engine::quant::GGML_TYPE_Q6_K,
+                crate::engine::quant::GGML_TYPE_F32,
+            ],
+        };
+        for &ggml_type in &types {
             let w = weight_of(ggml_type, in_dim, out_dim);
             println!(
                 "\n== [{{n}} x {in_dim}] x [{in_dim} x {out_dim}] {} ==",
@@ -765,12 +783,21 @@ fn prefill_gemm_probe() {
                     ))
                 );
                 // The integer-dot GEMM at the same shape, where it applies.
-                if let Some(us) = gpu.mmq_kernel_us_tokens(&x, n, &w, reps) {
+                let rotation: Vec<_> = (0..rotate)
+                    .map(|i| weight_of_seeded(ggml_type, in_dim, out_dim, 0x42 + i as u8))
+                    .collect();
+                if let Some((us, name)) =
+                    gpu.mmq_kernel_us_tokens_rotating(&x, n, &rotation, reps.max(rotate as u32))
+                {
                     println!(
-                        "{n:>6} {:>22} {us:>11.1} {:>10.0} {:>10.2}",
-                        "mmq-q4k",
+                        "{n:>6} {name:>22} {us:>11.1} {:>10.0} {:>10.2}{}",
                         flops / us / 1e3,
-                        us / n as f64
+                        us / n as f64,
+                        if rotate > 1 {
+                            format!("   (over {rotate} matrices)")
+                        } else {
+                            String::new()
+                        }
                     );
                 }
             }
@@ -779,19 +806,50 @@ fn prefill_gemm_probe() {
 }
 
 fn weight_of(ggml_type: u32, in_dim: usize, out_dim: usize) -> crate::engine::loader::QuantMatrix {
+    weight_of_seeded(ggml_type, in_dim, out_dim, 0x42)
+}
+
+fn weight_of_seeded(
+    ggml_type: u32,
+    in_dim: usize,
+    out_dim: usize,
+    fill: u8,
+) -> crate::engine::loader::QuantMatrix {
     let (bytes_per_block, block) =
         crate::engine::quant::block_layout(ggml_type).expect("a probed format has a block layout");
     let bytes = in_dim * out_dim / block * bytes_per_block;
-    test_quant_matrix(&vec![0x42u8; bytes], ggml_type, in_dim, out_dim)
+    test_quant_matrix(&vec![fill; bytes], ggml_type, in_dim, out_dim)
 }
 
+const PROBE_TYPES: &[(&str, u32)] = &[
+    ("Q4_K", crate::engine::quant::GGML_TYPE_Q4_K),
+    ("Q5_K", crate::engine::quant::GGML_TYPE_Q5_K),
+    ("Q6_K", crate::engine::quant::GGML_TYPE_Q6_K),
+    ("Q8_0", crate::engine::quant::GGML_TYPE_Q8_0),
+    ("Q4_0", crate::engine::quant::GGML_TYPE_Q4_0),
+    ("Q4_1", crate::engine::quant::GGML_TYPE_Q4_1),
+    ("Q5_0", crate::engine::quant::GGML_TYPE_Q5_0),
+    ("Q5_1", crate::engine::quant::GGML_TYPE_Q5_1),
+    ("Q2_K", crate::engine::quant::GGML_TYPE_Q2_K),
+    ("Q3_K", crate::engine::quant::GGML_TYPE_Q3_K),
+    ("IQ4_XS", crate::engine::quant::GGML_TYPE_IQ4_XS),
+    ("IQ3_S", crate::engine::quant::GGML_TYPE_IQ3_S),
+    ("IQ2_S", crate::engine::quant::GGML_TYPE_IQ2_S),
+    ("F32", crate::engine::quant::GGML_TYPE_F32),
+];
+
 fn quant_name(ggml_type: u32) -> &'static str {
-    match ggml_type {
-        crate::engine::quant::GGML_TYPE_Q4_K => "Q4_K",
-        crate::engine::quant::GGML_TYPE_Q6_K => "Q6_K",
-        crate::engine::quant::GGML_TYPE_F32 => "F32",
-        _ => "?",
-    }
+    PROBE_TYPES
+        .iter()
+        .find(|(_, t)| *t == ggml_type)
+        .map_or("?", |(n, _)| n)
+}
+
+fn quant_type_named(name: &str) -> Option<u32> {
+    PROBE_TYPES
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, t)| *t)
 }
 
 /// The instruction rates the GEMM kernels are built on, measured in

@@ -1997,9 +1997,18 @@ fn prefill_in_chunks(
     let mut chunk = |model: &dyn ModelForward,
                      cache: &mut KvCache,
                      part: &[u32],
-                     pos: usize|
+                     pos: usize,
+                     last: bool|
      -> Result<Vec<f32>> {
         let Some(drafter) = drafter.as_deref_mut().filter(|d| d.wants_states()) else {
+            // A chunk before the last produces logits nobody reads; the
+            // architecture is told so and may skip the work that makes them.
+            if !last {
+                crate::engine::decode_stages::pass(|| {
+                    model.forward_no_logits(cache, part, pos, slot_id)
+                })?;
+                return Ok(Vec::new());
+            }
             return crate::engine::decode_stages::pass(|| model.forward(cache, part, pos, slot_id));
         };
         let (logits, states) = crate::engine::decode_stages::pass(|| {
@@ -2076,7 +2085,7 @@ fn prefill_in_chunks(
         // feeds the drafter its state rows. The pass still has to be
         // counted — `forward_passes` is what the NPU work measures chunking
         // against.
-        let logits = chunk(model, cache, tokens, start_pos)?;
+        let logits = chunk(model, cache, tokens, start_pos, true)?;
         crate::engine::note_forward_pass();
         on_chunk(tokens.len());
         return Ok(logits);
@@ -2114,7 +2123,11 @@ fn prefill_in_chunks(
         let n = width.min(tokens.len() - done);
         let started = Instant::now();
         let submits_before = crate::engine::decode_stages::submissions_so_far();
-        logits = chunk(model, cache, &tokens[done..done + n], pos)?;
+        let last = done + n >= tokens.len();
+        let out = chunk(model, cache, &tokens[done..done + n], pos, last)?;
+        if last {
+            logits = out;
+        }
         crate::engine::note_forward_pass();
         let elapsed = started.elapsed();
         let submits = crate::engine::decode_stages::submissions_so_far() - submits_before;

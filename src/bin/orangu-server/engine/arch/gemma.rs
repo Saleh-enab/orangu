@@ -1188,7 +1188,7 @@ gemma 4 checkpoint."
         tokens: &[u32],
         start_pos: usize,
     ) -> Result<Vec<f32>> {
-        self.run_layers(Some(cache), None, x0, tokens, start_pos)
+        self.run_layers(Some(cache), None, x0, tokens, start_pos, true)
     }
 
     /// [`Self::run_layers_cpu`], or — with `batch` — one decode step of
@@ -1198,6 +1198,11 @@ gemma 4 checkpoint."
     /// (`VulkanBackend::fused_attention_decode_batch`). A batch needs the
     /// device-resident chains for every layer; where one declines, this
     /// fails and the caller steps the sequences one by one.
+    ///
+    /// `want_x`: whether the caller reads the returned residual. A prompt
+    /// chunk whose logits nobody needs does not, and then the rows the
+    /// device holds at the end are left there — no readback, and the one
+    /// wait of the chunk is the K/V fill's.
     fn run_layers(
         &self,
         mut one: Option<&mut KvCache>,
@@ -1205,6 +1210,7 @@ gemma 4 checkpoint."
         x0: &[f32],
         tokens: &[u32],
         start_pos: usize,
+        want_x: bool,
     ) -> Result<Vec<f32>> {
         let n_tokens = tokens.len();
         let n_embd = self.config.n_embd;
@@ -1248,11 +1254,61 @@ gemma 4 checkpoint."
 
         let per_layer = self.n_embd_per_layer;
         let has_ple = per_layer > 0;
-        let inp_per_layer = if has_ple {
+        // The per-layer-embedding inputs: on the device, as one GEMM and one
+        // dispatch recorded ahead of the first layer's chain, when the chunk
+        // runs its chains there; on the host otherwise. The device form is
+        // layer-major, so each layer's stage takes its operand as a slice
+        // of the buffer; a layer that has to land on the host (or a device
+        // that declines) reads the host form, computed on demand.
+        let inp_per_layer_dev = if has_ple
+            && prefill_stream_ple_inputs()
+            && self
+                .backend
+                .as_wgpu()
+                .is_some_and(|v| v.prefill_fused_attention_enabled())
+            && self.layers.iter().all(|l| l.moe.is_none())
+        {
+            let (Some(proj_w), Some(proj_norm), Some(v)) = (
+                self.per_layer_model_proj.as_ref(),
+                self.per_layer_proj_norm.as_ref(),
+                self.backend.as_wgpu(),
+            ) else {
+                unreachable!("a per-layer-embedding model loads its projection and norm")
+            };
+            let gathered = self.gather_per_layer_tok_embd(tokens, n_tokens);
+            v.ple_inputs_prefill(
+                &x,
+                n_tokens,
+                proj_w,
+                proj_norm,
+                &gathered,
+                self.layers.len(),
+                per_layer,
+                self.rms_eps(),
+            )
+        } else {
+            None
+        };
+        let mut inp_per_layer = if has_ple && inp_per_layer_dev.is_none() {
             Some(self.compute_per_layer_inputs(&x, tokens, n_tokens))
         } else {
             None
         };
+        // The chunk's scaled embeddings, kept only while the inputs live on
+        // the device: a layer that lands on the host after that needs the
+        // host form computed from *these*, not from the residual `x` has
+        // become by then.
+        let x_embd: Option<Vec<f32>> = inp_per_layer_dev.is_some().then(|| x.clone());
+        let host_inputs = |inp: &mut Option<Vec<f32>>| {
+            if inp.is_none() {
+                let embd = x_embd
+                    .as_deref()
+                    .expect("kept while the device holds the inputs");
+                *inp = Some(self.compute_per_layer_inputs(embd, tokens, n_tokens));
+            }
+        };
+        // Whether the model has per-layer inputs at all, wherever they are.
+        let ple_inputs_present = has_ple;
 
         // CPU-side wall-clock around each GPU submission this
         // (CPU-orchestrated) prefill path makes — unlike the fused decode
@@ -1336,7 +1392,7 @@ gemma 4 checkpoint."
             let has_ple_stage = layer.per_layer_inp_gate.is_some()
                 && layer.per_layer_proj.is_some()
                 && layer.per_layer_post_norm.is_some()
-                && inp_per_layer.is_some();
+                && ple_inputs_present;
             let stays = stream_bufs.is_some()
                 && layer.moe.is_none()
                 && !ffn_on_npu
@@ -1902,8 +1958,8 @@ gemma 4 checkpoint."
                 }
             }
 
-            if let (Some(inp_per_layer), Some(gate_w), Some(proj_w), Some(post_norm)) = (
-                &inp_per_layer,
+            if let (true, Some(gate_w), Some(proj_w), Some(post_norm)) = (
+                ple_inputs_present,
                 &layer.per_layer_inp_gate,
                 &layer.per_layer_proj,
                 &layer.per_layer_post_norm,
@@ -1926,33 +1982,63 @@ gemma 4 checkpoint."
                     .as_wgpu_on(layer.wo.device())
                     .and_then(|vulkan| {
                         let t_gather = Instant::now();
-                        let mut per_layer_in = Vec::with_capacity(n_tokens * per_layer);
-                        for t in 0..n_tokens {
-                            let base = (t * self.layers.len() + il) * per_layer;
-                            per_layer_in.extend_from_slice(&inp_per_layer[base..base + per_layer]);
-                        }
-                        gather_ms = t_gather.elapsed().as_secs_f64() * 1000.0;
-                        match (&x_dev, &stream_bufs) {
-                            (Some(b), Some(bufs)) => vulkan.fused_ple_prefill_rows(
-                                crate::engine::backend::vulkan::AttnOutSrc::Gpu(b, 0, n_tokens),
-                                n_tokens,
-                                gate_w,
-                                proj_w,
-                                &per_layer_in,
-                                Some(crate::engine::backend::vulkan::PleTail {
-                                    post_norm,
-                                    eps,
-                                    out_scale: layer.layer_output_scale,
-                                }),
-                                Some((&bufs[1], 0)),
-                            ),
-                            _ => vulkan.fused_ple_prefill(
-                                &x,
-                                n_tokens,
-                                gate_w,
-                                proj_w,
-                                &per_layer_in,
-                            ),
+                        match (&x_dev, &stream_bufs, &inp_per_layer_dev) {
+                            (Some(b), Some(bufs), Some(dev)) => {
+                                use crate::engine::backend::vulkan::AttnOutSrc;
+                                vulkan.fused_ple_prefill_rows(
+                                    AttnOutSrc::Gpu(b, 0, n_tokens),
+                                    n_tokens,
+                                    gate_w,
+                                    proj_w,
+                                    AttnOutSrc::Gpu(
+                                        dev,
+                                        (il * device_rows * per_layer) as u64 * 4,
+                                        n_tokens,
+                                    ),
+                                    Some(crate::engine::backend::vulkan::PleTail {
+                                        post_norm,
+                                        eps,
+                                        out_scale: layer.layer_output_scale,
+                                    }),
+                                    Some((&bufs[1], 0)),
+                                )
+                            }
+                            _ => {
+                                host_inputs(&mut inp_per_layer);
+                                let inp = inp_per_layer.as_deref().expect("computed above");
+                                let mut per_layer_in = Vec::with_capacity(n_tokens * per_layer);
+                                for t in 0..n_tokens {
+                                    let base = (t * self.layers.len() + il) * per_layer;
+                                    per_layer_in.extend_from_slice(&inp[base..base + per_layer]);
+                                }
+                                gather_ms = t_gather.elapsed().as_secs_f64() * 1000.0;
+                                match (&x_dev, &stream_bufs) {
+                                    (Some(b), Some(bufs)) => vulkan.fused_ple_prefill_rows(
+                                        crate::engine::backend::vulkan::AttnOutSrc::Gpu(
+                                            b, 0, n_tokens,
+                                        ),
+                                        n_tokens,
+                                        gate_w,
+                                        proj_w,
+                                        crate::engine::backend::vulkan::AttnOutSrc::Host(
+                                            &per_layer_in,
+                                        ),
+                                        Some(crate::engine::backend::vulkan::PleTail {
+                                            post_norm,
+                                            eps,
+                                            out_scale: layer.layer_output_scale,
+                                        }),
+                                        Some((&bufs[1], 0)),
+                                    ),
+                                    _ => vulkan.fused_ple_prefill(
+                                        &x,
+                                        n_tokens,
+                                        gate_w,
+                                        proj_w,
+                                        &per_layer_in,
+                                    ),
+                                }
+                            }
                         }
                     });
                 if x_dev.is_some() {
@@ -1991,6 +2077,8 @@ gemma 4 checkpoint."
                     }
                     proj
                 } else {
+                    host_inputs(&mut inp_per_layer);
+                    let inp_per_layer = inp_per_layer.as_deref().expect("computed above");
                     self.backend.matmul_into(&mut pl_gate, &x, n_tokens, gate_w);
                     tensor::gelu_inplace(&mut pl_gate);
                     for t in 0..n_tokens {
@@ -2025,13 +2113,28 @@ gemma 4 checkpoint."
         if let Some(v) = self.backend.as_wgpu() {
             v.end_prefill_group();
         }
-        land(&mut x, &mut x_dev);
-        // Every group is submitted, so the rows are on their way: one wait
-        // for the chunk's worth of them.
+        // The previous chunk's rows, parked while this chunk's chains were
+        // recorded and submitted — brought home now, while the device works.
+        if let (Some(vulkan), Some(cache)) = (self.backend.as_wgpu(), one.as_deref_mut()) {
+            vulkan.fill_deferred_kv_rows(cache);
+        }
+        if want_x {
+            land(&mut x, &mut x_dev);
+        }
+        // Every group is submitted, so the rows are on their way. A chunk
+        // whose residual nobody reads (`want_x` off — one before the last)
+        // parks the readback for the next chunk to complete after *its*
+        // chains are submitted, so the device runs straight on; the last
+        // chunk waits here, and the cache is whole when it returns.
         if let (Some(vulkan), Some(cache), Some(stage)) =
             (self.backend.as_wgpu(), one, kv_stage.take())
         {
-            vulkan.fill_kv_rows(stage, std::mem::take(&mut pending_kv), cache);
+            let pending = std::mem::take(&mut pending_kv);
+            if want_x {
+                vulkan.fill_kv_rows(stage, pending, cache);
+            } else {
+                vulkan.defer_kv_rows(stage, pending, cache);
+            }
         }
 
         // Once per prefill, not per layer: what the backend's own allocators
@@ -2341,6 +2444,36 @@ impl ModelForward for GemmaModel {
         KvCache::new_with_dims(capacity, &self.kv_dims())
     }
 
+    fn forward_no_logits(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        _slot_id: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.causal,
+            "'{}' is an embeddings-only architecture and does not support text generation",
+            self.config.architecture
+        );
+        let n_tokens = tokens.len();
+        let n_embd = self.config.n_embd;
+        let mut x = vec![0f32; n_tokens * n_embd];
+        for (t, &tok) in tokens.iter().enumerate() {
+            let tok = tok as usize;
+            anyhow::ensure!(
+                tok < self.config.n_vocab,
+                "token id {tok} is out of vocab range"
+            );
+            x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
+        }
+        for v in x.iter_mut() {
+            *v *= (n_embd as f32).sqrt();
+        }
+        self.run_layers(Some(cache), None, &x, tokens, start_pos, false)
+            .map(|_| ())
+    }
+
     fn forward(
         &self,
         cache: &mut KvCache,
@@ -2510,7 +2643,7 @@ impl ModelForward for GemmaModel {
         for v in x.iter_mut() {
             *v *= (n_embd as f32).sqrt();
         }
-        let mut h = self.run_layers(None, Some(rows), &x, tokens, 0)?;
+        let mut h = self.run_layers(None, Some(rows), &x, tokens, 0, true)?;
         tensor::rmsnorm_inplace(&mut h, &self.output_norm, n_tokens, n_embd, eps);
         let flat = self.backend.matmul(&h, n_tokens, &self.output_weight);
         anyhow::ensure!(
@@ -3446,6 +3579,13 @@ fn prefill_stream_dense() -> bool {
 fn prefill_kv_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_PREFILL_KV_WAIT"))
+}
+
+/// `ORANGU_PREFILL_PLE_INPUTS=0` computes a chunk's per-layer-embedding
+/// inputs on the host, as every chunk did before they were recorded on the
+/// device — the control arm for measuring the device form.
+fn prefill_stream_ple_inputs() -> bool {
+    crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_PLE_INPUTS")
 }
 
 fn prefill_layers_per_submit() -> usize {

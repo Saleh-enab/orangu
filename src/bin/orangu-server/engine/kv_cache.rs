@@ -119,6 +119,11 @@ pub struct LayerCache {
     /// between that call and the [`Self::fill_gpu_written`] that pairs with
     /// it, which is within one prefill chunk.
     pending_rows: usize,
+    /// Of `pending_rows`, how many a parked readback (`KvCache::
+    /// deferred_fill`) will bring home — advanced by a chunk that finished
+    /// and left its wait to the next one, as opposed to a chunk that failed.
+    /// [`Self::discard_pending_rows`] keeps these and forgets the rest.
+    deferred_rows: usize,
 }
 
 /// The pages of **one sequence**, shared by every layer of it.
@@ -924,6 +929,7 @@ impl LayerCache {
             paged: None,
             pool_backed: false,
             pending_rows: 0,
+            deferred_rows: 0,
         }
     }
 
@@ -950,6 +956,7 @@ impl LayerCache {
             stride: 1,
             pool_backed: false,
             pending_rows: 0,
+            deferred_rows: 0,
         }
     }
 
@@ -974,6 +981,7 @@ impl LayerCache {
             paged: None,
             pool_backed: false,
             pending_rows: 0,
+            deferred_rows: 0,
         }
     }
 
@@ -1426,7 +1434,36 @@ impl LayerCache {
             .zip(v_rows.chunks_exact(self.kv_dim))
         {
             self.pending_rows -= 1;
+            self.deferred_rows = self.deferred_rows.saturating_sub(1);
             self.push_row(k, v);
+        }
+    }
+
+    /// Records that every row the host now holds is already on the device
+    /// in the pool's own pages — the fused prefill chain wrote them there
+    /// (`paged_range_refs`), and the host copy that just arrived was read
+    /// back *from* those pages. Without this, the next
+    /// [`Self::sync_pool_device`] sees pages sealed since its last call and
+    /// uploads them again: for every layer, the same bytes converted to
+    /// the pool's storage on the host and sent over the bus a second time.
+    /// Measured on a 512-token chunk that was the host's largest single
+    /// job between chunks. A no-op for a layer the pool does not serve on
+    /// the device, whose rows the chain could not have written there.
+    pub fn mark_pool_device_written(&mut self) {
+        let kv_dim = self.kv_dim.max(1);
+        let tail_rows = self.k.len() / kv_dim;
+        let Some(paged) = self.paged.as_mut() else {
+            return;
+        };
+        if paged.seq.pool.device_pages().is_none() {
+            return;
+        }
+        paged.device_synced = paged.full_pages;
+        // The tail page exists on the device only once `sync_pool_device`
+        // has allocated it; the chain's write went through the pages
+        // `paged_range_refs` reserved, which covers the tail's rows too.
+        if paged.pages.len() > paged.full_pages {
+            paged.tail_uploaded = tail_rows;
         }
     }
 
@@ -1443,13 +1480,20 @@ impl LayerCache {
     /// host holds; the device rows past it are overwritten before they are
     /// read again. Nothing to do on a healthy cache.
     pub fn discard_pending_rows(&mut self) {
-        if self.pending_rows > 0 {
-            self.len -= self.pending_rows;
-            self.pending_rows = 0;
+        let stray = self.pending_rows.saturating_sub(self.deferred_rows);
+        if stray > 0 {
+            self.len -= stray;
+            self.pending_rows -= stray;
             if let Some(gpu) = &mut self.gpu {
                 gpu.synced_len = gpu.synced_len.min(self.len);
             }
         }
+    }
+
+    /// Marks every pending row as spoken for by a parked readback — see
+    /// `KvCache::deferred_fill`.
+    pub fn defer_pending_rows(&mut self) {
+        self.deferred_rows = self.pending_rows;
     }
 
     /// Commits `n = k_rows.len() / kv_dim` positions whose K/V a GPU-resident
@@ -2255,6 +2299,17 @@ pub struct KvCache {
     /// slot persistence — so a restored or reused cache hashes the same
     /// n-grams a freshly prefilled one would.
     pub recent_tokens: Vec<u32>,
+    /// A prefill chunk's K/V readback, left for the *next* chunk to bring
+    /// home: the chunk's chains wrote the rows into the device pages and
+    /// counted them (`advance_gpu_written`), and only the host copy is
+    /// outstanding. The chunk after it takes this after submitting its
+    /// own chains, so the device runs on while the host fills — and
+    /// whoever finishes the prompt takes it last. What it holds is the
+    /// backend's own staging (`VulkanBackend::fill_kv_rows`'s operands),
+    /// type-erased so this module stays unaware of any one backend; every
+    /// host-side reader of K/V rows already bounds itself by
+    /// [`Self::host_committed_len`], which is what makes the wait movable.
+    pub deferred_fill: Option<Box<dyn std::any::Any + Send>>,
 }
 
 impl KvCache {
@@ -2282,6 +2337,7 @@ impl KvCache {
                 .map(RecurrentLayerState::new)
                 .collect(),
             recent_tokens: Vec::new(),
+            deferred_fill: None,
         }
     }
 
@@ -2641,6 +2697,13 @@ impl KvCache {
         }
     }
 
+    /// [`LayerCache::defer_pending_rows`] on every layer.
+    pub fn defer_pending_rows(&mut self) {
+        for layer in &mut self.layers {
+            layer.defer_pending_rows();
+        }
+    }
+
     pub fn host_committed_len(&self) -> usize {
         self.layers
             .iter()
@@ -2702,6 +2765,9 @@ impl KvCache {
                 .map(RecurrentLayerState::duplicate)
                 .collect(),
             recent_tokens: self.recent_tokens.clone(),
+            // A copy takes only the rows that are home; the readback in
+            // flight belongs to the cache it was staged for.
+            deferred_fill: None,
         }
     }
 
@@ -2861,6 +2927,7 @@ impl KvCache {
             layers,
             recurrent,
             recent_tokens,
+            deferred_fill: None,
         })
     }
 }

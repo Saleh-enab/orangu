@@ -59,6 +59,7 @@ mod report;
 mod shell;
 mod storage;
 mod sweep;
+mod table;
 mod web;
 use orangu::shell_completions;
 
@@ -205,9 +206,13 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     chart: Option<String>,
 
-    /// Only render the chart from an existing history file; measure nothing.
+    /// Only render the chart and table from an existing history file; measure nothing.
     #[arg(long, default_value_t = false)]
     chart_only: bool,
+
+    /// Write the history file as a markdown comparison table to this path (`-` for stdout).
+    #[arg(long, value_name = "PATH")]
+    table: Option<String>,
 
     /// Storage mode: comma-separated read request sizes in KiB to sweep.
     #[arg(long, value_name = "LIST")]
@@ -244,6 +249,10 @@ struct Args {
     /// Label for the chart's x-axis.
     #[arg(long, value_name = "TEXT")]
     chart_x_label: Option<String>,
+
+    /// Draw only these modes' panels (e.g. `pp,tg`); default: every mode in the file.
+    #[arg(long, value_delimiter = ',', value_name = "LIST")]
+    chart_panels: Vec<String>,
 
     /// Record a CPU flamegraph of the server over the measured window.
     #[arg(long, value_name = "PATH")]
@@ -1062,7 +1071,8 @@ fn run(args: &Args) -> anyhow::Result<()> {
     // carried off the machine that produced it — and, more usefully, after a
     // hand-edit of that file, without needing a server up to redraw.
     if args.chart_only {
-        return write_chart(args, &[]);
+        write_chart(args, &[])?;
+        return write_table(args);
     }
 
     // Before every server-touching mode: the probe measures the *device*, not
@@ -1568,10 +1578,11 @@ fn provenance_fields(args: &Args, env: &Environment) -> Vec<(String, String)> {
             .map(str::to_string)
     };
     let mut fields = vec![("url".to_string(), args.url.clone())];
-    for (label, key) in [("model", "model"), ("backend", "backend")] {
-        if let Some(value) = text(key) {
-            fields.push((label.to_string(), value));
-        }
+    if let Some(model) = engine_model(Some(&env.props)) {
+        fields.push(("model".to_string(), model));
+    }
+    if let Some(backend) = text("backend") {
+        fields.push(("backend".to_string(), backend));
     }
     if let Some(build) = server_build(Some(&env.props)) {
         fields.push(("server build".to_string(), build));
@@ -1882,7 +1893,8 @@ fn run_sweep(args: &Args) -> anyhow::Result<()> {
     if !bundles.is_empty() {
         println!("\nbundles: {}", bundles.join(" "));
     }
-    write_chart(args, &all)
+    write_chart(args, &all)?;
+    write_table(args)
 }
 
 /// Warm a freshly-started server on **the workload it is about to be measured
@@ -1926,6 +1938,27 @@ fn warm_up_for_sweep(client: &reqwest::blocking::Client, args: &Args) -> anyhow:
                 run_embed_once(client, &args.url, &prompt, &args.model)?;
             }
         }
+        return Ok(());
+    }
+    // A decode sweep has the same cold first rep for the same reason, and an
+    // eight-token generation is not the warmup for it: measured on a freshly
+    // started server, the first timed 64-token rep ran at 17 tok/s and the
+    // next at 72, which the best-of statistic hides and the mean ± sd does
+    // not. Generate once at the deepest requested context for the run's own
+    // length, so what is recorded is the warm engine every rep after would
+    // have measured anyway.
+    if let Some(depth) = args.depths.iter().copied().max()
+        && args.n_gen > 0
+    {
+        let prompt = build_prompt(depth);
+        run_once(
+            client,
+            &args.url,
+            &prompt,
+            args.n_gen,
+            &args.model,
+            args.temperature,
+        )?;
     }
     Ok(())
 }
@@ -2861,7 +2894,35 @@ fn record_and_chart(args: &Args, records: &[history::Record]) -> anyhow::Result<
             println!("  history  {} rows appended to {path}", records.len());
         }
     }
-    write_chart(args, records)
+    write_chart(args, records)?;
+    write_table(args)
+}
+
+/// `--table`: the history file as a markdown comparison, after the run's
+/// rows are in it. From the file only — the table's whole point is the rows
+/// this run did *not* produce, the other engine's — so without `--history`
+/// there is nothing to render and it says so.
+fn write_table(args: &Args) -> anyhow::Result<()> {
+    let Some(path) = &args.table else {
+        return Ok(());
+    };
+    let Some(history) = &args.history else {
+        anyhow::bail!("--table needs --history <FILE>: the table is rendered from the file");
+    };
+    let records = history::read(history)?;
+    if records.is_empty() {
+        anyhow::bail!("nothing to tabulate — {history} has no recorded rows");
+    }
+    let md = table::render(&records);
+    if path == "-" {
+        print!("{md}");
+    } else {
+        std::fs::write(path, md)?;
+        if !args.json {
+            println!("  table    {path}");
+        }
+    }
+    Ok(())
 }
 
 /// `--storage-probe`: the block-size curve `[orangu-server].read_size` is set
@@ -2992,8 +3053,8 @@ fn device_label(path: &std::path::Path) -> Option<String> {
 /// without a history file still shows the run that just happened.
 fn write_chart(args: &Args, extra: &[history::Record]) -> anyhow::Result<()> {
     let Some(chart_path) = &args.chart else {
-        if args.chart_only {
-            anyhow::bail!("--chart-only needs --chart <FILE.svg>");
+        if args.chart_only && args.table.is_none() {
+            anyhow::bail!("--chart-only needs --chart <FILE.svg> or --table <FILE.md>");
         }
         return Ok(());
     };
@@ -3042,6 +3103,7 @@ fn write_chart(args: &Args, extra: &[history::Record]) -> anyhow::Result<()> {
             chart::Labels {
                 y: args.chart_y_label.clone(),
                 x: args.chart_x_label.clone(),
+                panels: args.chart_panels.clone(),
             },
         ),
     )?;
@@ -3080,11 +3142,42 @@ fn server_build(props: Option<&serde_json::Value>) -> Option<String> {
             .filter(|v| !v.is_empty() && *v != "unknown")
             .map(str::to_string)
     };
-    let version = text("version")?;
+    let version = match text("version") {
+        Some(version) => version,
+        // The reference engine spells its build as one `build_info` string;
+        // a comparison's provenance has to name both sides' builds.
+        None => return text("build_info"),
+    };
     match text("commit") {
         Some(commit) => Some(format!("{version} ({commit})")),
         None => Some(version),
     }
+}
+
+/// The model a server reports, whichever engine it is: orangu-server's
+/// `model` id, or the reference engine's `model_path` shortened to its file
+/// name. `None` when neither is present.
+///
+/// The file name rather than the path: the history file's label defaults to
+/// this, and a legend entry that is a hub-cache path is unreadable.
+fn engine_model(props: Option<&serde_json::Value>) -> Option<String> {
+    let text = |key: &str| -> Option<&str> {
+        props
+            .and_then(|p| p.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && *v != "unknown" && *v != "none")
+    };
+    if let Some(model) = text("model") {
+        return Some(model.to_string());
+    }
+    text("model_path").map(|path| {
+        std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path)
+            .to_string()
+    })
 }
 
 /// The series name for a server that was not given one: its model id, which is
@@ -3095,11 +3188,7 @@ fn server_label(client: &reqwest::blocking::Client, args: &Args) -> String {
         .send()
         .ok()
         .and_then(|r| r.json::<serde_json::Value>().ok())
-        .and_then(|p| {
-            p.get("model")
-                .and_then(|v| v.as_str())
-                .map(std::string::ToString::to_string)
-        })
+        .and_then(|p| engine_model(Some(&p)))
         .unwrap_or_else(|| "unknown".to_string())
 }
 
@@ -4377,7 +4466,7 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Enviro
             .and_then(|p| p.get(key))
             .and_then(serde_json::Value::as_u64)
     };
-    let model = field("model");
+    let model = engine_model(props.as_ref()).unwrap_or_else(|| field("model"));
     let backend = field("backend");
     let pid = num("pid");
     let uptime = num("uptime_seconds");

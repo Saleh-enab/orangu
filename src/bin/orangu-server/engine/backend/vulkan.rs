@@ -71,7 +71,8 @@ use pipeline_cache::{pipeline_cache_file_path, save_pipeline_cache};
 // architectures name them, and a move must not rewrite call sites.
 use meta::{
     ArgmaxSampleResources, ArgmaxSplitMeta, AttnMeta, AttnReduceMeta, AttnSplitMeta, ElemMeta,
-    FusedNormRopeMeta, KvEpilogueMeta, Meta, PerHeadNormMeta, RopeMeta, SampleMeta, TopkResources,
+    FusedNormRopeMeta, KvEpilogueMeta, Meta, PerHeadNormMeta, PleInMeta, RopeMeta, SampleMeta,
+    TopkResources,
 };
 pub use meta::{RopeYarn, rope_layout_code};
 
@@ -689,6 +690,10 @@ pub struct VulkanBackend {
     /// `rmsnorm_add_rows` with the per-layer output scale folded in — see
     /// `vulkan_shaders::shader_source_rmsnorm_add_scale_rows`.
     rmsnorm_add_scale_rows_pipeline: wgpu::ComputePipeline,
+    /// gemma4's per-layer-embedding inputs for a prefill, on the device —
+    /// `vulkan_shaders::shader_source_ple_inputs`, see
+    /// [`Self::ple_inputs_prefill`].
+    ple_inputs_pipeline: wgpu::ComputePipeline,
     /// The row-strided norms on the wide kernel, taken for a row width that
     /// is a multiple of four unless `ORANGU_NORM_WIDE=0` — see
     /// `vulkan_shaders::shader_source_rmsnorm_wide_shaped`.
@@ -809,6 +814,12 @@ pub struct VulkanBackend {
     /// cooperative kernel is available and the model actually has a group to
     /// share over; opt out with `ORANGU_NO_PREFILL_GQA`.
     prefill_gqa: bool,
+    /// Whether the prefill attention dispatch is the tiled kernel
+    /// (`vulkan_shaders::shader_source_attention_prefill_tiled`: a tile of
+    /// queries per workgroup, the window in blocks) rather than the
+    /// per-query kernels. On by default with subgroups; `ORANGU_PREFILL_TILED_ATTN=0`
+    /// is the control arm.
+    prefill_tiled_attn: bool,
     /// Multi-query attention — prefill's counterpart to `attn_pipeline`. Built
     /// lazily **per (head_dim, heads-per-workgroup)**: per head_dim like
     /// `attn_split_pipelines` and for the same reason (the classic kernel's
@@ -951,7 +962,25 @@ pub struct VulkanBackend {
     /// taken for a `Q4_K` projection of a batch that fits its tile unless
     /// `ORANGU_PREFILL_MMQ=0`.
     mmq_q4k_pipeline: Option<wgpu::ComputePipeline>,
+    /// The 128 × 128-tile form of the `Q4_K` kernel
+    /// (`vulkan_shaders::shader_source_mmq_q4k_wide`), taken by the
+    /// projections wide enough to fill the device with it — see
+    /// [`Self::mmq_kernel_for`].
+    mmq_q4k_wide_pipeline: Option<wgpu::ComputePipeline>,
+    mmq_q4k_mid_pipeline: Option<wgpu::ComputePipeline>,
     mmq_q6k_pipeline: Option<wgpu::ComputePipeline>,
+    mmq_q6k_wide_pipeline: Option<wgpu::ComputePipeline>,
+    mmq_q6k_mid_pipeline: Option<wgpu::ComputePipeline>,
+    /// The byte-unpacked wide kernels
+    /// (`vulkan_shaders::shader_source_mmq_wide_bytes`) for the other
+    /// weight types, built on first use per `(type, rows)` — a model
+    /// carries two or three types, not six, and a kernel nobody dispatches
+    /// costs nothing at start-up. `None` when the integer-dot GEMMs are off
+    /// (`prefill_mmq`), or `Some(empty)` before any is built.
+    mmq_bytes_pipelines: Option<Mutex<HashMap<(u32, u32), wgpu::ComputePipeline>>>,
+    /// Whether the integer-dot kernels keep the injected bounds clamps —
+    /// see `ORANGU_CHECKED_MMQ`; a lazily built one has to know too.
+    checked_mmq: bool,
     quantize_q8_rows_pipeline: Option<wgpu::ComputePipeline>,
     /// Whether the integer-dot GEMM is built on this device: the flag, or
     /// where it is unset, the driver's own word that the packed dot is a
@@ -1037,6 +1066,14 @@ pub struct VulkanBackend {
     /// restores the element-wise `reduce` for these types — the control for
     /// its measurement.
     block_hoisted_pipelines: HashMap<u32, wgpu::ComputePipeline>,
+    /// The block-hoisted pipelines at [`BLOCK_HOISTED_WIDE_ROWS`] rows per
+    /// workgroup, for the types with a word-reading `block_dot` — taken for
+    /// a projection of [`BLOCK_HOISTED_WIDE_MIN_OUT`] rows or more, where
+    /// one row per workgroup leaves each workgroup too short-lived for its
+    /// fixed cost (measured: the E2B `Q2_K` FFN gate 2.54 → 1.88 ms per
+    /// token at four rows, the 256-wide per-layer projections 0.41 → 1.58 —
+    /// hence the split by width). `ORANGU_BLOCK_HOISTED_WIDE=0` turns it off.
+    block_hoisted_wide_pipelines: HashMap<u32, wgpu::ComputePipeline>,
     /// The `vec4`, loads-in-flight decode matvec for the float weight types
     /// (`vulkan_shaders::shader_source_reduce_float_wide`), taken ahead of
     /// the generic `reduce` for `F32`/`F16` at decode. Opt out with
@@ -1860,16 +1897,42 @@ impl CachedOpResources {
 /// Sweepable as `ORANGU_COOP_MIN_TOKENS`; `PERF-GAP.md` has the sweep.
 const COOP_MIN_N_TOKENS: usize = 24;
 
-/// The shared backend-wide token cap, but never below the Vulkan tiled/reduce
-/// crossover. Other backends can split at any positive width; the `wgpu`
-/// prefill paths need at least [`COOP_MIN_N_TOKENS`] so a tuned run cannot
+/// Below this many 128 × 128 workgroups the wide integer-dot kernel leaves
+/// compute units idle and the narrow one is faster; see
+/// `VulkanBackend::mmq_kernel_for`. Sweepable as `ORANGU_MMQ_WIDE_MIN_WG`.
+fn mmq_wide_min_workgroups() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("ORANGU_MMQ_WIDE_MIN_WG")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32)
+    })
+}
+
+/// The token stripe of one `wgpu` prefill submission: [`WGPU_STRIPE_TOKENS`]
+/// unless `ORANGU_MAX_TOKENS_PER_SUBMISSION` says otherwise, and never below
+/// the tiled/reduce crossover [`COOP_MIN_N_TOKENS`], so a tuned run cannot
 /// accidentally push a wide stripe onto the "small batch" shape everywhere.
 pub(crate) fn max_matmul_tokens_per_submission() -> usize {
     static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
-        crate::engine::backend::max_multi_token_phase_tokens().max(COOP_MIN_N_TOKENS)
+        std::env::var("ORANGU_MAX_TOKENS_PER_SUBMISSION")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(WGPU_STRIPE_TOKENS)
+            .max(COOP_MIN_N_TOKENS)
     })
 }
+
+/// The default `wgpu` prefill stripe, wider than the backend-wide phase cap
+/// the other backends share: the integer-dot GEMMs' 128-token tiles reach
+/// their rate at 512 (measured: the same kernel at 256 tokens runs at
+/// three quarters of it), and every element-wise dispatch in the chains is
+/// grid-stride, so nothing bounds the stripe but the device's memory.
+/// `ORANGU_MAX_TOKENS_PER_SUBMISSION` overrides it for a sweep.
+const WGPU_STRIPE_TOKENS: usize = 512;
 
 /// How many rows a buffer holding a prefill's residual stream needs for
 /// `n_tokens`: the chains write every stripe padded (`padded_stripe_len`),
@@ -2038,6 +2101,12 @@ static Q4K_GLSL_GEMV_SPIRV: &[u8] = include_bytes!("shaders/q4k_gemv.spv");
 /// `REDUCE_N_ROWS_DEFAULT`. Read once from `ORANGU_REDUCE_N_ROWS` (clamped
 /// `1..=16`) so the same value drives both pipeline creation and the
 /// dispatch-count math.
+/// Rows per workgroup of the wide block-hoisted pipelines, and the
+/// narrowest projection they are taken for — see
+/// `VulkanBackend::block_hoisted_wide_pipelines`.
+const BLOCK_HOISTED_WIDE_ROWS: usize = 4;
+const BLOCK_HOISTED_WIDE_MIN_OUT: usize = 2048;
+
 fn reduce_n_rows() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -2937,6 +3006,18 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
     /// Release builds keep the old behaviour exactly: `debug_assert!` compiles
     /// out, and a count that is genuinely too large still reaches `wgpu`,
     /// which rejects it with the same message it always did.
+    /// Workgroup count for a grid-stride dispatch over `elems` elements at
+    /// 64 per group: as many as the elements ask for, capped at the device's
+    /// workgroups-per-dimension limit — the kernel walks on by the grid's
+    /// width past that, so the count is a choice rather than a constraint
+    /// and no token stripe has to be bounded for it.
+    fn strided_workgroups(&self, elems: usize) -> u32 {
+        (elems as u32)
+            .div_ceil(64)
+            .min(self.device.limits().max_compute_workgroups_per_dimension)
+            .max(1)
+    }
+
     fn flat_workgroups(&self, elems: usize) -> u32 {
         let groups = (elems as u32).div_ceil(64);
         debug_assert!(
@@ -3310,6 +3391,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                 "flash_attn": self.flash_attn,
                 "prefill_attn": self.prefill_attn,
                 "prefill_gqa": self.prefill_gqa,
+                "prefill_tiled_attn": self.prefill_tiled_attn,
                 "gpu_sample": self.gpu_sample,
                 "gpu_timestamps": self.gpu_timestamps,
                 "q4_k_light": self.q4_k_light_pipeline.is_some(),
@@ -3325,6 +3407,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                 // device — off where the driver does not accelerate the
                 // packed dot, which a split model's overflow device may not.
                 "prefill_mmq": self.prefill_mmq,
+                "prefill_mmq_wide": self.mmq_q4k_wide_pipeline.is_some(),
             },
             "tuning": {
                 "coop_min_n_tokens": self.coop_min_n_tokens,
@@ -3877,6 +3960,40 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                 cache: pipeline_cache.as_ref(),
             })
         };
+        // The tiled integer-dot GEMMs are built without the injected
+        // bounds clamps whatever `ORANGU_TRUSTED_SHADERS` says. Every index
+        // they form is bounded by construction rather than by the clamp:
+        // the grid comes from `out_dim` (a multiple of the row tile, checked
+        // in `mmq_for`) and the q8 buffer is padded to whole token tiles
+        // (`mmq_stage`), so a workgroup's rows and tokens exist; shared
+        // memory is indexed by lane and unrolled constant; the only write
+        // guarded by a runtime test is the output row, and it is. Measured
+        // on the wide `Q4_K` tile at 512 tokens the clamps cost 46% of the
+        // kernel — one `v_min_u32` and an add per shared-memory read on a
+        // kernel already at the register limit. `ORANGU_CHECKED_MMQ=1`
+        // puts them back for a bisect.
+        let checked_mmq = crate::engine::env::flag_on("ORANGU_CHECKED_MMQ");
+        let build_mmq_pipeline = |source: String| {
+            if checked_mmq {
+                return build_pipeline(source);
+            }
+            let desc = wgpu::ShaderModuleDescriptor {
+                label: Some("orangu-server integer-dot GEMM shader"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            };
+            // Safety: see above — the kernels bound their own indices.
+            let module = unsafe {
+                device.create_shader_module_trusted(desc, wgpu::ShaderRuntimeChecks::unchecked())
+            };
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("orangu-server integer-dot GEMM pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: pipeline_cache.as_ref(),
+            })
+        };
 
         let mut pipelines = HashMap::with_capacity(SUPPORTED_TYPES.len());
         let mut pipelines_coop = HashMap::with_capacity(SUPPORTED_TYPES.len());
@@ -3993,6 +4110,10 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         let rmsnorm_add_scale_rows_pipeline = build_elem_pipeline(
             &elem5_pipeline_layout,
             vulkan_shaders::shader_source_rmsnorm_add_scale_rows(),
+        );
+        let ple_inputs_pipeline = build_elem_pipeline(
+            &elem5_pipeline_layout,
+            vulkan_shaders::shader_source_ple_inputs(),
         );
         let rmsnorm_rows_wide_pipeline = build_elem_pipeline(
             &elem4_pipeline_layout,
@@ -4202,14 +4323,39 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             Err(_) => integer_dot_accelerated,
         };
         let mmq_q4k_pipeline =
-            prefill_mmq.then(|| build_pipeline(vulkan_shaders::shader_source_mmq_q4k()));
+            prefill_mmq.then(|| build_mmq_pipeline(vulkan_shaders::shader_source_mmq_q4k()));
+        // `ORANGU_PREFILL_MMQ_WIDE=0` keeps every GEMM on the narrow tiles —
+        // the control arm for measuring the wide ones.
+        let mmq_wide =
+            prefill_mmq && crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_MMQ_WIDE");
+        let mmq_q4k_wide_pipeline = mmq_wide.then(|| {
+            build_mmq_pipeline(vulkan_shaders::shader_source_mmq_q4k_wide(
+                vulkan_shaders::MMQ_WIDE_TILE_ROWS,
+            ))
+        });
+        let mmq_q4k_mid_pipeline = mmq_wide.then(|| {
+            build_mmq_pipeline(vulkan_shaders::shader_source_mmq_q4k_wide(
+                vulkan_shaders::MMQ_MID_TILE_ROWS,
+            ))
+        });
         // The `Q6_K` form: 21% faster than the float kernel on the probe and
         // ~3% on a prefill (its staging reads the 210-byte blocks a word at
         // a time, half of them misaligned); `ORANGU_PREFILL_MMQ_Q6K=0` keeps
         // that one projection on the float kernel.
-        let mmq_q6k_pipeline = (prefill_mmq
-            && crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_MMQ_Q6K"))
-        .then(|| build_pipeline(vulkan_shaders::shader_source_mmq_q6k()));
+        let mmq_q6k =
+            prefill_mmq && crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_MMQ_Q6K");
+        let mmq_q6k_pipeline =
+            mmq_q6k.then(|| build_mmq_pipeline(vulkan_shaders::shader_source_mmq_q6k()));
+        let mmq_q6k_wide_pipeline = (mmq_q6k && mmq_wide).then(|| {
+            build_mmq_pipeline(vulkan_shaders::shader_source_mmq_q6k_wide(
+                vulkan_shaders::MMQ_WIDE_TILE_ROWS,
+            ))
+        });
+        let mmq_q6k_mid_pipeline = (mmq_q6k && mmq_wide).then(|| {
+            build_mmq_pipeline(vulkan_shaders::shader_source_mmq_q6k_wide(
+                vulkan_shaders::MMQ_MID_TILE_ROWS,
+            ))
+        });
         let quantize_q8_rows_pipeline = prefill_mmq.then(|| {
             build_elem_pipeline(
                 &elem3_pipeline_layout,
@@ -4314,6 +4460,25 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                         let source = vulkan_shaders::shader_source_reduce_block_hoisted(
                             ggml_type,
                             reduce_n_rows(),
+                            subgroup_reduce,
+                        )?;
+                        Some((ggml_type, build_pipeline(source)))
+                    })
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+        let block_hoisted_wide_pipelines: HashMap<u32, wgpu::ComputePipeline> =
+            if !block_hoisted_pipelines.is_empty()
+                && crate::engine::env::flag_on_unless_disabled("ORANGU_BLOCK_HOISTED_WIDE")
+            {
+                SUPPORTED_TYPES
+                    .iter()
+                    .filter(|&&ggml_type| vulkan_shaders::has_words_block_dot(ggml_type))
+                    .filter_map(|&ggml_type| {
+                        let source = vulkan_shaders::shader_source_reduce_block_hoisted(
+                            ggml_type,
+                            BLOCK_HOISTED_WIDE_ROWS,
                             subgroup_reduce,
                         )?;
                         Some((ggml_type, build_pipeline(source)))
@@ -4614,6 +4779,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             rmsnorm_rows_pipeline,
             rmsnorm_add_rows_pipeline,
             rmsnorm_add_scale_rows_pipeline,
+            ple_inputs_pipeline,
             rmsnorm_rows_wide_pipeline,
             rmsnorm_add_rows_wide_pipeline,
             rmsnorm_add_scale_rows_wide_pipeline,
@@ -4640,6 +4806,8 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                 "ORANGU_PREFILL_FUSED_ATTN",
             ),
             prefill_gqa: attn_coop && (!crate::engine::env::flag_on("ORANGU_NO_PREFILL_GQA")),
+            prefill_tiled_attn: supports_subgroup
+                && crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_TILED_ATTN"),
             attn_prefill_pipelines: Mutex::new(HashMap::new()),
             attn_split_pipelines: Mutex::new(HashMap::new()),
             attn_pipeline_layout,
@@ -4659,7 +4827,13 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             q8_quantize_pipeline,
             q4_k_mmvq_fused_pipeline,
             mmq_q4k_pipeline,
+            mmq_q4k_wide_pipeline,
+            mmq_q4k_mid_pipeline,
             mmq_q6k_pipeline,
+            mmq_q6k_wide_pipeline,
+            mmq_q6k_mid_pipeline,
+            mmq_bytes_pipelines: mmq_wide.then(|| Mutex::new(HashMap::new())),
+            checked_mmq,
             quantize_q8_rows_pipeline,
             prefill_mmq,
             packed_dot_f16,
@@ -4670,6 +4844,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             wide_unroll,
             wide_unroll_pipelines,
             block_hoisted_pipelines,
+            block_hoisted_wide_pipelines,
             float_wide_pipelines,
             q4_k_unroll_packed_pipeline,
             q4_k_dual_pipeline,
@@ -5851,7 +6026,7 @@ impl VulkanBackend {
                     timestamp_writes: None,
                 });
                 for (op, guard) in ops.iter().zip(guards.iter()) {
-                    pass.set_pipeline(self.pipeline_for(op.w.ggml_type(), op.w.in_dim, padded));
+                    pass.set_pipeline(self.matmul_pipeline_for(op.w, padded));
                     pass.set_bind_group(0, &guard.bind_group, &[]);
                     let (wx, wy, wz) = guard.workgroups;
                     pass.dispatch_workgroups(wx, wy, wz);
@@ -5955,6 +6130,24 @@ impl VulkanBackend {
         workgroups: (u32, u32, u32),
         reps: u32,
     ) -> Option<f64> {
+        self.dispatch_kernels_us(pipeline, &[bind_group], workgroups, reps)
+    }
+
+    /// [`Self::dispatch_kernel_us`] over several bind groups, cycled across
+    /// the repetitions. One bind group repeated measures the kernel on
+    /// operands the last repetition left in the cache; a model runs the
+    /// kernel on a different layer's weights every time, and rotating
+    /// through as many distinct weight buffers as outrun the cache is what
+    /// reproduces that.
+    #[cfg(test)]
+    fn dispatch_kernels_us(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        bind_groups: &[&wgpu::BindGroup],
+        workgroups: (u32, u32, u32),
+        reps: u32,
+    ) -> Option<f64> {
+        let bind_group = bind_groups[0];
         if !self
             .device
             .features()
@@ -6006,8 +6199,8 @@ impl VulkanBackend {
                 }),
             });
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, bind_group, &[]);
-            for _ in 0..reps {
+            for i in 0..reps as usize {
+                pass.set_bind_group(0, bind_groups[i % bind_groups.len()], &[]);
                 pass.dispatch_workgroups(wx, wy, wz);
             }
         }
@@ -6203,8 +6396,8 @@ impl VulkanBackend {
                 self.record_mmq_quantize(&mut pass, qbg, *qwg);
             }
             for ((pipeline, guard), mmq) in pipelines.iter().zip(guards.iter()).zip(&mmq_ops) {
-                if let Some((bg, grid, ggml_type)) = mmq {
-                    self.record_mmq(&mut pass, bg, *grid, *ggml_type);
+                if let Some((bg, grid, kernel)) = mmq {
+                    self.record_mmq(&mut pass, bg, *grid, *kernel);
                     continue;
                 }
                 pass.set_pipeline(pipeline);
@@ -6369,6 +6562,39 @@ impl VulkanBackend {
         n_tokens: usize,
     ) -> &wgpu::ComputePipeline {
         self.pipeline_for_named(ggml_type, in_dim, n_tokens).0
+    }
+
+    /// The wide block-hoisted pipeline for this op, when it applies: a
+    /// decode shape the ladder would give the block-hoisted kernel, on a
+    /// projection of `BLOCK_HOISTED_WIDE_MIN_OUT` rows or more.
+    fn block_hoisted_wide_for(
+        &self,
+        w: &QuantMatrix,
+        n_tokens: usize,
+    ) -> Option<&wgpu::ComputePipeline> {
+        if w.out_dim < BLOCK_HOISTED_WIDE_MIN_OUT {
+            return None;
+        }
+        let pipeline = self.block_hoisted_wide_pipelines.get(&w.ggml_type())?;
+        (self.pipeline_for_named(w.ggml_type(), w.in_dim, n_tokens).1 == "block-hoisted")
+            .then_some(pipeline)
+    }
+
+    /// [`Self::pipeline_for`] for a matmul op — the wide block-hoisted
+    /// pipeline where it applies, the ladder's choice otherwise.
+    fn matmul_pipeline_for(&self, w: &QuantMatrix, n_tokens: usize) -> &wgpu::ComputePipeline {
+        self.block_hoisted_wide_for(w, n_tokens)
+            .unwrap_or_else(|| self.pipeline_for(w.ggml_type(), w.in_dim, n_tokens))
+    }
+
+    /// Rows per workgroup of the decode pipeline `matmul_pipeline_for`
+    /// picks — what its dispatch grid is sized by.
+    fn decode_rows_per_workgroup(&self, w: &QuantMatrix, n_tokens: usize) -> usize {
+        if self.block_hoisted_wide_for(w, n_tokens).is_some() {
+            BLOCK_HOISTED_WIDE_ROWS
+        } else {
+            reduce_n_rows()
+        }
     }
 
     /// [`Self::pipeline_for`] plus the *name* of the kernel it picked.
@@ -7104,7 +7330,7 @@ impl VulkanBackend {
         } else if one_row_per_workgroup {
             (out_dim * n_tokens) as u32
         } else {
-            (out_dim.div_ceil(reduce_n_rows()) * n_tokens) as u32
+            (out_dim.div_ceil(self.decode_rows_per_workgroup(w, n_tokens)) * n_tokens) as u32
         };
         let workgroups = Self::workgroup_dims(total_workgroups);
 
@@ -7562,6 +7788,13 @@ pub struct KvReadbackStage {
     used: u64,
 }
 
+/// A chunk's K/V readback between [`VulkanBackend::defer_kv_rows`] and its
+/// [`VulkanBackend::fill_deferred_kv_rows`].
+struct DeferredKvFill {
+    stage: KvReadbackStage,
+    pending: Vec<(usize, Vec<PendingKvRows>)>,
+}
+
 impl KvReadbackStage {
     /// Reserves `bytes` of the stage, or `None` when it is full — the caller
     /// then waits for that layer's rows as before.
@@ -7853,9 +8086,69 @@ pub struct FusedLayerInput<'a> {
 }
 
 /// One integer-dot GEMM dispatch as [`VulkanBackend::mmq_op`] builds it:
-/// its bind group, its workgroup grid, and the weight type that names the
-/// kernel.
-type MmqDispatch = (wgpu::BindGroup, (u32, u32, u32), u32);
+/// its bind group, its workgroup grid, and the kernel.
+type MmqDispatch = (wgpu::BindGroup, (u32, u32, u32), MmqKernel);
+
+/// Which integer-dot GEMM kernel a dispatch runs — the weight type, and
+/// for `Q4_K` which of its two tile geometries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MmqKernel {
+    Q4k,
+    Q4kWide,
+    Q4kMid,
+    Q6k,
+    Q6kWide,
+    Q6kMid,
+    /// The byte-unpacked wide kernel for `ggml_type` at `rows` per tile.
+    Bytes {
+        ggml_type: u32,
+        rows: u32,
+    },
+}
+
+impl MmqKernel {
+    /// The output tile one workgroup computes, `(rows, tokens)`.
+    fn tile(self) -> (u32, u32) {
+        match self {
+            MmqKernel::Q4k => (
+                vulkan_shaders::MMQ_TILE_ROWS,
+                vulkan_shaders::MMQ_Q4K_TILE_TOKENS,
+            ),
+            MmqKernel::Q4kWide => (
+                vulkan_shaders::MMQ_WIDE_TILE_ROWS,
+                vulkan_shaders::MMQ_WIDE_TILE_TOKENS,
+            ),
+            MmqKernel::Q6k => (
+                vulkan_shaders::MMQ_TILE_ROWS,
+                vulkan_shaders::MMQ_Q6K_TILE_TOKENS,
+            ),
+            MmqKernel::Q6kWide => (
+                vulkan_shaders::MMQ_WIDE_TILE_ROWS,
+                vulkan_shaders::MMQ_WIDE_TILE_TOKENS,
+            ),
+            MmqKernel::Q4kMid | MmqKernel::Q6kMid => (
+                vulkan_shaders::MMQ_MID_TILE_ROWS,
+                vulkan_shaders::MMQ_WIDE_TILE_TOKENS,
+            ),
+            MmqKernel::Bytes { rows, .. } => (rows, vulkan_shaders::MMQ_WIDE_TILE_TOKENS),
+        }
+    }
+
+    /// The name the probes print.
+    #[cfg(test)]
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            MmqKernel::Q4k => "mmq-q4k",
+            MmqKernel::Q4kWide => "mmq-q4k-wide",
+            MmqKernel::Q6k => "mmq-q6k",
+            MmqKernel::Q6kWide => "mmq-q6k-wide",
+            MmqKernel::Q4kMid => "mmq-q4k-mid",
+            MmqKernel::Q6kMid => "mmq-q6k-mid",
+            MmqKernel::Bytes { rows: 128, .. } => "mmq-bytes-wide",
+            MmqKernel::Bytes { .. } => "mmq-bytes-mid",
+        }
+    }
+}
 
 impl VulkanBackend {
     /// The gated-FFN activation kernel for `act`.
@@ -8040,21 +8333,122 @@ impl VulkanBackend {
     /// weight whose shape fits the kernel's tiles (see
     /// `vulkan_shaders::shader_source_mmq_q4k`), with the kernel built.
     fn mmq_for(&self, w: &QuantMatrix, n_tokens: usize) -> bool {
-        self.mmq_pipeline_for(w.ggml_type()).is_some()
-            && !MMQ_OFF_ON_THIS_THREAD.with(|c| c.get())
+        !MMQ_OFF_ON_THIS_THREAD.with(|c| c.get())
             && w.in_dim.is_multiple_of(256)
             && w.out_dim
                 .is_multiple_of(vulkan_shaders::MMQ_TILE_ROWS as usize)
             && n_tokens >= vulkan_shaders::MMQ_Q4K_TILE_TOKENS as usize
+            && self.mmq_kernel_for(w, n_tokens).is_some()
     }
 
-    /// The integer-dot GEMM kernel for a weight type, where there is one.
-    fn mmq_pipeline_for(&self, ggml_type: u32) -> Option<&wgpu::ComputePipeline> {
-        match ggml_type {
-            t if t == crate::engine::quant::GGML_TYPE_Q4_K => self.mmq_q4k_pipeline.as_ref(),
-            t if t == crate::engine::quant::GGML_TYPE_Q6_K => self.mmq_q6k_pipeline.as_ref(),
-            _ => None,
+    /// The kernel a GEMM of this shape and weight type runs, or `None` for
+    /// a type without one. The wide tiles want the device full: below the
+    /// workgroup floor the narrow kernel's 64 × 32 tiles keep more compute
+    /// units busy, so a projection narrower than that, or a short batch,
+    /// stays on it where the type has one.
+    fn mmq_kernel_for(&self, w: &QuantMatrix, n_tokens: usize) -> Option<MmqKernel> {
+        use crate::engine::quant::{GGML_TYPE_Q4_K, GGML_TYPE_Q6_K};
+        let ggml_type = w.ggml_type();
+        let (narrow, wide, mid) = match ggml_type {
+            GGML_TYPE_Q6_K => (Some(MmqKernel::Q6k), MmqKernel::Q6kWide, MmqKernel::Q6kMid),
+            GGML_TYPE_Q4_K => (Some(MmqKernel::Q4k), MmqKernel::Q4kWide, MmqKernel::Q4kMid),
+            // The other types have the wide tiles only; a projection too
+            // narrow for either stays on the float kernel.
+            t if vulkan_shaders::mmq_wide_bytes_types().contains(&t) => (
+                None,
+                MmqKernel::Bytes {
+                    ggml_type: t,
+                    rows: vulkan_shaders::MMQ_WIDE_TILE_ROWS,
+                },
+                MmqKernel::Bytes {
+                    ggml_type: t,
+                    rows: vulkan_shaders::MMQ_MID_TILE_ROWS,
+                },
+            ),
+            _ => return None,
+        };
+        // Tallest tile first: each halving of the tile doubles the
+        // workgroups and halves the reuse per staged byte. The tall tile
+        // asks for twice the floor — at exactly one round of workgroups it
+        // leaves half the device idle on the second, and measured on the
+        // down projection at 512 tokens (48 tall tiles against 96 half
+        // ones) the half tile was 1.4× faster on `Q6_K` and level on `Q4_K`.
+        let floor = mmq_wide_min_workgroups();
+        for (kernel, min) in [(wide, 2 * floor), (mid, floor)] {
+            let (rows, toks) = kernel.tile();
+            let workgroups = (w.out_dim / rows as usize) * n_tokens.div_ceil(toks as usize);
+            if w.out_dim.is_multiple_of(rows as usize)
+                && workgroups >= min
+                && self.mmq_pipeline(kernel).is_some()
+            {
+                return Some(kernel);
+            }
         }
+        narrow.filter(|k| self.mmq_pipeline(*k).is_some())
+    }
+
+    /// The pipeline of an integer-dot kernel. A `wgpu` pipeline is a
+    /// handle, so the clone is cheap; the byte-unpacked ones are built here
+    /// on first use.
+    fn mmq_pipeline(&self, kernel: MmqKernel) -> Option<wgpu::ComputePipeline> {
+        match kernel {
+            MmqKernel::Q4k => self.mmq_q4k_pipeline.clone(),
+            MmqKernel::Q4kWide => self.mmq_q4k_wide_pipeline.clone(),
+            MmqKernel::Q6k => self.mmq_q6k_pipeline.clone(),
+            MmqKernel::Q6kWide => self.mmq_q6k_wide_pipeline.clone(),
+            MmqKernel::Q4kMid => self.mmq_q4k_mid_pipeline.clone(),
+            MmqKernel::Q6kMid => self.mmq_q6k_mid_pipeline.clone(),
+            MmqKernel::Bytes { ggml_type, rows } => {
+                let table = self.mmq_bytes_pipelines.as_ref()?;
+                let mut table = table.lock().unwrap_or_else(|p| p.into_inner());
+                Some(
+                    table
+                        .entry((ggml_type, rows))
+                        .or_insert_with(|| {
+                            self.build_mmq_pipeline_lazily(
+                                vulkan_shaders::shader_source_mmq_wide_bytes(ggml_type, rows),
+                            )
+                        })
+                        .clone(),
+                )
+            }
+        }
+    }
+
+    /// [`Self::mmq_pipeline`]'s builder for a kernel first needed after
+    /// start-up: the matmul bind-group layout, and the integer-dot kernels'
+    /// unchecked indexing unless `ORANGU_CHECKED_MMQ` asked for the clamps
+    /// (the argument is in `new`, beside the start-up builder).
+    fn build_mmq_pipeline_lazily(&self, source: String) -> wgpu::ComputePipeline {
+        let desc = wgpu::ShaderModuleDescriptor {
+            label: Some("orangu-server integer-dot GEMM shader"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        };
+        let module = if self.checked_mmq {
+            self.device.create_shader_module(desc)
+        } else {
+            // Safety: the kernels bound their own indices — see `new`.
+            unsafe {
+                self.device
+                    .create_shader_module_trusted(desc, wgpu::ShaderRuntimeChecks::unchecked())
+            }
+        };
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("orangu-server integer-dot GEMM pipeline layout"),
+                bind_group_layouts: &[Some(&self.bind_group_layout)],
+                immediate_size: 0,
+            });
+        self.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("orangu-server integer-dot GEMM pipeline"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            })
     }
 
     /// The quantized form of one activation batch for the integer-dot GEMM:
@@ -8069,7 +8463,7 @@ impl VulkanBackend {
         // Whole token tiles of the widest kernel: a kernel stages the last
         // tile's padding rows too (and discards their results), so they have
         // to exist.
-        let tile = vulkan_shaders::MMQ_Q6K_TILE_TOKENS as usize;
+        let tile = vulkan_shaders::MMQ_MAX_TILE_TOKENS as usize;
         let words = n_tokens.div_ceil(tile) * tile * (in_dim / 256) * 96;
         let q8 = self.scratch_buffer(words);
         let meta = self.elem_meta_buffer_aux((n_tokens * in_dim) as u32, in_dim as u32);
@@ -8101,12 +8495,16 @@ impl VulkanBackend {
             entry.output_src(),
             BindSrc::Slice(&entry.meta_chunk, entry.meta_offset, entry.meta_size),
         );
+        let kernel = self
+            .mmq_kernel_for(w, entry.n_tokens)
+            .expect("mmq_for admitted the op");
+        let (rows, toks) = kernel.tile();
         let grid = (
-            (w.out_dim as u32) / vulkan_shaders::MMQ_TILE_ROWS,
-            (entry.n_tokens as u32).div_ceil(vulkan_shaders::mmq_tile_tokens(w.ggml_type())),
+            (w.out_dim as u32) / rows,
+            (entry.n_tokens as u32).div_ceil(toks),
             1,
         );
-        (bg, grid, w.ggml_type())
+        (bg, grid, kernel)
     }
 
     /// Records an [`Self::mmq_op`].
@@ -8115,34 +8513,45 @@ impl VulkanBackend {
         pass: &mut wgpu::ComputePass<'_>,
         bg: &wgpu::BindGroup,
         grid: (u32, u32, u32),
-        ggml_type: u32,
+        kernel: MmqKernel,
     ) {
-        pass.set_pipeline(
-            self.mmq_pipeline_for(ggml_type)
-                .expect("mmq op built without its kernel"),
-        );
+        let pipeline = self
+            .mmq_pipeline(kernel)
+            .expect("mmq op built without its kernel");
+        pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, bg, &[]);
         pass.dispatch_workgroups(grid.0, grid.1, grid.2);
     }
 
     /// Probe-only: the device time of the integer-dot GEMM dispatch alone
     /// (the activations quantized once beforehand), as
-    /// [`Self::matmul_kernel_us_tokens`] measures the float kernel.
+    /// [`Self::matmul_kernel_us_tokens`] measures the float kernel —
+    /// cycling through `weights`, every repetition a different matrix of
+    /// the same shape, so the reading is the kernel on weights the previous
+    /// dispatch did not just leave in the cache. One matrix repeated reads
+    /// 30% higher than a layer loop ever sees.
     #[cfg(test)]
-    pub(super) fn mmq_kernel_us_tokens(
+    pub(super) fn mmq_kernel_us_tokens_rotating(
         &self,
         x: &[f32],
         n_tokens: usize,
-        w: &QuantMatrix,
+        weights: &[QuantMatrix],
         reps: u32,
-    ) -> Option<f64> {
+    ) -> Option<(f64, &'static str)> {
+        let w = &weights[0];
         if !self.mmq_for(w, n_tokens) {
             return None;
         }
-        let op = MatmulOp { x, n_tokens, w };
         let _region_guard = self.prefill_region_guard();
-        let entry = self.op_entry_streamed(&op, 0, ROLE_BATCH, false);
-        let guard = entry.lock().expect("op cache entry poisoned");
+        let entries: Vec<_> = weights
+            .iter()
+            .map(|w| self.op_entry_streamed(&MatmulOp { x, n_tokens, w }, 0, ROLE_BATCH, false))
+            .collect();
+        let guards: Vec<_> = entries
+            .iter()
+            .map(|e| e.lock().expect("op cache entry poisoned"))
+            .collect();
+        let guard = &guards[0];
         let x_buf = self.upload_new(x);
         let (q8, qbg, qwg, _qmeta) = self.mmq_stage(BindSrc::Whole(&x_buf), n_tokens, w.in_dim);
         let mut encoder = self.new_encoder("orangu-server mmq probe quantize");
@@ -8154,9 +8563,16 @@ impl VulkanBackend {
             self.record_mmq_quantize(&mut pass, &qbg, qwg);
         }
         self.queue.submit(Some(encoder.finish()));
-        let (bg, grid, _) = self.mmq_op(w, &guard, &q8);
-        let pipeline = self.mmq_pipeline_for(w.ggml_type())?;
-        self.dispatch_kernel_us(pipeline, &bg, grid, reps)
+        let (_, grid, kernel) = self.mmq_op(w, guard, &q8);
+        let ops: Vec<MmqDispatch> = weights
+            .iter()
+            .zip(&guards)
+            .map(|(w, g)| self.mmq_op(w, g, &q8))
+            .collect();
+        let bgs: Vec<&wgpu::BindGroup> = ops.iter().map(|op| &op.0).collect();
+        let pipeline = self.mmq_pipeline(kernel)?;
+        self.dispatch_kernels_us(&pipeline, &bgs, grid, reps)
+            .map(|us| (us, kernel.name()))
     }
 
     /// Probe-only: the device time of `reps` dispatches of an ad-hoc kernel
@@ -8491,7 +8907,7 @@ impl VulkanBackend {
         let guard = entry.lock().expect("op cache entry poisoned");
         let x_buf = self.upload_new(x);
         let (q8, qbg, qwg, _qmeta) = self.mmq_stage(BindSrc::Whole(&x_buf), n_tokens, w.in_dim);
-        let (bg, grid, _) = self.mmq_op(w, &guard, &q8);
+        let (bg, grid, kernel) = self.mmq_op(w, &guard, &q8);
         let mut encoder = self.new_encoder("orangu-server mmq test");
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -8499,7 +8915,7 @@ impl VulkanBackend {
                 timestamp_writes: None,
             });
             self.record_mmq_quantize(&mut pass, &qbg, qwg);
-            self.record_mmq(&mut pass, &bg, grid, w.ggml_type());
+            self.record_mmq(&mut pass, &bg, grid, kernel);
         }
         Some(self.submit_and_readback(
             encoder,
@@ -9392,7 +9808,7 @@ impl VulkanBackend {
         // The entry's grid was sized for `entry.n_tokens`, so the kernel bound
         // here has to be the one that grid belongs to — see `CachedOpResources
         // ::n_tokens`.
-        pass.set_pipeline(self.pipeline_for(w.ggml_type(), w.in_dim, entry.n_tokens));
+        pass.set_pipeline(self.matmul_pipeline_for(w, entry.n_tokens));
         pass.set_bind_group(0, &entry.bind_group, &[]);
         let (wx, wy, wz) = entry.workgroups;
         pass.dispatch_workgroups(wx, wy, wz);
@@ -9603,7 +10019,7 @@ impl VulkanBackend {
     ) {
         // Same grid/kernel pairing as `record_matmul` — see
         // `CachedOpResources::n_tokens`.
-        pass.set_pipeline(self.pipeline_for(w.ggml_type(), w.in_dim, entry.n_tokens));
+        pass.set_pipeline(self.matmul_pipeline_for(w, entry.n_tokens));
         pass.set_bind_group(0, input_bg, &[]);
         let (wx, wy, wz) = entry.workgroups;
         pass.dispatch_workgroups(wx, wy, wz);
@@ -11217,9 +11633,11 @@ impl VulkanBackend {
         }
         let n_embd = down.out_dim;
         // The configured stripe, bounded by what the flat element-wise
-        // dispatches in this chain can actually express on this device.
+        // dispatches in this chain can actually express on this device. The
+        // activation over `n_tokens × n_ff` is grid-stride and needs no
+        // bound; the widest flat dispatch left is a row of the model width.
         let stripe_tokens =
-            max_matmul_tokens_per_submission().min(self.max_stripe_tokens_for(gate.out_dim));
+            max_matmul_tokens_per_submission().min(self.max_stripe_tokens_for(n_embd));
         if n_tokens > stripe_tokens {
             let mut out = Vec::with_capacity(n_tokens * n_embd);
             let mut start = 0;
@@ -11290,7 +11708,7 @@ impl VulkanBackend {
 
             pass.set_pipeline(&self.gelu_mul_pipeline);
             pass.set_bind_group(0, &bg_gelu_mul, &[]);
-            pass.dispatch_workgroups((elems as u32).div_ceil(64), 1, 1);
+            pass.dispatch_workgroups(self.strided_workgroups(elems), 1, 1);
 
             self.record_matmul(&mut pass, down, &down_g);
         }
@@ -11462,20 +11880,11 @@ impl VulkanBackend {
             entries: &entries,
         });
 
-        // The GQA kernel's workgroup covers `heads` query heads at once, so its
-        // grid is one workgroup per `(kv_head, head-slice)` — `n_head / heads`
-        // in total — where the ungrouped kernels need one per query head.
-        let group = n_head / n_head_kv;
-        let heads = self.attn_prefill_heads(head_dim, group);
-        let grid_x = if heads > 0 {
-            (n_head / heads as usize) as u32
-        } else {
-            n_head as u32
-        };
-        let prefill_pipeline = self.attn_prefill_pipeline_for(
+        let (prefill_pipeline, grid_x, grid_y) = self.attn_prefill_dispatch(
             head_dim,
-            group,
-            heads,
+            n_head,
+            n_head_kv,
+            n_tokens,
             if paged.is_some() {
                 vulkan_shaders::KvPaging::Paged
             } else {
@@ -11490,7 +11899,7 @@ impl VulkanBackend {
             });
             pass.set_pipeline(&prefill_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(grid_x, n_tokens as u32, 1);
+            pass.dispatch_workgroups(grid_x, grid_y, 1);
         }
         self.submit_and_readback(encoder, out_buf, 0, out_len)
     }
@@ -11620,6 +12029,34 @@ impl VulkanBackend {
         }
     }
 
+    /// Parks a chunk's K/V readback on its cache for a later
+    /// [`Self::fill_kv_rows`] — see `KvCache::deferred_fill`. The next
+    /// chunk calls [`Self::fill_deferred_kv_rows`] once its own chains are
+    /// submitted, so the wait for this chunk's rows overlaps that chunk's
+    /// device time instead of idling the device in front of it.
+    pub fn defer_kv_rows(
+        &self,
+        stage: KvReadbackStage,
+        pending: Vec<(usize, Vec<PendingKvRows>)>,
+        cache: &mut crate::engine::kv_cache::KvCache,
+    ) {
+        // Two in flight would need two stages; one chunk at a time is the
+        // contract, so an earlier one still parked is brought home first.
+        self.fill_deferred_kv_rows(cache);
+        cache.defer_pending_rows();
+        cache.deferred_fill = Some(Box::new(DeferredKvFill { stage, pending }));
+    }
+
+    /// Completes the readback [`Self::defer_kv_rows`] parked, if any.
+    pub fn fill_deferred_kv_rows(&self, cache: &mut crate::engine::kv_cache::KvCache) {
+        if let Some(parked) = cache.deferred_fill.take() {
+            match parked.downcast::<DeferredKvFill>() {
+                Ok(fill) => self.fill_kv_rows(fill.stage, fill.pending, cache),
+                Err(_) => unreachable!("only this backend parks a readback on a cache"),
+            }
+        }
+    }
+
     /// Brings home every K/V row a chunk's chains left in `stage`, in
     /// order, and fills them into their layer caches — one map and one wait
     /// for the whole chunk. Everything that wrote them has been submitted by
@@ -11651,6 +12088,7 @@ impl VulkanBackend {
                         let (k_rows, v_rows) = all.split_at(p.kv_elems);
                         cache.layers[*cache_index].fill_gpu_written(k_rows, v_rows);
                     }
+                    cache.layers[*cache_index].mark_pool_device_written();
                 }
             }
             stage.buffer.unmap();
@@ -12190,16 +12628,11 @@ impl VulkanBackend {
         // so keep a one-element buffer and skip the map entirely below.
         let combined = self.scratch_buffer(readback_len.max(1));
 
-        let heads = self.attn_prefill_heads(head_dim, (n_head / n_head_kv).max(1));
-        let grid_x = if heads > 0 {
-            (n_head / heads as usize) as u32
-        } else {
-            n_head as u32
-        };
-        let attn_pipeline = self.attn_prefill_pipeline_for(
+        let (attn_pipeline, grid_x, grid_y) = self.attn_prefill_dispatch(
             head_dim,
-            (n_head / n_head_kv).max(1),
-            heads,
+            n_head,
+            n_head_kv.max(1),
+            n_tokens,
             match paged {
                 Some(_) => vulkan_shaders::KvPaging::Paged,
                 None => vulkan_shaders::KvPaging::Contiguous,
@@ -12208,6 +12641,10 @@ impl VulkanBackend {
 
         let (mut encoder, grouped) =
             self.take_prefill_encoder("orangu-server fused prefill attention encoder");
+        // Stamped at the chain's first command, so what the previous chain
+        // left unstamped after its last dispatch (its readback copies) is
+        // reported under its own name rather than under this chain's norm.
+        self.op_stamp_encoder(&mut encoder, "pp.attn.begin");
         if let Some((bg, ..)) = &attn_norm_rows {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("orangu-server fused prefill attention norm pass"),
@@ -12483,7 +12920,7 @@ impl VulkanBackend {
             });
             pass.set_pipeline(&attn_pipeline);
             pass.set_bind_group(0, &attn_bg, &[]);
-            pass.dispatch_workgroups(grid_x, n_tokens as u32, 1);
+            pass.dispatch_workgroups(grid_x, grid_y, 1);
             self.op_stamp(&mut pass, "pp.attn.attention");
             if let Some(g) = &gate_g {
                 // `attn_out *= sigmoid(gate)`, in place, before anything
@@ -12679,11 +13116,11 @@ impl VulkanBackend {
         }
         let n_embd = wo.out_dim;
         debug_assert_eq!(down.out_dim, n_embd);
-        // Same bound as `fused_ffn_prefill`: this chain runs the same
-        // `n_tokens * n_ff` flat activation dispatch and overflows the same
-        // limit. Two functions, one invariant — see `max_stripe_tokens_for`.
+        // Same bound as `fused_ffn_prefill`: the activation is grid-stride,
+        // so the widest flat dispatch is a row of the model width. Two
+        // functions, one invariant — see `max_stripe_tokens_for`.
         let stripe_tokens =
-            max_matmul_tokens_per_submission().min(self.max_stripe_tokens_for(gate.out_dim));
+            max_matmul_tokens_per_submission().min(self.max_stripe_tokens_for(n_embd));
         if n_tokens > stripe_tokens {
             let mut all = Vec::with_capacity(if out.is_none() { n_tokens * n_embd } else { 0 });
             let mut start = 0;
@@ -13023,7 +13460,7 @@ impl VulkanBackend {
 
                 pass.set_pipeline(self.ffn_activation_pipeline(activation));
                 pass.set_bind_group(0, &bg_gelu_mul, &[]);
-                pass.dispatch_workgroups(self.flat_workgroups(n_tokens * ffn_len), 1, 1);
+                pass.dispatch_workgroups(self.strided_workgroups(n_tokens * ffn_len), 1, 1);
                 self.op_stamp(&mut pass, "pp.ffn.activation");
 
                 match &mmq_down {
@@ -13109,10 +13546,130 @@ impl VulkanBackend {
             n_tokens,
             gate,
             proj,
-            per_layer,
+            AttnOutSrc::Host(per_layer),
             None,
             None,
         )
+    }
+
+    /// gemma4's per-layer-embedding inputs for a whole prefill chunk,
+    /// computed on the device and left there: the projection of the scaled
+    /// embeddings `x` (`[n_tokens, n_embd]`) through `proj_w`, scaled,
+    /// RMS-normed per (token, layer) row against `proj_norm`, added to the
+    /// token's `gathered` per-layer embedding rows (token-major, as
+    /// `GemmaModel::gather_per_layer_tok_embd` lays them out) and scaled
+    /// again — `compute_per_layer_inputs` as one GEMM and one dispatch,
+    /// recorded into the open prefill group. The result is **layer-major**
+    /// with `prefill_rows_capacity(n_tokens)` rows per layer: layer `il`'s
+    /// `[n_tokens, per_layer]` operand starts at row `il * capacity`, which
+    /// is how [`Self::fused_ple_prefill_rows`] takes it as an
+    /// `AttnOutSrc::Gpu` — its striped tail reads rows up to the capacity.
+    ///
+    /// What this replaces was the host computing the same values between
+    /// chunks: a device GEMM with its `[n_tokens, n_layer × per_layer]`
+    /// result read back (18 MiB at 512 tokens on the served model), normed
+    /// and added on the CPU, then uploaded again a layer at a time — with
+    /// the device idle throughout, since the chunk's chains cannot start
+    /// without it. `None` when the row count would not fit one dispatch
+    /// dimension (a chunk wider than the sizer ever makes) or the MMVQ
+    /// diagnostic path is on; the caller then keeps the host computation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ple_inputs_prefill(
+        &self,
+        x: &[f32],
+        n_tokens: usize,
+        proj_w: &QuantMatrix,
+        proj_norm: &[f32],
+        gathered: &[f32],
+        n_layer: usize,
+        per_layer: usize,
+        eps: f32,
+    ) -> Option<wgpu::Buffer> {
+        if self.q4_k_mmvq {
+            return None;
+        }
+        let total = n_layer * per_layer;
+        debug_assert_eq!(proj_w.out_dim, total);
+        debug_assert_eq!(proj_norm.len(), per_layer);
+        debug_assert_eq!(gathered.len(), n_tokens * total);
+        debug_assert_eq!(x.len(), n_tokens * proj_w.in_dim);
+        let rows = n_tokens * n_layer;
+        if rows as u32 > self.device.limits().max_compute_workgroups_per_dimension {
+            return None;
+        }
+        let op = MatmulOp {
+            x,
+            n_tokens,
+            w: proj_w,
+        };
+        let _region_guard = self.prefill_region_guard();
+        let entry = self.op_entry_streamed(&op, 0, ROLE_BATCH, false);
+        let g = entry.lock().expect("op cache entry poisoned");
+        // Fresh buffers, not pooled regions: a `write_buffer` lands at the
+        // submission's start, and inside a group that is before the earlier
+        // chains' dispatches — safe only for memory nothing else reads.
+        let x_staged = self.upload_new(x);
+        let gathered_buf = self.upload_new(gathered);
+        let norm_w = self.upload_new(proj_norm);
+        let row_cap = prefill_rows_capacity(n_tokens);
+        let out = self.fresh_buffer(n_layer * row_cap * per_layer);
+        let meta = PleInMeta {
+            n_tokens: n_tokens as u32,
+            n_layer: n_layer as u32,
+            per_layer: per_layer as u32,
+            eps,
+            proj_scale: 1.0 / (proj_w.in_dim as f32).sqrt(),
+            in_scale: 1.0 / 2f32.sqrt(),
+            row_cap: row_cap as u32,
+            _p1: 0,
+        };
+        let meta_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server ple inputs meta"),
+            size: std::mem::size_of::<PleInMeta>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&meta_buf, 0, bytemuck::bytes_of(&meta));
+        let bg = self.elem5_bind_group(
+            g.output_src(),
+            &norm_w,
+            BindSrc::Whole(&gathered_buf),
+            BindSrc::Whole(&out),
+            &meta_buf,
+        );
+        let mmq = self.mmq_for(proj_w, n_tokens).then(|| {
+            let (q8, qbg, qwg, qmeta) =
+                self.mmq_stage(BindSrc::Whole(&x_staged), n_tokens, proj_w.in_dim);
+            let op = self.mmq_op(proj_w, &g, &q8);
+            (q8, qbg, qwg, qmeta, op)
+        });
+
+        let (mut encoder, grouped) =
+            self.take_prefill_encoder("orangu-server prefill PLE inputs encoder");
+        self.op_stamp_encoder(&mut encoder, "pp.gap");
+        let x_bytes = (n_tokens * proj_w.in_dim) as u64 * 4;
+        encoder.copy_buffer_to_buffer(&x_staged, 0, &g.x_buffer, g.x_offset, x_bytes);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server prefill PLE inputs pass"),
+                timestamp_writes: None,
+            });
+            match &mmq {
+                Some((_, qbg, qwg, _, op)) => {
+                    self.record_mmq_quantize(&mut pass, qbg, *qwg);
+                    self.record_mmq(&mut pass, &op.0, op.1, op.2);
+                }
+                None => self.record_matmul(&mut pass, proj_w, &g),
+            }
+            self.op_stamp(&mut pass, "pp.ple_in.proj");
+            pass.set_pipeline(&self.ple_inputs_pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(rows as u32, 1, 1);
+            self.op_stamp(&mut pass, "pp.ple_in.norm_add");
+        }
+        self.park_or_submit(encoder, grouped);
+        Some(out)
     }
 
     /// [`Self::fused_ple_prefill`] with `x` wherever it is and, given a
@@ -13130,7 +13687,7 @@ impl VulkanBackend {
         n_tokens: usize,
         gate: &QuantMatrix,
         proj: &QuantMatrix,
-        per_layer: &[f32],
+        per_layer: AttnOutSrc<'_>,
         tail: Option<PleTail<'_>>,
         out: Option<(&wgpu::Buffer, usize)>,
     ) -> Option<Vec<f32>> {
@@ -13139,7 +13696,9 @@ impl VulkanBackend {
         }
         let per_layer_dim = gate.out_dim;
         debug_assert_eq!(proj.in_dim, per_layer_dim);
-        debug_assert_eq!(per_layer.len(), n_tokens * per_layer_dim);
+        if let AttnOutSrc::Host(h) = per_layer {
+            debug_assert_eq!(h.len(), n_tokens * per_layer_dim);
+        }
         let out_dim = proj.out_dim;
 
         // Same ceiling again: this chain's element-wise dispatches are flat
@@ -13170,18 +13729,33 @@ impl VulkanBackend {
                         rows.saturating_sub(start).min(len),
                     ),
                 };
-                let pl_stripe = pad_rows(
-                    &per_layer[start * per_layer_dim..end * per_layer_dim],
-                    len,
-                    padded,
-                    per_layer_dim,
-                );
+                let pl_host;
+                let pl_stripe = match per_layer {
+                    AttnOutSrc::Host(h) => {
+                        pl_host = pad_rows(
+                            &h[start * per_layer_dim..end * per_layer_dim],
+                            len,
+                            padded,
+                            per_layer_dim,
+                        );
+                        AttnOutSrc::Host(&pl_host)
+                    }
+                    // Layer-major on the device, so a stripe is an offset;
+                    // the padded tail rows read whatever follows (the next
+                    // layer's rows, or the buffer's own padding) and their
+                    // results are discarded.
+                    AttnOutSrc::Gpu(b, off, rows) => AttnOutSrc::Gpu(
+                        b,
+                        off + (start * per_layer_dim) as u64 * 4,
+                        rows.saturating_sub(start).min(len),
+                    ),
+                };
                 let mut stripe = self.fused_ple_prefill_rows(
                     x_stripe,
                     padded,
                     gate,
                     proj,
-                    &pl_stripe,
+                    pl_stripe,
                     tail,
                     out.map(|(b, row)| (b, row + start)),
                 )?;
@@ -13226,8 +13800,18 @@ impl VulkanBackend {
             AttnOutSrc::Host(h) => Some(self.upload_new(h)),
             AttnOutSrc::Gpu(..) => None,
         };
-        // The multiply's second operand is the only extra upload this needs.
-        let per_layer_buf = self.upload_new(per_layer);
+        // The multiply's second operand is the only extra upload this needs
+        // — none at all when the chunk's inputs were computed on the device.
+        let per_layer_owned = match per_layer {
+            AttnOutSrc::Host(h) => Some(self.upload_new(h)),
+            AttnOutSrc::Gpu(..) => None,
+        };
+        let per_layer_bytes = (n_tokens * per_layer_dim) as u64 * 4;
+        let per_layer_src: BindSrc<'_> = match (per_layer, &per_layer_owned) {
+            (AttnOutSrc::Host(_), Some(b)) => BindSrc::Whole(b),
+            (AttnOutSrc::Host(_), None) => unreachable!("uploaded above"),
+            (AttnOutSrc::Gpu(b, off, _), _) => BindSrc::Slice(b, off, per_layer_bytes),
+        };
         let upload_ms = t_upload.ms();
         // The tail's resources: the post-norm weight, and the residual — the
         // gate's own `x` region for a host `x` (uploaded above, and read-only
@@ -13265,7 +13849,7 @@ impl VulkanBackend {
         let meta = self.elem_meta_buffer(elems as u32, 0.0);
         let bg_gelu_mul = self.elem4_bind_group(
             gate_g.output_src(),
-            &per_layer_buf,
+            per_layer_src,
             BindSrc::Slice(&proj_g.x_buffer, proj_g.x_offset, (elems as u64) * 4),
             &meta,
         );
@@ -13317,7 +13901,7 @@ impl VulkanBackend {
 
                 pass.set_pipeline(&self.gelu_mul_pipeline);
                 pass.set_bind_group(0, &bg_gelu_mul, &[]);
-                pass.dispatch_workgroups((elems as u32).div_ceil(64), 1, 1);
+                pass.dispatch_workgroups(self.strided_workgroups(elems), 1, 1);
                 self.op_stamp(&mut pass, "pp.ple.gelu_mul");
 
                 self.record_matmul(&mut pass, proj, &proj_g);
@@ -14096,6 +14680,105 @@ impl VulkanBackend {
     /// Doubles as the second half of the `attn_prefill_pipelines` cache key and
     /// as what the dispatch grid's `x` extent is derived from, so the two can
     /// never disagree about which kernel is bound.
+    /// The prefill attention pipeline and its grid for one layer: the tiled
+    /// kernel (one workgroup per query tile and head) when it applies,
+    /// otherwise the per-query kernels — the GQA kernel's workgroup covers
+    /// `heads` query heads at once, so its grid is one workgroup per
+    /// `(kv_head, head-slice)` and query, the ungrouped kernels' one per
+    /// head and query.
+    fn attn_prefill_dispatch(
+        &self,
+        head_dim: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        n_tokens: usize,
+        paging: vulkan_shaders::KvPaging,
+    ) -> (wgpu::ComputePipeline, u32, u32) {
+        let tile = vulkan_shaders::FaPrefillTile::for_head_dim(head_dim as u32);
+        if self.prefill_tiled_attn && head_dim.is_multiple_of(8 * tile.dlanes as usize) {
+            return (
+                self.attn_prefill_tiled_pipeline_for(head_dim, paging, tile),
+                n_tokens.div_ceil(4 * tile.rows as usize) as u32,
+                n_head as u32,
+            );
+        }
+        let group = (n_head / n_head_kv).max(1);
+        let heads = self.attn_prefill_heads(head_dim, group);
+        let grid_x = if heads > 0 {
+            (n_head / heads as usize) as u32
+        } else {
+            n_head as u32
+        };
+        (
+            self.attn_prefill_pipeline_for(head_dim, group, heads, paging),
+            grid_x,
+            n_tokens as u32,
+        )
+    }
+
+    /// The tiled prefill attention pipeline for this `head_dim`, built on
+    /// first use into `attn_prefill_pipelines` under its own key.
+    fn attn_prefill_tiled_pipeline_for(
+        &self,
+        head_dim: usize,
+        paging: vulkan_shaders::KvPaging,
+        tile: vulkan_shaders::FaPrefillTile,
+    ) -> wgpu::ComputePipeline {
+        let hd = head_dim as u32;
+        let paged = matches!(paging, vulkan_shaders::KvPaging::Paged);
+        let key = (
+            hd,
+            (1 << 17)
+                | u32::from(paged) << 16
+                | tile.dlanes << 12
+                | tile.lanes << 8
+                | tile.rows << 4
+                | tile.cols,
+        );
+        let mut cache = self
+            .attn_prefill_pipelines
+            .lock()
+            .expect("attn prefill pipelines poisoned");
+        if let Some(p) = cache.get(&key) {
+            return p.clone();
+        }
+        let source = vulkan_shaders::shader_source_attention_prefill_tiled(
+            self.kv_storage,
+            hd,
+            paging,
+            tile,
+        );
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("orangu-server tiled prefill attention shader"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("orangu-server tiled prefill attention pipeline layout"),
+                bind_group_layouts: &[Some(if paged {
+                    &self.attn_paged_bind_group_layout
+                } else {
+                    &self.attn_bind_group_layout
+                })],
+                immediate_size: 0,
+            });
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("orangu-server tiled prefill attention pipeline"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        cache.insert(key, pipeline.clone());
+        pipeline
+    }
+
     fn attn_prefill_heads(&self, head_dim: usize, group: usize) -> u32 {
         if self.prefill_gqa && group > 1 && head_dim.is_multiple_of(32) {
             vulkan_shaders::gqa_prefill_heads_per_workgroup(head_dim as u32, group as u32)
@@ -16709,6 +17392,18 @@ impl VulkanBackend {
             e.1 += ns;
         }
         let total_ns = ticks[n - 1].saturating_sub(ticks[0]) as f64 * ns_per_tick;
+        // `ORANGU_GPU_OPS_RAW=1`: every stamp in order with its interval —
+        // the per-layer structure the totals below fold away, for the
+        // question "which dispatch of the 70 is the slow one".
+        if crate::engine::env::flag_on("ORANGU_GPU_OPS_RAW") {
+            for i in 1..n {
+                let us = ticks[i].saturating_sub(ticks[i - 1]) as f64 * ns_per_tick / 1e3;
+                eprintln!(
+                    "orangu-server: [gpu-ops-raw] {i:>5} {:<28} {us:>9.1}us",
+                    t.labels[i]
+                );
+            }
+        }
         let gap = t
             .prev_end
             .map(|prev| ticks[0].saturating_sub(prev) as f64 * ns_per_tick / 1e6);

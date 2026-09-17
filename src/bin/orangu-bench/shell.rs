@@ -43,7 +43,7 @@ _orangu_bench() {
     COMPREPLY=()
 
     case "$prev" in
-        --history|--chart|--storage-file|--flamegraph|--compare-profiles|--bundle|--read-bundle|--render-profile|--report)
+        --history|--chart|--table|--storage-file|--flamegraph|--compare-profiles|--bundle|--read-bundle|--render-profile|--report)
             COMPREPLY=( $(compgen -f -- "$cur") )
             compopt -o filenames 2>/dev/null
             return 0
@@ -56,7 +56,7 @@ _orangu_bench() {
             COMPREPLY=( $(compgen -W "all 0.0.0.0 127.0.0.1" -- "$cur") )
             return 0
             ;;
-        --url|--depths|--pp|--pp-continue|--pg|--streams|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--cap|--chart-scale|--chart-y-label|--chart-x-label|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--sweep|--sweep-cmd|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature)
+        --url|--depths|--pp|--pp-continue|--pg|--streams|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--cap|--chart-scale|--chart-y-label|--chart-x-label|--chart-panels|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--sweep|--sweep-cmd|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature)
             return 0
             ;;
     esac
@@ -65,8 +65,8 @@ _orangu_bench() {
         COMPREPLY=( $(compgen -W \
             "--url --depths --pp --pp-continue --pg --decode-cpu --streams --shared-prefix --shared-prefix-tokens \
              --prefix-scan --pp-continue-base --embed --gen --curve --bucket --reps --drop-model-cache --no-warmup \
-             --timeout --model --json --history --label --chart --chart-only --storage-probe --storage-file \
-             --storage-span --storage-ramp --cap --chart-png --chart-scale --chart-y-label --chart-x-label \
+             --timeout --model --json --history --label --chart --chart-only --table --storage-probe --storage-file \
+             --storage-span --storage-ramp --cap --chart-png --chart-scale --chart-y-label --chart-x-label --chart-panels \
              --flamegraph --flamegraph-pid --flamegraph-freq --flamegraph-call-graph --flamegraph-png \
              --flamegraph-layers --flamegraph-duration \
              --compare-profiles --bundle --read-bundle --sweep --sweep-cmd --sweep-env --sweep-start-timeout \
@@ -114,7 +114,8 @@ _orangu_bench() {
         '--history[Append each measured point to this tab-separated history file]:path:_files' \
         '--label[Series name recorded in the history file; prefixes each --sweep point]:name:' \
         '--chart[Render the history file to this SVG after measuring]:path:_files' \
-        '--chart-only[Only render the chart from an existing history file; measure nothing]' \
+        '--chart-only[Only render the chart and table from an existing history file; measure nothing]' \
+        '--table[Write the history file as a markdown comparison table to this path (- for stdout)]:path:_files' \
         '--storage-probe[Storage mode: comma-separated read request sizes in KiB to sweep]:list:' \
         '--storage-file[File the storage probe reads (default: the server'"'"'s largest shard)]:path:_files' \
         '--storage-span[MiB to read at each request size, per pass]:mib:' \
@@ -124,6 +125,7 @@ _orangu_bench() {
         '--chart-scale[Pin the chart'"'"'s tok/s axis to MIN:MAX so a pair of charts compare]:min\:max:' \
         '--chart-y-label[Label for the chart'"'"'s y-axis]:text:' \
         '--chart-x-label[Label for the chart'"'"'s x-axis]:text:' \
+        '--chart-panels[Draw only these modes'"'"' panels (e.g. pp,tg); default: every mode in the file]:list:' \
         '--flamegraph[Record a CPU flamegraph of the server over the measured window]:path:_files' \
         '--flamegraph-pid[Process to profile (default: the server'"'"'s own, else the URL port'"'"'s owner)]:pid:' \
         '--flamegraph-freq[Sampling frequency in Hz for --flamegraph]:hz:' \
@@ -186,7 +188,8 @@ complete -c orangu-bench -l json                      -d 'Emit machine-readable 
 complete -c orangu-bench -l history                -r -d 'Append each measured point to this tab-separated history file'
 complete -c orangu-bench -l label                  -x -d 'Series name recorded in the history file; prefixes each --sweep point'
 complete -c orangu-bench -l chart                  -r -d 'Render the history file to this SVG after measuring'
-complete -c orangu-bench -l chart-only                -d 'Only render the chart from an existing history file; measure nothing'
+complete -c orangu-bench -l chart-only                -d 'Only render the chart and table from an existing history file; measure nothing'
+complete -c orangu-bench -l table                  -r -d 'Write the history file as a markdown comparison table to this path (- for stdout)'
 complete -c orangu-bench -l storage-probe          -x -d 'Storage mode: comma-separated read request sizes in KiB to sweep'
 complete -c orangu-bench -l storage-file           -r -d 'File the storage probe reads (default: the server\'s largest shard)'
 complete -c orangu-bench -l storage-span           -x -d 'MiB to read at each request size, per pass'
@@ -196,6 +199,7 @@ complete -c orangu-bench -l chart-png                 -d 'Also render a PNG besi
 complete -c orangu-bench -l chart-scale            -x -d 'Pin the chart\'s tok/s axis to MIN:MAX so a pair of charts compare'
 complete -c orangu-bench -l chart-y-label          -x -d 'Label for the chart\'s y-axis'
 complete -c orangu-bench -l chart-x-label          -x -d 'Label for the chart\'s x-axis'
+complete -c orangu-bench -l chart-panels           -x -d 'Draw only these modes\' panels (e.g. pp,tg); default: every mode in the file'
 complete -c orangu-bench -l flamegraph             -r -d 'Record a CPU flamegraph of the server over the measured window'
 complete -c orangu-bench -l flamegraph-pid         -x -d 'Process to profile (default: the server\'s own, else the URL port\'s owner)'
 complete -c orangu-bench -l flamegraph-freq        -x -d 'Sampling frequency in Hz for --flamegraph'
@@ -267,7 +271,8 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--history', 'Append each measured point to this tab-separated history file'),
         @('--label', 'Series name recorded in the history file; prefixes each --sweep point'),
         @('--chart', 'Render the history file to this SVG after measuring'),
-        @('--chart-only', 'Only render the chart from an existing history file; measure nothing'),
+        @('--chart-only', 'Only render the chart and table from an existing history file; measure nothing'),
+        @('--table', 'Write the history file as a markdown comparison table to this path (- for stdout)'),
         @('--storage-probe', 'Storage mode: comma-separated read request sizes in KiB to sweep'),
         @('--storage-file', 'File the storage probe reads (default: the server''s largest shard)'),
         @('--storage-span', 'MiB to read at each request size, per pass'),
@@ -277,6 +282,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--chart-scale', 'Pin the chart''s tok/s axis to MIN:MAX so a pair of charts compare'),
         @('--chart-y-label', 'Label for the chart''s y-axis'),
         @('--chart-x-label', 'Label for the chart''s x-axis'),
+        @('--chart-panels', 'Draw only these modes'' panels (e.g. pp,tg); default: every mode in the file'),
         @('--flamegraph', 'Record a CPU flamegraph of the server over the measured window'),
         @('--flamegraph-pid', 'Process to profile (default: the server''s own, else the URL port''s owner)'),
         @('--flamegraph-freq', 'Sampling frequency in Hz for --flamegraph'),
@@ -313,10 +319,10 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
 
     switch ($prev) {
         # A path: PowerShell's own completion takes over.
-        { $_ -in '--history', '--chart', '--storage-file', '--flamegraph', '--compare-profiles', '--bundle', '--read-bundle', '--render-profile', '--report' } { return }
+        { $_ -in '--history', '--chart', '--table', '--storage-file', '--flamegraph', '--compare-profiles', '--bundle', '--read-bundle', '--render-profile', '--report' } { return }
         '--flamegraph-call-graph' { return Offer @('fp', 'dwarf') }
         '--host' { return Offer @('all', '0.0.0.0', '127.0.0.1') }
-        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--sweep', '--sweep-cmd', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature' } { return }
+        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--chart-panels', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--sweep', '--sweep-cmd', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature' } { return }
     }
 
     if ($wordToComplete.StartsWith('-')) {

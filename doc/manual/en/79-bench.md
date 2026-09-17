@@ -683,6 +683,52 @@ parser can still catch is caught: a comma-separated sweep of
 `ORANGU_DEVICE_SPLIT` containing a bare number is refused, with the semicolon
 form in the message, rather than measured.
 
+#### Two engines through one harness
+
+The comparison this tool exists for — orangu against another engine, on the
+same model, through the same requests — is a `--sweep` whose variable the
+*command* reads rather than the engine:
+
+```sh
+cat > serve.sh <<'END'
+#!/bin/sh
+case "$ENGINE" in
+  orangu)    exec orangu-server "$MODEL" --port 8100 --web 0 --device 5500M ;;
+  reference) exec other-server -m "$MODEL" --port 8100 --device Vulkan1 ;;
+esac
+END
+orangu-bench --sweep ENGINE=orangu,reference --sweep-cmd ./serve.sh \
+             --sweep-env MODEL=/models/gemma-4-E2B-it-Q4_K_M.gguf \
+             --label gemma-4-E2B-it-Q4_K_M --depths 0,1024,4096 --delay 15 \
+             --history gemma-4-E2B-it-Q4_K_M.tsv --chart gemma-4-E2B-it-Q4_K_M.svg
+```
+
+Every guarantee the sweep makes for a tuning knob then holds for the engine
+comparison: each point is a freshly started server on a port that was free,
+proved to be the process this invocation spawned, measured, killed and reaped,
+with the port waited back to free and **every card's memory in use waited back
+to what it was before the first point** (within a quarter of a gigabyte, for a
+desktop's own drift) before the next engine starts. Neither engine ever shares
+the machine with the other, or with a leftover of itself. The `exec` in the
+script is what makes the supervised pid the server's own; see *`--sweep`*.
+
+A server that reports no pid in `/props` is identified the way the profiler
+identifies one: the kernel is asked which process holds the listening socket,
+and that pid must be the child this invocation spawned. A third-party server
+therefore passes the identity check without being taught anything — and a
+leftover of either engine on the port still fails it, which is the point.
+
+The comparison table at the end reads *against the first value*, so list
+orangu first and the percentages say how far behind or ahead it is. The
+history rows carry the label `<label> · ENGINE=<value>`, which is the shape
+`--table` turns into one row per model with one column per engine.
+
+A decode sweep warms each fresh server on its own workload — one generation
+of `--gen` tokens at the deepest requested context — before anything is
+recorded. An eight-token warmup was measured leaving the first timed
+repetition at 17 tok/s against 72 for the next, which the best-of statistic
+hides and the mean ± sd does not.
+
 #### Every card against every model
 
 `--sweep` is deliberately **one axis**. A cartesian product costs the product of
@@ -891,7 +937,8 @@ Options:
       --history <PATH>                 Append each measured point to this tab-separated history file
       --label <NAME>                   Series name recorded in the history file (defaults to the server's model); prefixes each `--sweep` point
       --chart <PATH>                   Render the history file to this SVG after measuring
-      --chart-only                     Only render the chart from an existing history file; measure nothing
+      --chart-only                     Only render the chart and table from an existing history file; measure nothing
+      --table <PATH>                   Write the history file as a markdown comparison table to this path (`-` for stdout)
       --storage-probe <LIST>           Storage mode: comma-separated read request sizes in KiB to sweep
       --storage-file <PATH>            File the storage probe reads. Defaults to the server's largest shard
       --storage-span <MIB>             MiB to read at each request size, per pass [default: 256]
@@ -901,6 +948,7 @@ Options:
       --chart-scale <MIN:MAX>          Pin the chart's tok/s axis to `MIN:MAX` so a pair of charts compare
       --chart-y-label <TEXT>           Label for the chart's y-axis [default: "tok/s (log)"]
       --chart-x-label <TEXT>           Label for the chart's x-axis
+      --chart-panels <LIST>            Draw only these modes' panels (e.g. `pp,tg`); default: every mode in the file
       --flamegraph <PATH>              Record a CPU flamegraph of the server over the measured window
       --flamegraph-pid <PID>           Process to profile (default: the server's own, else the URL port's owner)
       --flamegraph-freq <HZ>           Sampling frequency in Hz for `--flamegraph` [default: 999]
@@ -1491,6 +1539,16 @@ its own shape — the thing being tracked — becomes unreadable. On a log axis 
 constant ratio is a constant vertical distance, which is how "N× behind" should
 read; the bounds are `1/2/5 × 10^k` so every gridline is a round number.
 
+Every mode in the file gets a panel, with two exceptions. The storage panels
+(bytes read from disk per token, major faults) are left out when no row of
+the file read a byte from disk — a fully cached model makes them two plots of
+zero, and beside a two-engine comparison they read as a difference between
+the engines when only one of them reports the figure at all. And
+`--chart-panels pp,tg` keeps exactly the panels named, for the same
+comparison: the mechanism rows a mixture-of-experts run records (expert
+re-reads, MB dequantized) are one engine's instrumentation, and a chart meant
+to put two engines side by side wants the panels both appear in.
+
 Only the **newest measurement date** in the file is drawn, and the subtitle says
 which — `showing 2026-07-26 (18 of 50 rows)`. The file keeps every run; that is
 what it is for. But a chart of "how does throughput behave as context grows" is
@@ -1501,6 +1559,42 @@ at one context on one date collapse to their best, for the same reason a single
 run reports its best repetition. Series colours are assigned in first-seen order and never
 recycled; past the last slot a label is dropped from the chart rather than
 given a colour another series already owns.
+
+### The history file as a table (`--table`)
+
+The chart is the view for one question — throughput against context. A
+document comparing two engines across many models needs the other one: every
+model on its own row, one column per engine, and the ratio. `--table FILE.md`
+writes exactly that from the history file, as markdown, so the table in a
+report is produced by the tool that took the measurements rather than retyped
+from terminal transcripts:
+
+```sh
+# after a run, beside the chart
+orangu-bench … --history perf.tsv --chart perf.svg --table perf.md
+# from the file alone, no server needed
+orangu-bench --chart-only --history perf.tsv --table -
+```
+
+One table per mode, in the order the modes appear in the file; each cell is
+the best repetition with the mean ± sample sd beside it. Rows come from the
+label convention the sweep writes — `<label> · VAR=value` is one row per
+`<label>` and one column per `value` — and with exactly two columns a last
+column gives their ratio, first over second, so `ENGINE=orangu,reference`
+reads as "above 1, orangu ahead":
+
+```text
+**tg** (tok/s)
+
+| model | depth | orangu | reference | orangu / reference |
+| :-- | --: | --: | --: | --: |
+| gemma-4-E2B-it-Q4_K_M | 0 | 70.8 (70.6 ± 0.2) | 68.0 (67.9 ± 0.1) | 1.04× |
+```
+
+Labels without that shape render as one row each under a single `best`
+column, so an ordinary run's history still tabulates. As with the chart, only
+the latest measurement of each point is shown: the file keeps every run, the
+table answers what the build that exists does now.
 
 ### The run as a document (`--report`)
 

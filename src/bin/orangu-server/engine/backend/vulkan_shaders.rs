@@ -3100,6 +3100,314 @@ fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
 }
 "#;
 
+/// [`PRELUDE`] with the activations bound as `vec4`s: the word-reading
+/// `block_dot`s below take four activations per load, so their prelude
+/// binds `x` as `array<vec4<f32>>` (`xv`). Nothing else changes — the
+/// weight buffer is still `array<u32>` and `read_u8`/`read_u32_at` still
+/// apply — and the block-hoisted `main` never touches `x` itself.
+const PRELUDE_XV: &str = r#"
+struct Meta {
+    in_dim: u32,
+    out_dim: u32,
+    n_tokens: u32,
+    row_bytes: u32,
+}
+
+@group(0) @binding(0) var<storage, read> weights: array<u32>;
+@group(0) @binding(1) var<storage, read> xv2: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> params: Meta;
+
+// Four activations from the pair view.
+fn xv(i: u32) -> vec4<f32> {
+    return vec4<f32>(xv2[2u * i], xv2[2u * i + 1u]);
+}
+
+fn read_u8(byte_offset: u32) -> u32 {
+    let word = weights[byte_offset >> 2u];
+    let shift = (byte_offset & 3u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+fn read_u32_at(byte_offset: u32) -> u32 {
+    let index = byte_offset >> 2u;
+    let shift = (byte_offset & 3u) * 8u;
+    let lo = weights[index] >> shift;
+    let hi = weights[index + 1u] << ((32u - shift) & 31u);
+    return lo | select(hi, 0u, shift == 0u);
+}
+
+fn read_u16_at(byte_offset: u32) -> u32 {
+    return read_u32_at(byte_offset) & 0xFFFFu;
+}
+
+fn f16_to_f32(bits: u32) -> f32 {
+    return unpack2x16float(bits & 0xFFFFu).x;
+}
+
+// The four bytes of a word as floats.
+fn unpack4_f(w: u32) -> vec4<f32> {
+    return vec4<f32>(f32(w & 0xFFu), f32((w >> 8u) & 0xFFu), f32((w >> 16u) & 0xFFu), f32(w >> 24u));
+}
+
+// Bits 0..4 of `s` as a lane sign: +1 where clear, -1 where set.
+fn sign4(s: u32) -> vec4<f32> {
+    return vec4<f32>(1.0) - 2.0 * vec4<f32>(f32(s & 1u), f32((s >> 1u) & 1u), f32((s >> 2u) & 1u), f32((s >> 3u) & 1u));
+}
+"#;
+
+/// `block_q2_K` for [`block_hoisted_suffix`], read as **words**: a lane's
+/// 16 elements are sixteen consecutive 2-bit fields at one shift in one
+/// 128-element group, so they are four words masked once each, against four
+/// `vec4` activations — no loop, no byte reads. The block is 84 bytes, so
+/// every field is word-aligned.
+const Q2_K_WORDS_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 84u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+// Lane `sub` = (v_im, v_in): the 128-element half `v_im`, and within it the
+// element pairs `l0, l0 + 1` and `l0 + 16, l0 + 17` of every one of the four
+// 32-element sub-blocks (`l0 = 2 * v_in`) — sixteen elements that are the
+// four 2-bit fields of one word, whose bytes are `q_offset, +1, +16, +17`.
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let w0 = byte_offset / 4u;
+    let hdr = weights[w0 + 20u];
+    let d = f16_to_f32(hdr & 0xFFFFu);
+    let dmin = f16_to_f32(hdr >> 16u);
+    let v_im = sub / 8u;
+    let l0 = 2u * (sub % 8u);
+    // This half's eight scale bytes: two words.
+    let sw0 = weights[w0 + 2u * v_im];
+    let sw1 = weights[w0 + 2u * v_im + 1u];
+    // qs bytes 32·v_im + l0 .. +2 and +16 .. +18: two halves of two words.
+    let qw = w0 + 4u + 8u * v_im + l0 / 4u;
+    let half_sel = 16u * ((l0 / 2u) % 2u);
+    let lo = (weights[qw] >> half_sel) & 0xFFFFu;
+    let hi = (weights[qw + 4u] >> half_sel) & 0xFFFFu;
+    let q = lo | (hi << 16u);
+    let q0 = unpack4_f(q & 0x03030303u);
+    let q2 = unpack4_f((q >> 2u) & 0x03030303u);
+    let q4 = unpack4_f((q >> 4u) & 0x03030303u);
+    let q6 = unpack4_f((q >> 6u) & 0x03030303u);
+    // Activations: for sub-block `s`, elements `y + 32s, +1` and `+16, +17`.
+    let y = (x_off + 128u * v_im + l0) / 2u;
+    let b0 = xv2[y];
+    let b16 = xv2[y + 8u];
+    let b32 = xv2[y + 16u];
+    let b48 = xv2[y + 24u];
+    let b64 = xv2[y + 32u];
+    let b80 = xv2[y + 40u];
+    let b96 = xv2[y + 48u];
+    let b112 = xv2[y + 56u];
+    // Scale `8·v_im + 2s` for the low pair, `+1` for the high pair.
+    let sc0 = unpack4_f(sw0 & 0x0F0F0F0Fu);
+    let sc1 = unpack4_f(sw1 & 0x0F0F0F0Fu);
+    let mn0 = unpack4_f((sw0 >> 4u) & 0x0F0F0F0Fu);
+    let mn1 = unpack4_f((sw1 >> 4u) & 0x0F0F0F0Fu);
+    var sum1: f32 = dot(vec4<f32>(b0, b16) * vec4<f32>(sc0.x, sc0.x, sc0.y, sc0.y), q0);
+    sum1 = sum1 + dot(vec4<f32>(b32, b48) * vec4<f32>(sc0.z, sc0.z, sc0.w, sc0.w), q2);
+    sum1 = sum1 + dot(vec4<f32>(b64, b80) * vec4<f32>(sc1.x, sc1.x, sc1.y, sc1.y), q4);
+    sum1 = sum1 + dot(vec4<f32>(b96, b112) * vec4<f32>(sc1.z, sc1.z, sc1.w, sc1.w), q6);
+    var sum2: f32 = dot(vec4<f32>(b0, b16), vec4<f32>(mn0.x, mn0.x, mn0.y, mn0.y));
+    sum2 = sum2 + dot(vec4<f32>(b32, b48), vec4<f32>(mn0.z, mn0.z, mn0.w, mn0.w));
+    sum2 = sum2 + dot(vec4<f32>(b64, b80), vec4<f32>(mn1.x, mn1.x, mn1.y, mn1.y));
+    sum2 = sum2 + dot(vec4<f32>(b96, b112), vec4<f32>(mn1.z, mn1.z, mn1.w, mn1.w));
+    return d * sum1 - dmin * sum2;
+}
+"#;
+
+/// `block_q3_K` for [`block_hoisted_suffix`], read as words: the 2-bit
+/// fields as in `Q2_K`, the third bit from the `hmask` words (bit `4n + s`
+/// of each byte, set meaning "no `-4`"), the 6-bit scale assembled once.
+/// 110-byte blocks start at either word parity, so the reads go through
+/// `read_u32_at`.
+const Q3_K_WORDS_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 110u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+// A `u16` at an even byte offset: one load, whichever word parity the
+// block starts at.
+fn read_u16_even(byte_offset: u32) -> u32 {
+    return (weights[byte_offset >> 2u] >> ((byte_offset & 2u) * 8u)) & 0xFFFFu;
+}
+// Lane `sub` = (v_im, v_in), the same element mapping as `Q2_K`: sixteen
+// elements from one `qs` word, their third bits from one `hmask` word (bit
+// `4·v_im + s` of each byte), the eight scales of the half from its three
+// scale words.
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d_all = f16_to_f32(read_u16_even(byte_offset + 108u));
+    let v_im = sub / 8u;
+    let l0 = 2u * (sub % 8u);
+    let qo = byte_offset + 32u + 32u * v_im + l0;
+    let q = read_u16_even(qo) | (read_u16_even(qo + 16u) << 16u);
+    let ho = byte_offset + l0;
+    let hm = read_u16_even(ho) | (read_u16_even(ho + 16u) << 16u);
+    // Scales `8·v_im + 2s + half`: low nibbles of bytes `0..8` (high for the
+    // second half's eight), top two bits from bytes `8..12` at `2·(i / 4)`.
+    let so = byte_offset + 96u;
+    let sa = read_u16_even(so) | (read_u16_even(so + 2u) << 16u);
+    let sb = read_u16_even(so + 4u) | (read_u16_even(so + 6u) << 16u);
+    let sc = read_u16_even(so + 8u) | (read_u16_even(so + 10u) << 16u);
+    let nib = 4u * v_im;
+    let lo0 = (sa >> nib) & 0x0F0F0F0Fu;
+    let lo1 = (sb >> nib) & 0x0F0F0F0Fu;
+    let hi0 = (sc >> nib) & 0x03030303u;
+    let hi1 = (sc >> (nib + 2u)) & 0x03030303u;
+    let s0 = unpack4_f(lo0 | (hi0 << 4u)) - vec4<f32>(32.0);
+    let s1 = unpack4_f(lo1 | (hi1 << 4u)) - vec4<f32>(32.0);
+    let m = nib;
+    let four = vec4<f32>(4.0);
+    let q0 = unpack4_f(q & 0x03030303u) - four + 4.0 * unpack4_f((hm >> m) & 0x01010101u);
+    let q2 = unpack4_f((q >> 2u) & 0x03030303u) - four + 4.0 * unpack4_f((hm >> (m + 1u)) & 0x01010101u);
+    let q4 = unpack4_f((q >> 4u) & 0x03030303u) - four + 4.0 * unpack4_f((hm >> (m + 2u)) & 0x01010101u);
+    let q6 = unpack4_f((q >> 6u) & 0x03030303u) - four + 4.0 * unpack4_f((hm >> (m + 3u)) & 0x01010101u);
+    let y = (x_off + 128u * v_im + l0) / 2u;
+    let b0 = xv2[y];
+    let b16 = xv2[y + 8u];
+    let b32 = xv2[y + 16u];
+    let b48 = xv2[y + 24u];
+    let b64 = xv2[y + 32u];
+    let b80 = xv2[y + 40u];
+    let b96 = xv2[y + 48u];
+    let b112 = xv2[y + 56u];
+    var sum: f32 = dot(vec4<f32>(b0, b16) * vec4<f32>(s0.x, s0.x, s0.y, s0.y), q0);
+    sum = sum + dot(vec4<f32>(b32, b48) * vec4<f32>(s0.z, s0.z, s0.w, s0.w), q2);
+    sum = sum + dot(vec4<f32>(b64, b80) * vec4<f32>(s1.x, s1.x, s1.y, s1.y), q4);
+    sum = sum + dot(vec4<f32>(b96, b112) * vec4<f32>(s1.z, s1.z, s1.w, s1.w), q6);
+    return d_all * sum;
+}
+"#;
+
+/// `block_iq4_xs` for [`block_hoisted_suffix`], read as words: a lane's 16
+/// elements are one nibble half of a 32-element group's 16 bytes — four
+/// words, each nibble through the value table.
+const IQ4_XS_WORDS_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 136u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn kv4(w: u32) -> vec4<f32> {
+    return vec4<f32>(iq_kvalue(w & 0xFu), iq_kvalue((w >> 8u) & 0xFu), iq_kvalue((w >> 16u) & 0xFu), iq_kvalue((w >> 24u) & 0xFu));
+}
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let w0 = byte_offset / 4u;
+    let hdr = weights[w0];
+    let d = f16_to_f32(hdr & 0xFFFFu);
+    let scales_h = hdr >> 16u;
+    let ib = sub / 2u;
+    let nsh = 4u * (sub % 2u);
+    let low = (weights[w0 + 1u] >> (8u * (ib / 2u) + 4u * (ib % 2u))) & 0xFu;
+    let high = (scales_h >> (2u * ib)) & 3u;
+    let dl = d * (f32(low | (high << 4u)) - 32.0);
+    let qb = w0 + 2u + 4u * ib;
+    let xb = (x_off + sub * 16u) / 4u;
+    let x0 = xv(xb);
+    let x1 = xv(xb + 1u);
+    let x2 = xv(xb + 2u);
+    let x3 = xv(xb + 3u);
+    let q0 = kv4((weights[qb] >> nsh) & 0x0F0F0F0Fu);
+    let q1 = kv4((weights[qb + 1u] >> nsh) & 0x0F0F0F0Fu);
+    let q2 = kv4((weights[qb + 2u] >> nsh) & 0x0F0F0F0Fu);
+    let q3 = kv4((weights[qb + 3u] >> nsh) & 0x0F0F0F0Fu);
+    return dl * (dot(q0, x0) + dot(q1, x1) + dot(q2, x2) + dot(q3, x3));
+}
+"#;
+
+/// `block_iq3_s` for [`block_hoisted_suffix`], read as words: a lane's 16
+/// elements are two 8-element runs of one 32-element group — four lattice
+/// words, each index a `qs` byte with its bit of the group's `qh` byte
+/// above it, each word's signs a nibble of the run's sign byte.
+const IQ3_S_WORDS_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 110u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u16_at(byte_offset));
+    let ib = sub / 2u;
+    let h = sub % 2u;
+    let sc = (read_u8(byte_offset + 106u + ib / 2u) >> (4u * (ib % 2u))) & 0xFu;
+    let db = d * f32(1u + 2u * sc);
+    let qh = read_u8(byte_offset + 66u + ib);
+    // Index bytes 8·ib + 4h .. +4, sign bytes 4·ib + 2h .. +2.
+    let idx = read_u32_at(byte_offset + 2u + 8u * ib + 4u * h);
+    let sg = read_u16_at(byte_offset + 74u + 4u * ib + 2u * h);
+    let bit = 4u * h;
+    let g0 = iq_grids[IQ3S_GRID_OFF + ((idx & 0xFFu) | (((qh >> bit) & 1u) << 8u))];
+    let g1 = iq_grids[IQ3S_GRID_OFF + (((idx >> 8u) & 0xFFu) | (((qh >> (bit + 1u)) & 1u) << 8u))];
+    let g2 = iq_grids[IQ3S_GRID_OFF + (((idx >> 16u) & 0xFFu) | (((qh >> (bit + 2u)) & 1u) << 8u))];
+    let g3 = iq_grids[IQ3S_GRID_OFF + ((idx >> 24u) | (((qh >> (bit + 3u)) & 1u) << 8u))];
+    let xb = (x_off + sub * 16u) / 4u;
+    let x0 = xv(xb);
+    let x1 = xv(xb + 1u);
+    let x2 = xv(xb + 2u);
+    let x3 = xv(xb + 3u);
+    let s = dot(unpack4_f(g0) * sign4(sg), x0) + dot(unpack4_f(g1) * sign4(sg >> 4u), x1)
+        + dot(unpack4_f(g2) * sign4(sg >> 8u), x2) + dot(unpack4_f(g3) * sign4(sg >> 12u), x3);
+    return db * s;
+}
+"#;
+
+/// `block_iq2_s` for [`block_hoisted_suffix`], read as words: a lane's 16
+/// elements are two 8-element runs of one 32-element group, each run one
+/// 64-bit lattice entry (two words) with a sign byte, the pair sharing the
+/// group's scale nibble for that half.
+const IQ2_S_WORDS_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 82u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u16_at(byte_offset));
+    let ib = sub / 2u;
+    let h = sub % 2u;
+    let l0 = 2u * h;
+    let sc = (read_u8(byte_offset + 74u + ib) >> (4u * h)) & 0xFu;
+    let db = d * (0.5 + f32(sc)) * 0.25;
+    let qh = read_u8(byte_offset + 66u + ib);
+    let idx2 = read_u16_at(byte_offset + 2u + 4u * ib + l0);
+    let sg2 = read_u16_at(byte_offset + 34u + 4u * ib + l0);
+    let i0 = (idx2 & 0xFFu) | ((qh << (8u - 2u * l0)) & 0x300u);
+    let i1 = (idx2 >> 8u) | ((qh << (6u - 2u * l0)) & 0x300u);
+    let e0 = IQ2S_GRID_OFF + 2u * i0;
+    let e1 = IQ2S_GRID_OFF + 2u * i1;
+    let xb = (x_off + sub * 16u) / 4u;
+    let x0 = xv(xb);
+    let x1 = xv(xb + 1u);
+    let x2 = xv(xb + 2u);
+    let x3 = xv(xb + 3u);
+    let s = dot(unpack4_f(iq_grids[e0]) * sign4(sg2), x0) + dot(unpack4_f(iq_grids[e0 + 1u]) * sign4(sg2 >> 4u), x1)
+        + dot(unpack4_f(iq_grids[e1]) * sign4(sg2 >> 8u), x2) + dot(unpack4_f(iq_grids[e1 + 1u]) * sign4(sg2 >> 12u), x3);
+    return db * s;
+}
+"#;
+
+/// The word-reading `block_dot`s (`ORANGU_BLOCK_DOT_WORDS`, on; `0` keeps
+/// the byte-reading ones as the control arm): the same per-type contract
+/// as [`block_hoisted_middle`], with a lane's sixteen elements taken as
+/// four words against four `vec4` activations in straight-line code.
+///
+/// The byte-reading forms decode a lane's elements one byte at a time in a
+/// rolled loop — sixteen word loads with a shift and mask each, sixteen
+/// scalar activation loads, and the loop keeps every one of them in
+/// order. Measured on the E2B UD-Q2_K_XL file, the FFN gate ran at 13 GB/s
+/// that way against the Q4_K kernel's ~80.
+/// Whether `ggml_type` decodes through a word-reading `block_dot`.
+pub fn has_words_block_dot(ggml_type: u32) -> bool {
+    block_hoisted_words_middle(ggml_type).is_some()
+}
+
+fn block_hoisted_words_middle(ggml_type: u32) -> Option<&'static str> {
+    if !crate::engine::env::flag_on_unless_disabled("ORANGU_BLOCK_DOT_WORDS") {
+        return None;
+    }
+    Some(match ggml_type {
+        t if t == GGML_TYPE_Q2_K => Q2_K_WORDS_MIDDLE,
+        t if t == GGML_TYPE_Q3_K => Q3_K_WORDS_MIDDLE,
+        t if t == GGML_TYPE_IQ4_XS => IQ4_XS_WORDS_MIDDLE,
+        t if t == GGML_TYPE_IQ3_S => IQ3_S_WORDS_MIDDLE,
+        t if t == GGML_TYPE_IQ2_S => IQ2_S_WORDS_MIDDLE,
+        _ => return None,
+    })
+}
+
 /// The per-type half of [`block_hoisted_suffix`], or `None` for a type that
 /// has no block-hoisted implementation yet and so keeps the element-wise
 /// path.
@@ -3151,9 +3459,17 @@ pub fn shader_source_reduce_block_hoisted(
     n_rows: usize,
     subgroup: bool,
 ) -> Option<String> {
+    let suffix = block_hoisted_suffix(n_rows, subgroup);
+    if let Some(middle) = block_hoisted_words_middle(ggml_type) {
+        let grids = if needs_iq_grids(ggml_type) {
+            IQ_GRID_PRELUDE
+        } else {
+            ""
+        };
+        return Some(format!("{PRELUDE_XV}\n{grids}\n{middle}\n{suffix}"));
+    }
     let middle = block_hoisted_middle(ggml_type)?;
     let prelude = prelude_for(ggml_type);
-    let suffix = block_hoisted_suffix(n_rows, subgroup);
     Some(format!("{prelude}\n{middle}\n{suffix}"))
 }
 
@@ -4410,14 +4726,9 @@ const MMQ_THREAD_ROWS: u32 = 8;
 pub const MMQ_Q4K_TILE_TOKENS: u32 = 32;
 pub const MMQ_Q6K_TILE_TOKENS: u32 = 64;
 
-/// The token tile of the integer-dot kernel for a weight type.
-pub fn mmq_tile_tokens(ggml_type: u32) -> u32 {
-    if ggml_type == crate::engine::quant::GGML_TYPE_Q6_K {
-        MMQ_Q6K_TILE_TOKENS
-    } else {
-        MMQ_Q4K_TILE_TOKENS
-    }
-}
+/// The widest token tile any integer-dot kernel stages — what the q8
+/// activation buffer is padded to.
+pub const MMQ_MAX_TILE_TOKENS: u32 = MMQ_WIDE_TILE_TOKENS;
 
 /// The integer-dot `Q4_K` GEMM for a prefill batch — the tiled form of
 /// [`shader_source_reduce_q4k_mmvq`]'s arithmetic, over activations
@@ -4655,6 +4966,1285 @@ fn main(
     }
     src.push_str("}\n");
     src
+}
+
+/// The wide integer-dot `Q4_K` GEMM: the same arithmetic as
+/// [`shader_source_mmq_q4k`] over a **128 × 128** output tile, staged
+/// **32 elements deep** at a time.
+///
+/// The narrow kernel stages a whole 256-element super-block per step, which
+/// bounds its output tile to 64 × 32 under the shared-memory limit: every
+/// staged byte serves 2 tokens × 8 rows, and a thread carries 16
+/// accumulators. Measured on the served model's FFN shape at 512 tokens it
+/// reached 3.4 TFLOP/s-equivalent while the same shape can run at ~6 on
+/// this class of card. This kernel slices the reduction instead — `KS`
+/// sub-blocks of 32 elements per barrier — so the tile can grow to 128 rows
+/// × 128 tokens with the same shared memory, and each thread holds a
+/// 4-row × 32-token micro-tile: 128 accumulators as named scalars, each
+/// staged row read once against 32 tokens and each token read once against
+/// 4 rows. Per staged byte the arithmetic is 16× the narrow kernel's, and
+/// the tile reads its operands from device memory 3.3× fewer times.
+///
+/// Thread layout: two subgroups of 64; subgroup `w` owns tokens
+/// `64w..64w+64`, lane `l % 32` owns rows `l % 32 + 32c` (`c < 4`) and lane
+/// `l / 32` the odd or even four of each eight tokens. Rows interleaved by
+/// 32 rather than contiguous per thread so the 32 lanes of a half-subgroup
+/// read shared memory at a stride of one row entry (7 words — coprime with
+/// the bank count, so conflict-free) and store their outputs to 32
+/// consecutive rows (coalesced). A token entry is read by a whole
+/// half-subgroup at once — a broadcast — so its stride (11) only needs to
+/// keep the two halves' addresses in different banks.
+///
+/// Shared memory per row and sub-block: the 32 nibbles packed two per
+/// byte into 4 words (`u_{2q} | u_{2q+1} << 4`, unpacked back to 8 words
+/// once per sub-block per thread, not per dot) and the row's `(d·sc,
+/// dmin·m)` for that sub-block, computed at staging — 7 words. Per token
+/// and sub-block: the 8 quant words, `d`, and `Σq` — 11 words. At `KS = 4`
+/// that is 14 + 22 KiB.
+///
+/// Shapes: `in_dim` a multiple of 256, `out_dim` of 128, any `n_tokens`
+/// (the q8 buffer is padded to whole 128-token tiles; padding rows are
+/// staged and their results discarded). Same bindings and activation
+/// layout as the narrow kernel, so the two are interchangeable per
+/// dispatch — `mmq_pipeline_for` picks by shape, keeping the narrow one for
+/// the projections too small to fill the device with 128 × 128 tiles.
+pub const MMQ_WIDE_TILE_ROWS: u32 = 128;
+/// The half-height wide tile, for a projection too narrow to fill the
+/// device with 128-row tiles: 2 rows per thread, 64 accumulators.
+pub const MMQ_MID_TILE_ROWS: u32 = 64;
+pub const MMQ_WIDE_TILE_TOKENS: u32 = 128;
+/// Sub-blocks of 32 elements staged per barrier, per kernel. Must divide 8
+/// and, for `Q4_K`, be even (a nibble pair is two sub-blocks). Two rather
+/// than four: the deeper slice halves the barriers but doubles the shared
+/// memory (37 KiB against 18), and the workgroups that no longer fit beside
+/// each other were what hid the weight loads' latency — measured over
+/// eight rotating matrices at 512 tokens, 3.9 against 5.1 TFLOP/s-eq.
+pub const MMQ_WIDE_KS: u32 = 2;
+pub const MMQ_WIDE_KS_Q6K: u32 = 2;
+
+pub fn shader_source_mmq_q4k_wide(rows: u32) -> String {
+    // `ORANGU_MMQ_WIDE_KS`: the slice depth, for measuring it.
+    let ks = std::env::var("ORANGU_MMQ_WIDE_KS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MMQ_WIDE_KS);
+    assert!(
+        8 % ks == 0 && ks.is_multiple_of(2),
+        "KS must be an even divisor of 8"
+    );
+    assert!(
+        rows.is_multiple_of(32) && rows <= 128,
+        "a wide tile is 32 rows per lane group"
+    );
+    let trows = (rows / 32) as usize;
+    let mut src = String::new();
+    src.push_str(&format!(
+        r#"
+struct Meta {{
+    in_dim: u32,
+    out_dim: u32,
+    n_tokens: u32,
+    row_bytes: u32,
+}}
+
+@group(0) @binding(0) var<storage, read> weights: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read> q8x: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> params: Meta;
+
+fn f16_to_f32(bits: u32) -> f32 {{
+    return unpack2x16float(bits & 0xFFFFu).x;
+}}
+fn vec3_word(v: vec3<u32>, i: u32) -> u32 {{
+    if (i == 0u) {{ return v.x; }}
+    if (i == 1u) {{ return v.y; }}
+    return v.z;
+}}
+fn get_scale_min_k4_v4(scales: vec3<u32>, j: u32) -> vec2<u32> {{
+    if (j < 4u) {{
+        let qj = (vec3_word(scales, j / 4u) >> (8u * (j % 4u))) & 0xFFu;
+        let qj4 = (vec3_word(scales, (j + 4u) / 4u) >> (8u * ((j + 4u) % 4u))) & 0xFFu;
+        return vec2<u32>(qj & 63u, qj4 & 63u);
+    }}
+    let qj = (vec3_word(scales, j / 4u) >> (8u * (j % 4u))) & 0xFFu;
+    let qj4 = (vec3_word(scales, (j + 4u) / 4u) >> (8u * ((j + 4u) % 4u))) & 0xFFu;
+    let qjm4 = (vec3_word(scales, (j - 4u) / 4u) >> (8u * ((j - 4u) % 4u))) & 0xFFu;
+    let sc = (qj4 & 0xFu) | ((qjm4 >> 6u) << 4u);
+    let m = (qj4 >> 4u) | ((qj >> 6u) << 4u);
+    return vec2<u32>(sc, m);
+}}
+
+const ROWS: u32 = {rows}u;
+const TOKS: u32 = {toks}u;
+const KS: u32 = {ks}u;
+// Per sub-block staged, per row: 4 packed quant words, d*sc, dmin*m, pad.
+var<workgroup> wt: array<u32, {wt_len}>;
+// Per sub-block staged, per token: 8 quant words, d, sum of quants, pad.
+var<workgroup> xt: array<u32, {xt_len}>;
+
+@compute @workgroup_size(128)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {{
+    let row0 = wid.x * ROWS;
+    let tok0 = wid.y * TOKS;
+    let tid = lid.x;
+    let warp = tid / 64u;
+    let lane = tid % 64u;
+    let tiwr = lane % 32u;
+    let tiwc = lane / 32u;
+    let n_super = params.in_dim / 256u;
+    let row_vec4s = params.row_bytes / 16u;
+    let n_slices = n_super * (8u / KS);
+    let m4 = vec4<u32>(0x0F0F0F0Fu);
+    let f4 = vec4<u32>(4u);
+"#,
+        rows = rows,
+        toks = MMQ_WIDE_TILE_TOKENS,
+        wt_len = rows * ks * 7,
+        xt_len = MMQ_WIDE_TILE_TOKENS * ks * 11,
+    ));
+    for cr in 0..trows {
+        for t in 0..32 {
+            src.push_str(&format!("    var a{cr}_{t}: f32 = 0.0;\n"));
+        }
+    }
+    // The staging as straight-line code, every device load issued before
+    // any is consumed: a `loop` over the items stages them one round trip
+    // at a time, and on weights that are not already in the cache those
+    // round trips are what the kernel waits on. Measured over eight
+    // rotating matrices at 256 tokens, the rolled form ran at 75% of its
+    // warm-cache rate.
+    // Items per thread, and whether the last round is partial — the
+    // half-height tile at two sub-blocks has 64 row items for 128 threads.
+    let row_total = rows * ks / 2;
+    let row_items = row_total.div_ceil(128) as usize;
+    let row_partial = !row_total.is_multiple_of(128);
+    let tok_items = ks as usize;
+    src.push_str(
+        r#"
+    var slice: u32 = 0u;
+    loop {
+        if (slice >= n_slices) { break; }
+        let sb = slice / (8u / KS);
+        let k0 = (slice % (8u / KS)) * KS;
+"#,
+    );
+    // `ORANGU_MMQ_STAGE_ROLLED=1`: the staging as loops, one item per
+    // iteration — the control arm for measuring the straight-line form.
+    if crate::engine::env::flag_on("ORANGU_MMQ_STAGE_ROLLED") {
+        src.push_str(
+            r#"        var i: u32 = tid;
+        loop {
+            if (i >= ROWS * (KS / 2u)) { break; }
+            let r = i % ROWS;
+            let pr = i / ROWS;
+            let base = (row0 + r) * row_vec4s + sb * 9u;
+            let h = weights[base];
+            let jp = (k0 + 2u * pr) / 2u;
+            let v0 = weights[base + 1u + 2u * jp];
+            let v1 = weights[base + 2u + 2u * jp];
+            let d = f16_to_f32(h.x & 0xFFFFu);
+            let dm = f16_to_f32(h.x >> 16u);
+            let lo0 = v0 & m4;
+            let lo1 = v1 & m4;
+            let hi0 = (v0 >> f4) & m4;
+            let hi1 = (v1 >> f4) & m4;
+            let e = ((2u * pr) * ROWS + r) * 7u;
+            wt[e] = lo0.x | (lo0.y << 4u);
+            wt[e + 1u] = lo0.z | (lo0.w << 4u);
+            wt[e + 2u] = lo1.x | (lo1.y << 4u);
+            wt[e + 3u] = lo1.z | (lo1.w << 4u);
+            let s0 = get_scale_min_k4_v4(vec3<u32>(h.y, h.z, h.w), k0 + 2u * pr);
+            wt[e + 4u] = bitcast<u32>(d * f32(s0.x));
+            wt[e + 5u] = bitcast<u32>(dm * f32(s0.y));
+            let e1 = e + ROWS * 7u;
+            wt[e1] = hi0.x | (hi0.y << 4u);
+            wt[e1 + 1u] = hi0.z | (hi0.w << 4u);
+            wt[e1 + 2u] = hi1.x | (hi1.y << 4u);
+            wt[e1 + 3u] = hi1.z | (hi1.w << 4u);
+            let s1 = get_scale_min_k4_v4(vec3<u32>(h.y, h.z, h.w), k0 + 2u * pr + 1u);
+            wt[e1 + 4u] = bitcast<u32>(d * f32(s1.x));
+            wt[e1 + 5u] = bitcast<u32>(dm * f32(s1.y));
+            i = i + 128u;
+        }
+        i = tid;
+        loop {
+            if (i >= TOKS * KS) { break; }
+            let t = i % TOKS;
+            let k = i / TOKS;
+            let b = k0 + k;
+            let tb = ((tok0 + t) * n_super + sb) * 24u;
+            let hd = q8x[tb + b];
+            let q0 = q8x[tb + 8u + 2u * b];
+            let q1 = q8x[tb + 9u + 2u * b];
+            let e = (k * TOKS + t) * 11u;
+            xt[e] = q0.x;
+            xt[e + 1u] = q0.y;
+            xt[e + 2u] = q0.z;
+            xt[e + 3u] = q0.w;
+            xt[e + 4u] = q1.x;
+            xt[e + 5u] = q1.y;
+            xt[e + 6u] = q1.z;
+            xt[e + 7u] = q1.w;
+            xt[e + 8u] = hd.x;
+            xt[e + 9u] = bitcast<u32>(bitcast<i32>(hd.y) + bitcast<i32>(hd.z));
+            i = i + 128u;
+        }
+        workgroupBarrier();
+        var k: u32 = 0u;
+        loop {
+            if (k >= KS) { break; }
+"#,
+        );
+    } else {
+        // Rows: one item per (row, nibble pair) — a pair of sub-blocks shares
+        // 32 bytes of the super-block, low and high nibbles, read once and
+        // written as two entries.
+        for it in 0..row_items {
+            // A thread past the last item loads the last item again (an
+            // address that exists) and skips the write below.
+            let index = if row_partial && it + 1 == row_items {
+                format!("min(tid + {}u, ROWS * (KS / 2u) - 1u)", it * 128)
+            } else {
+                format!("tid + {}u", it * 128)
+            };
+            src.push_str(&format!(
+                "        let ri{it} = {index};
+        let rr{it} = ri{it} % ROWS;
+        let rp{it} = ri{it} / ROWS;
+        let rb{it} = (row0 + rr{it}) * row_vec4s + sb * 9u + 2u * ((k0 + 2u * rp{it}) / 2u);
+        let rh{it} = weights[rb{it} - 2u * ((k0 + 2u * rp{it}) / 2u)];
+        let rv{it}a = weights[rb{it} + 1u];
+        let rv{it}b = weights[rb{it} + 2u];
+"
+            ));
+        }
+        for it in 0..tok_items {
+            src.push_str(&format!(
+                "        let ti{it} = tid + {}u;
+        let tt{it} = ti{it} % TOKS;
+        let tk{it} = ti{it} / TOKS;
+        let tb{it} = ((tok0 + tt{it}) * n_super + sb) * 24u;
+        let th{it} = q8x[tb{it} + k0 + tk{it}];
+        let tq{it}a = q8x[tb{it} + 8u + 2u * (k0 + tk{it})];
+        let tq{it}b = q8x[tb{it} + 9u + 2u * (k0 + tk{it})];
+",
+                it * 128
+            ));
+        }
+        for it in 0..row_items {
+            let guard = if row_partial && it + 1 == row_items {
+                format!("if (tid + {}u < ROWS * (KS / 2u)) ", it * 128)
+            } else {
+                String::new()
+            };
+            src.push_str(&format!(
+            r#"        {guard}{{
+            let d = f16_to_f32(rh{it}.x & 0xFFFFu);
+            let dm = f16_to_f32(rh{it}.x >> 16u);
+            let lo0 = rv{it}a & m4;
+            let lo1 = rv{it}b & m4;
+            let hi0 = (rv{it}a >> f4) & m4;
+            let hi1 = (rv{it}b >> f4) & m4;
+            let e = ((2u * rp{it}) * ROWS + rr{it}) * 7u;
+            wt[e] = lo0.x | (lo0.y << 4u);
+            wt[e + 1u] = lo0.z | (lo0.w << 4u);
+            wt[e + 2u] = lo1.x | (lo1.y << 4u);
+            wt[e + 3u] = lo1.z | (lo1.w << 4u);
+            let s0 = get_scale_min_k4_v4(vec3<u32>(rh{it}.y, rh{it}.z, rh{it}.w), k0 + 2u * rp{it});
+            wt[e + 4u] = bitcast<u32>(d * f32(s0.x));
+            wt[e + 5u] = bitcast<u32>(dm * f32(s0.y));
+            let e1 = e + ROWS * 7u;
+            wt[e1] = hi0.x | (hi0.y << 4u);
+            wt[e1 + 1u] = hi0.z | (hi0.w << 4u);
+            wt[e1 + 2u] = hi1.x | (hi1.y << 4u);
+            wt[e1 + 3u] = hi1.z | (hi1.w << 4u);
+            let s1 = get_scale_min_k4_v4(vec3<u32>(rh{it}.y, rh{it}.z, rh{it}.w), k0 + 2u * rp{it} + 1u);
+            wt[e1 + 4u] = bitcast<u32>(d * f32(s1.x));
+            wt[e1 + 5u] = bitcast<u32>(dm * f32(s1.y));
+        }}
+"#
+        ));
+        }
+        for it in 0..tok_items {
+            src.push_str(&format!(
+                r#"        {{
+            let e = (tk{it} * TOKS + tt{it}) * 11u;
+            xt[e] = tq{it}a.x;
+            xt[e + 1u] = tq{it}a.y;
+            xt[e + 2u] = tq{it}a.z;
+            xt[e + 3u] = tq{it}a.w;
+            xt[e + 4u] = tq{it}b.x;
+            xt[e + 5u] = tq{it}b.y;
+            xt[e + 6u] = tq{it}b.z;
+            xt[e + 7u] = tq{it}b.w;
+            xt[e + 8u] = th{it}.x;
+            xt[e + 9u] = bitcast<u32>(bitcast<i32>(th{it}.y) + bitcast<i32>(th{it}.z));
+        }}
+"#
+            ));
+        }
+        src.push_str(
+            r#"        workgroupBarrier();
+        var k: u32 = 0u;
+        loop {
+            if (k >= KS) { break; }
+"#,
+        );
+    }
+    // The thread's rows for this sub-block: unpacked once.
+    for cr in 0..trows {
+        src.push_str(&format!(
+            "            let re{cr} = (k * ROWS + tiwr + {}u) * 7u;\n",
+            32 * cr
+        ));
+        for q in 0..4 {
+            src.push_str(&format!(
+                "            let p{cr}_{q} = wt[re{cr} + {q}u];\n            let u{cr}_{} = p{cr}_{q} & 0x0F0F0F0Fu;\n            let u{cr}_{} = (p{cr}_{q} >> 4u) & 0x0F0F0F0Fu;\n",
+                2 * q,
+                2 * q + 1
+            ));
+        }
+        src.push_str(&format!(
+            "            let sc{cr} = bitcast<f32>(wt[re{cr} + 4u]);\n            let mn{cr} = bitcast<f32>(wt[re{cr} + 5u]);\n"
+        ));
+    }
+    // The thread's thirty-two tokens, each against the four rows.
+    for g in 0..8 {
+        for cc in 0..4 {
+            let t = g * 4 + cc;
+            src.push_str(&format!(
+                "            {{\n            let te = (k * TOKS + warp * 64u + {}u + tiwc * 4u) * 11u;\n",
+                g * 8 + cc
+            ));
+            for i in 0..8 {
+                src.push_str(&format!("            let q{i} = xt[te + {i}u];\n"));
+            }
+            src.push_str(
+                "            let d = bitcast<f32>(xt[te + 8u]);\n            let dq = d * f32(bitcast<i32>(xt[te + 9u]));\n",
+            );
+            for cr in 0..trows {
+                let dot = (0..8)
+                    .map(|i| format!("dot4I8Packed(u{cr}_{i}, q{i})"))
+                    .collect::<Vec<_>>()
+                    .join(" + ");
+                src.push_str(&format!(
+                    "            a{cr}_{t} = a{cr}_{t} + fma(sc{cr} * d, f32({dot}), -mn{cr} * dq);\n"
+                ));
+            }
+            src.push_str("            }\n");
+        }
+    }
+    src.push_str(
+        r#"            k = k + 1u;
+        }
+        workgroupBarrier();
+        slice = slice + 1u;
+    }
+"#,
+    );
+    for g in 0..8 {
+        for cc in 0..4 {
+            let t = g * 4 + cc;
+            src.push_str(&format!(
+                "    {{\n    let tok = tok0 + warp * 64u + {}u + tiwc * 4u;\n    if (tok < params.n_tokens) {{\n",
+                g * 8 + cc
+            ));
+            for cr in 0..trows {
+                src.push_str(&format!(
+                    "        y[tok * params.out_dim + row0 + tiwr + {}u] = a{cr}_{t};\n",
+                    32 * cr
+                ));
+            }
+            src.push_str("    }\n    }\n");
+        }
+    }
+    src.push_str("}\n");
+    src
+}
+
+/// The wide integer-dot `Q6_K` GEMM: [`shader_source_mmq_q4k_wide`]'s
+/// tile over [`shader_source_mmq_q6k`]'s unpacking. Per row and sub-block
+/// the staging writes the 32 six-bit values as bytes (8 words, straight
+/// from the `ql` nibbles and `qh` bit pairs the way the narrow kernel
+/// unpacks a whole super-block) and the two `d·scale` of its sixteen-value
+/// halves — 10 words at a stride of 11. Per token and sub-block: the 8
+/// quant words, `d`, and `32·d·Σq` for each half (the `−32` offset folded
+/// as the narrow kernel folds it) — 11 words at a stride of 13. Same
+/// bindings as the narrow kernel: the weights as words, since a 210-byte
+/// block may start two bytes into one.
+pub fn shader_source_mmq_q6k_wide(rows: u32) -> String {
+    let ks = std::env::var("ORANGU_MMQ_WIDE_KS_Q6K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(MMQ_WIDE_KS_Q6K);
+    assert!(8 % ks == 0, "KS must divide 8");
+    assert!(
+        rows.is_multiple_of(32) && rows <= 128,
+        "a wide tile is 32 rows per lane group"
+    );
+    let trows = (rows / 32) as usize;
+    let mut src = String::new();
+    src.push_str(&format!(
+        r#"
+struct Meta {{
+    in_dim: u32,
+    out_dim: u32,
+    n_tokens: u32,
+    row_bytes: u32,
+}}
+
+@group(0) @binding(0) var<storage, read> weights: array<u32>;
+@group(0) @binding(1) var<storage, read> q8x: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> params: Meta;
+
+fn f16_to_f32(bits: u32) -> f32 {{
+    return unpack2x16float(bits & 0xFFFFu).x;
+}}
+
+const ROWS: u32 = {rows}u;
+const TOKS: u32 = {toks}u;
+const KS: u32 = {ks}u;
+// Per sub-block staged, per row: 8 words of six-bit values, d*sc0, d*sc1, pad.
+var<workgroup> wt: array<u32, {wt_len}>;
+// Per sub-block staged, per token: 8 quant words, d, 32*d*sumq_lo, 32*d*sumq_hi, pad, pad.
+var<workgroup> xt: array<u32, {xt_len}>;
+
+@compute @workgroup_size(128)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {{
+    let row0 = wid.x * ROWS;
+    let tok0 = wid.y * TOKS;
+    let tid = lid.x;
+    let warp = tid / 64u;
+    let lane = tid % 64u;
+    let tiwr = lane % 32u;
+    let tiwc = lane / 32u;
+    let n_super = params.in_dim / 256u;
+    let n_slices = n_super * (8u / KS);
+"#,
+        rows = rows,
+        toks = MMQ_WIDE_TILE_TOKENS,
+        wt_len = rows * ks * 11,
+        xt_len = MMQ_WIDE_TILE_TOKENS * ks * 13,
+    ));
+    for cr in 0..trows {
+        for t in 0..32 {
+            src.push_str(&format!("    var a{cr}_{t}: f32 = 0.0;\n"));
+        }
+    }
+    src.push_str(
+        r#"
+    var slice: u32 = 0u;
+    loop {
+        if (slice >= n_slices) { break; }
+        let sb = slice / (8u / KS);
+        let k0 = (slice % (8u / KS)) * KS;
+        // Stage the rows: one item per (row, sub-block) — the eight `ql`
+        // words and eight `qh` words its values come from, read as two runs
+        // of consecutive words (nine each when the block starts mid-word;
+        // the alignment is uniform across a slice whenever the row stride
+        // is a multiple of four bytes, which every in_dim that is a
+        // multiple of 512 gives), then the two scales and `d`.
+        var i: u32 = tid;
+        loop {
+            if (i >= ROWS * KS) { break; }
+            let r = i % ROWS;
+            let k = i / ROWS;
+            let b = k0 + k;
+            let h = b / 4u;
+            let j = b % 4u;
+            let byte0 = (row0 + r) * params.row_bytes + sb * 210u;
+            let e = (k * ROWS + r) * 11u;
+            let w0 = byte0 / 4u;
+            let qlb = w0 + 16u * h + 8u * (j % 2u);
+            let qhb = w0 + 32u + 8u * h;
+            var ql0: u32; var ql1: u32; var ql2: u32; var ql3: u32;
+            var ql4: u32; var ql5: u32; var ql6: u32; var ql7: u32;
+            var qh0: u32; var qh1: u32; var qh2: u32; var qh3: u32;
+            var qh4: u32; var qh5: u32; var qh6: u32; var qh7: u32;
+            var sc_word: u32;
+            var d_word: u32;
+            if ((byte0 & 3u) == 0u) {
+                ql0 = weights[qlb]; ql1 = weights[qlb + 1u]; ql2 = weights[qlb + 2u]; ql3 = weights[qlb + 3u];
+                ql4 = weights[qlb + 4u]; ql5 = weights[qlb + 5u]; ql6 = weights[qlb + 6u]; ql7 = weights[qlb + 7u];
+                qh0 = weights[qhb]; qh1 = weights[qhb + 1u]; qh2 = weights[qhb + 2u]; qh3 = weights[qhb + 3u];
+                qh4 = weights[qhb + 4u]; qh5 = weights[qhb + 5u]; qh6 = weights[qhb + 6u]; qh7 = weights[qhb + 7u];
+                sc_word = weights[w0 + 48u + b / 2u];
+                d_word = weights[w0 + 52u];
+            } else {
+                let a0 = weights[qlb]; let a1 = weights[qlb + 1u]; let a2 = weights[qlb + 2u]; let a3 = weights[qlb + 3u];
+                let a4 = weights[qlb + 4u]; let a5 = weights[qlb + 5u]; let a6 = weights[qlb + 6u]; let a7 = weights[qlb + 7u];
+                let a8 = weights[qlb + 8u];
+                ql0 = (a0 >> 16u) | (a1 << 16u); ql1 = (a1 >> 16u) | (a2 << 16u);
+                ql2 = (a2 >> 16u) | (a3 << 16u); ql3 = (a3 >> 16u) | (a4 << 16u);
+                ql4 = (a4 >> 16u) | (a5 << 16u); ql5 = (a5 >> 16u) | (a6 << 16u);
+                ql6 = (a6 >> 16u) | (a7 << 16u); ql7 = (a7 >> 16u) | (a8 << 16u);
+                let c0 = weights[qhb]; let c1 = weights[qhb + 1u]; let c2 = weights[qhb + 2u]; let c3 = weights[qhb + 3u];
+                let c4 = weights[qhb + 4u]; let c5 = weights[qhb + 5u]; let c6 = weights[qhb + 6u]; let c7 = weights[qhb + 7u];
+                let c8 = weights[qhb + 8u];
+                qh0 = (c0 >> 16u) | (c1 << 16u); qh1 = (c1 >> 16u) | (c2 << 16u);
+                qh2 = (c2 >> 16u) | (c3 << 16u); qh3 = (c3 >> 16u) | (c4 << 16u);
+                qh4 = (c4 >> 16u) | (c5 << 16u); qh5 = (c5 >> 16u) | (c6 << 16u);
+                qh6 = (c6 >> 16u) | (c7 << 16u); qh7 = (c7 >> 16u) | (c8 << 16u);
+                let s0 = weights[w0 + 48u + b / 2u];
+                let s1 = weights[w0 + 49u + b / 2u];
+                sc_word = (s0 >> 16u) | (s1 << 16u);
+                // `d` is the block's last half-word: only its own word is read.
+                d_word = weights[w0 + 52u] >> 16u;
+            }
+            let nsh = 4u * (j / 2u);
+            let hsh = 2u * j;
+            wt[e] = ((ql0 >> nsh) & 0x0F0F0F0Fu) | (((qh0 >> hsh) & 0x03030303u) << 4u);
+            wt[e + 1u] = ((ql1 >> nsh) & 0x0F0F0F0Fu) | (((qh1 >> hsh) & 0x03030303u) << 4u);
+            wt[e + 2u] = ((ql2 >> nsh) & 0x0F0F0F0Fu) | (((qh2 >> hsh) & 0x03030303u) << 4u);
+            wt[e + 3u] = ((ql3 >> nsh) & 0x0F0F0F0Fu) | (((qh3 >> hsh) & 0x03030303u) << 4u);
+            wt[e + 4u] = ((ql4 >> nsh) & 0x0F0F0F0Fu) | (((qh4 >> hsh) & 0x03030303u) << 4u);
+            wt[e + 5u] = ((ql5 >> nsh) & 0x0F0F0F0Fu) | (((qh5 >> hsh) & 0x03030303u) << 4u);
+            wt[e + 6u] = ((ql6 >> nsh) & 0x0F0F0F0Fu) | (((qh6 >> hsh) & 0x03030303u) << 4u);
+            wt[e + 7u] = ((ql7 >> nsh) & 0x0F0F0F0Fu) | (((qh7 >> hsh) & 0x03030303u) << 4u);
+            let d = f16_to_f32(d_word);
+            let sh = 16u * (b % 2u);
+            wt[e + 8u] = bitcast<u32>(d * f32(i32((sc_word >> sh) << 24u) >> 24u));
+            wt[e + 9u] = bitcast<u32>(d * f32(i32((sc_word >> (sh + 8u)) << 24u) >> 24u));
+            i = i + 128u;
+        }
+        // Stage the tokens: one item per (token, sub-block).
+        i = tid;
+        loop {
+            if (i >= TOKS * KS) { break; }
+            let t = i % TOKS;
+            let k = i / TOKS;
+            let b = k0 + k;
+            let tb = ((tok0 + t) * n_super + sb) * 24u;
+            let hd = q8x[tb + b];
+            let q0 = q8x[tb + 8u + 2u * b];
+            let q1 = q8x[tb + 9u + 2u * b];
+            let e = (k * TOKS + t) * 13u;
+            xt[e] = q0.x;
+            xt[e + 1u] = q0.y;
+            xt[e + 2u] = q0.z;
+            xt[e + 3u] = q0.w;
+            xt[e + 4u] = q1.x;
+            xt[e + 5u] = q1.y;
+            xt[e + 6u] = q1.z;
+            xt[e + 7u] = q1.w;
+            let d = bitcast<f32>(hd.x);
+            xt[e + 8u] = hd.x;
+            xt[e + 9u] = bitcast<u32>(32.0 * d * f32(bitcast<i32>(hd.y)));
+            xt[e + 10u] = bitcast<u32>(32.0 * d * f32(bitcast<i32>(hd.z)));
+            i = i + 128u;
+        }
+        workgroupBarrier();
+        var k: u32 = 0u;
+        loop {
+            if (k >= KS) { break; }
+"#,
+    );
+    for cr in 0..trows {
+        src.push_str(&format!(
+            "            let re{cr} = (k * ROWS + tiwr + {}u) * 11u;\n",
+            32 * cr
+        ));
+        for i in 0..8 {
+            src.push_str(&format!("            let u{cr}_{i} = wt[re{cr} + {i}u];\n"));
+        }
+        src.push_str(&format!(
+            "            let s{cr}a = bitcast<f32>(wt[re{cr} + 8u]);\n            let s{cr}b = bitcast<f32>(wt[re{cr} + 9u]);\n"
+        ));
+    }
+    for g in 0..8 {
+        for cc in 0..4 {
+            let t = g * 4 + cc;
+            src.push_str(&format!(
+                "            {{\n            let te = (k * TOKS + warp * 64u + {}u + tiwc * 4u) * 13u;\n",
+                g * 8 + cc
+            ));
+            for i in 0..8 {
+                src.push_str(&format!("            let q{i} = xt[te + {i}u];\n"));
+            }
+            src.push_str(
+                "            let d = bitcast<f32>(xt[te + 8u]);\n            let lo = bitcast<f32>(xt[te + 9u]);\n            let hi = bitcast<f32>(xt[te + 10u]);\n",
+            );
+            for cr in 0..trows {
+                let dlo = (0..4)
+                    .map(|i| format!("dot4I8Packed(u{cr}_{i}, q{i})"))
+                    .collect::<Vec<_>>()
+                    .join(" + ");
+                let dhi = (4..8)
+                    .map(|i| format!("dot4I8Packed(u{cr}_{i}, q{i})"))
+                    .collect::<Vec<_>>()
+                    .join(" + ");
+                src.push_str(&format!(
+                    "            a{cr}_{t} = a{cr}_{t} + fma(s{cr}a, fma(d, f32({dlo}), -lo), s{cr}b * fma(d, f32({dhi}), -hi));\n"
+                ));
+            }
+            src.push_str("            }\n");
+        }
+    }
+    src.push_str(
+        r#"            k = k + 1u;
+        }
+        workgroupBarrier();
+        slice = slice + 1u;
+    }
+"#,
+    );
+    for g in 0..8 {
+        for cc in 0..4 {
+            let t = g * 4 + cc;
+            src.push_str(&format!(
+                "    {{\n    let tok = tok0 + warp * 64u + {}u + tiwc * 4u;\n    if (tok < params.n_tokens) {{\n",
+                g * 8 + cc
+            ));
+            for cr in 0..trows {
+                src.push_str(&format!(
+                    "        y[tok * params.out_dim + row0 + tiwr + {}u] = a{cr}_{t};\n",
+                    32 * cr
+                ));
+            }
+            src.push_str("    }\n    }\n");
+        }
+    }
+    src.push_str("}\n");
+    src
+}
+
+/// The wide integer-dot GEMM for every other weight type the prefill sees
+/// often — `Q5_K`, `Q8_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1` — as one
+/// generator with a per-type staging routine.
+///
+/// [`shader_source_mmq_q4k_wide`]'s tile and loop, with each row's
+/// sub-block staged **unpacked**: its 32 values as bytes in 8 words (the
+/// packed nibble form fits only 4-bit types) and two floats `a`, `b` such
+/// that the sub-block's contribution is `a · dₓ · Σ q·x + b · dₓ · Σ x` —
+/// `(d·sc, −dmin·m)` for the K-quants, `(d, −8d)` for `Q4_0`, `(d, −16d)`
+/// for `Q5_0`, `(d, m)` for the `_1` types and `(d, 0)` for `Q8_0`, whose
+/// bytes are signed already. So one compute loop serves them all; only
+/// the staging, generated per type from the block's byte layout, differs.
+///
+/// Blocks of 18, 22 and 34 bytes make a row's odd blocks start two bytes
+/// into a word, so the weights are bound as words and each block's fields
+/// are read through a per-parity variant of the staging (the parity is
+/// uniform across a slice whenever the row stride is a multiple of four
+/// bytes, which a multiple-of-256 `in_dim` guarantees). Rows: 10 words at
+/// a stride of 11; tokens as the `Q4_K` kernel's. Two sub-blocks per
+/// slice, for the occupancy the `Q4_K` measurement settled on.
+pub fn shader_source_mmq_wide_bytes(ggml_type: u32, rows: u32) -> String {
+    use crate::engine::quant::*;
+    let ks = 2u32;
+    assert!(
+        rows.is_multiple_of(32) && rows <= 128,
+        "a wide tile is 32 rows per lane group"
+    );
+    let trows = (rows / 32) as usize;
+    let (block_bytes, block_elems): (u32, u32) = match ggml_type {
+        GGML_TYPE_Q5_K => (176, 256),
+        GGML_TYPE_Q8_0 => (34, 32),
+        GGML_TYPE_Q4_0 => (18, 32),
+        GGML_TYPE_Q4_1 => (20, 32),
+        GGML_TYPE_Q5_0 => (22, 32),
+        GGML_TYPE_Q5_1 => (24, 32),
+        GGML_TYPE_Q2_K => (84, 256),
+        GGML_TYPE_Q3_K => (110, 256),
+        GGML_TYPE_IQ4_XS => (136, 256),
+        GGML_TYPE_IQ3_S => (110, 256),
+        GGML_TYPE_IQ2_S => (82, 256),
+        t => panic!("no byte-unpacked integer-dot kernel for ggml type {t}"),
+    };
+    // `Q2_K`, `Q3_K` and `IQ2_S` scale each *sixteen* values, so a sub-block
+    // has two `(a, b)` pairs and the dot is taken per half — against the two
+    // sums of quants the activation layout keeps per half for exactly this.
+    let halves = matches!(ggml_type, GGML_TYPE_Q2_K | GGML_TYPE_Q3_K | GGML_TYPE_IQ2_S);
+    let row_words: u32 = if halves { 13 } else { 11 };
+    // Whether a block can start two bytes into a word: only when its size
+    // is not a multiple of four.
+    let may_shift = !block_bytes.is_multiple_of(4);
+
+    // WGSL for "the four block bytes at `off`" and "the half-word at
+    // `off`" under a given parity, with `w0` the block's first (possibly
+    // partial) word.
+    let word_at = |off: u32, parity: u32| -> String {
+        let byte = 2 * parity + off;
+        let idx = byte / 4;
+        if byte.is_multiple_of(4) {
+            format!("weights[w0 + {idx}u]")
+        } else {
+            format!(
+                "((weights[w0 + {idx}u] >> 16u) | (weights[w0 + {}u] << 16u))",
+                idx + 1
+            )
+        }
+    };
+    // Like `word_at`, with a runtime byte offset (a multiple of four) added
+    // to the block byte.
+    let word_at_g = |off: u32, parity: u32, plus_bytes: &str| -> String {
+        let byte = 2 * parity + off;
+        let idx = byte / 4;
+        if byte.is_multiple_of(4) {
+            format!("weights[w0 + {idx}u + ({plus_bytes}) / 4u]")
+        } else {
+            format!(
+                "((weights[w0 + {idx}u + ({plus_bytes}) / 4u] >> 16u) | (weights[w0 + {}u + ({plus_bytes}) / 4u] << 16u))",
+                idx + 1
+            )
+        }
+    };
+    let half_at = |off: u32, parity: u32| -> String {
+        let byte = 2 * parity + off;
+        let idx = byte / 4;
+        if byte.is_multiple_of(4) {
+            format!("(weights[w0 + {idx}u] & 0xFFFFu)")
+        } else {
+            format!("(weights[w0 + {idx}u] >> 16u)")
+        }
+    };
+    // The staging body for one parity: sets `u0..u7`, `sa`, `sb` from the
+    // block at word `w0` (and, for a 256-block, sub-block `sub`).
+    let stage = |parity: u32| -> String {
+        let mut o = String::new();
+        match ggml_type {
+            GGML_TYPE_Q8_0 => {
+                for i in 0..8u32 {
+                    o += &format!("            u{i} = {};\n", word_at(2 + 4 * i, parity));
+                }
+                o += &format!(
+                    "            sa = f16_to_f32({});\n            sb = 0.0;\n",
+                    half_at(0, parity)
+                );
+            }
+            GGML_TYPE_Q4_0 | GGML_TYPE_Q4_1 => {
+                let qs = if ggml_type == GGML_TYPE_Q4_0 { 2 } else { 4 };
+                for i in 0..4u32 {
+                    o += &format!("            let q{i} = {};\n", word_at(qs + 4 * i, parity));
+                }
+                for i in 0..4u32 {
+                    o += &format!(
+                        "            u{i} = q{i} & 0x0F0F0F0Fu;\n            u{} = (q{i} >> 4u) & 0x0F0F0F0Fu;\n",
+                        i + 4
+                    );
+                }
+                o += &format!("            let d = f16_to_f32({});\n", half_at(0, parity));
+                if ggml_type == GGML_TYPE_Q4_0 {
+                    o += "            sa = d;\n            sb = -8.0 * d;\n";
+                } else {
+                    o += &format!(
+                        "            sa = d;\n            sb = f16_to_f32({});\n",
+                        half_at(2, parity)
+                    );
+                }
+            }
+            GGML_TYPE_Q5_0 | GGML_TYPE_Q5_1 => {
+                let (qh, qs) = if ggml_type == GGML_TYPE_Q5_0 {
+                    (2, 6)
+                } else {
+                    (4, 8)
+                };
+                o += &format!("            let qh = {};\n", word_at(qh, parity));
+                for i in 0..4u32 {
+                    o += &format!("            let q{i} = {};\n", word_at(qs + 4 * i, parity));
+                }
+                // Element e takes bit e of `qh` as its fifth bit; spread the
+                // four bits of each element group into byte lanes.
+                for i in 0..8u32 {
+                    let nib = if i < 4 {
+                        format!("(q{i} & 0x0F0F0F0Fu)")
+                    } else {
+                        format!("((q{} >> 4u) & 0x0F0F0F0Fu)", i - 4)
+                    };
+                    o += &format!(
+                        "            u{i} = {nib} | spread_bits(qh >> {}u);\n",
+                        4 * i
+                    );
+                }
+                o += &format!("            let d = f16_to_f32({});\n", half_at(0, parity));
+                if ggml_type == GGML_TYPE_Q5_0 {
+                    o += "            sa = d;\n            sb = -16.0 * d;\n";
+                } else {
+                    o += &format!(
+                        "            sa = d;\n            sb = f16_to_f32({});\n",
+                        half_at(2, parity)
+                    );
+                }
+            }
+            GGML_TYPE_Q5_K => {
+                // d, dmin, scales[12] at 0; qh[32] at 16; qs[128] at 48.
+                // Sub-block `sub`: nibble pair `sub / 2` (32 bytes of qs),
+                // low or high nibble by `sub % 2`, fifth bit `sub` of qh.
+                o += &format!(
+                    "            let h = vec4<u32>({}, {}, {}, {});\n",
+                    word_at(0, parity),
+                    word_at(4, parity),
+                    word_at(8, parity),
+                    word_at(12, parity)
+                );
+                o += "            let jp = sub / 2u;\n            let nsh = 4u * (sub % 2u);\n";
+                for i in 0..8u32 {
+                    o += &format!(
+                        "            u{i} = ((weights[w0 + 12u + 8u * jp + {i}u] >> nsh) & 0x0F0F0F0Fu) | (((weights[w0 + 4u + {i}u] >> sub) & 0x01010101u) << 4u);\n"
+                    );
+                }
+                o += "            let d = f16_to_f32(h.x & 0xFFFFu);\n            let dm = f16_to_f32(h.x >> 16u);\n            let p = get_scale_min_k4_v4(vec3<u32>(h.y, h.z, h.w), sub);\n            sa = d * f32(p.x);\n            sb = -dm * f32(p.y);\n";
+            }
+            GGML_TYPE_Q2_K => {
+                // scales[16] at 0, qs[64] at 16, d at 80, dmin at 82.
+                // Sub-block `sub`: 128-group `sub / 4`, bit pair `sub % 4`;
+                // its halves' scale bytes are `2·sub` and `2·sub + 1`, low
+                // nibble the scale, high nibble the min.
+                o += "            let grp = sub / 4u;
+            let sh = 2u * (sub % 4u);
+";
+                // Word `i` of the sub-block: the group's bytes `4i..4i+4`
+                // for the low half and `16 + 4(i-4)..` for the high — the
+                // same word `4 + 8·grp + i` either way.
+                for i in 0..8u32 {
+                    o += &format!(
+                        "            u{i} = (weights[w0 + 4u + 8u * grp + {i}u] >> sh) & 0x03030303u;
+"
+                    );
+                }
+                o += &format!(
+                    "            let d = f16_to_f32({});
+            let dm = f16_to_f32({});
+",
+                    half_at(80, 0),
+                    half_at(82, 0)
+                );
+                o += "            let sc0 = (weights[w0 + (2u * sub) / 4u] >> (8u * ((2u * sub) % 4u))) & 0xFFu;
+            let sc1 = (weights[w0 + (2u * sub + 1u) / 4u] >> (8u * ((2u * sub + 1u) % 4u))) & 0xFFu;
+";
+                o += "            sa = d * f32(sc0 & 0xFu);
+            sb = -dm * f32(sc0 >> 4u);
+            sa1 = d * f32(sc1 & 0xFu);
+            sb1 = -dm * f32(sc1 >> 4u);
+";
+            }
+            GGML_TYPE_Q3_K => {
+                // hmask[32] at 0, qs[64] at 32, scales[12] at 96, d at 108.
+                // A value is its two `qs` bits with the `hmask` bit `sub` as
+                // the third, minus four — signed, so the dot takes it as is.
+                o += "            let grp = sub / 4u;
+            let sh = 2u * (sub % 4u);
+";
+                for i in 0..8u32 {
+                    let qs_off = 32 + 4 * i; // + 32·g
+                    let hm_off = 4 * i;
+                    o += &format!(
+                        "            {{
+                let q2 = ({} >> sh) & 0x03030303u;
+                let hb = ({} >> sub) & 0x01010101u;
+                let v = q2 | (hb << 2u);
+                u{i} = ((v | 0x80808080u) - 0x04040404u) ^ 0x80808080u;
+            }}
+",
+                        word_at_g(qs_off, parity, "32u * grp"),
+                        word_at(hm_off, parity)
+                    );
+                }
+                o += &format!(
+                    "            let a0 = {};
+            let a1 = {};
+            let a2 = {};
+",
+                    word_at(96, parity),
+                    word_at(100, parity),
+                    word_at(104, parity)
+                );
+                o += "            let x0 = (a0 & 0x0F0F0F0Fu) | ((a2 & 0x03030303u) << 4u);
+            let x1 = (a1 & 0x0F0F0F0Fu) | (((a2 >> 2u) & 0x03030303u) << 4u);
+            let x2 = ((a0 >> 4u) & 0x0F0F0F0Fu) | (((a2 >> 4u) & 0x03030303u) << 4u);
+            let x3 = ((a1 >> 4u) & 0x0F0F0F0Fu) | (((a2 >> 6u) & 0x03030303u) << 4u);
+";
+                o += "            let is0 = 2u * sub;
+            let w_lo = select(select(x0, x1, is0 >= 4u), select(x2, x3, is0 >= 12u), is0 >= 8u);
+            let s0 = (w_lo >> (8u * (is0 % 4u))) & 0xFFu;
+            let s1 = (w_lo >> (8u * ((is0 + 1u) % 4u))) & 0xFFu;
+";
+                o += &format!(
+                    "            let d = f16_to_f32({});
+",
+                    half_at(108, parity)
+                );
+                o += "            sa = d * (f32(s0) - 32.0);
+            sb = 0.0;
+            sa1 = d * (f32(s1) - 32.0);
+            sb1 = 0.0;
+";
+            }
+            GGML_TYPE_IQ4_XS => {
+                // d at 0, scales_h (u16) at 2, scales_l[4] at 4, qs[128] at 8;
+                // a nibble indexes the sixteen-entry value table.
+                o += "            let sw = weights[w0];
+            let scales_h = sw >> 16u;
+            let sl_word = weights[w0 + 1u];
+            let low = (sl_word >> (8u * (sub / 2u) + 4u * (sub % 2u))) & 0xFu;
+            let high = (scales_h >> (2u * sub)) & 3u;
+            let ls = low | (high << 4u);
+";
+                for i in 0..8u32 {
+                    let word = 2 + if i < 4 { i } else { i - 4 };
+                    let shift = if i < 4 { "" } else { " >> 4u" };
+                    o += &format!(
+                        "            u{i} = iq4nl_bytes((weights[w0 + 4u * sub + {word}u]{shift}) & 0x0F0F0F0Fu);
+"
+                    );
+                }
+                o += "            let d = f16_to_f32(sw & 0xFFFFu);
+            sa = d * (f32(ls) - 32.0);
+            sb = 0.0;
+";
+            }
+            GGML_TYPE_IQ3_S => {
+                // d at 0, qs[64] at 2, qh[8] at 66, signs[32] at 74,
+                // scales[4] at 106. Word `i` of sub-block `sub` is lattice
+                // point `qs[8·sub + i]` with bit `i` of `qh[sub]` as its
+                // ninth index bit, negated where nibble `i` of the
+                // sub-block's four sign bytes says; one scale per sub-block.
+                o += &format!(
+                    "            let qh = ({} >> (8u * (sub % 4u))) & 0xFFu;\n",
+                    word_at_g(66, parity, "sub & ~3u")
+                );
+                o += &format!(
+                    "            let sg0 = {};\n",
+                    word_at_g(74, parity, "4u * sub")
+                );
+                for i in 0..8u32 {
+                    // Index bytes `8·sub + i`: word `2·sub + i/4`, byte `i%4`.
+                    let idx_word = word_at_g(2 + 4 * (i / 4), parity, "8u * sub");
+                    o += &format!(
+                        "            u{i} = iq_signed_bytes(iq_grids[IQ3S_GRID_OFF + ((({idx_word} >> {}u) & 0xFFu) | (((qh >> {i}u) & 1u) << 8u))], (sg0 >> {}u) & 0xFu);\n",
+                        8 * (i % 4),
+                        4 * i
+                    );
+                }
+                o += &format!(
+                    "            let sc = ({} >> (8u * ((sub / 2u) % 4u) + 4u * (sub % 2u))) & 0xFu;\n",
+                    word_at(106, parity)
+                );
+                o += &format!("            let d = f16_to_f32({});\n", half_at(0, parity));
+                o += "            sa = d * f32(1u + 2u * sc);\n            sb = 0.0;\n";
+            }
+            GGML_TYPE_IQ2_S => {
+                // d at 0, qs[32] at 2 then signs[32] at 34, qh[8] at 66,
+                // scales[8] at 74. Run `l` (eight values) of sub-block
+                // `sub` is lattice point `qs[4·sub + l]` with bits `2l..2l+2`
+                // of `qh[sub]` above it, one sign bit per value in
+                // `signs[4·sub + l]`; the scale nibbles are per half.
+                o += &format!(
+                    "            let qh = ({} >> (8u * (sub % 4u))) & 0xFFu;\n            let iw = {};\n            let sgw = {};\n",
+                    word_at_g(66, parity, "sub & ~3u"),
+                    word_at_g(2, parity, "4u * sub"),
+                    word_at_g(34, parity, "4u * sub")
+                );
+                for i in 0..8u32 {
+                    let l = i / 2;
+                    o += &format!(
+                        "            u{i} = iq_signed_bytes(iq_grids[IQ2S_GRID_OFF + 2u * (((iw >> {}u) & 0xFFu) | (((qh >> {}u) & 3u) << 8u)) + {}u], (sgw >> {}u) & 0xFu);\n",
+                        8 * l,
+                        2 * l,
+                        i % 2,
+                        8 * l + 4 * (i % 2)
+                    );
+                }
+                o += &format!(
+                    "            let sc = ({} >> (8u * (sub % 4u))) & 0xFFu;\n",
+                    word_at_g(74, parity, "sub & ~3u")
+                );
+                o += &format!("            let d = f16_to_f32({});\n", half_at(0, parity));
+                o += "            sa = d * (0.5 + f32(sc & 0xFu)) * 0.25;\n            sb = 0.0;\n            sa1 = d * (0.5 + f32(sc >> 4u)) * 0.25;\n            sb1 = 0.0;\n";
+            }
+            _ => unreachable!(),
+        }
+        o
+    };
+    let staging = if may_shift {
+        format!(
+            "            if ((byte0 & 3u) == 0u) {{\n{}            }} else {{\n{}            }}\n",
+            stage(0),
+            stage(1)
+        )
+    } else {
+        stage(0)
+    };
+
+    let mut src = String::new();
+    src.push_str(&format!(
+        r#"
+struct Meta {{
+    in_dim: u32,
+    out_dim: u32,
+    n_tokens: u32,
+    row_bytes: u32,
+}}
+
+@group(0) @binding(0) var<storage, read> weights: array<u32>;
+@group(0) @binding(1) var<storage, read> q8x: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> params: Meta;
+@group(0) @binding(4) var<storage, read> iq_grids: array<u32>;
+
+const IQ2S_GRID_OFF: u32 = 1024u;
+const IQ3S_GRID_OFF: u32 = 3328u;
+const KVALUES_IQ4NL_OFF: u32 = 3872u;
+
+fn f16_to_f32(bits: u32) -> f32 {{
+    return unpack2x16float(bits & 0xFFFFu).x;
+}}
+// Each nibble of `n` to its `kvalues_iq4nl` entry, a signed byte.
+fn iq4nl_byte(i: u32) -> u32 {{
+    return (iq_grids[KVALUES_IQ4NL_OFF + (i >> 2u)] >> ((i & 3u) * 8u)) & 0xFFu;
+}}
+fn iq4nl_bytes(n: u32) -> u32 {{
+    return iq4nl_byte(n & 0xFu) | (iq4nl_byte((n >> 8u) & 0xFu) << 8u)
+        | (iq4nl_byte((n >> 16u) & 0xFu) << 16u) | (iq4nl_byte((n >> 24u) & 0xFu) << 24u);
+}}
+// A lattice word's four (small, positive) bytes, each negated where its
+// bit of the four-bit `signs` is set: two's complement per byte lane,
+// which cannot carry because every value is below 128.
+fn iq_signed_bytes(g: u32, signs: u32) -> u32 {{
+    let m = (spread_bits(signs) >> 4u) * 0xFFu;
+    return (g ^ m) + (m & 0x01010101u);
+}}
+// Bits 0..4 of `x` to bit 4 of bytes 0..4 — a nibble's fifth bit per lane.
+fn spread_bits(x: u32) -> u32 {{
+    return ((x & 1u) << 4u) | ((x & 2u) << 11u) | ((x & 4u) << 18u) | ((x & 8u) << 25u);
+}}
+fn vec3_word(v: vec3<u32>, i: u32) -> u32 {{
+    if (i == 0u) {{ return v.x; }}
+    if (i == 1u) {{ return v.y; }}
+    return v.z;
+}}
+fn get_scale_min_k4_v4(scales: vec3<u32>, j: u32) -> vec2<u32> {{
+    if (j < 4u) {{
+        let qj = (vec3_word(scales, j / 4u) >> (8u * (j % 4u))) & 0xFFu;
+        let qj4 = (vec3_word(scales, (j + 4u) / 4u) >> (8u * ((j + 4u) % 4u))) & 0xFFu;
+        return vec2<u32>(qj & 63u, qj4 & 63u);
+    }}
+    let qj = (vec3_word(scales, j / 4u) >> (8u * (j % 4u))) & 0xFFu;
+    let qj4 = (vec3_word(scales, (j + 4u) / 4u) >> (8u * ((j + 4u) % 4u))) & 0xFFu;
+    let qjm4 = (vec3_word(scales, (j - 4u) / 4u) >> (8u * ((j - 4u) % 4u))) & 0xFFu;
+    let sc = (qj4 & 0xFu) | ((qjm4 >> 6u) << 4u);
+    let m = (qj4 >> 4u) | ((qj >> 6u) << 4u);
+    return vec2<u32>(sc, m);
+}}
+
+const ROWS: u32 = {rows}u;
+const TOKS: u32 = {toks}u;
+const KS: u32 = {ks}u;
+const BLOCK_BYTES: u32 = {block_bytes}u;
+const SUBS_PER_BLOCK: u32 = {subs}u;
+const ROW_WORDS: u32 = {row_words}u;
+var<workgroup> wt: array<u32, {wt_len}>;
+var<workgroup> xt: array<u32, {xt_len}>;
+
+@compute @workgroup_size(128)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {{
+    let row0 = wid.x * ROWS;
+    let tok0 = wid.y * TOKS;
+    let tid = lid.x;
+    let warp = tid / 64u;
+    let lane = tid % 64u;
+    let tiwr = lane % 32u;
+    let tiwc = lane / 32u;
+    let n_super = params.in_dim / 256u;
+    let n_slices = params.in_dim / 32u / KS;
+"#,
+        rows = rows,
+        toks = MMQ_WIDE_TILE_TOKENS,
+        ks = ks,
+        block_bytes = block_bytes,
+        subs = block_elems / 32,
+        row_words = row_words,
+        wt_len = rows * ks * row_words,
+        xt_len = MMQ_WIDE_TILE_TOKENS * ks * 11,
+    ));
+    for cr in 0..trows {
+        for t in 0..32 {
+            src.push_str(&format!("    var a{cr}_{t}: f32 = 0.0;\n"));
+        }
+    }
+    src.push_str(&format!(
+        r#"
+    var slice: u32 = 0u;
+    loop {{
+        if (slice >= n_slices) {{ break; }}
+        let g0 = slice * KS;
+        // Stage the rows: one item per (row, sub-block).
+        var i: u32 = tid;
+        loop {{
+            if (i >= ROWS * KS) {{ break; }}
+            let r = i % ROWS;
+            let k = i / ROWS;
+            let g = g0 + k;
+            let blk = g / SUBS_PER_BLOCK;
+            let sub = g % SUBS_PER_BLOCK;
+            let byte0 = (row0 + r) * params.row_bytes + blk * BLOCK_BYTES;
+            let w0 = byte0 / 4u;
+            var u0: u32; var u1: u32; var u2: u32; var u3: u32;
+            var u4: u32; var u5: u32; var u6: u32; var u7: u32;
+            var sa: f32; var sb: f32; var sa1: f32 = 0.0; var sb1: f32 = 0.0;
+{staging}            let e = (k * ROWS + r) * ROW_WORDS;
+            wt[e] = u0; wt[e + 1u] = u1; wt[e + 2u] = u2; wt[e + 3u] = u3;
+            wt[e + 4u] = u4; wt[e + 5u] = u5; wt[e + 6u] = u6; wt[e + 7u] = u7;
+            wt[e + 8u] = bitcast<u32>(sa);
+            wt[e + 9u] = bitcast<u32>(sb);
+{halves_write}            i = i + 128u;
+        }}
+        // Stage the tokens: one item per (token, sub-block), from the q8
+        // layout's 256-element super-blocks.
+        i = tid;
+        loop {{
+            if (i >= TOKS * KS) {{ break; }}
+            let t = i % TOKS;
+            let k = i / TOKS;
+            let g = g0 + k;
+            let sbk = g / 8u;
+            let b = g % 8u;
+            let tb = ((tok0 + t) * n_super + sbk) * 24u;
+            let hd = q8x[tb + b];
+            let q0 = q8x[tb + 8u + 2u * b];
+            let q1 = q8x[tb + 9u + 2u * b];
+            let e = (k * TOKS + t) * 11u;
+            xt[e] = q0.x;
+            xt[e + 1u] = q0.y;
+            xt[e + 2u] = q0.z;
+            xt[e + 3u] = q0.w;
+            xt[e + 4u] = q1.x;
+            xt[e + 5u] = q1.y;
+            xt[e + 6u] = q1.z;
+            xt[e + 7u] = q1.w;
+            xt[e + 8u] = hd.x;
+{token_sums}            i = i + 128u;
+        }}
+        workgroupBarrier();
+        var k: u32 = 0u;
+        loop {{
+            if (k >= KS) {{ break; }}
+"#,
+        halves_write = if halves {
+            "            wt[e + 10u] = bitcast<u32>(sa1);\n            wt[e + 11u] = bitcast<u32>(sb1);\n"
+        } else {
+            ""
+        },
+        token_sums = if halves {
+            "            xt[e + 9u] = hd.y;\n            xt[e + 10u] = hd.z;\n"
+        } else {
+            "            xt[e + 9u] = bitcast<u32>(bitcast<i32>(hd.y) + bitcast<i32>(hd.z));\n"
+        },
+    ));
+    for cr in 0..trows {
+        src.push_str(&format!(
+            "            let re{cr} = (k * ROWS + tiwr + {}u) * ROW_WORDS;\n",
+            32 * cr
+        ));
+        for i in 0..8 {
+            src.push_str(&format!("            let u{cr}_{i} = wt[re{cr} + {i}u];\n"));
+        }
+        src.push_str(&format!(
+            "            let sa{cr} = bitcast<f32>(wt[re{cr} + 8u]);\n            let sb{cr} = bitcast<f32>(wt[re{cr} + 9u]);\n"
+        ));
+        if halves {
+            src.push_str(&format!(
+                "            let sc{cr} = bitcast<f32>(wt[re{cr} + 10u]);\n            let sd{cr} = bitcast<f32>(wt[re{cr} + 11u]);\n"
+            ));
+        }
+    }
+    for g in 0..8 {
+        for cc in 0..4 {
+            let t = g * 4 + cc;
+            src.push_str(&format!(
+                "            {{\n            let te = (k * TOKS + warp * 64u + {}u + tiwc * 4u) * 11u;\n",
+                g * 8 + cc
+            ));
+            for i in 0..8 {
+                src.push_str(&format!("            let q{i} = xt[te + {i}u];\n"));
+            }
+            if halves {
+                src.push_str(
+                    "            let d = bitcast<f32>(xt[te + 8u]);\n            let dqlo = d * f32(bitcast<i32>(xt[te + 9u]));\n            let dqhi = d * f32(bitcast<i32>(xt[te + 10u]));\n",
+                );
+                for cr in 0..trows {
+                    let lo = (0..4)
+                        .map(|i| format!("dot4I8Packed(u{cr}_{i}, q{i})"))
+                        .collect::<Vec<_>>()
+                        .join(" + ");
+                    let hi = (4..8)
+                        .map(|i| format!("dot4I8Packed(u{cr}_{i}, q{i})"))
+                        .collect::<Vec<_>>()
+                        .join(" + ");
+                    src.push_str(&format!(
+                        "            a{cr}_{t} = a{cr}_{t} + fma(sa{cr} * d, f32({lo}), sb{cr} * dqlo) + fma(sc{cr} * d, f32({hi}), sd{cr} * dqhi);\n"
+                    ));
+                }
+            } else {
+                src.push_str(
+                    "            let d = bitcast<f32>(xt[te + 8u]);\n            let dq = d * f32(bitcast<i32>(xt[te + 9u]));\n",
+                );
+                for cr in 0..trows {
+                    let dot = (0..8)
+                        .map(|i| format!("dot4I8Packed(u{cr}_{i}, q{i})"))
+                        .collect::<Vec<_>>()
+                        .join(" + ");
+                    src.push_str(&format!(
+                        "            a{cr}_{t} = a{cr}_{t} + fma(sa{cr} * d, f32({dot}), sb{cr} * dq);\n"
+                    ));
+                }
+            }
+            src.push_str("            }\n");
+        }
+    }
+    src.push_str(
+        r#"            k = k + 1u;
+        }
+        workgroupBarrier();
+        slice = slice + 1u;
+    }
+"#,
+    );
+    for g in 0..8 {
+        for cc in 0..4 {
+            let t = g * 4 + cc;
+            src.push_str(&format!(
+                "    {{\n    let tok = tok0 + warp * 64u + {}u + tiwc * 4u;\n    if (tok < params.n_tokens) {{\n",
+                g * 8 + cc
+            ));
+            for cr in 0..trows {
+                src.push_str(&format!(
+                    "        y[tok * params.out_dim + row0 + tiwr + {}u] = a{cr}_{t};\n",
+                    32 * cr
+                ));
+            }
+            src.push_str("    }\n    }\n");
+        }
+    }
+    src.push_str("}\n");
+    src
+}
+
+/// The weight types [`shader_source_mmq_wide_bytes`] generates a kernel for.
+pub fn mmq_wide_bytes_types() -> &'static [u32] {
+    use crate::engine::quant::*;
+    &[
+        GGML_TYPE_Q5_K,
+        GGML_TYPE_Q8_0,
+        GGML_TYPE_Q4_0,
+        GGML_TYPE_Q4_1,
+        GGML_TYPE_Q5_0,
+        GGML_TYPE_Q5_1,
+        GGML_TYPE_Q2_K,
+        GGML_TYPE_Q3_K,
+        GGML_TYPE_IQ4_XS,
+        GGML_TYPE_IQ3_S,
+        GGML_TYPE_IQ2_S,
+    ]
 }
 
 /// The integer-dot `Q6_K` GEMM — [`shader_source_mmq_q4k`]'s structure
@@ -6763,17 +8353,27 @@ const GELU_MUL_SHADER_BODY: &str = r#"
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
 @group(0) @binding(3) var<uniform> em: ElemMeta;
 
+// Grid-stride: a dispatch may carry fewer workgroups than elements / 64
+// (a device's workgroups-per-dimension limit is what bounds it), and each
+// thread walks on by the grid's width until the end.
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= em.len) {
-        return;
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    var i: u32 = gid.x;
+    let stride = nwg.x * 64u;
+    loop {
+        if (i >= em.len) {
+            break;
+        }
+        let v = a[i];
+        let sqrt_2_over_pi = 0.7978846;
+        let coef_a = 0.044715;
+        let g = 0.5 * v * (1.0 + tanh(clamp(sqrt_2_over_pi * v * (1.0 + coef_a * v * v), -20.0, 20.0)));
+        y[i] = g * b[i];
+        i = i + stride;
     }
-    let v = a[i];
-    let sqrt_2_over_pi = 0.7978846;
-    let coef_a = 0.044715;
-    let g = 0.5 * v * (1.0 + tanh(clamp(sqrt_2_over_pi * v * (1.0 + coef_a * v * v), -20.0, 20.0)));
-    y[i] = g * b[i];
 }
 "#;
 
@@ -6955,15 +8555,25 @@ const SILU_MUL_SHADER_BODY: &str = r#"
 @group(0) @binding(2) var<storage, read_write> y: array<f32>;
 @group(0) @binding(3) var<uniform> em: ElemMeta;
 
+// Grid-stride: a dispatch may carry fewer workgroups than elements / 64
+// (a device's workgroups-per-dimension limit is what bounds it), and each
+// thread walks on by the grid's width until the end.
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
-    if (i >= em.len) {
-        return;
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    var i: u32 = gid.x;
+    let stride = nwg.x * 64u;
+    loop {
+        if (i >= em.len) {
+            break;
+        }
+        let v = a[i];
+        let g = v / (1.0 + exp(-v));
+        y[i] = g * b[i];
+        i = i + stride;
     }
-    let v = a[i];
-    let g = v / (1.0 + exp(-v));
-    y[i] = g * b[i];
 }
 "#;
 
@@ -7368,6 +8978,94 @@ pub fn shader_source_rmsnorm_add_rows() -> String {
 /// `shader_source_rmsnorm_add_rows` with the trailing write multiplied by
 /// `em.out_scale` — the row-strided form of `shader_source_rmsnorm_add_scale`,
 /// for a prefill layer's per-layer output scale.
+/// gemma4's per-layer-embedding inputs for a prefill, in one dispatch per
+/// (token, layer) row: the projection's row scaled by `proj_scale`,
+/// RMS-normed against the shared `proj_norm` weight, added to the token's
+/// gathered per-layer embedding row, scaled by `in_scale` — and written
+/// **layer-major** (`[n_layer][row_cap][per_layer]`, `row_cap` being
+/// `n_tokens` rounded up to whole stripes), so each layer's stage reads its
+/// `[n_tokens, per_layer]` operand as one contiguous slice of the device
+/// buffer where the host path gathered it per layer, padded tail included.
+/// The inputs are token-major, the layout the projection GEMM writes.
+///
+/// One workgroup of 64 per row over `per_layer` (256) elements. Bindings:
+/// the projection (read), the norm weight (read), the gathered rows (read),
+/// the output (write), the meta.
+const PLE_INPUTS_SHADER: &str = r#"
+struct PleInMeta {
+    n_tokens: u32,
+    n_layer: u32,
+    per_layer: u32,
+    eps: f32,
+    proj_scale: f32,
+    in_scale: f32,
+    // Rows per layer in the output — `n_tokens` rounded up to whole
+    // stripes, so a striped stage's padded tail stays inside its layer.
+    row_cap: u32,
+    _p1: u32,
+}
+
+@group(0) @binding(0) var<storage, read> proj: array<f32>;
+@group(0) @binding(1) var<storage, read> nw: array<f32>;
+@group(0) @binding(2) var<storage, read> gathered: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(4) var<uniform> pm: PleInMeta;
+
+var<workgroup> pi_partial: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let row = wid.x;
+    let t = row / pm.n_layer;
+    let il = row % pm.n_layer;
+    let local = lid.x;
+    let base_in = (t * pm.n_layer + il) * pm.per_layer;
+    let base_out = (il * pm.row_cap + t) * pm.per_layer;
+
+    var partial: f32 = 0.0;
+    var k: u32 = local;
+    loop {
+        if (k >= pm.per_layer) {
+            break;
+        }
+        let v = proj[base_in + k] * pm.proj_scale;
+        partial = partial + v * v;
+        k = k + 64u;
+    }
+    pi_partial[local] = partial;
+    workgroupBarrier();
+    var stride: u32 = 32u;
+    loop {
+        if (stride == 0u) {
+            break;
+        }
+        if (local < stride) {
+            pi_partial[local] = pi_partial[local] + pi_partial[local + stride];
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let mean_sq = pi_partial[0] / f32(pm.per_layer);
+    let scale = 1.0 / sqrt(mean_sq + pm.eps);
+    k = local;
+    loop {
+        if (k >= pm.per_layer) {
+            break;
+        }
+        let v = proj[base_in + k] * pm.proj_scale;
+        out[base_out + k] = (v * scale * nw[k] + gathered[base_in + k]) * pm.in_scale;
+        k = k + 64u;
+    }
+}
+"#;
+
+pub fn shader_source_ple_inputs() -> String {
+    PLE_INPUTS_SHADER.to_string()
+}
+
 pub fn shader_source_rmsnorm_add_scale_rows() -> String {
     shader_source_rmsnorm_add_rows().replace(
         "y[base + k] = x[base + k] * scale * weight[k] + residual[base + k];",
@@ -9115,6 +10813,468 @@ fn main(
 "#
     );
     paging.finish(src)
+}
+
+/// The **tiled** prefill attention kernel: one workgroup per (query tile,
+/// head), the tile's queries staged once in workgroup memory, the window
+/// walked in blocks of positions, every thread owning a few rows × a few
+/// columns × a slice of `head_dim`.
+///
+/// The per-query kernels above walk the window one position at a time and
+/// pay a cross-lane reduction and an `exp` per head per position for a
+/// handful of multiply-adds; every query also streams K and V for itself.
+/// Here a K or V element loaded from the cache feeds one multiply-add per
+/// owned row, the scores' only cross-lane work is a three-step shuffle over
+/// the eight lanes that split `head_dim`, and the online softmax runs
+/// **per thread over its own columns** — a partial `(m, l, o)` over a subset
+/// of positions is a valid partial softmax, so the lanes that share a row
+/// merge their partials once at the end instead of agreeing on a running
+/// maximum every block.
+///
+/// Thread layout (four row groups of `lanes` threads): `row_tid` picks a
+/// group of `rows` rows, `d_tid = tid % dlanes` one of the `head_dim`
+/// slices (eight elements per lane per step, adjacent lanes adjacent in
+/// memory, so a position's row is read as one contiguous run), `col_tid`
+/// one of the `lanes / dlanes` column phases. The tile is `4 * rows`
+/// queries by `cols` × phases positions per block; the accumulator is
+/// `rows * head_dim / dlanes` registers and the scores `rows * cols`, which
+/// is what bounds both — see [`FaPrefillTile`].
+///
+/// Every row derives its own window from `start_pos + t` (the same four cases
+/// as [`ATTENTION_MULTI_QUERY_SETUP`]); a position outside a row's window
+/// scores `-inf`, which the softmax turns into exactly zero, and the block
+/// loop runs from the tile's earliest window start to its latest end. Rows
+/// past `n_query` in a partial last tile compute on a clamped token and are
+/// not written.
+///
+/// Q is read pre-scaled into workgroup memory as `vec4`s with a padded stride;
+/// K and V are read straight from the cache eight elements at a time
+/// (`kv_read_k8`/`v8`, per storage type), never staged — the four row groups
+/// of a workgroup reread a position through the cache. The probabilities are
+/// recomputed from the scores where they are used rather than kept, so the
+/// live set is the accumulator and the scores.
+pub fn shader_source_attention_prefill_tiled(
+    kv_storage: KvStorage,
+    head_dim: u32,
+    paging: KvPaging,
+    tile: FaPrefillTile,
+) -> String {
+    debug_assert_eq!(
+        head_dim % (8 * tile.dlanes),
+        0,
+        "tiled attention needs head_dim % (8 * dlanes) == 0"
+    );
+    let rows = tile.rows;
+    let cols = tile.cols;
+    let lanes = tile.lanes;
+    let dl = tile.dlanes;
+    let col_lanes = lanes / dl;
+    let wg = 4 * lanes;
+    let br = rows * 4;
+    let bc = cols * col_lanes;
+    let dv = head_dim / (4 * dl); // vec4s of head_dim per thread
+    let enable = kv_storage.enable_directive();
+    let kv_page_binding = paging.binding();
+    let kv_slot_fn = paging.slot_fn();
+    let (kv_bindings, kv_read4) = match kv_storage {
+        KvStorage::F32 => (
+            "@group(0) @binding(1) var<storage, read> k_cache: array<vec4<f32>>;\n\
+             @group(0) @binding(2) var<storage, read> v_cache: array<vec4<f32>>;"
+                .to_string(),
+            "fn kv_read_k8(e: u32) -> array<vec4<f32>, 2> { return array<vec4<f32>, 2>(k_cache[e / 4u], k_cache[e / 4u + 1u]); }\n\
+             fn kv_read_v8(e: u32) -> array<vec4<f32>, 2> { return array<vec4<f32>, 2>(v_cache[e / 4u], v_cache[e / 4u + 1u]); }"
+                .to_string(),
+        ),
+        // Eight halves as one 128-bit load, unpacked in pairs.
+        KvStorage::F16 => (
+            "@group(0) @binding(1) var<storage, read> k_cache: array<vec4<u32>>;\n\
+             @group(0) @binding(2) var<storage, read> v_cache: array<vec4<u32>>;"
+                .to_string(),
+            "fn h8(w: vec4<u32>) -> array<vec4<f32>, 2> { return array<vec4<f32>, 2>(vec4<f32>(unpack2x16float(w.x), unpack2x16float(w.y)), vec4<f32>(unpack2x16float(w.z), unpack2x16float(w.w))); }\n\
+             fn kv_read_k8(e: u32) -> array<vec4<f32>, 2> { return h8(k_cache[e / 8u]); }\n\
+             fn kv_read_v8(e: u32) -> array<vec4<f32>, 2> { return h8(v_cache[e / 8u]); }"
+                .to_string(),
+        ),
+        // `KV_QUANTIZE_Q8_0_SHADER`'s layout: 9 words per 32 values, the
+        // scale then the bytes; four consecutive values are one word.
+        KvStorage::Q8_0 => (
+            "@group(0) @binding(1) var<storage, read> k_cache: array<u32>;\n\
+             @group(0) @binding(2) var<storage, read> v_cache: array<u32>;"
+                .to_string(),
+            "fn q8x4(d: f32, w: u32) -> vec4<f32> {\n    \
+                 return d * vec4<f32>(f32(i32(w << 24u) >> 24u), f32(i32(w << 16u) >> 24u), f32(i32(w << 8u) >> 24u), f32(i32(w) >> 24u));\n}\n\
+             fn kv_read_k8(e: u32) -> array<vec4<f32>, 2> {\n    \
+                 let b = (e / 32u) * 9u;\n    \
+                 let d = bitcast<f32>(k_cache[b]);\n    \
+                 let w = b + 1u + (e % 32u) / 4u;\n    \
+                 return array<vec4<f32>, 2>(q8x4(d, k_cache[w]), q8x4(d, k_cache[w + 1u]));\n}\n\
+             fn kv_read_v8(e: u32) -> array<vec4<f32>, 2> {\n    \
+                 let b = (e / 32u) * 9u;\n    \
+                 let d = bitcast<f32>(v_cache[b]);\n    \
+                 let w = b + 1u + (e % 32u) / 4u;\n    \
+                 return array<vec4<f32>, 2>(q8x4(d, v_cache[w]), q8x4(d, v_cache[w + 1u]));\n}"
+                .to_string(),
+        ),
+    };
+
+    // Registers: accumulators, per-row running max and sum, row windows.
+    let mut decl = String::new();
+    for r in 0..rows {
+        for d in 0..dv {
+            decl += &format!("    var o{r}_{d}: vec4<f32> = vec4<f32>(0.0);\n");
+        }
+        decl += &format!("    var m{r}: f32 = NEG_HALF_MAX;\n    var l{r}: f32 = 0.0;\n");
+        decl += &format!("    let tr{r} = min(tb + {r}u, am.n_query - 1u);\n");
+        decl +=
+            &format!("    let ws{r} = window_start(tr{r});\n    let we{r} = window_end(tr{r});\n");
+    }
+
+    let mut s = String::new();
+    for r in 0..rows {
+        for c in 0..cols {
+            s += &format!("        var s{r}_{c}: f32 = 0.0;\n");
+        }
+    }
+    // Each column's K element base; the position itself is `pb + 4c + col_tid`.
+    for c in 0..cols {
+        s += &format!(
+            "        let kb{c} = (kv_row(min(pb + {}u + col_tid, we_max)) * am.n_head_kv + kv_head) * HEAD_DIM + 8u * d_tid;\n",
+            col_lanes * c
+        );
+    }
+    // QK: per head_dim slice, the rows' Q from workgroup memory, then every
+    // column's K once for all rows. A column past the window's end reads
+    // a clamped row and is masked below.
+    // Owned slot `d` (a vec4) sits at element `8 * (d / 2 * 8 + d_tid) + 4 *
+    // (d % 2)`: a thread's two slots of a step are adjacent, one 8-element
+    // load, and the eight lanes' loads are contiguous.
+    let slot = |d: u32| -> String { format!("{}u + 2u * d_tid + {}u", 2 * dl * (d / 2), d % 2) };
+    for d2 in 0..dv / 2 {
+        for d in [2 * d2, 2 * d2 + 1] {
+            for r in 0..rows {
+                s += &format!(
+                    "        let q{r}_{d} = qsh[(row_tid * ROWS + {r}u) * QSTRIDE + {}];\n",
+                    slot(d)
+                );
+            }
+        }
+        for c in 0..cols {
+            s += &format!(
+                "        {{\n            let k = kv_read_k8(kb{c} + {}u);\n",
+                8 * dl * d2
+            );
+            for r in 0..rows {
+                s += &format!(
+                    "            s{r}_{c} = s{r}_{c} + dot(q{r}_{}, k[0]) + dot(q{r}_{}, k[1]);\n",
+                    2 * d2,
+                    2 * d2 + 1
+                );
+            }
+            s += "        }\n";
+        }
+    }
+    // Scores summed over the eight head_dim lanes, then masked per row.
+    for r in 0..rows {
+        for c in 0..cols {
+            let mut step = dl / 2;
+            while step >= 1 {
+                s += &format!(
+                    "        s{r}_{c} = s{r}_{c} + subgroupShuffleXor(s{r}_{c}, {step}u);\n"
+                );
+                step /= 2;
+            }
+            s += &format!(
+                "        s{r}_{c} = select(neg_inf(), s{r}_{c}, pb + {}u + col_tid >= ws{r} && pb + {}u + col_tid <= we{r});\n",
+                col_lanes * c,
+                col_lanes * c
+            );
+        }
+    }
+    // Online softmax per row over this thread's columns: the running max
+    // moves, the accumulator and sum are rescaled.
+    for r in 0..rows {
+        let mut mx = format!("s{r}_0");
+        for c in 1..cols {
+            mx = format!("max({mx}, s{r}_{c})");
+        }
+        s += &format!(
+            "        let nm{r} = max(m{r}, {mx});\n        let em{r} = exp(m{r} - nm{r});\n        m{r} = nm{r};\n        l{r} = l{r} * em{r};\n"
+        );
+        for d in 0..dv {
+            s += &format!("        o{r}_{d} = o{r}_{d} * em{r};\n");
+        }
+    }
+    // PV: every column's V once for all rows, its probabilities taken from
+    // the scores here.
+    for c in 0..cols {
+        s += &format!(
+            "        if (pb + {}u + col_tid <= we_max) {{\n",
+            col_lanes * c
+        );
+        for r in 0..rows {
+            s += &format!(
+                "            let pw{r} = exp(s{r}_{c} - m{r});\n            l{r} = l{r} + pw{r};\n"
+            );
+        }
+        for d2 in 0..dv / 2 {
+            s += &format!(
+                "            let v{d2} = kv_read_v8(kb{c} + {}u);\n",
+                8 * dl * d2
+            );
+            for (i, d) in [2 * d2, 2 * d2 + 1].into_iter().enumerate() {
+                for r in 0..rows {
+                    s += &format!(
+                        "            o{r}_{d} = fma(vec4<f32>(pw{r}), v{d2}[{i}], o{r}_{d});\n"
+                    );
+                }
+            }
+        }
+        s += "        }\n";
+    }
+    // Merge the column phases' partials, then write. Phases 0..4 sit within
+    // 32 lanes and merge by shuffle; with eight phases the upper four are a
+    // second 32-lane half, merged by shuffle when the subgroup spans all 64
+    // lanes and through workgroup memory (over the staged Q, no longer
+    // needed) when it does not: each half reduces to its own `(max, sum,
+    // acc)` first, then the lower half folds the upper's in.
+    let wide = lanes == 64;
+    // Sum (or max) `v` over the column phases: the steps within 32 lanes
+    // unconditionally, the 32-lane step only on a 64-wide subgroup.
+    let fold = |v: &str, op: &str| -> String {
+        let mut o = String::new();
+        let mut step = dl;
+        while step < 32 {
+            o += &format!("    {v} = {op}({v}, subgroupShuffleXor({v}, {step}u));\n");
+            step *= 2;
+        }
+        if wide {
+            o += &format!(
+                "    if (sg_size >= 64u) {{ {v} = {op}({v}, subgroupShuffleXor({v}, 32u)); }}\n"
+            );
+        }
+        o
+    };
+    let mut fin = String::new();
+    for r in 0..rows {
+        fin += &format!("    var gm{r} = m{r};\n");
+        fin += &fold(&format!("gm{r}"), "max");
+        fin += &format!("    let f{r} = exp(m{r} - gm{r});\n    var gl{r} = l{r} * f{r};\n");
+        fin += &fold(&format!("gl{r}"), "fadd");
+        for d in 0..dv {
+            fin += &format!("    o{r}_{d} = o{r}_{d} * f{r};\n");
+            fin += &fold(&format!("o{r}_{d}"), "vadd");
+        }
+    }
+    if wide {
+        let mut lds = String::new();
+        lds += &format!(
+            "        workgroupBarrier();\n        let xb = (row_tid * {dl}u + d_tid) * (ROWS * XROW);\n        if (col_tid == {}u) {{\n",
+            col_lanes / 2
+        );
+        for r in 0..rows {
+            lds += &format!(
+                "            qsh[xb + {r}u * XROW + {dv}u] = vec4<f32>(gm{r}, gl{r}, 0.0, 0.0);\n"
+            );
+            for d in 0..dv {
+                lds += &format!("            qsh[xb + {r}u * XROW + {d}u] = o{r}_{d};\n");
+            }
+        }
+        lds += &format!(
+            "        }}\n        workgroupBarrier();\n        if (col_tid < {}u) {{\n",
+            col_lanes / 2
+        );
+        for r in 0..rows {
+            lds += &format!(
+                "            let u{r} = qsh[xb + {r}u * XROW + {dv}u];\n            let jm{r} = max(gm{r}, u{r}.x);\n            let fl{r} = exp(gm{r} - jm{r});\n            let fu{r} = exp(u{r}.x - jm{r});\n            gl{r} = gl{r} * fl{r} + u{r}.y * fu{r};\n"
+            );
+            for d in 0..dv {
+                lds += &format!(
+                    "            o{r}_{d} = o{r}_{d} * fl{r} + qsh[xb + {r}u * XROW + {d}u] * fu{r};\n"
+                );
+            }
+        }
+        lds += "        }\n";
+        fin += &format!("    if (sg_size < 64u) {{\n{lds}    }}\n");
+    }
+    for r in 0..rows {
+        fin += &format!(
+            "    let inv{r} = select(1.0 / gl{r}, 0.0, gl{r} == 0.0);\n    if (col_tid == 0u && tb + {r}u < am.n_query) {{\n"
+        );
+        for d in 0..dv {
+            fin += &format!(
+                "        aout[((tb + {r}u) * am.n_head + h) * (HEAD_DIM / 4u) + {}] = o{r}_{d} * inv{r};\n",
+                slot(d)
+            );
+        }
+        fin += "    }\n";
+    }
+
+    let src = format!(
+        r#"{enable}
+struct AttnMeta {{
+    n_head: u32,
+    n_head_kv: u32,
+    head_dim: u32,
+    window_start: u32,
+    n_pos: u32,
+    capacity: u32,
+    scale: f32,
+    start_pos: u32,
+    n_query: u32,
+    n_swa: u32,
+    causal: u32,
+    kv_page_base: u32,
+    kv_page_tokens: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}}
+
+@group(0) @binding(0) var<storage, read> aq: array<vec4<f32>>;
+{kv_bindings}
+@group(0) @binding(3) var<storage, read_write> probs_scratch: array<f32>;
+@group(0) @binding(4) var<storage, read_write> aout: array<vec4<f32>>;
+@group(0) @binding(5) var<uniform> am: AttnMeta;
+{kv_page_binding}
+
+{kv_read4}
+{kv_slot_fn}
+fn kv_row(p: u32) -> u32 {{ return kv_slot(p); }}
+
+const HEAD_DIM: u32 = {head_dim}u;
+const BR: u32 = {br}u;
+const BC: u32 = {bc}u;
+const ROWS: u32 = {rows}u;
+const LANES: u32 = {lanes}u;
+const DL: u32 = {dl}u;
+const QSTRIDE: u32 = {qstride}u;
+const XROW: u32 = {xrow}u;
+// `-inf` and `-FLT_MAX / 2`: a masked score and the running maximum's
+// start — far enough apart from anything finite that `exp(a - b)` is 0 or
+// 1 exactly, never a NaN.
+fn neg_inf() -> f32 {{ return bitcast<f32>(0xFF800000u); }}
+fn fadd(a: f32, b: f32) -> f32 {{ return a + b; }}
+fn vadd(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {{ return a + b; }}
+const NEG_HALF_MAX: f32 = -1.7014117e38;
+var<workgroup> qsh: array<vec4<f32>, {qsh_len}>;
+
+// Per-query window, same rule as `GemmaModel::attention_window`.
+fn window_start(t: u32) -> u32 {{
+    let pos = am.start_pos + t;
+    if (am.causal == 0u) {{
+        if (am.n_swa > 0u) {{
+            let half = am.n_swa / 2u;
+            return select(0u, pos - half, pos > half);
+        }}
+        return 0u;
+    }}
+    if (am.n_swa > 0u) {{
+        return select(0u, pos - (am.n_swa - 1u), pos + 1u > am.n_swa);
+    }}
+    return 0u;
+}}
+fn window_end(t: u32) -> u32 {{
+    let pos = am.start_pos + t;
+    if (am.causal == 0u) {{
+        if (am.n_swa > 0u) {{
+            return min(pos + am.n_swa / 2u, am.n_query - 1u);
+        }}
+        return am.n_query - 1u;
+    }}
+    return pos;
+}}
+
+@compute @workgroup_size({wg})
+fn main(
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(subgroup_size) sg_size: u32,
+) {{
+    let t0 = wid.x * BR;
+    let h = wid.y;
+    let kv_head = h / (am.n_head / am.n_head_kv);
+    let tid = lid.x;
+    let row_tid = tid / LANES;
+    let col_tid = (tid % LANES) / DL;
+    let d_tid = tid % DL;
+    // This thread's first row (token) of the tile.
+    let tb = t0 + row_tid * ROWS;
+
+    // The tile's queries, scaled, one vec4 per thread per step.
+    var i: u32 = tid;
+    loop {{
+        if (i >= BR * (HEAD_DIM / 4u)) {{ break; }}
+        let r = i / (HEAD_DIM / 4u);
+        let d = i % (HEAD_DIM / 4u);
+        let t = min(t0 + r, am.n_query - 1u);
+        let qv = aq[(t * am.n_head + h) * (HEAD_DIM / 4u) + d] * am.scale;
+{q_stage}        i = i + {wg}u;
+    }}
+    workgroupBarrier();
+
+{decl}
+    let ws_min = window_start(t0);
+    let we_max = window_end(min(t0 + BR - 1u, am.n_query - 1u));
+    var pb: u32 = (ws_min / BC) * BC;
+    loop {{
+        if (pb > we_max) {{ break; }}
+{s}        pb = pb + BC;
+    }}
+
+{fin}}}
+"#,
+        qstride = head_dim / 4 + 1,
+        qsh_len = (br * (head_dim / 4 + 1)).max(if wide { 4 * dl * rows * (dv + 1) } else { 0 }),
+        q_stage = "        qsh[r * QSTRIDE + d] = qv;\n",
+        lanes = lanes,
+        dl = dl,
+        xrow = dv + 1,
+        wg = wg,
+    );
+    paging.finish(src)
+}
+
+/// The tiled prefill kernel's per-thread tile: `rows` query rows and `cols`
+/// positions per block (the workgroup covers four of each).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FaPrefillTile {
+    pub rows: u32,
+    pub cols: u32,
+    /// Lanes per row group, 32 or 64: `dlanes` `head_dim` lanes by the
+    /// column phases that fill the rest; the workgroup is four row groups.
+    pub lanes: u32,
+    /// Lanes that split `head_dim`, 8 or 16 — each owns `head_dim / dlanes`
+    /// elements, so more of them means fewer accumulator registers per row.
+    pub dlanes: u32,
+}
+
+impl FaPrefillTile {
+    /// The tile for a `head_dim`: the accumulator is `rows * head_dim /
+    /// dlanes` registers per thread. Two rows was the measured optimum at
+    /// both `head_dim` 256 and 512 — four rows halve the loads per
+    /// multiply-add but the registers they hold cost more occupancy than
+    /// that buys, whichever way the lanes are split, and one row at 512
+    /// (a 64-register accumulator) was a third slower than two. Narrower
+    /// heads take four. `ORANGU_FA_ROWS`, `ORANGU_FA_COLS`,
+    /// `ORANGU_FA_LANES` and `ORANGU_FA_DLANES` pin the tile for measurement.
+    pub fn for_head_dim(head_dim: u32) -> Self {
+        let pinned = |name: &str, allowed: &[u32]| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|n| allowed.contains(n))
+        };
+        Self {
+            rows: pinned("ORANGU_FA_ROWS", &[1, 2, 3, 4, 8]).unwrap_or(if head_dim <= 128 {
+                4
+            } else {
+                2
+            }),
+            cols: pinned("ORANGU_FA_COLS", &[2, 4, 8]).unwrap_or(8),
+            lanes: pinned("ORANGU_FA_LANES", &[32, 64]).unwrap_or(32),
+            dlanes: pinned("ORANGU_FA_DLANES", &[8, 16]).unwrap_or(8),
+        }
+    }
 }
 
 /// Builds [`ATTENTION_COOP_PREFILL_TEMPLATE`] for a specific `head_dim`

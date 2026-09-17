@@ -226,6 +226,23 @@ pub(super) struct PerHeadNormMeta {
     pub(super) _pad: u32,
 }
 
+/// `PleInMeta` in `vulkan_shaders::PLE_INPUTS_SHADER` — `#[repr(C)]` so its
+/// layout matches WGSL's `struct PleInMeta { n_tokens: u32, n_layer: u32,
+/// per_layer: u32, eps: f32, proj_scale: f32, in_scale: f32, row_cap: u32,
+/// _p1: u32 }` field-for-field.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(super) struct PleInMeta {
+    pub(super) n_tokens: u32,
+    pub(super) n_layer: u32,
+    pub(super) per_layer: u32,
+    pub(super) eps: f32,
+    pub(super) proj_scale: f32,
+    pub(super) in_scale: f32,
+    pub(super) row_cap: u32,
+    pub(super) _p1: u32,
+}
+
 /// `FusedNormRopeMeta` in `vulkan_shaders::FUSED_NORM_ROPE_SHADER` —
 /// `#[repr(C)]` so its layout matches WGSL's `struct FusedNormRopeMeta {
 /// n_head: u32, head_dim: u32, rope_dim: u32, pos: u32, freq_base: f32,

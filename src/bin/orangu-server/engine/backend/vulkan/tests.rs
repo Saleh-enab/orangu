@@ -2074,6 +2074,61 @@ fn matmul_matches_cpu_backend_for_q4_k() {
     cross_check(GGML_TYPE_Q4_K, 512, 5);
 }
 
+/// The word-reading `block_dot`s on the **decode** path: one token, a
+/// model-shaped width, and a weight large enough that the host-matmul rule
+/// leaves it on the device — `cross_check`'s three tokens take the
+/// thin-tile kernel and a small one-token weight goes to the CPU (both
+/// proved by breaking the kernel under them: they kept passing). The
+/// pipeline the backend picks is asserted to be the block-hoisted one.
+/// Enough blocks for every lane to go round the block loop more than
+/// once, an `out_dim` that is not a multiple of the row batch, and for the
+/// 110/82-byte types both word parities of a block start.
+fn cross_check_decode(ggml_type: u32, in_dim: usize) {
+    let (block_bytes, block_elems) = crate::engine::quant::block_layout(ggml_type).unwrap();
+    let row_bytes = in_dim / block_elems * block_bytes;
+    let out_dim = crate::engine::backend::host_matmul_threshold_bytes().div_ceil(row_bytes) + 7;
+    {
+        let Some(vulkan) = shared_vulkan() else {
+            return;
+        };
+        assert_eq!(
+            vulkan.pipeline_for_named(ggml_type, in_dim, 1).1,
+            "block-hoisted",
+            "type {ggml_type} at one token"
+        );
+    }
+    cross_check_n_tokens(ggml_type, in_dim, out_dim, 1);
+}
+
+#[test]
+fn decode_matvec_matches_cpu_backend_for_q2_k_model_shaped() {
+    cross_check_decode(GGML_TYPE_Q2_K, 1536);
+    cross_check_decode(GGML_TYPE_Q2_K, 6144);
+}
+
+#[test]
+fn decode_matvec_matches_cpu_backend_for_q3_k_model_shaped() {
+    cross_check_decode(GGML_TYPE_Q3_K, 1536);
+    cross_check_decode(GGML_TYPE_Q3_K, 6144);
+}
+
+#[test]
+fn decode_matvec_matches_cpu_backend_for_iq4_xs_model_shaped() {
+    cross_check_decode(GGML_TYPE_IQ4_XS, 1536);
+}
+
+#[test]
+fn decode_matvec_matches_cpu_backend_for_iq3_s_model_shaped() {
+    cross_check_decode(GGML_TYPE_IQ3_S, 1536);
+    cross_check_decode(GGML_TYPE_IQ3_S, 6144);
+}
+
+#[test]
+fn decode_matvec_matches_cpu_backend_for_iq2_s_model_shaped() {
+    cross_check_decode(GGML_TYPE_IQ2_S, 1536);
+    cross_check_decode(GGML_TYPE_IQ2_S, 6144);
+}
+
 /// A prefill-width batch routes to *every* expert in a layer, which on
 /// this model is 408 MiB against a 256 MiB region. Grouping is what keeps
 /// that inside the region: each group is dispatched separately and so
@@ -8667,6 +8722,21 @@ fn gpu_attention_prefill_is_correct_after_a_larger_batch_on_the_same_backend() {
     cross_check_gpu_attention_prefill_sized(4, true, 5, 8, 1, 256, 5);
 }
 
+/// The tiled kernel over many blocks: a window several blocks wide that
+/// starts and ends inside blocks, a tile count that does not divide the
+/// token count, a deep `start_pos`, and the narrower head_dim that takes
+/// eight rows per thread.
+#[test]
+fn gpu_attention_prefill_tiled_long_sliding_window() {
+    cross_check_gpu_attention_prefill_sized(64, true, 300, 8, 2, 256, 203);
+}
+
+#[test]
+fn gpu_attention_prefill_tiled_deep_causal_narrow_head() {
+    cross_check_gpu_attention_prefill_sized(0, true, 1000, 4, 1, 128, 100);
+    cross_check_gpu_attention_prefill_sized(40, false, 0, 4, 2, 128, 77);
+}
+
 /// `n_head_kv == n_head` leaves nothing to share, so this is the one shape
 /// that still reaches the ungrouped cooperative kernel — the other prefill
 /// cross-checks all have a group and take the GQA path.
@@ -10473,13 +10543,49 @@ fn mmq_q4k_gemm_matches_the_cpu_product() {
         (GGML_TYPE_Q4_K, 1536usize, 512usize, 64usize),
         (GGML_TYPE_Q4_K, 6144, 512, 128),
         (GGML_TYPE_Q4_K, 1536, 256, 90),
+        // Wide enough for the 128 × 128 kernel (`mmq_kernel_for`): the
+        // FFN gate shape at two token tiles, and a down projection whose
+        // last token tile is partial.
+        (GGML_TYPE_Q4_K, 1536, 6144, 256),
+        (GGML_TYPE_Q4_K, 6144, 1536, 200),
         // `Q6_K`: 210-byte blocks, so the odd blocks of a row start two
         // bytes into a word, and a row of `1536` is not 16-byte aligned.
         (crate::engine::quant::GGML_TYPE_Q6_K, 6144, 512, 128),
         (crate::engine::quant::GGML_TYPE_Q6_K, 1536, 256, 90),
+        // And the wide `Q6_K` tile, on the down-projection shape with a
+        // partial last token tile and on an unaligned row width.
+        (crate::engine::quant::GGML_TYPE_Q6_K, 6144, 1536, 200),
+        (crate::engine::quant::GGML_TYPE_Q6_K, 1536, 6144, 256),
+        // The byte-unpacked kernels, one shape each that takes the tall
+        // tile and one the half tile with a partial token tile; the
+        // 18/22/34-byte blocks exercise both word alignments.
+        (crate::engine::quant::GGML_TYPE_Q5_K, 1536, 6144, 256),
+        (crate::engine::quant::GGML_TYPE_Q5_K, 6144, 1536, 200),
+        (crate::engine::quant::GGML_TYPE_Q8_0, 1536, 6144, 256),
+        (crate::engine::quant::GGML_TYPE_Q8_0, 6144, 1536, 200),
+        (crate::engine::quant::GGML_TYPE_Q4_0, 1536, 6144, 200),
+        (crate::engine::quant::GGML_TYPE_Q4_1, 1536, 6144, 200),
+        (crate::engine::quant::GGML_TYPE_Q5_0, 1536, 6144, 200),
+        (crate::engine::quant::GGML_TYPE_Q5_1, 1536, 6144, 200),
+        // The sixteen-value scale types take the dot per half; `Q3_K`'s
+        // 110-byte block puts odd blocks two bytes into a word.
+        (crate::engine::quant::GGML_TYPE_Q2_K, 1536, 6144, 256),
+        (crate::engine::quant::GGML_TYPE_Q2_K, 6144, 1536, 200),
+        (crate::engine::quant::GGML_TYPE_Q3_K, 1536, 6144, 256),
+        (crate::engine::quant::GGML_TYPE_Q3_K, 6144, 1536, 200),
+        (crate::engine::quant::GGML_TYPE_IQ4_XS, 1536, 6144, 256),
+        (crate::engine::quant::GGML_TYPE_IQ4_XS, 6144, 1536, 200),
+        // The lattice types: codebook lookups with per-value signs, `IQ2_S`
+        // with its scales per half; both have blocks of two-byte parity.
+        (crate::engine::quant::GGML_TYPE_IQ3_S, 1536, 6144, 256),
+        (crate::engine::quant::GGML_TYPE_IQ3_S, 6144, 1536, 200),
+        (crate::engine::quant::GGML_TYPE_IQ2_S, 1536, 6144, 256),
+        (crate::engine::quant::GGML_TYPE_IQ2_S, 6144, 1536, 200),
     ] {
         let mut bytes = Vec::new();
-        for _ in 0..out_dim * (in_dim / 256) {
+        let (_, block_elems) =
+            crate::engine::quant::block_layout(ggml_type).expect("a quantized type");
+        for _ in 0..out_dim * (in_dim / block_elems) {
             bytes.extend(build_block(ggml_type, &mut seed));
         }
         let w = test_quant_matrix(&bytes, ggml_type, in_dim, out_dim);
@@ -10931,4 +11037,108 @@ fn record_topk_sample_returns_the_k_largest_penalized_logits() {
     };
     assert!(pos(65_536) < pos(7));
     assert!(pos(7) < pos(200_001));
+}
+
+/// The device form of gemma4's per-layer-embedding inputs
+/// (`ple_inputs_prefill`) against the same arithmetic on the host — the
+/// projection scaled, RMS-normed per (token, layer) row, added to the
+/// gathered rows, scaled — read back layer by layer at the layer-major,
+/// capacity-strided layout the stage consumes. A token count that is not
+/// a whole stripe, so the per-layer stride is exercised.
+#[test]
+fn ple_inputs_on_the_device_match_the_host_computation() {
+    let _gpu_lock = gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    use crate::engine::backend::probe_blocks::next_byte;
+    let mut seed = 0x9E37_79B9_u64;
+    let (n_embd, n_layer, per_layer, n_tokens) = (512usize, 6usize, 256usize, 300usize);
+    let total = n_layer * per_layer;
+    // BF16, as the served model stores its projection.
+    // Irregular values — nothing a 16-bit intermediate could hold exactly,
+    // so a kernel that rounds its operands shows it here.
+    let mut irregular = |scale: f32| {
+        let a = next_byte(&mut seed) as f32;
+        let b = next_byte(&mut seed) as f32;
+        ((a * 0.37 + b * 0.011).sin() * 1.7 + (b - 128.0) / 300.0) * scale
+    };
+    let bf16: Vec<u8> = (0..total * n_embd)
+        .flat_map(|_| (irregular(0.05).to_bits() >> 16).to_le_bytes())
+        .collect();
+    let proj_w = test_quant_matrix(&bf16, crate::engine::quant::GGML_TYPE_BF16, n_embd, total);
+    let x: Vec<f32> = (0..n_tokens * n_embd).map(|_| irregular(2.0)).collect();
+    let gathered: Vec<f32> = (0..n_tokens * total).map(|_| irregular(4.0)).collect();
+    let norm_w: Vec<f32> = (0..per_layer).map(|_| 0.5 + irregular(0.2).abs()).collect();
+    let eps = 1e-6;
+
+    let Some(dev) = vulkan.ple_inputs_prefill(
+        &x, n_tokens, &proj_w, &norm_w, &gathered, n_layer, per_layer, eps,
+    ) else {
+        eprintln!("device per-layer inputs declined — nothing to check");
+        return;
+    };
+    // The chain was parked in no group, so it was submitted; the readback
+    // orders after it.
+    let cap = prefill_rows_capacity(n_tokens);
+    let got = vulkan.readback_rows(&dev, n_layer * cap * per_layer);
+
+    // The host arithmetic, on the same (8-bit-activation) GEMM the device
+    // ran when it applies, else the float one — either way through the
+    // backend, so only the norm/add/scale are compared here.
+    let mut proj = CpuBackend.matmul_dequant(&x, n_tokens, &proj_w);
+    {
+        // How far the device GEMM itself is from the exact product, for
+        // the record: the bound below has to hold over it.
+        let dev_proj = vulkan.matmul(&x, n_tokens, &proj_w);
+        let worst = proj
+            .iter()
+            .zip(&dev_proj)
+            .map(|(a, b)| (a - b).abs() / (1.0 + a.abs()))
+            .fold(0.0f32, f32::max);
+        eprintln!("device projection vs exact: worst relative error {worst:.2e}");
+    }
+    let proj_scale = 1.0 / (n_embd as f32).sqrt();
+    for v in proj.iter_mut() {
+        *v *= proj_scale;
+    }
+    crate::engine::tensor::rmsnorm_inplace(&mut proj, &norm_w, n_tokens * n_layer, per_layer, eps);
+    crate::engine::tensor::add_inplace(&mut proj, &gathered);
+    let in_scale = 1.0 / 2f32.sqrt();
+    let mut worst = 0.0f32;
+    for t in 0..n_tokens {
+        for il in 0..n_layer {
+            for c in 0..per_layer {
+                let want = proj[(t * n_layer + il) * per_layer + c] * in_scale;
+                let have = got[(il * cap + t) * per_layer + c];
+                let err = (have - want).abs() / (1.0 + want.abs());
+                worst = worst.max(err);
+                assert!(
+                    err <= 1e-2,
+                    "token {t} layer {il} elem {c}: device {have} vs host {want}"
+                );
+            }
+        }
+    }
+    eprintln!("per-layer inputs on the device: worst relative error {worst:.2e}");
+}
+
+/// A wide projection of a word-reading type takes the four-row block-hoisted
+/// pipeline at decode, a narrow one and a prefill-width batch do not.
+#[test]
+fn wide_projections_take_the_four_row_block_hoisted_pipeline() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let mut seed = 0xB10C_u64;
+    let block = build_block(GGML_TYPE_Q2_K, &mut seed);
+    let wide = test_quant_matrix(&block.repeat(6 * 2048), GGML_TYPE_Q2_K, 1536, 2048);
+    let narrow = test_quant_matrix(&block.repeat(6 * 256), GGML_TYPE_Q2_K, 1536, 256);
+    assert!(vulkan.block_hoisted_wide_for(&wide, 1).is_some());
+    assert_eq!(vulkan.decode_rows_per_workgroup(&wide, 1), 4);
+    assert!(vulkan.block_hoisted_wide_for(&narrow, 1).is_none());
+    assert!(vulkan.block_hoisted_wide_for(&wide, 64).is_none());
 }
