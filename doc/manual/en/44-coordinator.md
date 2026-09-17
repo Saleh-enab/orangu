@@ -113,6 +113,8 @@ only.
 | `max_body_bytes` | `[orangu-coordinator]` | No | Request/response body size cap in bytes. Defaults to `67108864` (64 MiB) |
 | `idle_timeout` | `[orangu-coordinator]` | No | Seconds of inactivity before automatically unloading the active model to free system resources (RAM/VRAM). Disabled by default. |
 | `shutdown_token` | `[orangu-coordinator]` | No | Shared secret that enables the `GET /v1/coordinator/shutdown` endpoint. The caller must pass `?token=<value>` and connect from localhost. Disabled by default when absent. |
+| `log_type` | `[orangu-coordinator]` | No | Where the coordinator's output goes: `console` (the default — exactly what it printed before the key existed) or `file`, which appends every line to `log_path` instead, stamped with a time and a level. Forwarded to every profile's `orangu-server`, which then logs into the same file — without the once-a-second progress line a request rewrites on a terminal, which a file has no use for |
+| `log_path` | `[orangu-coordinator]` | No | The file `log_type = file` writes to. Defaults to `orangu-coordinator.log` in the directory the coordinator was started from; a leading `~` is expanded. Ignored under `log_type = console` |
 | `role` | profile | No | Same roles as `orangu.conf`: `all` (default), `code`, `review`, `explorer`, `embeddings`. At least one profile must resolve to `all` — it's the fallback profile. Maps to `orangu-server`'s own `--all`/`--code`/`--review`/`--explorer`/`--embedding` flag |
 | `model` | profile | Yes | A model spec — local `.gguf` path, `NR`/`MODEL` label, or `<user>/<model>[:quant]` Hugging Face repo — the same shape `orangu-server`'s own positional `MODEL` argument accepts |
 | `host` | profile | No | Host this profile's `orangu-server` listens on — written straight into its generated config, so it takes the same `all`/`*`/address spellings. Defaults to `all` |
@@ -136,14 +138,18 @@ omitted once it's in place.
 - `-q`/`--quiet` suppresses the startup banner, profile list, and shutdown
   message — useful when running it under a supervisor that captures stdout.
   Errors (a bad config, a port already in use, ...) still go to stderr
-  regardless.
+  regardless. It is about the console: a log file (`log_type = file`) is
+  written in full whatever the flag says.
 - `-d`/`--daemon` detaches from the terminal and runs in the background
-  (Unix-only). It always implies `--quiet`. The config is loaded and the
-  listen address is bound *before* detaching, so a bad config or a port
-  already in use is still reported to your terminal rather than failing
-  silently. There is no PID file: find the process with `pgrep -f
-  orangu-coordinator` and stop it with `kill -INT <pid>` for the same
-  graceful shutdown `Ctrl+C` triggers in the foreground.
+  (Unix-only). With the console as its log there is nothing left to print
+  to, so a daemon logs nothing at all — set `log_type = file` to have it log
+  to a file, which is what that key is for. The config is loaded, the log
+  file opened and the listen address bound *before* detaching, so a bad
+  config, an unwritable `log_path` or a port already in use is still
+  reported to your terminal rather than failing silently. There is no PID
+  file: find the process with `pgrep -f orangu-coordinator` and stop it
+  with `kill -INT <pid>` for the same graceful shutdown `Ctrl+C` triggers
+  in the foreground.
 - `-s`/`--shell-completions` prints a bash/zsh/fish/PowerShell completion script for
   the shell detected from `$SHELL` and exits — the same switch every orangu
   binary has (see the Shell completions chapter). It covers every flag

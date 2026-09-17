@@ -217,7 +217,30 @@ the exit status and the last 20 captured lines of stdout/stderr, then
 restarts it before serving whatever triggered the check. A crash mid-stream
 still surfaces to the *client* as a broken connection (an already-started
 200 response can't be retroactively turned into an error), but the
-coordinator's own console now always has the actual reason logged.
+coordinator's own log now always has the actual reason.
+
+### Logging
+
+Everything the coordinator says while running goes through the `log`
+facade — `log::info!` for what used to be `println!`, `log::warn!` for
+`eprintln!` — and `orangu::logging::install` (`src/logging.rs`, shared with
+`orangu-server`) decides where that lands from `[orangu-coordinator].log_type`
+and `log_path`: `fern` with a bare-message format on stdout/stderr for the
+console, so the output is byte-for-byte what it was, or a stamped format on
+an append-mode file. `--quiet` is a console level (`Console::ErrorsOnly`),
+`--daemon` on the console is `Console::Nothing` — a detached process has
+`/dev/null` for a stdout, and there is no logging at all — and a file is
+never quiet. Records from dependencies are dropped outright. The logger is
+installed right after the config loads, before the listener is bound and
+before a daemon detaches, so an unwritable `log_path` fails on the terminal.
+
+Under `log_type = file`, `write_server_config` forwards the two keys into
+every profile's generated `orangu-server.conf`: the server then appends its
+own stamped lines to the same file (without its once-a-second progress
+line, which is not a log record), and what still arrives through the
+captured stdout/stderr pipes — its fatal `error:` line, mostly — is echoed
+into the log by `spawn_output_capture` as before. The keys are read once, at
+startup; a reload that changes them takes effect on the next start.
 
 ### Client-side integration (`orangu`)
 

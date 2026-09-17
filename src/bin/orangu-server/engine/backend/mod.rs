@@ -108,7 +108,7 @@ where
         // perfectly and is still not a value that kernel has, and that is the
         // case a sweep actually hits.
         _ => {
-            eprintln!(
+            log::warn!(
                 "orangu-server: {var}={raw:?} is not {expected} — using {default}. \
                  This run measures the default, not the value you asked for."
             );

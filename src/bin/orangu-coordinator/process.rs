@@ -190,10 +190,6 @@ pub struct Coordinator {
     /// lock just to kill a still-starting process, so this is tracked
     /// separately and only ever locked briefly.
     current_pid: AtomicU32,
-    /// Suppresses echoing a starting/active process's stdout/stderr to the
-    /// coordinator's own output, mirroring `--quiet`. The lines are still
-    /// captured into each process's tail regardless, for error reporting.
-    quiet: bool,
     /// When the coordinator was last accessed by a request (for idle timeout).
     last_accessed: StdMutex<Instant>,
     /// Explicit override for which `orangu-server` executable to spawn,
@@ -218,7 +214,6 @@ const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 impl Coordinator {
     pub fn new(
         config: CoordinatorConfiguration,
-        quiet: bool,
         server_binary_override: Option<PathBuf>,
     ) -> Result<Self> {
         // No default timeout: this client also proxies real requests to
@@ -237,7 +232,6 @@ impl Coordinator {
             http_client,
             active: Mutex::new(None),
             current_pid: AtomicU32::new(0),
-            quiet,
             last_accessed: StdMutex::new(Instant::now()),
             server_binary_override,
         })
@@ -337,12 +331,10 @@ impl Coordinator {
             && active.entry_at_start == entry_at_start
         {
             let active = guard.take().expect("checked above");
-            if !self.quiet {
-                println!(
-                    "stopping '{}' — profile was removed or changed in reloaded config",
-                    active.entry_name
-                );
-            }
+            log::info!(
+                "stopping '{}' — profile was removed or changed in reloaded config",
+                active.entry_name
+            );
             self.current_pid.store(0, Ordering::Relaxed);
             Self::stop(active).await;
         }
@@ -428,7 +420,7 @@ impl Coordinator {
                 // than silently proxied into.
                 match active.child.try_wait() {
                     Ok(None) => return Ok(entry.origin()),
-                    Ok(Some(status)) if !self.quiet => {
+                    Ok(Some(status)) => {
                         // A device-loss exit is expected, self-inflicted,
                         // and fixed by the restart this function is about
                         // to do — so it's reported as what it is rather
@@ -436,12 +428,12 @@ impl Coordinator {
                         // output tail, whose last lines are the same
                         // message `orangu-server` already printed.
                         if is_device_lost_exit(&status) {
-                            eprintln!(
+                            log::warn!(
                                 "'{running}' exited after losing its GPU device (a driver \
                                  reset); restarting it on a fresh device"
                             );
                         } else {
-                            eprintln!(
+                            log::warn!(
                                 "warning: '{running}' exited unexpectedly while active \
                                  (status: {status}){}",
                                 format_output_tail(&active.tail).await
@@ -469,14 +461,12 @@ impl Coordinator {
         // already doing the job.
         if let Some(occupant) = self.occupant(entry).await {
             if occupant.serves(entry) {
-                if !self.quiet {
-                    println!(
-                        "adopting the orangu-server already serving '{}' at {} (process {})",
-                        entry.name,
-                        entry.origin(),
-                        occupant.pid
-                    );
-                }
+                log::info!(
+                    "adopting the orangu-server already serving '{}' at {} (process {})",
+                    entry.name,
+                    entry.origin(),
+                    occupant.pid
+                );
                 self.current_pid.store(occupant.pid, Ordering::Relaxed);
                 *guard = Some(ActiveProcess {
                     entry_name: entry.name.clone(),
@@ -500,17 +490,15 @@ impl Coordinator {
             // Everything else falls through to the start below, which reports
             // the address as taken rather than signalling a stranger.
             if pid_is_orangu_server(occupant.pid) {
-                if !self.quiet {
-                    println!(
-                        "taking {} for '{}': process {} is serving {} in {} mode, which this profile \
+                log::info!(
+                    "taking {} for '{}': process {} is serving {} in {} mode, which this profile \
                      does not ask for",
-                        entry.origin(),
-                        entry.name,
-                        occupant.pid,
-                        occupant.model,
-                        occupant.role,
-                    );
-                }
+                    entry.origin(),
+                    entry.name,
+                    occupant.pid,
+                    occupant.model,
+                    occupant.role,
+                );
                 Self::stop(ActiveProcess {
                     entry_name: format!("(unmanaged, process {})", occupant.pid),
                     entry_at_start: entry.clone(),
@@ -613,13 +601,11 @@ impl Coordinator {
 
         let mut guard = self.active.lock().await;
         if let Some(active) = guard.take() {
-            if !self.quiet {
-                eprintln!(
-                    "'{}' stopped answering on {}; restarting it",
-                    entry.name,
-                    entry.origin()
-                );
-            }
+            log::warn!(
+                "'{}' stopped answering on {}; restarting it",
+                entry.name,
+                entry.origin()
+            );
             // Same ordering rule as `ensure_active`: clear the pid before
             // reaping, so a concurrent `shutdown` can't signal a number the
             // OS has already handed to something else.
@@ -668,12 +654,10 @@ impl Coordinator {
             if last_accessed.elapsed().as_secs() >= timeout_secs
                 && let Some(active) = guard.take()
             {
-                if !self.quiet {
-                    println!(
-                        "unloading active profile '{}' due to idle timeout",
-                        active.entry_name
-                    );
-                }
+                log::info!(
+                    "unloading active profile '{}' due to idle timeout",
+                    active.entry_name
+                );
                 self.current_pid.store(0, Ordering::Relaxed);
                 Self::stop(active).await;
             }
@@ -760,10 +744,14 @@ impl Coordinator {
         &self,
         entry: &CoordinatorLlmEntry,
     ) -> Result<(tokio::process::Child, OutputTail)> {
-        let models_dir = self.config.read().unwrap().models.clone();
-        let server_config_path = write_server_config(entry, &models_dir).with_context(|| {
-            format!("failed to write orangu-server config for '{}'", entry.name)
-        })?;
+        let (models_dir, log) = {
+            let config = self.config.read().unwrap();
+            (config.models.clone(), config.log.clone())
+        };
+        let server_config_path =
+            write_server_config(entry, &models_dir, &log).with_context(|| {
+                format!("failed to write orangu-server config for '{}'", entry.name)
+            })?;
         let program = self.resolve_server_binary();
         // Already validated at config-load time (`config::parse_llm_profiles`
         // rejects any role `role_server_flag` doesn't recognize), so this can
@@ -805,10 +793,10 @@ impl Coordinator {
         // reports what the process said — see `wait_until_healthy`.
         let mut capture = Vec::new();
         if let Some(stdout) = child.stdout.take() {
-            capture.push(spawn_output_capture(stdout, tail.clone(), self.quiet));
+            capture.push(spawn_output_capture(stdout, tail.clone()));
         }
         if let Some(stderr) = child.stderr.take() {
-            capture.push(spawn_output_capture(stderr, tail.clone(), self.quiet));
+            capture.push(spawn_output_capture(stderr, tail.clone()));
         }
 
         if let Err(err) = self
@@ -972,22 +960,25 @@ async fn answering_pid(response: reqwest::Response) -> Option<u32> {
 }
 
 /// Reads `stream` line by line for as long as the process keeps it open,
-/// keeping the last [`OUTPUT_TAIL_LINES`] in `tail` and, unless `quiet`,
-/// echoing each line to the coordinator's own stdout as it arrives —
-/// preserving today's visible behavior (e.g. model-download progress) for
-/// anyone watching the coordinator's console, while still letting a later
-/// crash or stuck health check report the same output inline.
+/// keeping the last [`OUTPUT_TAIL_LINES`] in `tail` and echoing each line
+/// into the coordinator's own log as it arrives (which `--quiet` silences on
+/// the console, like everything else) — preserving today's visible behavior
+/// (e.g. model-download progress) for anyone watching the coordinator's
+/// console, while still letting a later crash or stuck health check report
+/// the same output inline.
+///
+/// Under `log_type = file` a profile's `orangu-server` is handed the same
+/// file (see [`write_server_config`]) and writes its own log lines straight
+/// into it, so what arrives here is only what it prints *around* its log:
+/// the `error:` line it exits on, most usefully.
 fn spawn_output_capture(
     stream: impl AsyncRead + Send + Unpin + 'static,
     tail: OutputTail,
-    quiet: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut lines = BufReader::new(stream).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            if !quiet {
-                println!("{line}");
-            }
+            log::info!("{line}");
             let mut tail = tail.lock().await;
             if tail.len() >= OUTPUT_TAIL_LINES {
                 tail.pop_front();
@@ -1014,14 +1005,26 @@ async fn format_output_tail(tail: &OutputTail) -> String {
 }
 
 /// Writes `entry`'s own `orangu-server.conf` — the `[orangu-server]`
-/// section (`models`, `host`, `port`, and whichever of `backend`/`slots`
-/// were set), plus a `[web]` section when the profile asks for a web console
+/// section (`models`, `host`, `port`, whichever of `backend`/`slots` were
+/// set, and the coordinator's own `log_type`/`log_path` when that is a
+/// file), plus a `[web]` section when the profile asks for a web console
 /// — to `~/.orangu/coordinator/servers/<name>.conf`,
 /// overwriting any previous contents — `orangu-server` itself reads this
 /// file once at its own startup, so a stale file from a previous run is
 /// never an issue, and this path doubles as a debugging aid: exactly what a
 /// profile was last started with is always inspectable on disk.
-fn write_server_config(entry: &CoordinatorLlmEntry, models_dir: &Path) -> Result<PathBuf> {
+///
+/// The log keys travel because the server's output has to end up where the
+/// coordinator's does. Left to the console, a profile would print into the
+/// pipe this coordinator reads — every second of a request's progress
+/// included, `\r` and all — and the coordinator would copy that into its
+/// file as one long line. Handed the file, the server appends its own
+/// completed lines, each stamped, and prints no progress at all.
+fn write_server_config(
+    entry: &CoordinatorLlmEntry,
+    models_dir: &Path,
+    log: &orangu::logging::LogTarget,
+) -> Result<PathBuf> {
     let dir = home::home_dir()
         .context("failed to resolve home directory")?
         .join(".orangu/coordinator/servers");
@@ -1040,6 +1043,13 @@ fn write_server_config(entry: &CoordinatorLlmEntry, models_dir: &Path) -> Result
     }
     if let Some(slots) = entry.slots {
         contents.push_str(&format!("slots = {slots}\n"));
+    }
+    if let Some(path) = log.path() {
+        contents.push_str(&format!(
+            "log_type = {}\nlog_path = {}\n",
+            log.log_type(),
+            path.display()
+        ));
     }
     // Its own section, which is what `orangu-server` reads today: the
     // section's presence is what turns the console on. A profile with no
@@ -1216,7 +1226,7 @@ mod tests {
         });
 
         let config = minimal_config("", "[main]\nrole = all\nmodel = org/gemma\nport = 8100\n");
-        let coordinator = Coordinator::new(config, false, None).unwrap();
+        let coordinator = Coordinator::new(config, None).unwrap();
 
         let result = coordinator
             .http_client()
@@ -1232,7 +1242,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_entry_falls_back_to_default_when_model_hint_is_absent_or_unknown() {
         let config = minimal_config("", "[main]\nrole = all\nmodel = org/gemma\nport = 8100\n");
-        let coordinator = Coordinator::new(config, false, None).unwrap();
+        let coordinator = Coordinator::new(config, None).unwrap();
 
         assert_eq!(coordinator.resolve_entry(None, None).await.name, "main");
         assert_eq!(
@@ -1256,7 +1266,7 @@ mod tests {
             "",
             "[zeta]\nrole = explorer\nmodel = org/gemma\nport = 8200\n\n[alpha]\nrole = all\nmodel = org/gemma\nport = 8100\n",
         );
-        let coordinator = Coordinator::new(config, false, None).unwrap();
+        let coordinator = Coordinator::new(config, None).unwrap();
 
         assert_eq!(
             coordinator
@@ -1430,7 +1440,7 @@ mod tests {
         // Unlike ordinary routing, an explicit activation request has no
         // "currently active"/`all` fallback to paper over an unmatched hint.
         let config = minimal_config("", "[main]\nrole = all\nmodel = org/gemma\nport = 8100\n");
-        let coordinator = Coordinator::new(config, false, None).unwrap();
+        let coordinator = Coordinator::new(config, None).unwrap();
 
         assert_eq!(coordinator.match_hint("org/gemma").unwrap().name, "main");
         assert_eq!(coordinator.match_hint("all").unwrap().name, "main");
@@ -1440,12 +1450,8 @@ mod tests {
     #[test]
     fn resolve_server_binary_uses_the_override_when_given() {
         let config = minimal_config("", "[main]\nrole = all\nmodel = org/gemma\nport = 8100\n");
-        let coordinator = Coordinator::new(
-            config,
-            false,
-            Some(PathBuf::from("/opt/fake/orangu-server")),
-        )
-        .unwrap();
+        let coordinator =
+            Coordinator::new(config, Some(PathBuf::from("/opt/fake/orangu-server"))).unwrap();
         assert_eq!(
             coordinator.resolve_server_binary(),
             PathBuf::from("/opt/fake/orangu-server")
@@ -1464,7 +1470,12 @@ mod tests {
             slots: Some(4),
             web: Some(8181),
         };
-        let path = write_server_config(&entry, Path::new("/srv/models")).unwrap();
+        let path = write_server_config(
+            &entry,
+            Path::new("/srv/models"),
+            &orangu::logging::LogTarget::Console,
+        )
+        .unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("[orangu-server]"));
         assert!(contents.contains("models = /srv/models"));
@@ -1473,6 +1484,9 @@ mod tests {
         assert!(contents.contains("backend = vulkan"));
         assert!(contents.contains("slots = 4"));
         assert!(contents.contains("[web]\nport = 8181"), "{contents}");
+        // The console is the server's own default, so nothing is written
+        // for it.
+        assert!(!contents.contains("log_"), "{contents}");
         std::fs::remove_file(&path).ok();
 
         let minimal_entry = CoordinatorLlmEntry {
@@ -1481,11 +1495,46 @@ mod tests {
             web: None,
             ..entry
         };
-        let path = write_server_config(&minimal_entry, Path::new("/srv/models")).unwrap();
+        let path = write_server_config(
+            &minimal_entry,
+            Path::new("/srv/models"),
+            &orangu::logging::LogTarget::Console,
+        )
+        .unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(!contents.contains("backend"));
         assert!(!contents.contains("slots"));
         assert!(!contents.contains("web ="));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A coordinator logging to a file hands the same file to the server it
+    /// starts — otherwise the server would log into the pipe this
+    /// coordinator reads, progress updates and all, and the file would get
+    /// that as one line per request.
+    #[test]
+    fn write_server_config_forwards_a_file_log_to_the_server() {
+        let entry = CoordinatorLlmEntry {
+            name: "test-profile-logged".to_string(),
+            role: "all".to_string(),
+            model: "org/gemma".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 8100,
+            backend: None,
+            slots: None,
+            web: None,
+        };
+        let path = write_server_config(
+            &entry,
+            Path::new("/srv/models"),
+            &orangu::logging::LogTarget::File(PathBuf::from("/var/log/orangu.log")),
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.contains("log_type = file\nlog_path = /var/log/orangu.log\n"),
+            "{contents}"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -1513,7 +1562,7 @@ mod tests {
         );
         let fake_bin = fake_server_script("sleep 30");
         let coordinator =
-            std::sync::Arc::new(Coordinator::new(config, false, Some(fake_bin.clone())).unwrap());
+            std::sync::Arc::new(Coordinator::new(config, Some(fake_bin.clone())).unwrap());
 
         let entry = coordinator.resolve_entry(None, None).await.clone();
         let ensure_active_coordinator = coordinator.clone();
@@ -1560,7 +1609,7 @@ mod tests {
             "[main]\nrole = all\nmodel = org/gemma\nport = 65534\n",
         );
         let fake_bin = fake_server_script("echo GGML_ASSERT failed >&2; exit 1");
-        let coordinator = Coordinator::new(config, true, Some(fake_bin.clone())).unwrap();
+        let coordinator = Coordinator::new(config, Some(fake_bin.clone())).unwrap();
         let entry = coordinator.resolve_entry(None, None).await.clone();
 
         let err = coordinator.ensure_active(&entry).await.unwrap_err();
@@ -1665,7 +1714,7 @@ mod tests {
             ),
         );
         let fake_bin = fake_server_script(&format!("touch {}; sleep 30", marker.display()));
-        let coordinator = Coordinator::new(config, true, Some(fake_bin.clone())).unwrap();
+        let coordinator = Coordinator::new(config, Some(fake_bin.clone())).unwrap();
         let entry = coordinator.resolve_entry(Some("code"), None).await.clone();
         assert_eq!(
             entry.role, "code",
@@ -1724,7 +1773,7 @@ mod tests {
             &format!("[main]\nrole = all\nmodel = org/gemma\nport = {port}\n"),
         );
         let fake_bin = fake_server_script("sleep 30");
-        let coordinator = Coordinator::new(config, true, Some(fake_bin.clone())).unwrap();
+        let coordinator = Coordinator::new(config, Some(fake_bin.clone())).unwrap();
         let entry = coordinator.resolve_entry(None, None).await.clone();
 
         // Whether the *start* then succeeds is not what this is about — the
@@ -1773,7 +1822,7 @@ mod tests {
         // Alive and quiet: it never binds, exactly like a real server whose
         // own bind failed would be during the window this races.
         let fake_bin = fake_server_script("sleep 30");
-        let coordinator = Coordinator::new(config, true, Some(fake_bin.clone())).unwrap();
+        let coordinator = Coordinator::new(config, Some(fake_bin.clone())).unwrap();
         let entry = coordinator.resolve_entry(None, None).await.clone();
 
         let err = coordinator.ensure_active(&entry).await.unwrap_err();
@@ -1801,7 +1850,7 @@ mod tests {
             "[main]\nrole = all\nmodel = org/all-model\nport = 65531\n\n[marker]\nrole = explorer\nmodel = org/marker-model\nport = 65532\n",
         );
         let fake_bin = fake_server_script("echo \"argv=$*\" >&2; exit 1");
-        let coordinator = Coordinator::new(config, true, Some(fake_bin.clone())).unwrap();
+        let coordinator = Coordinator::new(config, Some(fake_bin.clone())).unwrap();
         let entry = coordinator
             .resolve_entry(Some("org/marker-model"), None)
             .await

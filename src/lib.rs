@@ -33,6 +33,7 @@ pub mod graph;
 pub mod hardware;
 pub mod license;
 pub mod llm;
+pub mod logging;
 pub mod mcp;
 pub mod model_download;
 pub mod model_registry;

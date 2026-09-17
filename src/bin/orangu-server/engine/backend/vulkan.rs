@@ -2809,7 +2809,7 @@ impl VulkanBackend {
         // the second attempt reads the flag this sets.
         if backend.attn_coop && !backend.attention_agrees() {
             ATTN_COOP_MISCOMPILED.store(true, std::sync::atomic::Ordering::Relaxed);
-            eprintln!(
+            log::warn!(
                 "orangu-server: [vulkan] this device computes the cooperative attention kernel \
                  incorrectly; rebuilding without it"
             );

@@ -258,7 +258,7 @@ impl NpuFfn {
                     Ok(Some(c)) => artifacts.push((Artifact::Ffn(Box::new(c)), *layer, tokens)),
                     // A corrupt artifact is worth saying out loud; a missing
                     // one is just a block that stays on the CPU or GPU.
-                    Err(e) => eprintln!("orangu-server: [npu] {prefix}: {e}"),
+                    Err(e) => log::warn!("orangu-server: [npu] {prefix}: {e}"),
                     Ok(None) => {}
                 }
             }
@@ -278,7 +278,7 @@ impl NpuFfn {
                     Ok(Some(compiled)) => {
                         artifacts.push((Artifact::Attn(compiled), *layer, tokens))
                     }
-                    Err(e) => eprintln!("orangu-server: [npu] attn.{prefix}: {e}"),
+                    Err(e) => log::warn!("orangu-server: [npu] attn.{prefix}: {e}"),
                     Ok(None) => {}
                 }
             }
@@ -312,7 +312,7 @@ impl NpuFfn {
         if let Some(limit) = read_capacity_hint(&capacity)
             && limit < artifacts.len()
         {
-            eprintln!(
+            log::info!(
                 "orangu-server: [npu] holding to {limit} block-width(s) of {}, the most this \
                  device accepted before — delete {} to measure it again",
                 artifacts.len(),
@@ -357,7 +357,7 @@ impl NpuFfn {
             if sharing.is_empty() {
                 write_capacity_hint(&capacity, bound.len());
             } else {
-                eprintln!(
+                log::warn!(
                     "orangu-server: [npu] the device refused past {} block-width(s), but \
                      pid(s) {sharing:?} were using it too — not remembering a limit measured \
                      against someone else's memory",
@@ -563,7 +563,7 @@ impl NpuFfn {
                 // issues, so everything loaded, reported success, and was
                 // never asked for anything.
                 if !self.used.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    eprintln!(
+                    log::info!(
                         "orangu-server: [npu] first feed-forward block ran on the NPU \
                          (layer {layer}, {tokens} tokens)"
                     );
@@ -571,7 +571,7 @@ impl NpuFfn {
                 true
             }
             Err(e) => {
-                eprintln!("orangu-server: [npu] layer {layer}: {e}");
+                log::warn!("orangu-server: [npu] layer {layer}: {e}");
                 false
             }
         };
@@ -658,7 +658,7 @@ fn device_thread(
                 // failed attempt leaves the driver holding buffers it
                 // cannot free at exit. `NpuFfn::open` records how many did
                 // bind so the next run does not walk into it again.
-                eprintln!(
+                log::warn!(
                     "orangu-server: [npu] layer {layer} at {tokens} tokens did not load, so \
                      the device is full at {} block-width(s): {e}",
                     bound.len()
@@ -784,10 +784,11 @@ fn device_thread(
                 if let Some(service) = service() {
                     service.withdraw(job.kind, job.layer, job.tokens);
                 }
-                eprintln!(
+                log::warn!(
                     "orangu-server: [npu] layer {} at {} tokens returned all zeros for a \
                      non-zero input and has been taken off the device",
-                    job.layer, job.tokens
+                    job.layer,
+                    job.tokens
                 );
                 result = Err("the block returned no signal".into());
             }

@@ -7,6 +7,7 @@
 - `src/bin/orangu.rs` - terminal loop, command handling, history, connection state, and waiting state
 - `src/bin/orangu/manual.rs` - built-in manual viewer (`/manual`); embeds the `doc/manual/en` chapters at compile time, so a new chapter file must be added to its `MANUAL_SOURCES` list
 - `src/config.rs` - INI parsing and normalization
+- `src/logging.rs` - where `orangu-server` and `orangu-coordinator` log (`log_type`/`log_path`): the `log` facade with `fern` behind it — bare lines on the console exactly as `println!` put them, stamped lines in a file
 - `src/llm/openai.rs` - OpenAI-compatible client for `orangu-server`
 - `src/session.rs` - tool-calling conversation flow
 - `src/tools.rs` - workspace-scoped local tool execution

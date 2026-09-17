@@ -227,6 +227,8 @@ below); set them explicitly only if a profile needs something different.
 | `max_body_bytes` | `[orangu-coordinator]` | No | Request/response body size cap in bytes. Defaults to `67108864` (64 MiB) |
 | `idle_timeout` | `[orangu-coordinator]` | No | Seconds of inactivity before automatically unloading the active model to free system resources (RAM/VRAM). Disabled by default. |
 | `shutdown_token` | `[orangu-coordinator]` | No | Shared secret that enables the `GET /v1/coordinator/shutdown` endpoint. The caller must pass `?token=<value>` and connect from localhost. Disabled by default when absent. |
+| `log_type` | `[orangu-coordinator]` | No | Where the coordinator's output goes: `console` (the default — exactly what it printed before the key existed) or `file`, which appends every line to `log_path` instead, with a timestamp and level in front. See [Logging to a file](#logging-to-a-file) |
+| `log_path` | `[orangu-coordinator]` | No | The file `log_type = file` writes to. Defaults to `orangu-coordinator.log` in the directory the coordinator was started from; a leading `~` is expanded. Ignored under `log_type = console` |
 | `role` | profile | No | Same roles as `orangu.conf`: `all` (default), `code`, `review`, `explorer`, `embeddings`. At least one profile must resolve to `all` — it's the fallback profile. Maps to `orangu-server`'s own `--all`/`--code`/`--review`/`--explorer`/`--embedding` flag; anything else is rejected at load time |
 | `model` | profile | Yes | A model spec in the same shape `orangu-server`'s own positional `MODEL` argument accepts: a local `.gguf` path, an `NR`/`MODEL` label already under the shared `models` directory, or a `<user>/<model>[:quant]` Hugging Face repo (fetched on first start if not already cached). This is the model id a client request's `model` field matches against — profiles *may* share one, e.g. the same model configured once per role; `resolve_entry` breaks any resulting tie by profile name |
 | `host` | profile | No | Host this profile's `orangu-server` listens on, written verbatim into its generated config so it takes the same `all`/`*`/address spellings. Defaults to `all`. The coordinator reaches a wildcard-bound profile over loopback |
@@ -237,8 +239,9 @@ below); set them explicitly only if a profile needs something different.
 
 Each profile's own `orangu-server` is started with a small, coordinator-
 generated config file (`~/.orangu/coordinator/servers/<profile-name>.conf`,
-overwritten on every start) carrying its `models`/`host`/`port` and whichever
-of `backend`/`slots`/`web` were set — inspect that file directly to see
+overwritten on every start) carrying its `models`/`host`/`port`, whichever
+of `backend`/`slots`/`web` were set, and — under `log_type = file` — the
+coordinator's own `log_type`/`log_path` — inspect that file directly to see
 exactly what a given profile's `orangu-server` last ran with.
 
 Every profile defaulting to `all:8100` — the same address, not a distinct
@@ -276,16 +279,58 @@ it's a terminal escape sequence rather than console output.
 Pass `-q`/`--quiet` to suppress the startup banner, profile list, and
 shutdown message — useful when running it under a supervisor that captures
 stdout. Errors (a bad config, a port already in use, ...) still go to
-stderr regardless.
+stderr regardless. It is about the console: a log file (`log_type = file`)
+is written in full whatever the flag says.
 
 Pass `-d`/`--daemon` to detach from the terminal and run in the background
-(Unix-only). It always implies `--quiet` — once detached there is no
-terminal left to print to. The config is loaded and the listen address is
-bound *before* detaching, so a bad config or a port already in use is still
-reported to your terminal, with a non-zero exit code, rather than failing
-silently in the background. There is no PID file: find the process with
-`pgrep -f orangu-coordinator` (or similar) and stop it with `kill -INT
-<pid>` for the same graceful shutdown `Ctrl+C` triggers in the foreground.
+(Unix-only). With the console as its log there is nothing left to print to,
+so a daemon logs nothing at all — set `log_type = file` to have it log to a
+file instead, which is the case that setting exists for (see [Logging to a
+file](#logging-to-a-file)). The config is loaded, the log file opened and
+the listen address bound *before* detaching, so a bad config, an unwritable
+`log_path` or a port already in use is still reported to your terminal,
+with a non-zero exit code, rather than failing silently in the background.
+There is no PID file: find the process with `pgrep -f orangu-coordinator`
+(or similar) and stop it with `kill -INT <pid>` for the same graceful
+shutdown `Ctrl+C` triggers in the foreground.
+
+### Logging to a file
+
+```ini
+[orangu-coordinator]
+models = /srv/models
+log_type = file
+log_path = /var/log/orangu/coordinator.log
+```
+
+`log_type = file` sends everything the coordinator would have printed —
+the startup banner and profile list, `reloaded configuration ...`, the
+profile swaps, idle unloads and crash reports, the shutdown line, and the
+output of each profile's `orangu-server` — to `log_path` instead of the
+terminal, appending to the file if it exists and creating it (and its
+directory) if it doesn't. `log_path` defaults to `orangu-coordinator.log`
+in the directory the coordinator was started from, so `log_type = file` on
+its own is enough. Each line is stamped:
+
+```text
+2026-09-16 23:36:29 INFO  orangu-coordinator 1.4.0 listening on 127.0.0.1:9000
+2026-09-16 23:36:29 INFO    main: unsloth/gemma-4-E2B-it-GGUF:Q4_K_M
+2026-09-16 23:36:41 INFO  Model      unsloth/gemma-4-E2B-it-GGUF:Q4_K_M (gemma4 arch, Vulkan, 30 layers, 32768 ctx)
+2026-09-16 23:36:41 INFO  Mode       all
+2026-09-16 23:37:02 INFO  orangu-server: [slot 0] prompt 41 tokens in 0.31s (132.26 tok/s), generated 64 tokens in 3.10s (20.65 tok/s)
+```
+
+The `Model`/`Mode` and `[slot 0]` lines are the `orangu-server`'s own: the
+coordinator forwards its `log_type`/`log_path` into the config it generates
+for every profile, so a profile's server appends to the same file rather
+than printing into the pipe the coordinator reads — with one difference from
+its console output, which is that the progress line a request rewrites once
+a second on a terminal (`\r`, no newline) is not written; a file gets each
+request's completed line and nothing in between. The keys are read once, at
+startup: a reload that changes them takes effect on the next start.
+
+`log_type = console` (or no `log_type` at all) is exactly the output the
+coordinator has always produced, on the same streams.
 
 Pass `-s`/`--shell-completions` to print a bash/zsh/fish/PowerShell completion script
 for the shell detected from `$SHELL` and exit — the same switch every orangu
@@ -312,7 +357,8 @@ orangu-coordinator --init
 Behaves the same way `orangu-server --init` does: it walks every
 `[orangu-coordinator]` key showing its default (including the `models`
 directory, which defaults to the Hugging Face cache
-`~/.cache/huggingface/hub` and is created if it isn't there yet), then asks
+`~/.cache/huggingface/hub` and is created if it isn't there yet, and
+`log_type`, whose `log_path` is only asked for on `file`), then asks
 for a model, host, and port role by role — `all` is mandatory, `code`/
 `review`/`explorer`/`embeddings` are skipped by leaving the model prompt
 blank. It shows the resulting file and asks for confirmation before writing
@@ -322,13 +368,21 @@ overwriting any existing file).
 The written file is kept terse: only `host`/`port` (in
 `[orangu-coordinator]`) and each profile's `model` are always present —
 every other answer left at its default is simply omitted, since the loader
-already falls back to the exact same value on its own.
+already falls back to the exact same value on its own. The one exception is
+a `file` log's `log_path`, written even at its default: that default is
+`orangu-coordinator.log` in whatever directory the coordinator is started
+from, and the file the wizard showed is the file the config should keep
+naming.
 
 Every prompt with something to offer shows it inline as grey ghost text
 while you type, and completes it on TAB (which also lists every candidate),
 exactly as `orangu-server --init` does:
 
 - `models` completes real filesystem paths.
+- `log_type` completes over `console` and `file`, ghosting `console`. On
+  `file`, `log_path` completes real filesystem paths as you type and ghosts
+  its default — `orangu-coordinator.log` in the current directory — on the
+  empty line.
 - Every `host` prompt — `[orangu-coordinator]`'s own and each profile's —
   completes over `all`, its `*` alias, and every address this machine's
   interfaces actually have, each annotated with the interface it belongs to
@@ -564,7 +618,10 @@ coordinator. Behind a confirmed coordinator, those sections' own `role` and
   error includes the last 20 lines of its stdout/stderr, so the actual
   reason is visible alongside the exit status instead of just a bare signal
   number. Unless `--quiet`, that same output is also echoed live to the
-  coordinator's own console as it's produced. The same diagnostic is printed
+  coordinator's own console as it's produced — or into its log file, under
+  `log_type = file`, where a profile's `orangu-server` writes its own lines
+  directly and only what it prints around them (its `error:` line, most
+  usefully) arrives through the coordinator. The same diagnostic is printed
   (unless `--quiet`) if a profile crashes *after* becoming active — including
   mid-request, which a client only sees as a broken connection — the next
   time anything asks for it: the coordinator notices the process has died,

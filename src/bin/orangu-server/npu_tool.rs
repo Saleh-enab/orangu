@@ -374,7 +374,7 @@ fn probe_prefill_width(model: &Path, executable: &Path) -> Option<usize> {
             service.forward_into(index, width, &x, &mut out);
         }
         let per_token = started.elapsed().as_secs_f64() / (RUNS as f64) / (width as f64) * 1000.0;
-        eprintln!("orangu-server: [npu] width {width}: {per_token:.3} ms/token");
+        log::info!("orangu-server: [npu] width {width}: {per_token:.3} ms/token");
         if best.is_none_or(|(_, seen)| per_token < seen) {
             best = Some((width, per_token));
         }
@@ -1155,7 +1155,7 @@ fn compile_child(
 /// actually needs. Blank lines go too: this output is mostly whitespace.
 fn report_compiler_stderr(stderr: &[u8]) {
     for line in compiler_report_lines(stderr) {
-        eprintln!("orangu-server: [npu] compiler: {line}");
+        log::warn!("orangu-server: [npu] compiler: {line}");
     }
 }
 
@@ -1531,7 +1531,7 @@ fn captured_calibration(block: &BlockSpec, rows_wanted: usize) -> Option<Vec<f32
         .collect();
     let d_model = block.d_model;
     if values.is_empty() || !values.len().is_multiple_of(d_model) {
-        eprintln!(
+        log::warn!(
             "orangu-server: [npu] {} holds {} floats, not a whole number of {d_model}-wide rows \
              — ignored",
             path.display(),
@@ -2485,7 +2485,7 @@ pub fn prepare_in_background(model: &Path, enabled: bool, budget_bytes: u64) {
     set_calibration_dir(capture_dir(model));
     if let Some(dir) = &capture {
         crate::engine::capture_ffn_inputs_into(dir.clone());
-        eprintln!(
+        log::info!(
             "orangu-server: [npu] capturing this model's own activations from the first \
              prompt — the device is calibrated on them, and until it is it stays out of the \
              way"
@@ -2515,7 +2515,7 @@ pub fn prepare_in_background(model: &Path, enabled: bool, budget_bytes: u64) {
                 match verdict {
                     Capture::Complete => {}
                     Capture::Unsupported => {
-                        eprintln!(
+                        log::warn!(
                             "orangu-server: [npu] this model's architecture never hands its \
                              feed-forward input to the device, so it cannot be calibrated and \
                              the device is not used. Only the llama and gemma families offer \
@@ -2524,7 +2524,7 @@ pub fn prepare_in_background(model: &Path, enabled: bool, budget_bytes: u64) {
                         return;
                     }
                     Capture::Incomplete => {
-                        eprintln!(
+                        log::warn!(
                             "orangu-server: [npu] no prompt arrived to calibrate on, so the \
                              device is not used this run. It will be ready for the first \
                              prompt of the next one."
@@ -2532,7 +2532,7 @@ pub fn prepare_in_background(model: &Path, enabled: bool, budget_bytes: u64) {
                         return;
                     }
                 }
-                eprintln!(
+                log::info!(
                     "orangu-server: [npu] calibrated on the first prompt; compiling in the \
                      background"
                 );
@@ -2549,7 +2549,7 @@ pub fn prepare_in_background(model: &Path, enabled: bool, budget_bytes: u64) {
             }
         }
         Err(e) => {
-            eprintln!("orangu-server: [npu] could not start the preparation thread: {e}");
+            log::warn!("orangu-server: [npu] could not start the preparation thread: {e}");
         }
     }
 }
@@ -2600,7 +2600,7 @@ fn prepare(model: &Path, enabled: bool, budget_bytes: u64) {
     let bar = max_block_error();
     match trial_block_error(model) {
         Some(error) if error > bar => {
-            eprintln!(
+            log::warn!(
                 "orangu-server: [npu] not used for this model: one block comes back {:.1}% \
                  off f32, past the {:.0}% this accepts. The device holds each weight matrix \
                  at one `uint8` scale, so a matrix with a wide tail leaves its bulk too few \
@@ -2629,7 +2629,7 @@ fn prepare(model: &Path, enabled: bool, budget_bytes: u64) {
         && let Some(width) = probe_prefill_width(model, &executable)
     {
         MEASURED_WIDTH.store(width, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("orangu-server: [npu] compiling for {width}-token chunks on this device");
+        log::info!("orangu-server: [npu] compiling for {width}-token chunks on this device");
     }
     if stopping() {
         return;
@@ -2722,7 +2722,7 @@ pub fn install_ffn_service(model: &Path, budget_bytes: u64) {
             // refusal below, which says `not used for this model`. A reader
             // scanning for which processors are working should find the
             // same words on each of them.
-            eprintln!(
+            log::info!(
                 "orangu-server: [npu] in use — {} feed-forward block-width(s) \
                  (widths {widths:?}, {:.1}% off f32)",
                 service.len(),
@@ -2730,7 +2730,7 @@ pub fn install_ffn_service(model: &Path, budget_bytes: u64) {
             );
             orangu::npu_ffn::install(Some(service));
         }
-        Some(error) => eprintln!(
+        Some(error) => log::warn!(
             "orangu-server: [npu] not used for this model: its blocks come back {:.1}% off \
              f32, past the {:.0}% this accepts. The device holds each weight matrix at one \
              `uint8` scale, so a matrix with a wide tail leaves its bulk too few levels — \
@@ -2741,7 +2741,7 @@ pub fn install_ffn_service(model: &Path, budget_bytes: u64) {
         ),
         // Weights this cannot read, so nothing to compare against. Refusing
         // is the safe direction: an unmeasured path is not a qualified one.
-        None => eprintln!(
+        None => log::warn!(
             "orangu-server: [npu] not used for this model: its blocks could not be checked \
              against an `f32` reference"
         ),
@@ -3117,7 +3117,7 @@ fn precompile(model: &Path, enabled: bool, budget_bytes: u64, cap: Option<usize>
         && let Some(limit) = orangu::npu_ffn::capacity_hint(&fingerprint, &widths)
         && limit < blocks.len()
     {
-        eprintln!(
+        log::info!(
             "orangu-server: [npu] compiling {limit} of {} feed-forward block(s): this device \
              would not hold more at {} tokens last time",
             blocks.len(),
@@ -3156,7 +3156,7 @@ fn precompile(model: &Path, enabled: bool, budget_bytes: u64, cap: Option<usize>
     let needed: u64 = blocks.iter().map(cost).sum::<u64>() * widths.len() as u64;
     let mut budget = budget_bytes.min(needed);
     if needed > budget_bytes {
-        eprintln!(
+        log::warn!(
             "orangu-server: [npu] {name} wants {} of compiled blocks and the budget is {} — \
              raise `npu_cache_gb` to put all of it on the device. Measured on Meta-Llama 3.1 \
              8B `Q8_0`: 18 of 32 blocks prefills at 2.52 tok/s, all 32 at 5.36.",
@@ -3191,7 +3191,7 @@ fn precompile(model: &Path, enabled: bool, budget_bytes: u64, cap: Option<usize>
         // half a gigabyte of cache on blocks `record_decode_run` declines to
         // use. See the layer sweep in `LlamaModel::record_decode_run`.
         if tokens == DECODE_WIDTH && affordable < blocks.len() {
-            eprintln!(
+            log::warn!(
                 "orangu-server: [npu] the {} cache budget does not cover every layer at \
                  {tokens} token, and a partial decode set is slower than none — skipped. \
                  Raise `npu_cache_gb` to use the device on decode too.",
@@ -3201,7 +3201,7 @@ fn precompile(model: &Path, enabled: bool, budget_bytes: u64, cap: Option<usize>
         }
         if affordable == 0 {
             if tokens != DECODE_WIDTH {
-                eprintln!(
+                log::warn!(
                     "orangu-server: [npu] no room left for {tokens}-token blocks within the {} \
                      cache budget. Raise `npu_cache_gb` to use more of the device.",
                     orangu::format::format_bytes(budget_bytes)
@@ -3223,7 +3223,7 @@ fn precompile(model: &Path, enabled: bool, budget_bytes: u64, cap: Option<usize>
             })
             .count();
         if affordable < blocks.len() {
-            eprintln!(
+            log::warn!(
                 "orangu-server: [npu] {} block(s) at {tokens} tokens left off: they would \
                  exceed the {} cache budget",
                 blocks.len() - affordable,
@@ -3234,7 +3234,7 @@ fn precompile(model: &Path, enabled: bool, budget_bytes: u64, cap: Option<usize>
             continue;
         }
         if cap.is_none() {
-            eprintln!(
+            log::info!(
                 "orangu-server: [npu] compiling {missing} feed-forward block(s) of {name} at \
                  {tokens} tokens — one time, about seven seconds each"
             );
@@ -3250,7 +3250,7 @@ fn precompile(model: &Path, enabled: bool, budget_bytes: u64, cap: Option<usize>
         match status {
             Ok(status) if status.success() => {
                 if cap.is_none() {
-                    eprintln!(
+                    log::info!(
                         "orangu-server: [npu] {missing} block(s) at {tokens} tokens compiled \
                          in {:.0}s, cached in {}",
                         started.elapsed().as_secs_f64(),
@@ -3259,13 +3259,13 @@ fn precompile(model: &Path, enabled: bool, budget_bytes: u64, cap: Option<usize>
                 }
             }
             Ok(status) => {
-                eprintln!(
+                log::warn!(
                     "orangu-server: [npu] precompile exited with {status}; continuing without it"
                 );
                 break;
             }
             Err(e) => {
-                eprintln!("orangu-server: [npu] could not run the compiler: {e}");
+                log::warn!("orangu-server: [npu] could not run the compiler: {e}");
                 break;
             }
         }

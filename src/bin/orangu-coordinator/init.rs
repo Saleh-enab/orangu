@@ -15,8 +15,9 @@
 
 //! Interactive `--init` flow that writes `~/.orangu/orangu-coordinator.conf`.
 //!
-//! It walks every `[orangu-coordinator]` option, showing its default, then
-//! asks for a model and a port for each role in turn. `all` is mandatory —
+//! It walks every `[orangu-coordinator]` option, showing its default —
+//! `log_path` only once `log_type` is `file`, since nothing else reads it —
+//! then asks for a model and a port for each role in turn. `all` is mandatory —
 //! it's the fallback profile a loaded config must always have — the rest
 //! (`code`, `review`, `explorer`, `embeddings`) are skipped by leaving the
 //! model prompt blank. Each role that gets a model becomes its own section,
@@ -28,6 +29,7 @@ use crate::config::{
     default_profile_port, default_startup_timeout,
 };
 use anyhow::{Context, Result, anyhow};
+use orangu::logging::{LOG_TYPES, LogTarget, default_log_path};
 use orangu::model_spec::ModelGroup;
 use rustyline::{
     Config, Context as RlContext, Editor, Helper,
@@ -67,6 +69,7 @@ pub async fn run_init() -> Result<()> {
     let max_body_bytes = prompt_number::<usize>("max_body_bytes", default_max_body_bytes())?;
     let idle_timeout = prompt_optional_number::<u64>("idle_timeout")?;
     let shutdown_token = prompt_optional_string("shutdown_token")?;
+    let log = prompt_log_target("orangu-coordinator")?;
 
     let groups = orangu::model_spec::scan_models_dir(Path::new(&models))
         .map(|found| orangu::model_spec::group_models(&found))
@@ -88,6 +91,7 @@ pub async fn run_init() -> Result<()> {
         max_body_bytes,
         idle_timeout,
         shutdown_token.as_deref(),
+        &log,
         &roles,
     );
 
@@ -125,7 +129,11 @@ pub async fn run_init() -> Result<()> {
 /// so omitting them changes nothing about how the written file behaves,
 /// only how much of it a reader has to look at. `model` is the one
 /// per-profile exception, always written since — like `models` above — it
-/// has no default.
+/// has no default. `log_type` follows the same rule — `console` is the
+/// default and is omitted — but a `file`'s `log_path` is written even when
+/// it is the loader's own default, because that default moves with the
+/// directory the coordinator is started from: the file this wizard showed
+/// is the file the config should keep naming.
 ///
 /// Pulled out of `run_init` itself so this terseness logic is directly
 /// unit-testable without needing to fake an interactive rustyline session.
@@ -138,6 +146,7 @@ fn render_config(
     max_body_bytes: usize,
     idle_timeout: Option<u64>,
     shutdown_token: Option<&str>,
+    log: &LogTarget,
     roles: &[(String, String, String, u16)],
 ) -> String {
     let mut client = vec![format!("host = {host}"), format!("port = {port}")];
@@ -153,6 +162,10 @@ fn render_config(
     }
     if let Some(tok) = shutdown_token {
         client.push(format!("shutdown_token = {tok}"));
+    }
+    if let Some(path) = log.path() {
+        client.push(format!("log_type = {}", log.log_type()));
+        client.push(format!("log_path = {}", path.display()));
     }
 
     let mut contents = format!("[orangu-coordinator]\n{}\n", client.join("\n"));
@@ -405,6 +418,140 @@ fn prompt_host(label: &str, default: &str) -> Result<String> {
     })
 }
 
+/// A rustyline helper that TAB-completes the whole line against a fixed set
+/// of options — the two `log_type` values here — matching the typed prefix
+/// case-insensitively, and ghosting `default` on an empty line so what
+/// Enter is about to take is visible before it is pressed. Mirrors
+/// `orangu-server`'s own `OptionCompleter` (`src/bin/orangu-server/init.rs`),
+/// duplicated here per [`DirCompleter`]'s own reasoning.
+struct OptionCompleter {
+    options: Vec<String>,
+    default: Option<String>,
+}
+
+impl Completer for OptionCompleter {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &RlContext<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let prefix = line[..pos].to_lowercase();
+        let matches = self
+            .options
+            .iter()
+            .filter(|option| option.to_lowercase().starts_with(&prefix))
+            .map(|option| Pair {
+                display: option.clone(),
+                replacement: option.clone(),
+            })
+            .collect();
+        Ok((0, matches))
+    }
+}
+
+impl Hinter for OptionCompleter {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, _ctx: &RlContext<'_>) -> Option<String> {
+        // Same "only at the end of the line" rule as every other hinter here.
+        if pos < line.len() {
+            return None;
+        }
+        if line.is_empty() {
+            return self.default.clone();
+        }
+        let prefix = line.to_lowercase();
+        let candidate = self
+            .options
+            .iter()
+            .find(|option| option.to_lowercase().starts_with(&prefix))?;
+        candidate
+            .get(line.len()..)
+            .filter(|suffix| !suffix.is_empty())
+            .map(str::to_string)
+    }
+}
+
+impl Highlighter for OptionCompleter {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Cow::Owned(format!("{GHOST_TEXT}{hint}{ANSI_RESET}"))
+    }
+}
+impl Validator for OptionCompleter {}
+impl Helper for OptionCompleter {}
+
+/// Prompts for `log_type` (TAB-completing `console`/`file`, ghosting the
+/// default `console`), and — only on `file`, since nothing else reads it —
+/// for `log_path`, with the same filesystem completion the `models` prompt
+/// has and the loader's own [`default_log_path`] (`orangu-coordinator.log`
+/// in the current directory) ghosted on the empty line. A value that is
+/// neither of the two re-prompts, as [`LogTarget::from_keys`] would reject
+/// it at load time anyway; a log path is accepted as typed, since the file
+/// is created at startup and a directory that isn't there yet along with
+/// it.
+fn prompt_log_target(program: &str) -> Result<LogTarget> {
+    let default = LogTarget::default();
+    let config = Config::builder()
+        .completion_type(rustyline::CompletionType::List)
+        .build();
+    let mut editor: Editor<OptionCompleter, DefaultHistory> = Editor::with_config(config)?;
+    editor.set_helper(Some(OptionCompleter {
+        options: LOG_TYPES.iter().map(|option| option.to_string()).collect(),
+        default: Some(default.log_type().to_string()),
+    }));
+    let log_type = loop {
+        let value = match editor.readline(&format!("log_type [{}]: ", default.log_type())) {
+            Ok(line) => line.trim().to_lowercase(),
+            Err(ReadlineError::Eof | ReadlineError::Interrupted) => {
+                return Err(anyhow!("aborted: reached end of input"));
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if value.is_empty() {
+            break default.log_type().to_string();
+        }
+        if LOG_TYPES.contains(&value.as_str()) {
+            break value;
+        }
+        println!("'{value}' is not one of: {}.", LOG_TYPES.join(", "));
+    };
+    if log_type == default.log_type() {
+        return Ok(default);
+    }
+    let path = prompt_path("log_path", &default_log_path(program))?;
+    LogTarget::from_keys(program, Some(&log_type), Some(&path))
+}
+
+/// Prompts for a filesystem path with TAB completion and ghost text over
+/// real entries ([`DirCompleter`]), and `default` — shown in the label and
+/// ghosted on the empty line, so what Enter takes is visible before it is
+/// pressed — kept on an empty entry. Nothing is created or checked: unlike
+/// [`prompt_models_dir`], the path here names a file that the process opens
+/// itself at startup.
+fn prompt_path(label: &str, default: &Path) -> Result<String> {
+    let default = default.display().to_string();
+    let config = Config::builder()
+        .completion_type(rustyline::CompletionType::List)
+        .build();
+    let mut editor: Editor<DirCompleter, DefaultHistory> = Editor::with_config(config)?;
+    editor.set_helper(Some(DirCompleter {
+        inner: FilenameCompleter::new(),
+        empty_line: Some(default.clone()),
+    }));
+
+    let value = match editor.readline(&format!("{label} [{default}]: ")) {
+        Ok(line) => line.trim().to_string(),
+        Err(ReadlineError::Eof | ReadlineError::Interrupted) => {
+            return Err(anyhow!("aborted: reached end of input"));
+        }
+        Err(err) => return Err(err.into()),
+    };
+    Ok(if value.is_empty() { default } else { value })
+}
+
 /// TAB-completes filesystem paths (via `FilenameCompleter`) for the
 /// `models` prompt, and — the same underlying candidates — shows the first
 /// match as a greyed-out inline ghost-text suggestion while typing, so a
@@ -417,6 +564,11 @@ fn prompt_host(label: &str, default: &str) -> Result<String> {
 /// nothing in this codebase's existing rustyline helpers does yet.
 struct DirCompleter {
     inner: FilenameCompleter,
+    /// What an empty line ghosts, when the prompt has a default worth
+    /// previewing (`log_path`); `None` (`models`) leaves the empty line to
+    /// the filesystem, which ghosts the first entry of the current
+    /// directory.
+    empty_line: Option<String>,
 }
 
 impl Completer for DirCompleter {
@@ -442,6 +594,9 @@ impl Hinter for DirCompleter {
         // earlier in the middle of an already-typed path.
         if pos < line.len() {
             return None;
+        }
+        if line.is_empty() && self.empty_line.is_some() {
+            return self.empty_line.clone();
         }
         let (start, candidates) = self.inner.complete(line, pos, ctx).ok()?;
         let candidate = candidates.first()?;
@@ -494,6 +649,7 @@ fn prompt_models_dir(label: &str) -> Result<String> {
     let mut editor: Editor<DirCompleter, DefaultHistory> = Editor::with_config(config)?;
     editor.set_helper(Some(DirCompleter {
         inner: FilenameCompleter::new(),
+        empty_line: None,
     }));
 
     loop {
@@ -807,6 +963,7 @@ mod tests {
             default_max_body_bytes(),
             None,
             None,
+            &LogTarget::Console,
             &roles,
         );
         assert_eq!(
@@ -831,6 +988,7 @@ mod tests {
             default_max_body_bytes(),
             None,
             None,
+            &LogTarget::Console,
             &[],
         );
         assert!(contents.contains(&format!("host = {}\n", default_host())));
@@ -863,6 +1021,7 @@ mod tests {
             1024,
             Some(300),
             Some("secret"),
+            &LogTarget::File(PathBuf::from("/var/log/orangu-coordinator.log")),
             &roles,
         );
         assert!(contents.contains("host = 0.0.0.0\n"));
@@ -872,6 +1031,10 @@ mod tests {
         assert!(contents.contains("max_body_bytes = 1024\n"));
         assert!(contents.contains("idle_timeout = 300\n"));
         assert!(contents.contains("shutdown_token = secret\n"));
+        assert!(
+            contents.contains("log_type = file\nlog_path = /var/log/orangu-coordinator.log\n"),
+            "{contents}"
+        );
         assert!(contents.contains("[all]\n"));
         assert!(contents.contains("model = org/gemma\n"));
         assert!(contents.contains("host = 192.168.1.1\n"));
@@ -887,6 +1050,7 @@ mod tests {
     fn hinter() -> DirCompleter {
         DirCompleter {
             inner: FilenameCompleter::new(),
+            empty_line: None,
         }
     }
 
@@ -1291,5 +1455,73 @@ mod tests {
     fn host_completer_highlight_hint_wraps_the_text_in_grey() {
         let rendered = host_hinter().highlight_hint("all");
         assert_eq!(rendered, format!("{GHOST_TEXT}all{ANSI_RESET}"));
+    }
+
+    fn log_type_hinter() -> OptionCompleter {
+        OptionCompleter {
+            options: LOG_TYPES.iter().map(|option| option.to_string()).collect(),
+            default: Some(LogTarget::default().log_type().to_string()),
+        }
+    }
+
+    /// The `log_type` prompt opens ghosting `console` — the default, and
+    /// what Enter takes — completes either value from a prefix in any
+    /// casing, and ghosts nothing for a prefix neither starts with.
+    #[test]
+    fn log_type_prompt_ghosts_the_default_and_completes_both_values() {
+        let history = DefaultHistory::new();
+        let ctx = RlContext::new(&history);
+        let hinter = log_type_hinter();
+        assert_eq!(hinter.hint("", 0, &ctx).as_deref(), Some("console"));
+        assert_eq!(hinter.hint("f", 1, &ctx).as_deref(), Some("ile"));
+        assert_eq!(hinter.hint("F", 1, &ctx).as_deref(), Some("ile"));
+        assert_eq!(hinter.hint("syslog", 6, &ctx), None);
+        assert_eq!(hinter.hint("fi", 1, &ctx), None, "not mid-line");
+
+        let (_, candidates) = hinter.complete("", 0, &ctx).unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|pair| pair.replacement.as_str())
+                .collect::<Vec<_>>(),
+            vec!["console", "file"]
+        );
+        assert_eq!(
+            hinter.highlight_hint("console"),
+            format!("{GHOST_TEXT}console{ANSI_RESET}")
+        );
+    }
+
+    /// The `log_path` prompt ghosts its default on the empty line — the
+    /// file the loader would pick on its own — and hands the line over to
+    /// the filesystem the moment something is typed, exactly like the
+    /// `models` prompt.
+    #[test]
+    fn log_path_prompt_ghosts_its_default_on_an_empty_line_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("logs")).unwrap();
+        let history = DefaultHistory::new();
+        let ctx = RlContext::new(&history);
+        let with_default = DirCompleter {
+            inner: FilenameCompleter::new(),
+            empty_line: Some("/srv/orangu-coordinator.log".to_string()),
+        };
+        assert_eq!(
+            with_default.hint("", 0, &ctx).as_deref(),
+            Some("/srv/orangu-coordinator.log")
+        );
+
+        let prefix = dir.path().join("lo");
+        let line = prefix.to_str().unwrap();
+        assert_eq!(
+            with_default.hint(line, line.len(), &ctx).as_deref(),
+            Some(format!("gs{}", std::path::MAIN_SEPARATOR).as_str())
+        );
+        // A prompt with no default of its own keeps the filesystem's
+        // answer on the empty line.
+        assert_ne!(
+            hinter().hint("", 0, &ctx).as_deref(),
+            Some("/srv/orangu-coordinator.log")
+        );
     }
 }

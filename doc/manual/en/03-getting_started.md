@@ -106,7 +106,7 @@ The server binds the host and port from step 1 and serves an OpenAI-compatible e
 http://localhost:8100/v1
 ```
 
-`-d`/`--daemon` detaches it from the terminal; that needs `[orangu-server].model` set in the configuration, because there is no terminal left to prompt on. See the *Inference server* chapter for GPU backend selection and the rest of the operational detail.
+`-d`/`--daemon` detaches it from the terminal; that needs `[orangu-server].model` set in the configuration, because there is no terminal left to prompt on — and `log_type = file` to keep its output, since detached it has no console to log to either (the file defaults to `orangu-server.log` in the directory it was started from). See the *Inference server* chapter for GPU backend selection and the rest of the operational detail.
 
 To move a working server to another machine without repeating steps 1–3, bundle it and its model into one executable:
 

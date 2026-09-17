@@ -6,6 +6,7 @@ This project is a local coding-environment client built around a direct OpenAI-c
 
 - `src/bin/orangu.rs` - terminal loop, commands, history, prompt rendering, and waiting state
 - `src/config.rs` - INI parsing and normalization
+- `src/logging.rs` - where `orangu-server` and `orangu-coordinator` log (`log_type`/`log_path`): the `log` facade with `fern` behind it — bare lines on the console exactly as `println!` put them, stamped lines in a file
 - `src/llm/openai.rs` - OpenAI-compatible client for `orangu-server`
 - `src/session.rs` - tool-calling conversation flow
 - `src/tools.rs` - local workspace tools for reading, editing, listing, fetching, and shell commands

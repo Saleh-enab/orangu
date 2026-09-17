@@ -122,7 +122,9 @@ http://localhost:8100/v1
 
 Add `-d`/`--daemon` to detach it from the terminal; that requires
 `[orangu-server].model` to be set in the config, since there is no terminal to
-prompt on.
+prompt on. Detached, it has no console to log to either — add `log_type =
+file` (and, optionally, a `log_path`; the default is `orangu-server.log` in
+the directory it was started from) to keep its output.
 
 As an alternative to steps 1–3, the server and a model can be built into one
 self-contained executable — no models directory and no `orangu-server.conf`,

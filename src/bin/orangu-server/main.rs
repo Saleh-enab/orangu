@@ -630,6 +630,18 @@ fn main() -> ExitCode {
     }
 
     if let Some(command) = args.command.take() {
+        // A subcommand is a terminal conversation and logs to it. Installed
+        // before anything can log, so a warning raised along the way (a
+        // rejected `ORANGU_*` value, say) isn't dropped on the floor for
+        // want of a logger.
+        if let Err(err) = orangu::logging::install(
+            &orangu::logging::LogTarget::Console,
+            orangu::logging::Console::Everything,
+            "orangu_server",
+        ) {
+            eprintln!("error: {err:#}");
+            return ExitCode::FAILURE;
+        }
         let _terminal_title_guard = TerminalTitleGuard::new(&terminal_title(command.mode()));
         // Only `bundle` reads these — it is the one subcommand that decides
         // how the server it writes will start, so the role and the address
@@ -707,8 +719,11 @@ fn main() -> ExitCode {
 
     match runtime.block_on(serve(prepared)) {
         Ok(()) => ExitCode::SUCCESS,
+        // Through the logger: by now a daemon's stderr is `/dev/null`, and a
+        // serving failure is exactly the line a log file exists to hold. On
+        // the console it lands on stderr as before.
         Err(err) => {
-            eprintln!("error: {err:#}");
+            log::error!("error: {err:#}");
             ExitCode::FAILURE
         }
     }
@@ -796,7 +811,6 @@ struct Prepared {
     workspace: PathBuf,
     api_listener: std::net::TcpListener,
     web_listener: Option<std::net::TcpListener>,
-    daemon: bool,
 }
 
 /// Which model this process is about to serve, and where its bytes are.
@@ -942,6 +956,19 @@ fn prepare(args: Args) -> Result<Prepared> {
     let split_flag = args.device_split.clone();
     let threads_flag = args.threads.clone();
     let conf = load_config(args.config, cli_role, args.daemon)?;
+    // The logger, as soon as there is a config to say where it goes and
+    // before anything worth logging happens. A `--daemon` with the console
+    // as its log has nowhere to write — detached, its stdout is `/dev/null`
+    // — and logs nothing at all; a file is written exactly as an attached
+    // run would write it, which is what a daemon with a log file is for. An
+    // unwritable `log_path` fails here, on the terminal, like every other
+    // config error.
+    let console = if args.daemon {
+        orangu::logging::Console::Nothing
+    } else {
+        orangu::logging::Console::Everything
+    };
+    orangu::logging::install(&conf.log, console, "orangu_server")?;
     let mut role = conf.role;
     let reasoning_effort = conf.reasoning_effort.clone();
     let workspace = resolve_workspace(args.workspace.clone())?;
@@ -1134,7 +1161,7 @@ fn prepare(args: Args) -> Result<Prepared> {
             .map(|(name, bytes)| (name, bytes, limit))
     });
     if let Some((name, bytes, limit)) = &oversized_tensor {
-        eprintln!(
+        log::warn!(
             "orangu-server: tensor `{name}` is {} and this device will not create a buffer \
              larger than {} — no placement changes that, so the model runs on the CPU.",
             orangu::format::format_bytes(*bytes),
@@ -1167,7 +1194,7 @@ fn prepare(args: Args) -> Result<Prepared> {
             (cpu, label.to_string())
         }
         Some((name, total)) => {
-            eprintln!(
+            log::warn!(
                 "orangu-server: {name} has {total_h} and this model pins {pinned} of embeddings \
                  and output weights to it before a single layer is placed — no split can make \
                  that fit, so the model runs on the CPU. Choose a device explicitly with \
@@ -1207,7 +1234,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         && conf.device_split.is_off()
         && overflows_selected_device(backend.as_ref(), weights_device_bytes)
     {
-        eprintln!(
+        log::warn!(
             "orangu-server: the weights are larger than the selected device — spreading \
              them across every device in order and running the remainder on the CPU \
              (`device_split = cpu`). Set `device_split` explicitly to choose differently."
@@ -1224,7 +1251,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         weights_device_bytes,
     )?;
 
-    eprintln!(
+    log::info!(
         "{}",
         cpu_inventory(
             match &split {
@@ -1240,7 +1267,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     // inferring it from a line that may arrive minutes later. Detected well
     // above, before the background preparation opened the same driver.
     if let Some(line) = &npu_line {
-        eprintln!("{line}");
+        log::info!("{line}");
     }
     // Before the model is built: `LoadedModel::matrix` is what stamps each
     // tensor's device, and every architecture calls it during construction.
@@ -1258,7 +1285,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     // three windows and never won: stating that here is cheaper than an
     // operator re-deriving it.
     if engine::dense_residency::enabled() {
-        eprintln!(
+        log::info!(
             "orangu-server: dense residency: releasing each layer's weights once the sweep is \
              past it (ORANGU_DENSE_WINDOW). Applies only to layers the CPU executes. \
              Measured at windows 1, 4 and 32: none beat leaving residency to the kernel."
@@ -1341,7 +1368,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         // `for_split_device`.
         let footprints = split.footprints(&loaded, &model.new_kv_cache(1), conf.slots);
         for line in split.lines(&footprints) {
-            eprintln!("{line}");
+            log::info!("{line}");
         }
         // `as_wgpu` is `None` on a split, so the ordinary tuning report was
         // never built. Standing this in its place keeps `/props` describing
@@ -1361,14 +1388,14 @@ fn prepare(args: Args) -> Result<Prepared> {
     });
     if let (Some(footprint), Some(wgpu)) = (&footprint, backend.as_wgpu()) {
         for line in footprint.report(wgpu.api_tag(), wgpu.device_in_use()) {
-            eprintln!("{line}");
+            log::info!("{line}");
         }
         // Here rather than during the self-check that found them: the check
         // runs before a model is chosen, so it can only say what is wrong
         // with the *device*, and what an operator needs is what is wrong
         // with the model they just loaded.
         for line in wgpu.quantization_notes_for(&loaded.quantization_types()) {
-            eprintln!("{line}");
+            log::info!("{line}");
         }
         // Beside the tuning report rather than in it: `tuning_report` is a
         // property of the device and its kernels, this is a property of the
@@ -1385,7 +1412,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         // can only be answered by building the tier first — see
         // `engine::expert_tier`.
         for line in expert_tier_projection(&loaded, footprint, wgpu, expert_tier_active) {
-            eprintln!("{line}");
+            log::info!("{line}");
         }
         // No refusal here, deliberately. A device with no headroom left is a
         // reason to place layers somewhere else — which the overflow split
@@ -1511,14 +1538,14 @@ fn prepare(args: Args) -> Result<Prepared> {
                 let (device, _) = wgpu.device_and_queue();
                 let entries = pool.num_pages() * conf.slots;
                 if pool.attach_device(device, wgpu.kv_storage(), entries) {
-                    println!(
+                    log::info!(
                         "orangu-server: [kv] device pages — {:.2} GiB across {} layers",
                         pool.device_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
                         pool.layers().len(),
                     );
                 }
             }
-            println!(
+            log::info!(
                 "orangu-server: [kv] paged cache — {} pages of {page_tokens} tokens                  ({} tokens total, {:.2} GiB host), policy {:?}",
                 pool.num_pages(),
                 pool.token_capacity(),
@@ -1576,7 +1603,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     // number — the room the weights leave — and an operator reading only that
     // one would be surprised by a refusal at a quarter of it.
     if let Some(tokens) = kv_ceiling {
-        println!(
+        log::info!(
             "orangu-server: [kv] one request may hold up to {tokens} tokens of context; \
              an answer stops there, and a longer prompt is refused rather than risking the device"
         );
@@ -1584,7 +1611,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     engine::generate::set_kv_device_token_ceiling(kv_ceiling);
 
     if engine::kv_pool::paged_kv_enabled() && !paged_supported {
-        println!(
+        log::info!(
             "orangu-server: [kv] paged cache off — this device's attention \
              kernels (GQA or flash split) have no paged form yet"
         );
@@ -1592,7 +1619,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         // Said out loud rather than silently falling back: an operator who
         // asked for the pool and did not get one should learn it here, not
         // from a hit rate that never moves.
-        eprintln!(
+        log::warn!(
             "orangu-server: [kv] ORANGU_PAGED_KV is set but the memory budget              does not hold one page; running with per-request caches"
         );
     }
@@ -1620,7 +1647,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     if let (Some(pool), Some(dir)) = (prefix_cache.as_ref(), prefix_cache_dir.as_ref()) {
         let loaded = pool.load_from(dir, &prefix_fingerprint);
         if loaded > 0 {
-            eprintln!(
+            log::info!(
                 "orangu-server: prefix cache restored {loaded} entries from {}",
                 dir.display()
             );
@@ -1680,10 +1707,11 @@ fn prepare(args: Args) -> Result<Prepared> {
             };
             match attach() {
                 Ok(head) => {
-                    println!(
+                    log::info!(
                         "orangu-server: multi-token-prediction head {} attached ({} drafted \
                          tokens per verification)",
-                        head.label, head.tokens
+                        head.label,
+                        head.tokens
                     );
                     Some(Arc::new(head))
                 }
@@ -1693,7 +1721,7 @@ fn prepare(args: Args) -> Result<Prepared> {
                 // though: a silently absent head is a feature nobody can
                 // tell from a slow one.
                 Err(err) => {
-                    eprintln!(
+                    log::warn!(
                         "orangu-server: multi-token-prediction head {} not attached: {err:#}",
                         path.display()
                     );
@@ -1741,6 +1769,10 @@ fn prepare(args: Args) -> Result<Prepared> {
         slot_store,
         role,
         reasoning_effort,
+        // Progress is for a console someone is watching: a file gets each
+        // request's completed line and nothing in between, and a daemon on
+        // the console has `/dev/null` for a stdout.
+        live_stats: conf.log.is_console() && !args.daemon,
     });
 
     // `all` (the default) and its `*` alias become `0.0.0.0` here — see
@@ -1802,7 +1834,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         // (`show`, `plan`, shell completion), or a load that later fails to
         // build its backend or bind its listener, must not change the date.
         if let Err(err) = orangu::model_registry::record_used(&model_label, path) {
-            eprintln!("warning: could not update ~/.orangu/models: {err:#}");
+            log::warn!("warning: could not update ~/.orangu/models: {err:#}");
         }
     }
 
@@ -1837,7 +1869,6 @@ fn prepare(args: Args) -> Result<Prepared> {
         workspace,
         api_listener,
         web_listener,
-        daemon: args.daemon,
     })
 }
 
@@ -2267,7 +2298,6 @@ async fn serve(prepared: Prepared) -> Result<()> {
         workspace,
         api_listener,
         web_listener,
-        daemon,
     } = prepared;
 
     // A handle to the pool taken before `engine` is moved into the router's
@@ -2327,18 +2357,25 @@ async fn serve(prepared: Prepared) -> Result<()> {
     });
     let app = http::build_router(state);
 
-    if !daemon {
+    // The banner, through the logger: on a console it prints as it always
+    // did, and a file gets it too — what a daemon serves, and where, is the
+    // first thing anyone opening its log wants to know. A daemon on the
+    // console logs nothing, having nowhere to.
+    {
         let os = orangu::os::detect();
         let cpu = orangu::hardware::detect_cpu();
         let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
         let npu = orangu::npu::detect_npu_inventory();
         let power = orangu::hardware::detect_power();
-        print!(
-            "{}",
-            orangu::hardware::format_report(&os, &cpu, &gpus, npu.as_ref(), &power)
-        );
-        println!();
-        println!(
+        // Line by line rather than as one record: a file stamps each line,
+        // and a report that is one record would carry one stamp on its
+        // first line and none on the rest.
+        for line in orangu::hardware::format_report(&os, &cpu, &gpus, npu.as_ref(), &power).lines()
+        {
+            log::info!("{line}");
+        }
+        log::info!("");
+        log::info!(
             "Model      {model_display} ({architecture} arch, {backend_label}, {} layers, {} ctx)",
             // Trunk layers, not `block_count`. On a file carrying a
             // multi-token-prediction block the two differ, and the banner
@@ -2358,14 +2395,14 @@ async fn serve(prepared: Prepared) -> Result<()> {
         // (`x-orangu-role`), so this is what the *process* was started as and
         // what a request that names nothing gets. A request served under
         // another role says so on its own completion line.
-        println!("Mode       {}", role.label());
+        log::info!("Mode       {}", role.label());
         // Speculation changes how fast an answer arrives and never what it
         // says, so it belongs on the banner rather than in a note: it is a
         // property of this server worth seeing beside the model, and a pair
         // whose acceptance is poor is a configuration to notice, not a fault
         // to warn about.
         if let Some(draft) = &engine.draft {
-            println!(
+            log::info!(
                 "Draft      {} ({} arch, {} layers, {} tokens/step)",
                 draft.label,
                 draft.model.config().architecture,
@@ -2386,41 +2423,41 @@ async fn serve(prepared: Prepared) -> Result<()> {
         // cuda:0` run look like a full-path run in every number taken from
         // it.
         if let Some(summary) = &gpu_tuning_summary {
-            println!("Kernels    {summary}");
+            log::info!("Kernels    {summary}");
         }
         // Where the weights came from, when the answer isn't a file somebody
         // can point at: this binary is the model. Worth a line of its own —
         // it explains both why no models directory was needed and why the
         // executable is the size it is.
         if let Some(bundle) = bundle {
-            println!(
+            log::info!(
                 "Bundled    {} embedded in {}",
                 orangu::format::format_bytes(bundle.bytes),
                 bundle.exe.display()
             );
         }
         match &web_listener {
-            Some(l) => println!("UI         {scheme}://{}", l.local_addr()?),
-            None => println!("UI         disabled"),
+            Some(l) => log::info!("UI         {scheme}://{}", l.local_addr()?),
+            None => log::info!("UI         disabled"),
         }
         // The bound address, not the configured `host`: `all` says nothing
         // about where to point a client, `0.0.0.0:8100` does.
-        println!("API        {scheme}://{}", listener.local_addr()?);
+        log::info!("API        {scheme}://{}", listener.local_addr()?);
         // The two deployment gates, on the two lines under the address they
         // are gates on, and printed on *every* start rather than only on the
         // ones where they are missing. A row that always has a value is a
         // thing a reader can check; a warning that appears conditionally is
         // a thing they learn to expect the absence of. What a `No` costs and
         // how to answer it is documented, not reprinted here — see `gate`.
-        println!("API key    {}", gate(has_api_key));
-        println!("TLS        {}", gate(tls_config.is_some()));
-        println!("Workspace  {}", workspace.display());
+        log::info!("API key    {}", gate(has_api_key));
+        log::info!("TLS        {}", gate(tls_config.is_some()));
+        log::info!("Workspace  {}", workspace.display());
         // The governor is a *state*, not a finding: it has an answer on
         // every machine, and `Performance` is as worth seeing as anything
         // else — it is what makes the throughput numbers below it
         // comparable. See `hardware::cpu_governor`.
         if let Some(governor) = orangu::hardware::cpu_governor() {
-            println!("Frequency  {governor}");
+            log::info!("Frequency  {governor}");
         }
         // What is left as a `Note` is *conditions* — on battery, or already
         // near a critical temperature. Neither has a command as an answer,
@@ -2430,7 +2467,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
         // and GPU power levels are in the manual, where a line per card does
         // not have to be reprinted on every start.
         for advisory in orangu::hardware::power_advisories(&power) {
-            println!("Note       {advisory}");
+            log::info!("Note       {advisory}");
         }
     }
 
@@ -2469,11 +2506,9 @@ async fn serve(prepared: Prepared) -> Result<()> {
                 )
                 .map(Arc::new)
                 .map_err(|err| {
-                    if !daemon {
-                        println!(
-                            "Note       model loading from the web console is unavailable: {err:#}"
-                        );
-                    }
+                    log::info!(
+                        "Note       model loading from the web console is unavailable: {err:#}"
+                    );
                 })
                 .ok()
             })
@@ -2531,14 +2566,10 @@ async fn serve(prepared: Prepared) -> Result<()> {
             result?;
         }
         _ = tokio::signal::ctrl_c() => {
-            if !daemon {
-                println!("shutting down");
-            }
+            log::info!("shutting down");
         }
         _ = shutdown_rx.recv() => {
-            if !daemon {
-                println!("received shutdown request, shutting down");
-            }
+            log::info!("received shutdown request, shutting down");
         }
         // A real terminal Ctrl+C also delivers SIGINT, so this branch races
         // tokio::signal::ctrl_c() above for the exact same event — tokio::
@@ -2546,9 +2577,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
         // must print the same message rather than staying silent, or the
         // "shutting down" line only shows up on half of all Ctrl+Cs.
         _ = wait_for_sigint() => {
-            if !daemon {
-                println!("shutting down");
-            }
+            log::info!("shutting down");
         }
     }
 
@@ -2580,11 +2609,10 @@ async fn serve(prepared: Prepared) -> Result<()> {
         prefix_cache_snapshot.as_ref(),
     ) {
         match pool.save_to(dir, fingerprint) {
-            Ok(n) if !daemon => println!("prefix cache saved {n} entries to {}", dir.display()),
-            Ok(_) => {}
+            Ok(n) => log::info!("prefix cache saved {n} entries to {}", dir.display()),
             // A snapshot that could not be written costs a cold start next
             // time, which is exactly the status quo — never a failed exit.
-            Err(err) => eprintln!("orangu-server: prefix cache not saved: {err}"),
+            Err(err) => log::warn!("orangu-server: prefix cache not saved: {err}"),
         }
     }
 
@@ -3634,7 +3662,7 @@ fn plan_expert_tier(
     // KV cache then cannot have. Measured with both on, the card sat at
     // capacity.
     if engine::arch::expert_streaming() {
-        eprintln!(
+        log::info!(
             "orangu-server: [{}] expert weights stream per batch; no resident tier is planned",
             backend.as_wgpu().map_or("cpu", |w| w.api_tag()),
         );
@@ -3698,7 +3726,7 @@ fn plan_expert_tier(
     // a silent no-op.
     let floor = engine::expert_tier::coverage_floor();
     if !engine::expert_tier::worth_building(plan.coverage(), floor) {
-        eprintln!(
+        log::info!(
             "orangu-server: [{}] expert tier declined: the budget of {} would cover only \
              {:.1}% of recorded routing, under the {:.0}% floor — that VRAM goes to the KV \
              cache and the arenas instead. Set ORANGU_EXPERT_TIER_FLOOR=<percent> to override.",
@@ -3709,7 +3737,7 @@ fn plan_expert_tier(
         );
         return false;
     }
-    eprintln!(
+    log::info!(
         "orangu-server: [{}] expert tier: {} of {} experts on device ({}), filled by {}",
         wgpu.api_tag(),
         plan.resident_count(),
@@ -4298,11 +4326,11 @@ fn choose_device(
     match device::select_all(candidates, request) {
         Ok(selected) => {
             for line in device::inventory(api, candidates, &selected) {
-                eprintln!("{line}");
+                log::info!("{line}");
             }
             let head = selected[0];
             if candidates[head].class.is_software() {
-                eprintln!(
+                log::warn!(
                     "orangu-server: [{api}] {} is a software rasterizer — this runs the GPU \
                      code path on the CPU, and orangu's own CPU backend is faster. It was \
                      asked for explicitly, so it is being used.",
@@ -4317,7 +4345,7 @@ fn choose_device(
         // surprising, and stays silent forever unless it is said here.
         Err(err) => {
             if !candidates.is_empty() && err.kind == DeviceErrorKind::Absent {
-                eprintln!("orangu-server: [{api}] {err}");
+                log::warn!("orangu-server: [{api}] {err}");
             }
             Err(err)
         }

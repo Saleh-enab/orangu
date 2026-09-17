@@ -167,7 +167,7 @@ pub fn fail(context: &str, detail: impl std::fmt::Display) -> ! {
 /// arms the exit. Shared by [`fail`] and [`note_panic`] so a loss reads the
 /// same whether we caught it as an `Err` or as `wgpu`'s own panic.
 fn report(context: &str, detail: impl std::fmt::Display) {
-    eprintln!(
+    log::error!(
         "orangu-server: GPU device lost while {context}: {detail}\n\
          orangu-server: the graphics driver reset the device (check `dmesg` for a GPU \
          hang or reset); a lost device cannot be re-created in this process, so \

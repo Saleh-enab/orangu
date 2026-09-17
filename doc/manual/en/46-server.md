@@ -1444,6 +1444,7 @@ device = auto
 kv_cache = f16
 read_size = 8192
 role = all
+log_type = console
 
 [web]
 port = 8101
@@ -1636,6 +1637,35 @@ reexec = yes
   overridable by typing another. That prompt only appears when no model was
   given on the CLI either; an attached run that names a model and no role
   flag is `all`, as before.
+- `log_type` / `log_path` — where the server's output goes. `console` (the
+  default) is exactly what it has always printed: the startup banner, a
+  progress line rewritten once a second while a request runs, each request's
+  completion line (`orangu-server: [slot 0] prompt 41 tokens in 0.31s ...`),
+  and every note or warning along the way. `file` appends all of that to
+  `log_path` instead — each line stamped with a time and a level, `INFO` for
+  what the console puts on stdout and `WARN`/`ERROR` for what it puts on
+  stderr — except the once-a-second progress, which a file has no use for: a
+  file gets each request's completed line and nothing in between. `log_path`
+  defaults to `orangu-server.log` in the directory the server was started
+  from, so `log_type = file` alone is enough; a leading `~` is expanded, a
+  directory that isn't there yet is created, and a file that already exists
+  is appended to. It is opened before `--daemon` detaches, so an unwritable
+  path is a startup error on the terminal. This is the setting a **`--daemon`**
+  run wants: detached, its stdout is `/dev/null`, so with the console as its
+  log a daemon logs nothing at all. Fatal `error:` lines the process exits on
+  stay on stderr — they are for the terminal that started it — and a
+  subcommand's own output (`list`, `show`, ...) is not logging and is
+  unaffected. A coordinator logging to a file hands the same file to every
+  `orangu-server` it starts (see the Coordinator chapter), and the two append
+  to it line by line.
+
+  ```text
+  2026-09-16 23:36:41 INFO  Model      unsloth/gemma-4-E2B-it-GGUF:Q4_K_M (gemma4 arch, Vulkan, 30 layers, 32768 ctx)
+  2026-09-16 23:36:41 INFO  Mode       all
+  2026-09-16 23:36:41 INFO  API        http://0.0.0.0:8100
+  2026-09-16 23:37:02 INFO  orangu-server: [slot 0] prompt 41 tokens in 0.31s (132.26 tok/s), generated 64 tokens in 3.10s (20.65 tok/s)
+  2026-09-16 23:52:00 INFO  shutting down
+  ```
 
 ### Every key, in one place
 
@@ -1663,6 +1693,8 @@ shown.
 | `threads` | rayon's choice | CPU worker threads |
 | `role` | `all` | `all`, `code`, `review`, `explorer`, `embedding` |
 | `reasoning_effort` | `medium` | how hard a reasoning model is asked to think, in its own template's words |
+| `log_type` | `console` | where the server's output goes: `console`, or `file` to append it — stamped, and without the once-a-second progress line — to `log_path`; what a `--daemon` needs, since detached it otherwise logs nothing |
+| `log_path` | `orangu-server.log` in the start directory | the file `log_type = file` writes to; `~` is expanded, a missing directory created |
 | `web` | `0` | the pre-section spelling of `[web].port`, still honored when the file has no `[web]` section and ignored when it does |
 
 | `[web]` | default | what it does |
@@ -1875,13 +1907,21 @@ created by widening the address, and asking it here is the difference between
 walking someone into an exposed server and letting them decide. Leaving it
 blank is still allowed and still writes no key; the prompt names the
 consequence rather than insisting. A `models` directory that doesn't exist yet
-is created, parents included, rather than refused. `-d`/`--daemon` detaches
+is created, parents included, rather than refused. The last `[orangu-server]`
+prompt is `log_type` (TAB-completing `console`/`file`, ghosting `console`),
+followed — only on `file` — by `log_path`, which TAB-completes real
+filesystem paths as you type and ghosts its default, `orangu-server.log` in
+the current directory, on the empty line; a `file` log's `log_path` is
+always written, since that default moves with the directory the server is
+started from. `-d`/`--daemon` detaches
 from the terminal and runs in the background (Unix-only) — it requires
 `model` to be set in the config, since there's no attached terminal left to
-pass a CLI argument to or prompt on; the config and model are resolved, and
-both listeners bound, *before* detaching, so a bad config or a port already
-in use is still reported to the invoking terminal rather than silently lost.
-`-h`/`--help` and `-V`/`--version` are also available. `-s`/
+pass a CLI argument to or prompt on; the config and model are resolved, the
+log file opened, and both listeners bound, *before* detaching, so a bad
+config, an unwritable `log_path` or a port already in use is still reported
+to the invoking terminal rather than silently lost. A daemon with the
+console as its log logs nothing at all — set `log_type = file` to keep its
+output. `-h`/`--help` and `-V`/`--version` are also available. `-s`/
 `--shell-completions` prints a bash/zsh/fish/PowerShell completion script for the
 shell detected from `$SHELL` (or, with no `$SHELL` as on Windows, from
 `$PSModulePath` — see the Shell completions chapter) — covering every flag above, the

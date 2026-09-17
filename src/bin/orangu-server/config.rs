@@ -20,6 +20,7 @@ use crate::engine::backend::DeviceRequest;
 use crate::engine::placement::SplitMode;
 use anyhow::{Context, Result, anyhow};
 use orangu::config::parse_ini_sections;
+use orangu::logging::LogTarget;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -231,6 +232,10 @@ pub fn bundled_configuration(
         role_key: Some(role),
         role,
         reasoning_effort: None,
+        // A bundle is run by hand, so it says what it has to say where it
+        // was started; a file log is a config-file decision like every other
+        // deployment setting here.
+        log: LogTarget::Console,
         mcp_servers: Vec::new(),
     }
 }
@@ -786,6 +791,16 @@ pub struct ServerConfiguration {
     /// theirs `high`/`medium`/`low` — and imposing one model family's word
     /// on every other template would turn an unset knob into a 400.
     pub reasoning_effort: Option<String>,
+    /// `[orangu-server].log_type` / `log_path`: where this server's output
+    /// goes — the banner, every request's completion line, and every note
+    /// or warning it produces while serving. The console by default, exactly
+    /// as before the keys existed; `file` appends all of it to `log_path`
+    /// instead, and drops the once-a-second progress a request writes to a
+    /// terminal, which a file has no use for. See `orangu::logging`.
+    ///
+    /// What a `--daemon` run needs: detached, its stdout is `/dev/null`, so
+    /// without this a daemon serves in silence.
+    pub log: LogTarget,
     /// Read-only HTTP MCP profiles exposed by the web console. Changing this
     /// list requires restarting `orangu-server`.
     pub mcp_servers: Vec<McpConfiguration>,
@@ -1128,6 +1143,12 @@ pub fn load_server_configuration(
         None => default_device_split(),
     };
 
+    let log = LogTarget::from_keys(
+        SERVER_SECTION,
+        section.get("log_type").map(String::as_str),
+        section.get("log_path").map(String::as_str),
+    )?;
+
     let mut mcp_servers = sections
         .into_iter()
         .map(|(name, values)| parse_mcp_configuration(name, values))
@@ -1162,6 +1183,7 @@ pub fn load_server_configuration(
         threads,
         reexec,
         delete,
+        log,
         mcp_servers,
     })
 }
@@ -1216,6 +1238,55 @@ mod tests {
         // Both on by default.
         assert!(conf.reexec);
         assert!(conf.delete);
+        // And the terminal, as it always was.
+        assert_eq!(conf.log, LogTarget::Console);
+    }
+
+    /// `log_type = file` sends the server's output to `log_path`; the loader
+    /// stores the resolved file so a `~` or a relative path is settled
+    /// before a daemon moves to `/`. The console needs no path and ignores
+    /// one it is given, so a config can keep a path written down while
+    /// switched back.
+    #[test]
+    fn loads_the_log_keys() {
+        let load = |lines: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(file, "[orangu-server]\nmodels = /srv/models\n{lines}").unwrap();
+            load_server_configuration(file.path(), None, false)
+        };
+        assert_eq!(
+            load("log_type = file\nlog_path = /var/log/orangu-server.log\n")
+                .unwrap()
+                .log,
+            LogTarget::File(PathBuf::from("/var/log/orangu-server.log"))
+        );
+        assert_eq!(
+            load("log_type = console\nlog_path = /var/log/orangu-server.log\n")
+                .unwrap()
+                .log,
+            LogTarget::Console
+        );
+
+        // A file with no path named is `orangu-server.log` where the server
+        // was started; a type that is neither is an error rather than a
+        // silent console.
+        assert_eq!(
+            load("log_type = file\n").unwrap().log,
+            LogTarget::File(std::env::current_dir().unwrap().join("orangu-server.log"))
+        );
+        let err = load("log_type = syslog\n").unwrap_err().to_string();
+        assert!(err.contains("[orangu-server].log_type"), "{err}");
+        assert!(err.contains("console or file"), "{err}");
+    }
+
+    /// A bundle has no config file to have asked for a file log, and is run
+    /// by hand: it logs to the console.
+    #[test]
+    fn a_bundle_logs_to_the_console() {
+        assert_eq!(
+            bundled_configuration(PathBuf::new(), Role::All, &BundledListen::default()).log,
+            LogTarget::Console
+        );
     }
 
     /// The whole promise of a bundle: no config file, and it still comes up

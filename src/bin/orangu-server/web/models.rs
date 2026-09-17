@@ -628,7 +628,7 @@ async fn select(
         // Only returns if the exec itself failed, which leaves this process
         // running the model it already had — worth saying out loud, since
         // the client has long since been told the handover was accepted.
-        eprintln!(
+        log::error!(
             "error: {:#}",
             handover.exec(&label, Some(previous.as_str()))
         );

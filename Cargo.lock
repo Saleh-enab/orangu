@@ -1490,6 +1490,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fern"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4316185f709b23713e41e3195f90edef7fb00c3ed4adc79769cf09cc762a3b29"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "filedescriptor"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3515,6 +3524,7 @@ dependencies = [
  "cubecl-hip-sys",
  "cudarc",
  "daemonize",
+ "fern",
  "flate2",
  "half",
  "home",
@@ -3525,6 +3535,7 @@ dependencies = [
  "infer",
  "libc",
  "libloading 0.9.0",
+ "log",
  "markdown",
  "memmap2",
  "merman",

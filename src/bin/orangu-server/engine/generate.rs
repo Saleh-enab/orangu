@@ -18,7 +18,9 @@
 //! generated tokens. Each call acquires a slot from the `SlotPool` (waiting
 //! if every slot is busy), runs prefill+decode on its own blocking-pool
 //! thread against its own KV cache, and reports throughput the same way
-//! llama-server's own console log does.
+//! llama-server's own console log does — a completion line per request
+//! through `log`, and, on a console only, a progress line in place while
+//! the request runs.
 
 use anyhow::Result;
 use std::collections::VecDeque;
@@ -305,6 +307,17 @@ pub struct Engine {
     /// nothing beside a forward pass, and a metric that only exists when
     /// something is configured is one nobody can ask for after the fact.
     pub metrics: Arc<super::metrics::ServerMetrics>,
+    /// Whether a request in flight rewrites a progress line on stdout once a
+    /// second (`\r`, no newline) until its completion line replaces it.
+    ///
+    /// Only for a console someone can watch: under `[orangu-server].log_type
+    /// = file` the progress is skipped and the file gets the completion line
+    /// alone — a file has no cursor to move back, and a line rewritten every
+    /// second would land in it once per second. Off under `--daemon` too,
+    /// whose stdout is `/dev/null`. The `log` facade carries the completion
+    /// line either way; this is the one piece of output that is not a log
+    /// record, because it is not a line.
+    pub live_stats: bool,
 }
 
 /// What a caught generation panic is reported to the caller as: the panic's
@@ -416,6 +429,7 @@ impl Engine {
         let process_role = self.role;
         let role = req.role.unwrap_or(process_role);
         let metrics = self.metrics.clone();
+        let live_stats = self.live_stats;
         // Before the spawn, not inside it: what an operator means by "how long
         // did this request take" starts when the request arrives, and a task
         // that has not been scheduled yet is already waiting.
@@ -474,6 +488,7 @@ impl Engine {
                         req,
                         role,
                         process_role,
+                        live_stats,
                         &metrics,
                         arrived,
                         task_tx.clone(),
@@ -566,6 +581,8 @@ fn run(
     // This process's own role, for the one line that reports when a request
     // was served under another — see the completion line below.
     process_role: crate::config::Role,
+    // See `Engine::live_stats`.
+    live_stats: bool,
     metrics: &super::metrics::ServerMetrics,
     arrived: Instant,
     tx: mpsc::UnboundedSender<StreamEvent>,
@@ -942,7 +959,7 @@ fn run(
                 generate_time: generate_start.elapsed(),
             }));
         }
-        if last_report.elapsed() >= Duration::from_secs(1) {
+        if live_stats && last_report.elapsed() >= Duration::from_secs(1) {
             let partial = GenerateStats {
                 prompt_tokens: req.prompt_tokens.len(),
                 cached_tokens: reused_len,
@@ -1181,9 +1198,11 @@ fn run(
         generated_tokens: generated,
         generate_time,
     };
-    // The trailing \r + \x1b[K only matter if a live update above already
-    // moved the cursor onto this line; harmless (a no-op) otherwise.
-    let prefix = if reported { "\r" } else { "" };
+    // The `\r` and the trailing `\x1b[K` (erase to end of line) only matter
+    // if a live update above already moved the cursor onto this line, and
+    // are left out otherwise — a log file gets a plain line, not a cursor
+    // movement it can't act on.
+    let (prefix, suffix) = if reported { ("\r", "\x1b[K") } else { ("", "") };
     // The serving role, named only when it is not the one the banner already
     // reported — a coordinator can hand this process a request belonging to
     // another of its profiles, and "did my `/auto_review` actually run in
@@ -1194,8 +1213,8 @@ fn run(
         }
         _ => String::new(),
     };
-    println!(
-        "{prefix}orangu-server: [slot {}{served_as}] {}\x1b[K",
+    log::info!(
+        "{prefix}orangu-server: [slot {}{served_as}] {}{suffix}",
         guard.id(),
         stats.log_line()
     );
@@ -3795,6 +3814,7 @@ mod tests {
             req,
             crate::config::Role::default(),
             crate::config::Role::default(),
+            false,
             &crate::engine::metrics::ServerMetrics::new(),
             Instant::now(),
             tx,
@@ -3840,6 +3860,7 @@ mod tests {
             req,
             crate::config::Role::default(),
             crate::config::Role::default(),
+            false,
             &crate::engine::metrics::ServerMetrics::new(),
             Instant::now(),
             tx,
@@ -5058,6 +5079,7 @@ mod tests {
             slot_store: None,
             role: crate::config::Role::default(),
             reasoning_effort: None,
+            live_stats: false,
         };
 
         let mut rx = engine
@@ -5154,6 +5176,7 @@ mod tests {
             },
             crate::config::Role::default(),
             crate::config::Role::default(),
+            false,
             &crate::engine::metrics::ServerMetrics::new(),
             Instant::now(),
             tx,

@@ -49,7 +49,18 @@ dependency on any C or C++ inference library.
   wizard. The web console has its own `[web]` section, whose *presence* is
   what enables it; `[web].host` falls back to `[orangu-server].host`, and
   the pre-section `[orangu-server].web` key is still honored when no `[web]`
-  section is there to take precedence over it.
+  section is there to take precedence over it. `log_type`/`log_path` resolve
+  to an `orangu::logging::LogTarget`, and `prepare` installs the logger
+  (`orangu::logging::install`, `src/logging.rs` — `log` with `fern` behind
+  it) right after the config loads: the serving path's `println!`/`eprintln!`
+  are `log::info!`/`log::warn!`, which the console dispatch prints bare on
+  the same streams as before and a file dispatch stamps. A `--daemon` on the
+  console gets `Console::Nothing` — no logging at all — and a file is
+  written in full either way. `Engine::live_stats` is the one piece of
+  output that is not a log record: the once-a-second progress line
+  `generate::run` rewrites in place, on for a console and off for a file
+  or a daemon. Subcommand output and interactive prompts stay on
+  `println!`, as does the fatal `error:` line `main` exits on.
 - `suggest.rs` — `suggest`: a hardware-based model-size estimate built on
   top of `orangu::hardware`'s own detection; see below.
 - `shell.rs` — hand-written bash/zsh/fish/PowerShell completion scripts.

@@ -157,7 +157,7 @@ fn policy_from_str(raw: &str) -> Policy {
             // Named rather than silently defaulted: a sweep that mistypes a
             // policy would otherwise measure the default twice and report the
             // difference between a thing and itself.
-            eprintln!(
+            log::warn!(
                 "orangu-server: ORANGU_KV_POLICY={other:?} is not arc, lru or fifo \
                  — using arc. This run measures the default, not the value you \
                  asked for."

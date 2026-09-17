@@ -204,9 +204,10 @@ pub async fn proxy(
         Err(err) => {
             let default_entry = coordinator.default_entry();
             if entry.name != default_entry.name {
-                eprintln!(
+                log::warn!(
                     "warning: failed to start '{}': {err:#}; falling back to '{}'",
-                    entry.name, default_entry.name
+                    entry.name,
+                    default_entry.name
                 );
                 match coordinator.ensure_active(&default_entry).await {
                     Ok(origin) => origin,
@@ -420,7 +421,7 @@ mod tests {
         // actually answers, so the spawned child only has to not exit.
         let script = crate::process::fake_server_script("sleep 30\n");
 
-        let coordinator = Arc::new(Coordinator::new(config, true, Some(script.clone())).unwrap());
+        let coordinator = Arc::new(Coordinator::new(config, Some(script.clone())).unwrap());
         let response = proxy(
             State(coordinator.clone()),
             Method::POST,
@@ -477,7 +478,7 @@ mod tests {
 
         let script = crate::process::fake_server_script("sleep 30\n");
 
-        let coordinator = Arc::new(Coordinator::new(config, true, Some(script.clone())).unwrap());
+        let coordinator = Arc::new(Coordinator::new(config, Some(script.clone())).unwrap());
         let response = proxy(
             State(coordinator.clone()),
             Method::POST,

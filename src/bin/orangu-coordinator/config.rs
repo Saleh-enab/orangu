@@ -21,6 +21,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use orangu::config::parse_ini_sections;
+use orangu::logging::LogTarget;
 use std::{collections::HashMap, path::Path, path::PathBuf};
 
 pub const CLIENT_SECTION: &str = "orangu-coordinator";
@@ -155,6 +156,14 @@ pub struct CoordinatorConfiguration {
     /// Shared secret required to use `GET /v1/coordinator/shutdown`. When
     /// absent the endpoint is disabled entirely.
     pub shutdown_token: Option<String>,
+    /// `log_type`/`log_path`: where this coordinator's own output goes —
+    /// the console (the default) or a file. Forwarded into every profile's
+    /// generated `orangu-server.conf` too (see `process::write_server_config`),
+    /// so a coordinator logging to a file has its servers logging to the
+    /// same one rather than into a pipe nobody reads. Read once at startup:
+    /// the logger is installed before the listener is even bound, so a
+    /// reload that changes these keys takes effect on the next start.
+    pub log: LogTarget,
     pub llms: HashMap<String, CoordinatorLlmEntry>,
     /// Name of the section whose `role` is `all`; used whenever a request's
     /// `model` field is absent or matches no configured entry.
@@ -421,6 +430,12 @@ pub fn load_coordinator_configuration(path: &Path) -> Result<CoordinatorConfigur
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
+    let log = LogTarget::from_keys(
+        CLIENT_SECTION,
+        client.get("log_type").map(String::as_str),
+        client.get("log_path").map(String::as_str),
+    )?;
+
     if sections.is_empty() {
         return Err(anyhow!("At least one named LLM profile must be defined"));
     }
@@ -449,6 +464,7 @@ pub fn load_coordinator_configuration(path: &Path) -> Result<CoordinatorConfigur
         max_body_bytes,
         idle_timeout_seconds,
         shutdown_token,
+        log,
         llms,
         default_entry,
     })
@@ -575,6 +591,7 @@ mod tests {
         assert_eq!(conf.max_body_bytes, 64 * 1024 * 1024);
         assert_eq!(conf.idle_timeout_seconds, None);
         assert_eq!(conf.shutdown_token, None);
+        assert_eq!(conf.log, LogTarget::Console);
 
         let main = &conf.llms["main"];
         assert_eq!(main.role, "all");
@@ -610,6 +627,74 @@ mod tests {
         assert_eq!(conf.idle_timeout_seconds, None);
         assert_eq!(conf.llms["main"].port, 8100);
         assert_eq!(conf.llms["main"].slots, None);
+    }
+
+    /// `log_type = file` names a file for the coordinator's own output;
+    /// what the loader stores is the resolved target, so a `~` and a
+    /// relative path are already usable by the time a daemon has moved to
+    /// `/`.
+    #[test]
+    fn loads_the_log_keys() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-coordinator]\nmodels = /srv/models\nlog_type = file\nlog_path = /var/log/orangu-coordinator.log\n\n[main]\nmodel = org/gemma\n"
+        )
+        .unwrap();
+
+        let conf = load_coordinator_configuration(file.path()).unwrap();
+        assert_eq!(
+            conf.log,
+            LogTarget::File(PathBuf::from("/var/log/orangu-coordinator.log"))
+        );
+
+        // The console needs no path, and keeps one that happens to be there.
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-coordinator]\nmodels = /srv/models\nlog_type = console\nlog_path = /var/log/orangu-coordinator.log\n\n[main]\nmodel = org/gemma\n"
+        )
+        .unwrap();
+        assert_eq!(
+            load_coordinator_configuration(file.path()).unwrap().log,
+            LogTarget::Console
+        );
+    }
+
+    /// `log_type = file` with no `log_path` logs to `orangu-coordinator.log`
+    /// in the directory the coordinator was started from; a `log_type` that
+    /// is neither of the two is a config error — the point of the key is to
+    /// have the output somewhere in particular, so a silent console is the
+    /// one answer that must not happen.
+    #[test]
+    fn a_file_log_defaults_its_path_and_an_unknown_log_type_is_rejected() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-coordinator]\nmodels = /srv/models\nlog_type = file\n\n[main]\nmodel = org/gemma\n"
+        )
+        .unwrap();
+        assert_eq!(
+            load_coordinator_configuration(file.path()).unwrap().log,
+            LogTarget::File(
+                std::env::current_dir()
+                    .unwrap()
+                    .join("orangu-coordinator.log")
+            )
+        );
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-coordinator]\nmodels = /srv/models\nlog_type = syslog\n\n[main]\nmodel = org/gemma\n"
+        )
+        .unwrap();
+        let err = load_coordinator_configuration(file.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid value for [orangu-coordinator].log_type"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]

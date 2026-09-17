@@ -136,6 +136,8 @@ if-addrs = "0.15.0"
 # with a board BSP, lives off the default loader path, and is absent from
 # nearly every machine, so it is resolved at runtime rather than linked.
 libloading = "0.9"
+fern = "0.7"
+log = "0.4"
 
 [features]
 rocm = ["dep:cubecl-hip-sys"]

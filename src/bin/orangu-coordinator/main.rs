@@ -26,6 +26,12 @@
 //! executable is spawned (see `process::Coordinator::resolve_server_binary`)
 //! — otherwise a sibling `orangu-server` next to this binary's own
 //! executable is used, falling back to `PATH`.
+//!
+//! Everything this process says while running goes through `log` — see
+//! `orangu::logging` for where that ends up: the console unless
+//! `[orangu-coordinator].log_type = file` sends it to `log_path`, which is
+//! what a `--daemon` run wants. The fatal `error:` lines `main` exits on stay
+//! on stderr regardless — they are for the terminal that started this.
 
 mod config;
 mod init;
@@ -81,12 +87,13 @@ struct Args {
     /// Interactively create ~/.orangu/orangu-coordinator.conf and exit.
     #[arg(short, long)]
     init: bool,
-    /// Suppress all output (the startup banner, profile list, and shutdown
-    /// message).
+    /// Suppress all console output (the startup banner, profile list, and
+    /// shutdown message). A log file is unaffected.
     #[arg(short, long)]
     quiet: bool,
-    /// Detach from the terminal and run in the background. Implies --quiet:
-    /// once detached there is no terminal left to print to. Unix-only.
+    /// Detach from the terminal and run in the background. Unix-only. With
+    /// the console as the log there is nothing left to print to, so it
+    /// implies --quiet; with log_type = file the log is written as usual.
     #[arg(short, long)]
     daemon: bool,
     /// Print the shell completion script for the detected shell and exit.
@@ -104,7 +111,7 @@ const COMPLETION_SCRIPTS: shell_completions::Scripts = shell_completions::Script
 };
 
 fn main() -> ExitCode {
-    let mut args = Args::parse();
+    let args = Args::parse();
 
     if args.shell_completions {
         return match shell_completions::print("orangu-coordinator", &COMPLETION_SCRIPTS) {
@@ -124,10 +131,6 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         };
-    }
-
-    if args.daemon {
-        args.quiet = true;
     }
 
     // Resolve the config and bind the listener synchronously, before either
@@ -152,6 +155,24 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // The logger, as soon as there is a config to say where it goes and
+    // before anything worth logging happens. Both flags are about the
+    // console: a `--daemon` with the console as its log has nowhere to
+    // write and logs nothing at all, `--quiet` keeps the errors — while a
+    // log file is written exactly as an attached run would write it, which
+    // is the point of having one. An unwritable `log_path` fails here, on
+    // the terminal.
+    let console = if args.daemon {
+        orangu::logging::Console::Nothing
+    } else if args.quiet {
+        orangu::logging::Console::ErrorsOnly
+    } else {
+        orangu::logging::Console::Everything
+    };
+    if let Err(err) = orangu::logging::install(&config.log, console, "orangu_coordinator") {
+        eprintln!("error: {err:#}");
+        return ExitCode::FAILURE;
+    }
     let listen = config.listen_addr();
     let std_listener = match std::net::TcpListener::bind(&listen) {
         Ok(listener) => listener,
@@ -174,8 +195,11 @@ fn main() -> ExitCode {
 
     match build_runtime().block_on(run(args, config, std_listener, config_path)) {
         Ok(()) => ExitCode::SUCCESS,
+        // Through the logger, not `eprintln!`: by now a daemon's stderr is
+        // `/dev/null`, and a serving failure is exactly the line a log file
+        // exists to hold. On the console it lands on stderr as before.
         Err(err) => {
-            eprintln!("error: {err:#}");
+            log::error!("error: {err:#}");
             ExitCode::FAILURE
         }
     }
@@ -225,11 +249,7 @@ async fn run(
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     let server_binary_override =
         std::env::var_os("ORANGU_COORDINATOR_SERVER_BIN").map(PathBuf::from);
-    let coordinator = Arc::new(Coordinator::new(
-        config,
-        args.quiet,
-        server_binary_override,
-    )?);
+    let coordinator = Arc::new(Coordinator::new(config, server_binary_override)?);
 
     // Eagerly activate the `all`-role profile so the default model is
     // already loaded (or loading) by the time the first request arrives,
@@ -240,13 +260,10 @@ async fn run(
     // loading. A real request for a different role races this harmlessly:
     // `ensure_active` serializes on the same lock either way.
     let startup_coordinator = coordinator.clone();
-    let quiet = args.quiet;
     tokio::spawn(async move {
         let entry = startup_coordinator.resolve_entry(None, None).await.clone();
-        if let Err(err) = startup_coordinator.ensure_active(&entry).await
-            && !quiet
-        {
-            eprintln!(
+        if let Err(err) = startup_coordinator.ensure_active(&entry).await {
+            log::warn!(
                 "warning: failed to start default profile '{}' at startup: {err:#}",
                 entry.name
             );
@@ -270,18 +287,16 @@ async fn run(
             {
                 last_modified = Some(modified);
                 if let Ok(new_config) = load_coordinator_configuration(&config_path_clone) {
-                    if !quiet {
-                        println!(
-                            "reloaded configuration from {}",
-                            config_path_clone.display()
-                        );
-                    }
+                    log::info!(
+                        "reloaded configuration from {}",
+                        config_path_clone.display()
+                    );
                     background_coordinator.reload_config(new_config);
                     // Reconcile: if the active profile was removed or its
                     // command changed, stop the now-stale process.
                     background_coordinator.stop_if_stale().await;
-                } else if !quiet {
-                    eprintln!("warning: failed to reload configuration; keeping previous state");
+                } else {
+                    log::warn!("warning: failed to reload configuration; keeping previous state");
                 }
             }
 
@@ -332,26 +347,20 @@ async fn run(
     let listener = tokio::net::TcpListener::from_std(std_listener)
         .context("failed to hand the bound listener off to the async runtime")?;
 
-    if !args.quiet {
-        println!("orangu-coordinator {VERSION} listening on {listen}");
-        for (name, model) in profile_summary {
-            println!("  {name}: {model}");
-        }
+    log::info!("orangu-coordinator {VERSION} listening on {listen}");
+    for (name, model) in profile_summary {
+        log::info!("  {name}: {model}");
     }
 
     let shutdown_coordinator = coordinator.clone();
     let result = tokio::select! {
         result = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()) => result.context("server error"),
         _ = terminated() => {
-            if !args.quiet {
-                println!("shutting down...");
-            }
+            log::info!("shutting down...");
             Ok(())
         },
         _ = shutdown_rx.recv() => {
-            if !args.quiet {
-                println!("shutting down via API...");
-            }
+            log::info!("shutting down via API...");
             Ok(())
         }
     };

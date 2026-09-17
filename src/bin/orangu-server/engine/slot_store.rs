@@ -225,7 +225,7 @@ impl SlotStore {
             Err(err) => {
                 // Incompatible/corrupt on-disk state is not a client error —
                 // fall back to a full prefill instead of failing the restore.
-                eprintln!(
+                log::warn!(
                     "orangu-server: ignoring unusable slot file {}: {err}",
                     path.display()
                 );
