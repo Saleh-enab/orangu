@@ -258,15 +258,17 @@ mod tests {
 
     #[test]
     fn a_file_needs_a_path_and_gets_an_absolute_one() {
-        let target =
-            LogTarget::from_keys("orangu-server", Some("file"), Some("/var/log/orangu.log"))
-                .unwrap();
-        assert_eq!(
-            target,
-            LogTarget::File(PathBuf::from("/var/log/orangu.log"))
-        );
+        // An absolute path is kept as given — spelled from the current
+        // directory so it is absolute on every platform (a bare `/var/...`
+        // has no drive on Windows and would get one prepended).
+        let given = std::env::current_dir()
+            .unwrap()
+            .join("var")
+            .join("orangu.log");
+        let target = LogTarget::from_keys("orangu-server", Some("file"), given.to_str()).unwrap();
+        assert_eq!(target, LogTarget::File(given.clone()));
         assert_eq!(target.log_type(), "file");
-        assert_eq!(target.path(), Some(Path::new("/var/log/orangu.log")));
+        assert_eq!(target.path(), Some(given.as_path()));
 
         // A relative path is anchored where the process started, since a
         // daemon moves to `/` before it writes a line.
