@@ -914,6 +914,81 @@ fn residency_probe_enabled() -> bool {
     *ENABLED.get_or_init(|| crate::engine::env::flag_on("ORANGU_EXPERT_RESIDENCY"))
 }
 
+/// Whether this process's routed experts are larger than the machine's
+/// memory — the regime where every expert read is a disk read.
+///
+/// Set once at load from the footprint (`set_streaming_regime`), read by the
+/// read-ahead hint. `false` until set, so a test binary or a tool that never
+/// loads a model hints nothing.
+static STREAMING: OnceLock<bool> = OnceLock::new();
+
+/// Records whether the routed experts (`host_weight_bytes`, the bytes that
+/// stay in host memory whatever the backend) can be held by `total_ram`.
+///
+/// The page cache is what holds an `mmap`'d expert between uses, and the
+/// page cache cannot be larger than the machine; a model whose experts
+/// exceed it re-reads them from disk every token, and a model whose
+/// experts fit reads them from disk once. The two want opposite things
+/// from a read-ahead hint — see [`streaming_regime`].
+pub fn set_streaming_regime(host_weight_bytes: u64, total_ram: u64) -> bool {
+    let streaming = host_weight_bytes > total_ram;
+    let _ = STREAMING.set(streaming);
+    streaming
+}
+
+/// Whether the routed experts are streamed from disk — see
+/// [`set_streaming_regime`].
+pub fn streaming_regime() -> bool {
+    STREAMING.get().copied().unwrap_or(false)
+}
+
+/// `ORANGU_EXPERT_WILLNEED=0` turns the read-ahead hint off — the control
+/// arm. On unless `0`; it only acts in the streaming regime either way.
+pub fn read_ahead_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_EXPERT_WILLNEED"))
+}
+
+/// Asks the kernel to start reading every expert a layer has just selected,
+/// across `tensors`, before the first of them is touched.
+///
+/// Only in the streaming regime, where the bytes are coming off the disk
+/// regardless: without the hint each expert is faulted in page by page from
+/// under the dot that needs it — a thread per expert, each fault a small
+/// read the drive answers one at a time, and the kernel's own read-ahead
+/// never sees a pattern it recognizes. With it, the whole selection is one
+/// batch of large sequential reads the device can queue, and the `down`
+/// projection's bytes arrive while `up` is still computing. A model in the
+/// page cache gets nothing from the hint and would pay a page walk per
+/// expert per layer for it, which is what the regime gate is for.
+///
+/// Advisory in the sense the store's `prefetch` is: it takes no lease and
+/// raises no heat, and a store that reads around the page cache ignores it.
+pub fn read_ahead_selected(selection: &[Vec<(usize, f32)>], tensors: &[&ExpertQuantMatrix]) {
+    if !streaming_regime() || !read_ahead_on() {
+        return;
+    }
+    let union = selected_union(selection);
+    let store = global();
+    for tensor in tensors {
+        store.prefetch(tensor, &union);
+    }
+}
+
+/// The distinct experts a batch selected, in first-seen order — each hinted
+/// once however many positions chose it.
+fn selected_union(selection: &[Vec<(usize, f32)>]) -> Vec<usize> {
+    let mut union: Vec<usize> = Vec::new();
+    for picks in selection {
+        for &(expert, _) in picks {
+            if !union.contains(&expert) {
+                union.push(expert);
+            }
+        }
+    }
+    union
+}
+
 /// The store every expert read goes through.
 ///
 /// Process-wide, like `engine::moe_stats`, so a residency policy does not have
@@ -981,6 +1056,31 @@ fn tier_budget_bytes() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selected_union_is_each_expert_once_in_first_seen_order() {
+        let selection = vec![
+            vec![(7usize, 0.5f32), (3, 0.3), (7, 0.2)],
+            vec![(3, 0.9), (11, 0.1)],
+            vec![],
+        ];
+        assert_eq!(super::selected_union(&selection), vec![7, 3, 11]);
+        assert!(super::selected_union(&[]).is_empty());
+    }
+
+    /// Outside the streaming regime the hint must do nothing at all: a
+    /// resident model would pay a page walk per expert per layer for a hint
+    /// that finds every page already in place.
+    #[test]
+    fn read_ahead_is_silent_outside_the_streaming_regime() {
+        // `STREAMING` is process-wide and set once; a test binary never
+        // loads a model, so it is unset here and reads as `false`.
+        assert!(!super::streaming_regime());
+        let before = super::PREFETCHED_EXPERTS.load(std::sync::atomic::Ordering::Relaxed);
+        super::read_ahead_selected(&[vec![(1, 1.0)]], &[]);
+        let after = super::PREFETCHED_EXPERTS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(before, after);
+    }
+
     use super::*;
     use crate::engine::loader::test_expert_matrix;
 

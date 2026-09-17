@@ -1071,6 +1071,10 @@ impl Deepseek4Model {
         // read: the counters should describe the work actually done,
         // and a dropped expert's weights must never be fetched.
         super::apply_expert_budget(&mut selection, &ffn.gate_exps);
+        crate::engine::expert_store::read_ahead_selected(
+            &selection,
+            &[&ffn.gate_exps, &ffn.up_exps, &ffn.down_exps],
+        );
         for picks in &selection {
             picks.iter().for_each(|&(e, _)| experts.select(e));
         }

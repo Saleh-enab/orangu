@@ -3189,9 +3189,17 @@ impl GemmaModel {
         match &moe.gate_up {
             GemmaExpertGateUp::Fused { gate_up, .. } => {
                 super::apply_expert_budget(&mut selection, gate_up);
+                crate::engine::expert_store::read_ahead_selected(
+                    &selection,
+                    &[gate_up, &moe.down_exps],
+                );
             }
-            GemmaExpertGateUp::Separate { gate, .. } => {
+            GemmaExpertGateUp::Separate { gate, up, .. } => {
                 super::apply_expert_budget(&mut selection, gate);
+                crate::engine::expert_store::read_ahead_selected(
+                    &selection,
+                    &[gate, up, &moe.down_exps],
+                );
             }
         }
         for picks in &selection {

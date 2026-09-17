@@ -1360,6 +1360,27 @@ fn prepare(args: Args) -> Result<Prepared> {
     // the slot-persistence fingerprint below uses: the per-layer shape is
     // fixed model geometry, so it can be read from a cache that allocates
     // nothing and then scaled to a context far too large to build.
+    // Whether the routed experts can live in memory at all decides how they
+    // are read — see `engine::expert_store::read_ahead_selected`. Decided
+    // here, from the same split the footprint reports, so the two agree.
+    {
+        let (_, host_bytes) =
+            engine::backend::device_resident_split(loaded.resident_tensor_sizes());
+        let total_ram = orangu::hardware::detect_cpu().total_memory_bytes;
+        if engine::expert_store::set_streaming_regime(host_bytes, total_ram) {
+            log::info!(
+                "[experts] {} of routed experts against {} of memory — streamed from the \
+                 disk; each layer's selection is {}",
+                orangu::format::format_bytes(host_bytes),
+                orangu::format::format_bytes(total_ram),
+                if engine::expert_store::read_ahead_on() {
+                    "read ahead (ORANGU_EXPERT_WILLNEED=0 turns that off)"
+                } else {
+                    "faulted in as it is used (ORANGU_EXPERT_WILLNEED=0)"
+                }
+            );
+        }
+    }
     // A split model has no single device to measure, so it reports what
     // each device holds instead — the same question, answered per device.
     if let Some(split) = &split {

@@ -796,6 +796,10 @@ impl NemotronModel {
         // the counters should describe the work actually done, and a
         // dropped expert's weights must never be fetched.
         super::apply_expert_budget(&mut selection, &layer.up_exps);
+        crate::engine::expert_store::read_ahead_selected(
+            &selection,
+            &[&layer.up_exps, &layer.down_exps],
+        );
         for picks in &selection {
             picks.iter().for_each(|&(e, _)| experts.select(e));
         }
