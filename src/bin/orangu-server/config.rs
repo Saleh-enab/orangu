@@ -1254,16 +1254,28 @@ mod tests {
             writeln!(file, "[orangu-server]\nmodels = /srv/models\n{lines}").unwrap();
             load_server_configuration(file.path(), None, false)
         };
+        // Spelled from the current directory so the path is absolute on
+        // every platform — a bare `/var/...` has no drive on Windows.
+        let log_path = std::env::current_dir()
+            .unwrap()
+            .join("var")
+            .join("orangu-server.log");
         assert_eq!(
-            load("log_type = file\nlog_path = /var/log/orangu-server.log\n")
-                .unwrap()
-                .log,
-            LogTarget::File(PathBuf::from("/var/log/orangu-server.log"))
+            load(&format!(
+                "log_type = file\nlog_path = {}\n",
+                log_path.display()
+            ))
+            .unwrap()
+            .log,
+            LogTarget::File(log_path.clone())
         );
         assert_eq!(
-            load("log_type = console\nlog_path = /var/log/orangu-server.log\n")
-                .unwrap()
-                .log,
+            load(&format!(
+                "log_type = console\nlog_path = {}\n",
+                log_path.display()
+            ))
+            .unwrap()
+            .log,
             LogTarget::Console
         );
 

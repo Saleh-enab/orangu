@@ -1634,6 +1634,7 @@ unsafe fn dot_unpacked_multi_avx2(w: &UnpackedRow, acts: &[ActQ8], out: &mut [f3
 /// `ORANGU_EXPERT_DOT_TILED=0` keeps the per-block reduction
 /// ([`dot_unpacked_multi_avx2`]) — the control arm for the register-resident
 /// tile below. On unless `0`.
+#[cfg(target_arch = "x86_64")]
 fn tiled_dot_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_EXPERT_DOT_TILED"))

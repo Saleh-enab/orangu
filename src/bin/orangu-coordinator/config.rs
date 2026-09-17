@@ -635,24 +635,29 @@ mod tests {
     /// `/`.
     #[test]
     fn loads_the_log_keys() {
+        // Spelled from the current directory so the path is absolute on
+        // every platform — a bare `/var/...` has no drive on Windows.
+        let log_path = std::env::current_dir()
+            .unwrap()
+            .join("var")
+            .join("orangu-coordinator.log");
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu-coordinator]\nmodels = /srv/models\nlog_type = file\nlog_path = /var/log/orangu-coordinator.log\n\n[main]\nmodel = org/gemma\n"
+            "[orangu-coordinator]\nmodels = /srv/models\nlog_type = file\nlog_path = {}\n\n[main]\nmodel = org/gemma\n",
+            log_path.display()
         )
         .unwrap();
 
         let conf = load_coordinator_configuration(file.path()).unwrap();
-        assert_eq!(
-            conf.log,
-            LogTarget::File(PathBuf::from("/var/log/orangu-coordinator.log"))
-        );
+        assert_eq!(conf.log, LogTarget::File(log_path.clone()));
 
         // The console needs no path, and keeps one that happens to be there.
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
             file,
-            "[orangu-coordinator]\nmodels = /srv/models\nlog_type = console\nlog_path = /var/log/orangu-coordinator.log\n\n[main]\nmodel = org/gemma\n"
+            "[orangu-coordinator]\nmodels = /srv/models\nlog_type = console\nlog_path = {}\n\n[main]\nmodel = org/gemma\n",
+            log_path.display()
         )
         .unwrap();
         assert_eq!(
