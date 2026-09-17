@@ -1343,8 +1343,10 @@ impl LayerCache {
     fn push_row(&mut self, k: &[f32], v: &[f32]) {
         debug_assert_eq!(k.len(), self.kv_dim);
         debug_assert_eq!(v.len(), self.kv_dim);
+        // `len` already counts the row being added, so the host holds one
+        // row fewer than the accounting says until it lands below.
         debug_assert_eq!(
-            self.k.len(),
+            self.k.len() + self.kv_dim,
             (self.len - self.sealed_rows() - self.pending_rows) * self.kv_dim
         );
         if let Some(paged) = self.paged.as_ref()
