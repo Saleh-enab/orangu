@@ -623,6 +623,8 @@ pub(crate) fn evaluate_routed_experts_batched(
         Some(&ExpertProjection::whole(gate_exps)),
         &ExpertProjection::whole(up_exps),
         &ExpertProjection::whole(down_exps),
+        None,
+        None,
         activate,
     )
 }
@@ -651,6 +653,8 @@ pub(crate) fn evaluate_routed_experts_batched_gateless(
         None,
         &ExpertProjection::whole(up_exps),
         &ExpertProjection::whole(down_exps),
+        None,
+        None,
         |_, up| activate(up),
     )
 }
@@ -661,12 +665,31 @@ pub(crate) fn evaluate_routed_experts_batched_gateless(
 /// cannot write into the slot vector directly.
 type HostProjections = (usize, (Vec<f32>, Vec<f32>));
 
+/// What the grouped device path produced for a layer: every group's gate
+/// and up projections with the down stack still to run, or the down
+/// projection's rows outright.
+enum Grouped {
+    TwoCall(
+        Vec<(Vec<f32>, Vec<f32>)>,
+        crate::engine::loader::QuantMatrix,
+    ),
+    /// The layer's routed result, `[n_tokens, out_dim]`, weighted and
+    /// summed on the card — returned as one contribution per token.
+    Combined(Vec<f32>),
+}
+
 /// [`evaluate_routed_experts_batched`] over row ranges rather than whole
 /// tensors, so a fused gate/up tensor and per-expert output scalars are
 /// expressible.
 ///
 /// Everything the wrapper's documentation says applies here; this is the
 /// implementation and that is the common case of it.
+///
+/// `next` is the next layer's first expert stack, if the caller knows it:
+/// the grouped device path stages its upload while this layer's down
+/// projection runs. With `fused`, that path may combine the experts on the
+/// card and hand back **one** contribution per token — the weighted sum —
+/// so a caller must sum whatever it is given rather than index by rank.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_routed_experts_batched_views(
     backend: &dyn crate::engine::backend::Backend,
@@ -676,13 +699,28 @@ pub(crate) fn evaluate_routed_experts_batched_views(
     gate: Option<&ExpertProjection<'_>>,
     up: &ExpertProjection<'_>,
     down: &ExpertProjection<'_>,
+    next: Option<&crate::engine::loader::ExpertQuantMatrix>,
+    fused: Option<FusedActivation>,
     activate: impl Fn(&[f32], &[f32]) -> Vec<f32> + Sync,
 ) -> Vec<Vec<Vec<f32>>> {
     crate::engine::decode_stages::scope(crate::engine::decode_stages::Stage::FfnRouted, || {
         evaluate_routed_experts_batched_views_inner(
-            backend, selection, hidden, n_embd, gate, up, down, activate,
+            backend, selection, hidden, n_embd, gate, up, down, next, fused, activate,
         )
     })
+}
+
+/// What `activate` computes, when it is one of the two forms the card can
+/// run between the expert projections — so the grouped device path can
+/// keep the whole routed feed-forward in one submission
+/// (`VulkanBackend::moe_ffn_experts`). `None` keeps the activation on the
+/// host, whatever the closure does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FusedActivation {
+    /// `gelu(gate) * up`.
+    Geglu,
+    /// `silu(gate) * up`.
+    Swiglu,
 }
 
 /// The body of [`evaluate_routed_experts_batched_views`], split out only so
@@ -696,9 +734,13 @@ fn evaluate_routed_experts_batched_views_inner(
     gate: Option<&ExpertProjection<'_>>,
     up: &ExpertProjection<'_>,
     down: &ExpertProjection<'_>,
+    next: Option<&crate::engine::loader::ExpertQuantMatrix>,
+    fused: Option<FusedActivation>,
     activate: impl Fn(&[f32], &[f32]) -> Vec<f32> + Sync,
 ) -> Vec<Vec<Vec<f32>>> {
     use crate::engine::backend::MatmulOp;
+    use crate::engine::backend::vulkan::ExpertOp;
+    let next_stack: Option<crate::engine::loader::QuantMatrix> = next.map(|n| n.stack_matrix());
 
     // A gate-less expert — `nemotron`'s squared-ReLU FFN is `down(relu(up
     // (x))^2)`, with no second projection to multiply against — is the same
@@ -752,6 +794,132 @@ fn evaluate_routed_experts_batched_views_inner(
     // gather is charged to every group, not only the resident ones, so it is
     // not visible in any comparison that toggles residency.
     let force_host = crate::engine::env::flag_on("ORANGU_MOE_FORCE_HOST_GROUPS");
+
+    // **The whole layer as one GEMM per projection**, when the batch is
+    // wide enough to pay for streaming the expert stack to the card once
+    // ([`expert_gemm_min_tokens`]) and the card has the indexed kernel for
+    // these types. Every expert's rows against the tokens routed to it, in
+    // one dispatch; the activations quantized once, never gathered. See
+    // `VulkanBackend::matmul_experts` for what this replaces.
+    let grouped = (|| {
+        let min = expert_gemm_min_tokens();
+        if force_host || min == 0 || selection.len() < min {
+            return None;
+        }
+        let vulkan = backend.as_wgpu()?;
+        let gate_stack = gate.map(|g| g.exps.stack_matrix());
+        let up_stack = up.exps.stack_matrix();
+        let down_stack = down.exps.stack_matrix();
+        let mut ops = Vec::new();
+        if let (Some(g), Some(stack)) = (gate, gate_stack.as_ref()) {
+            ops.push(ExpertOp {
+                stack,
+                rows_per_expert: g.exps.out_dim,
+                first_row: g.first_row,
+                n_rows: g.n_rows,
+                scale: g.scale,
+            });
+        }
+        ops.push(ExpertOp {
+            stack: &up_stack,
+            rows_per_expert: up.exps.out_dim,
+            first_row: up.first_row,
+            n_rows: up.n_rows,
+            scale: up.scale,
+        });
+        // The down scale stays with the routing weight (the combine's
+        // table, or the host's tail), not in the down GEMM.
+        let down_op = ExpertOp {
+            stack: &down_stack,
+            rows_per_expert: down.exps.out_dim,
+            first_row: down.first_row,
+            n_rows: down.n_rows,
+            scale: None,
+        };
+        if !vulkan.serves_experts(&ops) || !vulkan.serves_experts(std::slice::from_ref(&down_op)) {
+            return None;
+        }
+        let groups: Vec<(usize, Vec<usize>)> = experts
+            .iter()
+            .zip(&members)
+            .map(|(&e, m)| (e, m.iter().map(|&(token, _)| token).collect()))
+            .collect();
+        // The whole feed-forward in one submission when the activation is
+        // one the card runs (the gate and up scales, if any, are the
+        // GEMMs' own); otherwise gate/up here and the down projection
+        // after the host's activation, below.
+        if let (Some(_), Some(act)) = (gate, fused) {
+            let next: Vec<&crate::engine::loader::QuantMatrix> = next_stack.iter().collect();
+            // The combine table: each token's picks as row slots into the
+            // group-ordered rows, and the weight each row carries — the
+            // routing weight times the expert's down scale, which is what
+            // the host's tail below multiplies in on the other paths.
+            let k = selection.iter().map(Vec::len).max().unwrap_or(0);
+            let n_tokens = selection.len();
+            let mut table = vec![0u32; 2 * n_tokens * k];
+            let mut base = 0usize;
+            for (g, group) in members.iter().enumerate() {
+                let expert_scale = down.scale.map_or(1.0, |s| s[experts[g]]);
+                for (m, &(token, weight)) in group.iter().enumerate() {
+                    let slot = token * k + ranks[g][m];
+                    table[slot] = (base + m) as u32;
+                    table[n_tokens * k + slot] = (expert_scale * weight).to_bits();
+                }
+                base += group.len();
+            }
+            let combine = crate::engine::backend::vulkan::MoeCombine { table, n_tokens, k };
+            let combined = vulkan
+                .moe_ffn_experts(
+                    hidden,
+                    n_tokens,
+                    n_embd,
+                    &ops[0],
+                    &ops[1],
+                    &down_op,
+                    &groups,
+                    act == FusedActivation::Swiglu,
+                    Some(&combine),
+                    &next,
+                )
+                .pop()
+                .expect("the combined rows");
+            return Some(Grouped::Combined(combined));
+        }
+        let mut proj = vulkan.matmul_experts(
+            hidden,
+            selection.len(),
+            n_embd,
+            &ops,
+            &groups,
+            &[&down_stack],
+        );
+        let up_out = proj.pop().expect("the up projection");
+        let gate_out = proj.pop();
+        let projected: Vec<(Vec<f32>, Vec<f32>)> = up_out
+            .into_iter()
+            .enumerate()
+            .map(|(g, up)| {
+                (
+                    gate_out.as_ref().map_or_else(Vec::new, |o| o[g].clone()),
+                    up,
+                )
+            })
+            .collect();
+        Some(Grouped::TwoCall(projected, down_stack))
+    })();
+    let (grouped_projected, grouped_down) = match grouped {
+        Some(Grouped::TwoCall(projected, stack)) => (Some(projected), Some(stack)),
+        Some(Grouped::Combined(combined)) => {
+            let out_dim = down.n_rows;
+            return combined
+                .chunks(out_dim)
+                .map(|row| vec![row.to_vec()])
+                .collect();
+        }
+        None => (None, None),
+    };
+    let grouped_any = grouped_projected.is_some();
+
     // **With streaming on, residency stops deciding this.** The permanent
     // weight arena never evicts, so `is_device_resident` is a plan made
     // before the first token against total VRAM — on a card holding 4.00 GiB
@@ -764,6 +932,7 @@ fn evaluate_routed_experts_batched_views_inner(
         .iter()
         .map(|&e| {
             !force_host
+                && !grouped_any
                 && (streamed
                     || (gate.is_none_or(|g| g.exps.is_device_resident(e))
                         && up.exps.is_device_resident(e)
@@ -842,11 +1011,13 @@ fn evaluate_routed_experts_batched_views_inner(
     // with 11.8% of experts on the device it made the whole layer 14%
     // *slower* than leaving every expert on the host, because the device's
     // share was added to the host's rather than hidden behind it.
+    // (Nothing to do here on the grouped path: every group is already
+    // projected, so neither half has a group to take.)
     let (batched, host_gate_up) = rayon::join(
         || matmul_batch_mixed(backend, &ops),
         || -> Vec<HostProjections> {
             (0..experts.len())
-                .filter(|&group| !on_device[group])
+                .filter(|&group| !on_device[group] && !grouped_any)
                 .collect::<Vec<_>>()
                 .into_par_iter()
                 .map(|group| {
@@ -895,19 +1066,27 @@ fn evaluate_routed_experts_batched_views_inner(
     for (group, projections) in host_gate_up {
         slots[group] = Some(projections);
     }
-    let mut projected: Vec<(Vec<f32>, Vec<f32>)> = slots
-        .into_iter()
-        .map(|p| p.expect("every group took one path or the other"))
-        .collect();
+    let mut projected: Vec<(Vec<f32>, Vec<f32>)> = match grouped_projected {
+        Some(projected) => projected,
+        None => slots
+            .into_iter()
+            .map(|p| p.expect("every group took one path or the other"))
+            .collect(),
+    };
 
     // The per-expert output scalars, on the projections' outputs and before
     // the activation — see `ExpertProjection::scale` for why they are not
     // folded into the rows. Applied identically to both paths, so the device
     // and host halves of one layer stay comparable.
+    // (Not on the grouped path: its GEMMs stored the scaled rows.)
+    let scales_applied = grouped_any;
     projected
         .par_iter_mut()
         .zip(experts.par_iter())
         .for_each(|(projected, &expert)| {
+            if scales_applied {
+                return;
+            }
             if let Some(scale) = gate.and_then(|g| g.scale) {
                 let s = scale[expert];
                 projected.0.iter_mut().for_each(|v| *v *= s);
@@ -964,13 +1143,47 @@ fn evaluate_routed_experts_batched_views_inner(
         });
         down_group.push(group);
     }
+    // The grouped path's down projection: the activations of every group
+    // are one `[total, ffn_dim]` run in group order, so each group's rows
+    // are a consecutive range of it.
+    let grouped_down_out: Option<Vec<Vec<f32>>> = grouped_down.as_ref().map(|stack| {
+        let vulkan = backend.as_wgpu().expect("the grouped path ran on the card");
+        let total: usize = members.iter().map(Vec::len).sum();
+        let mut x2 = Vec::with_capacity(total * ffn_dim);
+        let mut ranges: Vec<(usize, Vec<usize>)> = Vec::with_capacity(experts.len());
+        for (group, h) in hs.iter().enumerate() {
+            let start = x2.len() / ffn_dim;
+            x2.extend_from_slice(h);
+            ranges.push((
+                experts[group],
+                (start..start + members[group].len()).collect(),
+            ));
+        }
+        vulkan
+            .matmul_experts(
+                &x2,
+                total,
+                ffn_dim,
+                &[ExpertOp {
+                    stack,
+                    rows_per_expert: down.exps.out_dim,
+                    first_row: down.first_row,
+                    n_rows: down.n_rows,
+                    scale: None,
+                }],
+                &ranges,
+                &next_stack.iter().collect::<Vec<_>>(),
+            )
+            .pop()
+            .expect("the down projection")
+    });
     // Overlapped for the same reason as the gate/up half above.
     let ffn_dim_in = down.exps.in_dim;
     let (down_batched, host_down) = rayon::join(
         || matmul_batch_mixed(backend, &down_ops),
         || -> Vec<(usize, Vec<f32>)> {
             (0..experts.len())
-                .filter(|&group| !on_device[group])
+                .filter(|&group| !on_device[group] && grouped_down_out.is_none())
                 .collect::<Vec<_>>()
                 .into_par_iter()
                 .map(|group| {
@@ -1000,10 +1213,13 @@ fn evaluate_routed_experts_batched_views_inner(
     for (group, projection) in host_down {
         down_out[group] = Some(projection);
     }
-    let down_out: Vec<Vec<f32>> = down_out
-        .into_iter()
-        .map(|d| d.expect("every group took one path or the other"))
-        .collect();
+    let down_out: Vec<Vec<f32>> = match grouped_down_out {
+        Some(down_out) => down_out,
+        None => down_out
+            .into_iter()
+            .map(|d| d.expect("every group took one path or the other"))
+            .collect(),
+    };
 
     let out_dim = down.n_rows;
     let mut out: Vec<Vec<Vec<f32>>> = selection
@@ -1784,6 +2000,39 @@ pub(crate) fn matmul_host_fallback_into(
 pub(crate) fn expert_streaming() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| env_flag("ORANGU_EXPERT_STREAM"))
+}
+
+/// The narrowest batch at which a layer's routed experts run as one
+/// indexed GEMM per projection on the card, the expert stack streamed there
+/// once per batch — `ORANGU_EXPERT_GEMM_TOKENS`, default
+/// [`EXPERT_GEMM_TOKENS_DEFAULT`]; `0` keeps the experts on the host at
+/// every width.
+///
+/// Below it the host's per-expert GEMM wins: the stack is hundreds of MiB
+/// per layer and crosses the bus whatever the batch, while the host's cost
+/// is per token. Measured on a 26B-A4B file: the host at 0.55 ms per token
+/// per layer against the card's ~120 ms per layer fixed (the copies and
+/// the turn) plus ~10 ms per 128 tokens — level near 220 tokens, 9% behind
+/// at 158, 33% ahead at 574.
+pub(crate) fn expert_gemm_min_tokens() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ORANGU_EXPERT_GEMM_TOKENS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(EXPERT_GEMM_TOKENS_DEFAULT)
+    })
+}
+
+/// Where the streamed expert GEMM overtakes the host — measured, see the
+/// server manual's row for the knob.
+const EXPERT_GEMM_TOKENS_DEFAULT: usize = 256;
+
+/// Whether a batch of `n_tokens` is wide enough for the grouped expert GEMM
+/// — what an architecture asks before taking the batched helper for it.
+pub(crate) fn expert_gemm_wide(n_tokens: usize) -> bool {
+    let min = expert_gemm_min_tokens();
+    min > 0 && n_tokens >= min
 }
 
 pub(crate) fn gpu_experts() -> bool {
@@ -2854,6 +3103,8 @@ mod tests {
                 scale: Some(&down_scale),
                 ..ExpertProjection::whole(&down_exps)
             },
+            None,
+            None,
             activate,
         );
 
@@ -2905,6 +3156,8 @@ mod tests {
                 scale: Some(&down_scale),
                 ..ExpertProjection::whole(&down_res)
             },
+            None,
+            None,
             activate,
         );
         for (token, picks) in dispatched.iter().enumerate() {

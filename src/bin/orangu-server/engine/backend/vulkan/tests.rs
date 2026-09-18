@@ -1957,7 +1957,16 @@ fn cross_check_n_tokens(ggml_type: u32, in_dim: usize, out_dim: usize, n_tokens:
     // (float-dequant weights × the same quantized x) at a tight tolerance,
     // isolating kernel correctness from the expected quantization loss —
     // this is what llama.cpp's own q8 mat-vec cross-checks effectively do.
-    let (reference, tol_factor) = if vulkan.q4_k_mmvq && ggml_type == GGML_TYPE_Q4_K {
+    // The same applies to the sub-`Q4_K` types' integer-dot decode kernels
+    // (`decode_mmvq`) — when the op reaches the device at all: a small
+    // one-token weight goes to the host matmul and is float there.
+    let on_integer_dot = vulkan.mmvq_pipeline_for(&w, n_tokens).is_some()
+        && !crate::engine::backend::prefers_host_matmul(&[MatmulOp {
+            x: &x,
+            n_tokens,
+            w: &w,
+        }]);
+    let (reference, tol_factor) = if on_integer_dot {
         let wdq = crate::engine::quant::dequantize(ggml_type, &bytes, out_dim * in_dim).unwrap();
         let q8 = quantize_activation_q8(&x);
         let mut qx = vec![0f32; x.len()];
@@ -2074,7 +2083,9 @@ fn matmul_matches_cpu_backend_for_q4_k() {
     cross_check(GGML_TYPE_Q4_K, 512, 5);
 }
 
-/// The word-reading `block_dot`s on the **decode** path: one token, a
+/// The word-reading `block_dot`s on the **decode** path — and under
+/// `ORANGU_DECODE_MMVQ=1` the integer-dot ones, against the q8-quantized
+/// reference: one token, a
 /// model-shaped width, and a weight large enough that the host-matmul rule
 /// leaves it on the device — `cross_check`'s three tokens take the
 /// thin-tile kernel and a small one-token weight goes to the CPU (both
@@ -2086,16 +2097,31 @@ fn matmul_matches_cpu_backend_for_q4_k() {
 fn cross_check_decode(ggml_type: u32, in_dim: usize) {
     let (block_bytes, block_elems) = crate::engine::quant::block_layout(ggml_type).unwrap();
     let row_bytes = in_dim / block_elems * block_bytes;
-    let out_dim = crate::engine::backend::host_matmul_threshold_bytes().div_ceil(row_bytes) + 7;
+    // Above the host-matmul threshold, and wide enough for the four-row
+    // pipelines (`BLOCK_HOISTED_WIDE_MIN_OUT`); the `+ 7` leaves a partial
+    // row group.
+    let out_dim = crate::engine::backend::host_matmul_threshold_bytes()
+        .div_ceil(row_bytes)
+        .max(2048)
+        + 7;
     {
         let Some(vulkan) = shared_vulkan() else {
             return;
         };
-        assert_eq!(
-            vulkan.pipeline_for_named(ggml_type, in_dim, 1).1,
-            "block-hoisted",
-            "type {ggml_type} at one token"
+        let name = vulkan.pipeline_for_named(ggml_type, in_dim, 1).1;
+        assert!(
+            matches!(name, "kq-light" | "block-hoisted"),
+            "type {ggml_type} at one token: {name}"
         );
+        if vulkan.decode_mmvq {
+            let mut seed = 0x1D07_u64;
+            let block = build_block(ggml_type, &mut seed);
+            let w = test_quant_matrix(&block.repeat(in_dim / block_elems), ggml_type, in_dim, 1);
+            assert!(
+                vulkan.mmvq_pipeline_for(&w, 1).is_some(),
+                "type {ggml_type}: no integer-dot decode pipeline"
+            );
+        }
     }
     cross_check_n_tokens(ggml_type, in_dim, out_dim, 1);
 }
@@ -2127,6 +2153,22 @@ fn decode_matvec_matches_cpu_backend_for_iq3_s_model_shaped() {
 fn decode_matvec_matches_cpu_backend_for_iq2_s_model_shaped() {
     cross_check_decode(GGML_TYPE_IQ2_S, 1536);
     cross_check_decode(GGML_TYPE_IQ2_S, 6144);
+}
+
+/// The legacy types on the integer dot (`decode_mmvq`), and on their
+/// block-hoisted float form otherwise.
+#[test]
+fn decode_matvec_matches_cpu_backend_for_the_legacy_types_model_shaped() {
+    for ggml_type in [
+        GGML_TYPE_Q4_0,
+        GGML_TYPE_Q4_1,
+        GGML_TYPE_Q5_0,
+        GGML_TYPE_Q5_1,
+        GGML_TYPE_Q8_0,
+    ] {
+        cross_check_decode(ggml_type, 1536);
+        cross_check_decode(ggml_type, 6144);
+    }
 }
 
 /// A prefill-width batch routes to *every* expert in a layer, which on
@@ -2208,6 +2250,28 @@ fn a_streamed_batch_is_split_into_groups_that_fit_the_region() {
 
 /// `n` distinct `Q4_0` weights of one shape, plus activations — the
 /// shape a batch of routed experts has.
+/// The tolerance for one output element of a matmul checked against the
+/// float reference: a fraction of the element where the op runs in float,
+/// a fraction of the *largest* output where it runs on the integer dot —
+/// an 8-bit activation moves an output by a fraction of the terms that
+/// formed it, and an element the terms cancel to can be small.
+fn matmul_tolerance(
+    vulkan: &VulkanBackend,
+    w: &QuantMatrix,
+    n_tokens: usize,
+    want: &[f32],
+) -> impl Fn(f32) -> f32 {
+    let integer_dot = vulkan.mmvq_pipeline_for(w, n_tokens).is_some();
+    let scale = want.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+    move |a: f32| {
+        if integer_dot {
+            2e-2 * scale
+        } else {
+            1e-2 * a.abs().max(1.0)
+        }
+    }
+}
+
 fn streamed_expert_fixture(
     n: usize,
     in_dim: usize,
@@ -2292,11 +2356,15 @@ fn a_second_streamed_weight_of_one_shape_reuses_the_entry_and_still_computes_its
     let second = vulkan.matmul_batch_streamed(&[op(&x, N_TOKENS, &mats[1])]);
     let after_second = entries();
 
-    for (got, want) in [(&first[0], &want[0]), (&second[0], &want[1])] {
+    for (got, want, w) in [
+        (&first[0], &want[0], &mats[0]),
+        (&second[0], &want[1], &mats[1]),
+    ] {
         assert_eq!(got.len(), want.len());
+        let tol = matmul_tolerance(vulkan, w, N_TOKENS, want);
         for (i, (g, w)) in got.iter().zip(want).enumerate() {
             assert!(
-                (g - w).abs() <= 1e-2 * w.abs().max(1.0),
+                (g - w).abs() <= tol(*w),
                 "element {i}: gpu={g} cpu={w} on {}",
                 vulkan.adapter_name
             );
@@ -2357,13 +2425,892 @@ fn two_streamed_experts_of_one_shape_in_a_batch_keep_their_own_outputs() {
     let got = vulkan.matmul_batch_streamed(&ops);
 
     for (e, (got, want)) in got.iter().zip(&want).enumerate() {
+        let tol = matmul_tolerance(vulkan, ops[e].w, N_TOKENS, want);
         for (i, (g, w)) in got.iter().zip(want).enumerate() {
             assert!(
-                (g - w).abs() <= 1e-2 * w.abs().max(1.0),
+                (g - w).abs() <= tol(*w),
                 "expert {e} element {i}: gpu={g} cpu={w} on {}",
                 vulkan.adapter_name
             );
         }
+    }
+}
+
+/// A streamed batch **wider than one submission's stripe** — the shape a
+/// host-resident dense layer's projections take when a split model's
+/// prefill sends them to the card — matches the CPU product, and its
+/// weights cross the bus once: every stripe after the first finds them
+/// resident.
+///
+/// Model-shaped rows, the two weight types a `Q4_K_M` layer has, and a
+/// width that is not a stripe multiple, so the last stripe is a ragged
+/// tail. The arena counters say what the bus saw: `uploads` grows by the
+/// number of distinct weights, `hits` by one per op per extra stripe.
+#[test]
+fn a_streamed_batch_wider_than_a_stripe_matches_the_cpu_backend_and_uploads_once() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    const IN_DIM: usize = 3840;
+    const OUT_DIM: usize = 256;
+    let n_tokens = crate::engine::backend::vulkan::max_matmul_tokens_per_submission() * 2 + 77;
+    let stripes =
+        n_tokens.div_ceil(crate::engine::backend::vulkan::max_matmul_tokens_per_submission());
+
+    let mut seed = 0x57A1_7ED5_u64;
+    let mut mats = Vec::new();
+    let mut raws = Vec::new();
+    for ggml_type in [GGML_TYPE_Q4_K, GGML_TYPE_Q6_K] {
+        let blocks = OUT_DIM * (IN_DIM / block_elems(ggml_type));
+        let bytes: Vec<u8> = (0..blocks)
+            .flat_map(|_| build_block(ggml_type, &mut seed))
+            .collect();
+        mats.push(test_quant_matrix(&bytes, ggml_type, IN_DIM, OUT_DIM));
+        raws.push((ggml_type, bytes));
+    }
+    let x: Vec<f32> = (0..n_tokens * IN_DIM)
+        .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
+        .collect();
+    let ops: Vec<MatmulOp<'_>> = mats
+        .iter()
+        .map(|w| MatmulOp { x: &x, n_tokens, w })
+        .collect();
+
+    let before = vulkan
+        .stream_upload_rate()
+        .unwrap_or((0, 0.0, 0, 0, 0, 0, 0));
+    let got = vulkan.matmul_batch_streamed(&ops);
+    let after = vulkan.stream_upload_rate().expect("the call streamed");
+    assert_eq!(
+        after.2 - before.2,
+        mats.len() as u64,
+        "each distinct weight uploads once for the whole call"
+    );
+    assert_eq!(
+        after.4 - before.4,
+        (mats.len() * (stripes - 1)) as u64,
+        "every stripe after the first finds its weights resident"
+    );
+
+    // The integer-dot GEMM's own bound (`mmq_q4k_gemm_matches_the_cpu_product`):
+    // the error against a token row's magnitude, since the activation is
+    // 8-bit per block and a wrong stripe would be off by whole rows.
+    for (e, (got, op)) in got.iter().zip(&ops).enumerate() {
+        assert_eq!(
+            got.len(),
+            n_tokens * OUT_DIM,
+            "op {e} has every token's row"
+        );
+        let want = CpuBackend.matmul_dequant(&x, n_tokens, op.w);
+        for t in 0..n_tokens {
+            let row = &want[t * OUT_DIM..(t + 1) * OUT_DIM];
+            let mag = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-3);
+            for o in 0..OUT_DIM {
+                let i = t * OUT_DIM + o;
+                assert!(
+                    (got[i] - want[i]).abs() / mag <= 2e-2,
+                    "op {e} token {t} row {o}: gpu={} cpu={} (row magnitude {mag}) on {}",
+                    got[i],
+                    want[i],
+                    vulkan.adapter_name
+                );
+            }
+        }
+    }
+}
+
+/// The split backend sends a **host layer's** wide projection to the card
+/// and leaves everything else where it was: a weight tagged for the host
+/// device streams at prefill width and comes back within the integer-dot
+/// GEMM's bound; the same weight at one token, and at any width through
+/// the decode entry points, is bit for bit the CPU's own product.
+///
+/// The card is device 0 and the CPU device 1, the way a `device_split =
+/// cpu` plan lays them out; the weight is stamped for device 1 the way
+/// `LoadedModel::matrix` stamps a host layer's.
+#[test]
+fn the_split_backend_streams_a_host_layers_wide_projection_and_nothing_else() {
+    use crate::engine::backend::Backend;
+    use crate::engine::backend::multi::MultiDeviceBackend;
+    use std::sync::Arc;
+
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    if crate::engine::backend::multi::host_stream_min_tokens() == 0 {
+        eprintln!("host-layer streaming is off (ORANGU_HOST_STREAM_TOKENS=0) — nothing to check");
+        return;
+    }
+    /// The shared test card as a `dyn Backend` the split wrapper can own.
+    struct Card(&'static VulkanBackend);
+    impl Backend for Card {
+        fn matmul(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Vec<f32> {
+            self.0.matmul(x, n_tokens, w)
+        }
+        fn matmul_batch(&self, ops: &[MatmulOp<'_>]) -> Vec<Vec<f32>> {
+            self.0.matmul_batch(ops)
+        }
+        fn as_wgpu(&self) -> Option<&VulkanBackend> {
+            Some(self.0)
+        }
+        fn supports_type(&self, ggml_type: u32) -> bool {
+            self.0.supports_type(ggml_type)
+        }
+    }
+    let split = MultiDeviceBackend::new(vec![
+        Arc::new(Card(vulkan)) as Arc<dyn Backend>,
+        Arc::new(CpuBackend) as Arc<dyn Backend>,
+    ]);
+
+    const IN_DIM: usize = 1536;
+    const OUT_DIM: usize = 256;
+    let mut seed = 0x0057_5EA7_u64;
+    let blocks = OUT_DIM * (IN_DIM / block_elems(GGML_TYPE_Q4_K));
+    let bytes: Vec<u8> = (0..blocks)
+        .flat_map(|_| build_block(GGML_TYPE_Q4_K, &mut seed))
+        .collect();
+    let mut w = test_quant_matrix(&bytes, GGML_TYPE_Q4_K, IN_DIM, OUT_DIM);
+    w.set_device(1);
+    let wide = crate::engine::backend::multi::host_stream_min_tokens().max(64);
+    let x: Vec<f32> = (0..wide * IN_DIM)
+        .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
+        .collect();
+
+    // Prefill width: streamed, so it is the card's integer-dot product —
+    // the bus saw an upload, and the result meets that kernel's bound.
+    let before = vulkan.stream_upload_rate().map_or(0, |r| r.2);
+    let got = split.matmul(&x, wide, &w);
+    let after = vulkan.stream_upload_rate().map_or(0, |r| r.2);
+    assert_eq!(after - before, 1, "the wide host-layer op streamed");
+    let want = CpuBackend.matmul_dequant(&x, wide, &w);
+    for t in 0..wide {
+        let row = &want[t * OUT_DIM..(t + 1) * OUT_DIM];
+        let mag = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-3);
+        for o in 0..OUT_DIM {
+            let i = t * OUT_DIM + o;
+            assert!(
+                (got[i] - want[i]).abs() / mag <= 2e-2,
+                "token {t} row {o}: streamed {} vs cpu {} (row magnitude {mag})",
+                got[i],
+                want[i]
+            );
+        }
+    }
+    let batched = split.matmul_batch(&[
+        MatmulOp {
+            x: &x,
+            n_tokens: wide,
+            w: &w,
+        },
+        MatmulOp {
+            x: &x,
+            n_tokens: wide,
+            w: &w,
+        },
+    ]);
+    assert_eq!(batched.len(), 2);
+    assert_eq!(
+        batched[0], got,
+        "a batch streams the same way a single op does"
+    );
+    assert_eq!(batched[1], got);
+
+    // One token, and decode at any width: the host's own product, exactly.
+    let one = split.matmul(&x[..IN_DIM], 1, &w);
+    assert_eq!(one, CpuBackend.matmul(&x[..IN_DIM], 1, &w));
+    let before = vulkan.stream_upload_rate().map_or(0, |r| r.2);
+    let decoded = split.matmul_decode(&x, wide, &w);
+    assert_eq!(decoded, CpuBackend.matmul_decode(&x, wide, &w));
+    let decoded = split.matmul_batch_decode(&[MatmulOp {
+        x: &x,
+        n_tokens: wide,
+        w: &w,
+    }]);
+    assert_eq!(decoded[0], CpuBackend.matmul_decode(&x, wide, &w));
+    let after = vulkan.stream_upload_rate().map_or(0, |r| r.2);
+    assert_eq!(after, before, "neither one token nor decode streamed");
+}
+
+/// The indexed expert GEMM (`matmul_experts`) against the per-expert CPU
+/// product: a stack of experts, each multiplied by the rows routed to it,
+/// as the two halves of a fused gate/up tensor (`Q4_K`, the 64-row tile)
+/// and a down projection (`Q8_0`, the 128-row tile, once at a row width
+/// that is not whole super-blocks). Routing is uneven on
+/// purpose — an expert with more tokens than a token tile, one with a
+/// single token, and one routed nothing — so the table's tiles, padding
+/// and output bases are all exercised.
+#[test]
+fn the_indexed_expert_gemm_matches_the_per_expert_cpu_product() {
+    use crate::engine::backend::vulkan::ExpertOp;
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    const N_EXPERT: usize = 6;
+    const N_TOKENS: usize = 300;
+    let mut seed = 0x1DE7_E4A7_u64;
+    // (type, in_dim, rows per expert, (first_row, n_rows) per op)
+    type Case = (u32, usize, usize, Vec<(usize, usize)>);
+    let cases: [Case; 3] = [
+        (GGML_TYPE_Q4_K, 512, 256, vec![(0, 128), (128, 128)]),
+        (
+            crate::engine::quant::GGML_TYPE_Q8_0,
+            256,
+            256,
+            vec![(0, 256)],
+        ),
+        // A row that is not whole super-blocks: 22 sub-blocks, the shape
+        // of a 704-wide expert down projection.
+        (
+            crate::engine::quant::GGML_TYPE_Q8_0,
+            704,
+            256,
+            vec![(0, 256)],
+        ),
+    ];
+    for (ggml_type, in_dim, rows_per_expert, projections) in cases {
+        let blocks = N_EXPERT * rows_per_expert * (in_dim / block_elems(ggml_type));
+        let bytes: Vec<u8> = (0..blocks)
+            .flat_map(|_| build_block(ggml_type, &mut seed))
+            .collect();
+        let stack = test_quant_matrix(&bytes, ggml_type, in_dim, N_EXPERT * rows_per_expert);
+        let x: Vec<f32> = (0..N_TOKENS * in_dim)
+            .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
+            .collect();
+        // Expert 3 gets nothing, expert 0 gets most tokens (over a tile),
+        // expert 5 exactly one; the rest share what is left.
+        let mut groups: Vec<(usize, Vec<usize>)> = vec![
+            (0, Vec::new()),
+            (1, Vec::new()),
+            (2, Vec::new()),
+            (4, Vec::new()),
+            (5, vec![7]),
+        ];
+        for t in 0..N_TOKENS {
+            let g = match t % 5 {
+                0..=2 => 0,
+                3 => 1,
+                _ => {
+                    if t % 10 == 4 {
+                        2
+                    } else {
+                        3
+                    }
+                }
+            };
+            groups[g].1.push(t);
+        }
+        assert!(
+            groups[0].1.len() > 128,
+            "expert 0 spans more than one token tile"
+        );
+        let ops: Vec<ExpertOp<'_>> = projections
+            .iter()
+            .map(|&(first_row, n_rows)| ExpertOp {
+                stack: &stack,
+                rows_per_expert,
+                first_row,
+                n_rows,
+                scale: None,
+            })
+            .collect();
+        assert!(
+            vulkan.serves_experts(&ops),
+            "type {ggml_type} has an indexed kernel"
+        );
+        let got = vulkan.matmul_experts(&x, N_TOKENS, in_dim, &ops, &groups, &[]);
+        assert_eq!(got.len(), ops.len());
+        for (op_i, (op, per_group)) in ops.iter().zip(&got).enumerate() {
+            assert_eq!(per_group.len(), groups.len());
+            for ((expert, tokens), result) in groups.iter().zip(per_group) {
+                let w = stack.rows(expert * rows_per_expert + op.first_row, op.n_rows);
+                let mut gathered = Vec::with_capacity(tokens.len() * in_dim);
+                for &t in tokens {
+                    gathered.extend_from_slice(&x[t * in_dim..(t + 1) * in_dim]);
+                }
+                let want = CpuBackend.matmul_dequant(&gathered, tokens.len(), &w);
+                assert_eq!(result.len(), want.len(), "op {op_i} expert {expert}");
+                for t in 0..tokens.len() {
+                    let row = &want[t * op.n_rows..(t + 1) * op.n_rows];
+                    let mag = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-3);
+                    for o in 0..op.n_rows {
+                        let i = t * op.n_rows + o;
+                        assert!(
+                            (result[i] - want[i]).abs() / mag <= 2e-2,
+                            "type {ggml_type} op {op_i} expert {expert} member {t} row {o}: \
+                             indexed {} vs cpu {} (row magnitude {mag})",
+                            result[i],
+                            want[i]
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The grouped expert GEMM on a real layer's stacks, phase by phase: the
+/// first call uploads the stack, the second finds it resident, so the
+/// difference is the upload and the second call is quantize + GEMM +
+/// readback. Random routing of 8 experts per token over `ORANGU_PROBE_TOKENS`
+/// (512) tokens, the shape of a prefill chunk.
+///
+/// `ORANGU_PROBE_GGUF=/path/to/moe.gguf cargo test _scratch_measure_expert_gemm -- --ignored --nocapture`
+#[test]
+#[ignore = "needs a real GGUF; run with --ignored"]
+fn _scratch_measure_expert_gemm() {
+    use crate::engine::backend::vulkan::ExpertOp;
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        return;
+    };
+    let path = std::env::var("ORANGU_PROBE_GGUF").expect("set ORANGU_PROBE_GGUF");
+    let n_tokens: usize = std::env::var("ORANGU_PROBE_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512);
+    let model =
+        crate::engine::loader::LoadedModel::open(std::path::Path::new(&path)).expect("open gguf");
+    let gate_up = model
+        .expert_matrix("blk.0.ffn_gate_up_exps.weight")
+        .expect("a fused gate/up stack");
+    let down = model
+        .expert_matrix("blk.0.ffn_down_exps.weight")
+        .expect("a down stack");
+    let n_expert = gate_up.n_expert;
+    let n_ff = gate_up.out_dim / 2;
+    let mut seed = 0xE0E0_7EA5_u64;
+    let mut members: Vec<Vec<usize>> = vec![Vec::new(); n_expert];
+    for t in 0..n_tokens {
+        let mut picked = std::collections::HashSet::new();
+        while picked.len() < 8 {
+            let e =
+                (next_byte(&mut seed) as usize * 256 + next_byte(&mut seed) as usize) % n_expert;
+            if picked.insert(e) {
+                members[e].push(t);
+            }
+        }
+    }
+    let groups: Vec<(usize, Vec<usize>)> = members
+        .into_iter()
+        .enumerate()
+        .filter(|(_, m)| !m.is_empty())
+        .collect();
+    let total: usize = groups.iter().map(|(_, m)| m.len()).sum();
+    let x: Vec<f32> = (0..n_tokens * gate_up.in_dim)
+        .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 512.0)
+        .collect();
+    let gu_stack = gate_up.stack_matrix();
+    let down_stack = down.stack_matrix();
+    let gu_ops = [
+        ExpertOp {
+            stack: &gu_stack,
+            rows_per_expert: gate_up.out_dim,
+            first_row: 0,
+            n_rows: n_ff,
+            scale: None,
+        },
+        ExpertOp {
+            stack: &gu_stack,
+            rows_per_expert: gate_up.out_dim,
+            first_row: n_ff,
+            n_rows: n_ff,
+            scale: None,
+        },
+    ];
+    let x2: Vec<f32> = (0..total * down.in_dim)
+        .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 512.0)
+        .collect();
+    let mut ranges = Vec::new();
+    let mut at = 0;
+    for (e, m) in &groups {
+        ranges.push((*e, (at..at + m.len()).collect::<Vec<_>>()));
+        at += m.len();
+    }
+    let down_ops = [ExpertOp {
+        stack: &down_stack,
+        rows_per_expert: down.out_dim,
+        first_row: 0,
+        n_rows: down.out_dim,
+        scale: None,
+    }];
+    assert!(vulkan.serves_experts(&gu_ops) && vulkan.serves_experts(&down_ops));
+    eprintln!(
+        "  {n_expert} experts, {} groups, {total} rows; gate/up {} MiB, down {} MiB",
+        groups.len(),
+        gu_stack.raw_bytes().len() >> 20,
+        down_stack.raw_bytes().len() >> 20
+    );
+    for round in 0..3 {
+        let t = std::time::Instant::now();
+        let _ = vulkan.matmul_experts(
+            &x,
+            n_tokens,
+            gate_up.in_dim,
+            &gu_ops,
+            &groups,
+            &[&down_stack],
+        );
+        let gu_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let t = std::time::Instant::now();
+        let _ = vulkan.matmul_experts(&x2, total, down.in_dim, &down_ops, &ranges, &[&gu_stack]);
+        let down_ms = t.elapsed().as_secs_f64() * 1000.0;
+        // Again with both stacks resident: the region holds one at a time
+        // when they exceed it together, so this is only resident when the
+        // region is large enough for both.
+        eprintln!("  round {round}: gate/up {gu_ms:.1} ms, down {down_ms:.1} ms");
+    }
+    // The whole routed feed-forward, with device stamps when
+    // `ORANGU_GPU_TIMESTAMPS=ops` is set — the per-dispatch times to put
+    // beside an in-situ `ops.sh` run.
+    let down_op = ExpertOp {
+        stack: &down_stack,
+        rows_per_expert: down.out_dim,
+        first_row: 0,
+        n_rows: down.out_dim,
+        scale: None,
+    };
+    for round in 0..3 {
+        vulkan.begin_op_span();
+        let t = std::time::Instant::now();
+        let _ = vulkan.moe_ffn_experts(
+            &x,
+            n_tokens,
+            gate_up.in_dim,
+            &gu_ops[0],
+            &gu_ops[1],
+            &down_op,
+            &groups,
+            false,
+            None,
+            &[&gu_stack, &down_stack],
+        );
+        eprintln!(
+            "  fused ffn round {round}: {:.1} ms",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+        vulkan.finish_op_span(round);
+    }
+    // The GEMM alone: the same stack twice in a row is a hit.
+    for _ in 0..2 {
+        let t = std::time::Instant::now();
+        let _ = vulkan.matmul_experts(&x, n_tokens, gate_up.in_dim, &gu_ops, &groups, &[]);
+        eprintln!(
+            "  gate/up resident: {:.1} ms",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    for _ in 0..2 {
+        let t = std::time::Instant::now();
+        let _ = vulkan.matmul_experts(&x2, total, down.in_dim, &down_ops, &ranges, &[]);
+        eprintln!(
+            "  down resident: {:.1} ms",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
+
+/// The one-submission routed feed-forward (`moe_ffn_experts`) against the
+/// same computation done by parts on the CPU: per expert, gate and up from
+/// the dequantized stack, `gelu(gate) * up`, then down — the shape of a
+/// fused gate/up tensor (`Q4_K`) and a `Q8_0` down stack whose row is the
+/// activation's width. Two 8-bit activation quantizations sit between
+/// the reference and the card, so the bound is wider than the single
+/// GEMM's: one row in 334 of this data lands 4.5% off, and the same row is
+/// 4.5% off through the two-call form (`ORANGU_TEST_DUMP=1` prints both),
+/// so that is the activation's rounding and not the chain's.
+#[test]
+fn the_fused_routed_ffn_matches_the_cpu_computation_by_parts() {
+    use crate::engine::backend::vulkan::ExpertOp;
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    const N_EXPERT: usize = 5;
+    const N_TOKENS: usize = 200;
+    const N_EMBD: usize = 512;
+    const N_FF: usize = 128;
+    let mut seed = 0xF0F0_FEED_u64;
+    let gu_blocks = N_EXPERT * 2 * N_FF * (N_EMBD / block_elems(GGML_TYPE_Q4_K));
+    let gu_bytes: Vec<u8> = (0..gu_blocks)
+        .flat_map(|_| build_block(GGML_TYPE_Q4_K, &mut seed))
+        .collect();
+    let gu_stack = test_quant_matrix(&gu_bytes, GGML_TYPE_Q4_K, N_EMBD, N_EXPERT * 2 * N_FF);
+    let q8_0 = crate::engine::quant::GGML_TYPE_Q8_0;
+    let dn_blocks = N_EXPERT * N_EMBD * (N_FF / block_elems(q8_0));
+    let dn_bytes: Vec<u8> = (0..dn_blocks)
+        .flat_map(|_| build_block(q8_0, &mut seed))
+        .collect();
+    let dn_stack = test_quant_matrix(&dn_bytes, q8_0, N_FF, N_EXPERT * N_EMBD);
+    // Small activations: the random blocks' scales put a projection of a
+    // unit-scale row far out on the GELU's flat sides, where the product's
+    // 8-bit rounding is a step rather than a rounding.
+    let x: Vec<f32> = (0..N_TOKENS * N_EMBD)
+        .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 65536.0)
+        .collect();
+    let mut groups: Vec<(usize, Vec<usize>)> = (0..N_EXPERT).map(|e| (e, Vec::new())).collect();
+    for t in 0..N_TOKENS {
+        groups[t % 3].1.push(t);
+        groups[3 + (t % 2)].1.push(t);
+    }
+    let gate = ExpertOp {
+        stack: &gu_stack,
+        rows_per_expert: 2 * N_FF,
+        first_row: 0,
+        n_rows: N_FF,
+        scale: None,
+    };
+    let up = ExpertOp {
+        stack: &gu_stack,
+        rows_per_expert: 2 * N_FF,
+        first_row: N_FF,
+        n_rows: N_FF,
+        scale: None,
+    };
+    let down = ExpertOp {
+        stack: &dn_stack,
+        rows_per_expert: N_EMBD,
+        first_row: 0,
+        n_rows: N_EMBD,
+        scale: None,
+    };
+    let got = vulkan.moe_ffn_experts(
+        &x,
+        N_TOKENS,
+        N_EMBD,
+        &gate,
+        &up,
+        &down,
+        &groups,
+        false,
+        None,
+        &[],
+    );
+    assert_eq!(got.len(), groups.len());
+
+    // Per-expert output scales on gate and up, applied by the GEMMs as
+    // they store: against the by-parts reference with the same scales.
+    let gate_scale = [0.5f32, 1.5, 0.25, 2.0, 1.0];
+    let up_scale = [1.0f32, 0.75, 1.25, 0.5, 2.0];
+    let scaled = vulkan.moe_ffn_experts(
+        &x,
+        N_TOKENS,
+        N_EMBD,
+        &ExpertOp {
+            scale: Some(&gate_scale),
+            ..gate
+        },
+        &ExpertOp {
+            scale: Some(&up_scale),
+            ..up
+        },
+        &down,
+        &groups,
+        false,
+        None,
+        &[],
+    );
+    for ((expert, tokens), result) in groups.iter().zip(&scaled) {
+        let mut gathered = Vec::with_capacity(tokens.len() * N_EMBD);
+        for &t in tokens {
+            gathered.extend_from_slice(&x[t * N_EMBD..(t + 1) * N_EMBD]);
+        }
+        let wg = gu_stack.rows(expert * 2 * N_FF, N_FF);
+        let wu = gu_stack.rows(expert * 2 * N_FF + N_FF, N_FF);
+        let wd = dn_stack.rows(expert * N_EMBD, N_EMBD);
+        let mut g = CpuBackend.matmul_dequant(&gathered, tokens.len(), &wg);
+        let mut u = CpuBackend.matmul_dequant(&gathered, tokens.len(), &wu);
+        g.iter_mut().for_each(|v| *v *= gate_scale[*expert]);
+        u.iter_mut().for_each(|v| *v *= up_scale[*expert]);
+        crate::engine::tensor::gelu_inplace(&mut g);
+        crate::engine::tensor::mul_inplace(&mut g, &u);
+        let want = CpuBackend.matmul_dequant(&g, tokens.len(), &wd);
+        for t in 0..tokens.len() {
+            let row = &want[t * N_EMBD..(t + 1) * N_EMBD];
+            let mag = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-3);
+            for o in 0..N_EMBD {
+                let i = t * N_EMBD + o;
+                assert!(
+                    (result[i] - want[i]).abs() / mag <= 5e-2,
+                    "scaled: expert {expert} member {t} row {o}: fused {} vs cpu {} (row magnitude {mag})",
+                    result[i],
+                    want[i]
+                );
+            }
+        }
+    }
+
+    // The same with the rows combined on the card: every token's two
+    // picks weighted 0.25 and 0.75, against the weighted sum of the rows
+    // just returned.
+    let k = 2;
+    let mut table = vec![0u32; 2 * N_TOKENS * k];
+    let mut base = 0usize;
+    for (g, (_, tokens)) in groups.iter().enumerate() {
+        for (m, &t) in tokens.iter().enumerate() {
+            let rank = if g < 3 { 0 } else { 1 };
+            table[t * k + rank] = (base + m) as u32;
+            table[N_TOKENS * k + t * k + rank] =
+                if rank == 0 { 0.25f32 } else { 0.75f32 }.to_bits();
+        }
+        base += tokens.len();
+    }
+    let combine = crate::engine::backend::vulkan::MoeCombine {
+        table,
+        n_tokens: N_TOKENS,
+        k,
+    };
+    let combined = vulkan
+        .moe_ffn_experts(
+            &x,
+            N_TOKENS,
+            N_EMBD,
+            &gate,
+            &up,
+            &down,
+            &groups,
+            false,
+            Some(&combine),
+            &[],
+        )
+        .pop()
+        .expect("the combined rows");
+    assert_eq!(combined.len(), N_TOKENS * N_EMBD);
+    let mut want = vec![0f32; N_TOKENS * N_EMBD];
+    for (g, (_, tokens)) in groups.iter().enumerate() {
+        let w = if g < 3 { 0.25 } else { 0.75 };
+        for (m, &t) in tokens.iter().enumerate() {
+            for e in 0..N_EMBD {
+                want[t * N_EMBD + e] += w * got[g][m * N_EMBD + e];
+            }
+        }
+    }
+    for t in 0..N_TOKENS {
+        let row = &want[t * N_EMBD..(t + 1) * N_EMBD];
+        let mag = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-3);
+        for e in 0..N_EMBD {
+            let i = t * N_EMBD + e;
+            assert!(
+                (combined[i] - want[i]).abs() / mag <= 1e-3,
+                "token {t} element {e}: combined {} vs summed rows {}",
+                combined[i],
+                want[i]
+            );
+        }
+    }
+    if std::env::var_os("ORANGU_TEST_DUMP").is_some() {
+        // The two-call form of the same computation, for telling the
+        // fused chain's own error from the 8-bit activation's.
+        let gu = vulkan.matmul_experts(&x, N_TOKENS, N_EMBD, &[gate, up], &groups, &[]);
+        let mut h = Vec::new();
+        let mut ranges = Vec::new();
+        let mut at = 0;
+        for (gi, (e, tokens)) in groups.iter().enumerate() {
+            let mut g = gu[0][gi].clone();
+            crate::engine::tensor::gelu_inplace(&mut g);
+            crate::engine::tensor::mul_inplace(&mut g, &gu[1][gi]);
+            h.extend_from_slice(&g);
+            ranges.push((*e, (at..at + tokens.len()).collect::<Vec<_>>()));
+            at += tokens.len();
+        }
+        let total = at;
+        let two = vulkan
+            .matmul_experts(&h, total, N_FF, &[down], &ranges, &[])
+            .pop()
+            .unwrap();
+        for (gi, (expert, tokens)) in groups.iter().enumerate() {
+            for t in 0..tokens.len() {
+                let a = &got[gi][t * N_EMBD..(t + 1) * N_EMBD];
+                let b = &two[gi][t * N_EMBD..(t + 1) * N_EMBD];
+                let mag = b.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-3);
+                let worst = a
+                    .iter()
+                    .zip(b)
+                    .map(|(x, y)| (x - y).abs() / mag)
+                    .fold(0.0f32, f32::max);
+                if worst > 1e-2 {
+                    eprintln!("fused vs two-call: expert {expert} member {t}: worst {worst:.3e}");
+                }
+            }
+        }
+    }
+    for ((expert, tokens), result) in groups.iter().zip(&got) {
+        let mut gathered = Vec::with_capacity(tokens.len() * N_EMBD);
+        for &t in tokens {
+            gathered.extend_from_slice(&x[t * N_EMBD..(t + 1) * N_EMBD]);
+        }
+        let wg = gu_stack.rows(expert * 2 * N_FF, N_FF);
+        let wu = gu_stack.rows(expert * 2 * N_FF + N_FF, N_FF);
+        let wd = dn_stack.rows(expert * N_EMBD, N_EMBD);
+        let mut g = CpuBackend.matmul_dequant(&gathered, tokens.len(), &wg);
+        let u = CpuBackend.matmul_dequant(&gathered, tokens.len(), &wu);
+        crate::engine::tensor::gelu_inplace(&mut g);
+        crate::engine::tensor::mul_inplace(&mut g, &u);
+        let want = CpuBackend.matmul_dequant(&g, tokens.len(), &wd);
+        assert_eq!(result.len(), want.len(), "expert {expert}");
+        if std::env::var_os("ORANGU_TEST_DUMP").is_some() {
+            for t in 0..tokens.len() {
+                let row = &want[t * N_EMBD..(t + 1) * N_EMBD];
+                let mag = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-3);
+                let worst = (0..N_EMBD)
+                    .map(|o| (result[t * N_EMBD + o] - want[t * N_EMBD + o]).abs() / mag)
+                    .fold(0.0f32, f32::max);
+                eprintln!(
+                    "expert {expert} member {t} (token {}): worst {worst:.3e}",
+                    tokens[t]
+                );
+            }
+        }
+        for t in 0..tokens.len() {
+            let row = &want[t * N_EMBD..(t + 1) * N_EMBD];
+            let mag = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-3);
+            for o in 0..N_EMBD {
+                let i = t * N_EMBD + o;
+                assert!(
+                    (result[i] - want[i]).abs() / mag <= 5e-2,
+                    "expert {expert} member {t} row {o}: fused {} vs cpu {} (row magnitude {mag})",
+                    result[i],
+                    want[i]
+                );
+            }
+        }
+    }
+}
+
+/// What one host-to-device upload of an expert stack costs by each route
+/// this backend could take, so the streaming path's upload can be judged
+/// against the bus rather than against itself: `queue.write_buffer` (the
+/// staging belt: one memcpy on the calling thread, then a copy the driver
+/// enqueues ahead of the next submission), a persistently mapped staging
+/// buffer filled by every core and copied by one `copy_buffer_to_buffer`,
+/// and the same with the fill left out (the copy alone, which is the DMA
+/// engine's rate over the link).
+#[test]
+#[ignore]
+fn _scratch_measure_upload_routes() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    use rayon::prelude::*;
+    let device = &vulkan.device;
+    let bytes: u64 = 256 * 1024 * 1024;
+    let src: Vec<u8> = (0..bytes).map(|i| (i % 251) as u8).collect();
+    let dst = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("probe dst"),
+        size: bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let wait = |label: &str, t: std::time::Instant| {
+        vulkan.poll_blocking_with(wgpu::PollType::wait_indefinitely(), "upload probe");
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "  {label:<44} {ms:8.1} ms  {:6.2} GB/s",
+            bytes as f64 / 1e9 / (ms / 1000.0)
+        );
+    };
+    for round in 0..3 {
+        eprintln!(" round {round}");
+        // 1. write_buffer: one call for the whole stack.
+        let t = std::time::Instant::now();
+        vulkan.queue.write_buffer(&dst, 0, &src);
+        let stage_ms = t.elapsed().as_secs_f64() * 1000.0;
+        vulkan.queue.submit(std::iter::empty());
+        wait(&format!("write_buffer (staging {stage_ms:.1} ms)"), t);
+
+        // 2. write_buffer in 4 MiB pieces from four threads.
+        let t = std::time::Instant::now();
+        let piece = 4 * 1024 * 1024;
+        src.par_chunks(piece).enumerate().for_each(|(i, chunk)| {
+            vulkan.queue.write_buffer(&dst, (i * piece) as u64, chunk);
+        });
+        let stage_ms = t.elapsed().as_secs_f64() * 1000.0;
+        vulkan.queue.submit(std::iter::empty());
+        wait(
+            &format!(
+                "write_buffer x{} threads (staging {stage_ms:.1} ms)",
+                rayon::current_num_threads()
+            ),
+            t,
+        );
+
+        // 3. Mapped staging buffer, filled in parallel, one copy.
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("probe staging"),
+            size: bytes,
+            usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+        let t = std::time::Instant::now();
+        // A write-only mapped range splits into pieces one per thread. The
+        // piece type is not `Send` for an unsized element (its bound is on
+        // `T: Sized`), so the pieces cross threads in a wrapper: each piece
+        // is a disjoint range of one mapping, written by one thread.
+        struct Piece<'a>(wgpu::WriteOnly<'a, [u8]>);
+        unsafe impl Send for Piece<'_> {}
+        let fill = |view: wgpu::WriteOnly<'_, [u8]>| {
+            let mut pieces = Vec::new();
+            let mut rest = view;
+            while rest.len() > piece {
+                let (head, tail) = rest.split_at(piece);
+                pieces.push(Piece(head));
+                rest = tail;
+            }
+            pieces.push(Piece(rest));
+            pieces
+                .into_par_iter()
+                .zip(src.par_chunks(piece))
+                .for_each(|(mut d, s)| d.0.copy_from_slice(s));
+        };
+        {
+            let mut view = staging.slice(..).get_mapped_range_mut().expect("mapped");
+            fill(view.slice(..));
+        }
+        staging.unmap();
+        let fill_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(&staging, 0, &dst, 0, bytes);
+        vulkan.queue.submit([encoder.finish()]);
+        wait(
+            &format!("mapped staging, parallel fill ({fill_ms:.1} ms) + copy"),
+            t,
+        );
+
+        // 4. The copy alone, staging already filled.
+        let t = std::time::Instant::now();
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(&staging, 0, &dst, 0, bytes);
+        vulkan.queue.submit([encoder.finish()]);
+        wait("copy_buffer_to_buffer alone", t);
+
+        // 5. Re-map and fill again (the reuse case: map_async + wait).
+        let t = std::time::Instant::now();
+        let mw = super::MapWait::new();
+        staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Write, mw.callback());
+        vulkan.wait_mapped(&mw, "probe remap");
+        {
+            let mut view = staging.slice(..).get_mapped_range_mut().expect("mapped");
+            fill(view.slice(..));
+        }
+        staging.unmap();
+        let fill_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(&staging, 0, &dst, 0, bytes);
+        vulkan.queue.submit([encoder.finish()]);
+        wait(
+            &format!("remapped staging, parallel fill ({fill_ms:.1} ms) + copy"),
+            t,
+        );
     }
 }
 
@@ -2909,6 +3856,87 @@ fn real_gguf_weights_match_the_cpu_backend() {
         }
     }
     eprintln!("  checked {} tensors, {bad} bad", names.len());
+}
+
+/// A host layer's projections on **real weights and real activations**, the
+/// streamed card product beside the CPU's own, each against the float
+/// reference — so a split model's streamed prefill can be judged by the
+/// error it adds rather than by whether a greedy continuation still agrees
+/// with the host's (on a 12B model it stops agreeing after eight tokens
+/// either way, and that says nothing about which arm is closer to the
+/// truth).
+///
+/// `ORANGU_PROBE_GGUF` names the model, `ORANGU_PROBE_LAYER` the layer
+/// (default 18, the first host layer of the 12B split on a 4 GiB card) and
+/// `ORANGU_PROBE_ACT` a row-major `f32` activation file for that layer's
+/// width, such as an `ORANGU_NPU_DUMP_ACT` capture's `blk.<layer>.<n>.f32`
+/// (random rows when unset) — the feed-forward's input stands in for the
+/// attention's, a normed residual of the same width. Reported per projection: the relative RMS
+/// error of each kernel against the dequantized product, and the two
+/// kernels' distance from each other.
+///
+/// `ORANGU_PROBE_GGUF=... ORANGU_PROBE_ACT=... cargo test real_gguf_host_layer_streamed -- --ignored --nocapture`
+#[test]
+#[ignore = "needs a real GGUF; run with --ignored"]
+fn real_gguf_host_layer_streamed_matches_the_cpu_kernel() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        return;
+    };
+    let path = std::env::var("ORANGU_PROBE_GGUF").expect("set ORANGU_PROBE_GGUF");
+    let layer: usize = std::env::var("ORANGU_PROBE_LAYER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(18);
+    let model =
+        crate::engine::loader::LoadedModel::open(std::path::Path::new(&path)).expect("open gguf");
+    let rel_rms = |a: &[f32], b: &[f32]| -> f64 {
+        let num: f64 = a.iter().zip(b).map(|(x, y)| ((x - y) as f64).powi(2)).sum();
+        let den: f64 = b.iter().map(|y| (*y as f64).powi(2)).sum();
+        (num / den.max(1e-30)).sqrt()
+    };
+    let mut seed = 0x9A7E_5EED_u64;
+    for name in ["attn_q", "attn_k", "attn_v", "ffn_gate", "ffn_up"] {
+        let w = model
+            .matrix(&format!("blk.{layer}.{name}.weight"))
+            .expect("the layer's projection");
+        let x: Vec<f32> = match std::env::var("ORANGU_PROBE_ACT") {
+            Ok(file) => {
+                let bytes = std::fs::read(&file).expect("read the activation file");
+                let all: Vec<f32> = bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| f32::from_le_bytes(*b))
+                    .collect();
+                let rows = (all.len() / w.in_dim).min(512);
+                all[..rows * w.in_dim].to_vec()
+            }
+            _ => (0..512 * w.in_dim)
+                .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 512.0)
+                .collect(),
+        };
+        let n_tokens = x.len() / w.in_dim;
+        let reference = CpuBackend.matmul_dequant(&x, n_tokens, &w);
+        let cpu = CpuBackend.matmul(&x, n_tokens, &w);
+        let streamed = vulkan
+            .matmul_batch_streamed(&[MatmulOp {
+                x: &x,
+                n_tokens,
+                w: &w,
+            }])
+            .pop()
+            .expect("one result");
+        eprintln!(
+            "  blk.{layer}.{name} type {} {}x{} at {n_tokens} tokens: cpu {:.3e}  streamed {:.3e}  cpu-vs-streamed {:.3e}",
+            w.ggml_type(),
+            w.in_dim,
+            w.out_dim,
+            rel_rms(&cpu, &reference),
+            rel_rms(&streamed, &reference),
+            rel_rms(&streamed, &cpu)
+        );
+    }
 }
 
 /// The same real-weight cross-check for **stacked routed-expert** tensors,
@@ -3995,8 +5023,15 @@ fn matmul_batch_matches_sequential_cpu_matmuls() {
         // `Q8_0`) are untouched by that flag and keep the tight
         // tolerance.
         let tol_factor = if name == "q" { 6e-2 } else { 1e-2 };
+        // "v" (`Q8_0`) runs on the integer dot where the device has it.
+        let w = match name {
+            "q" => &wq,
+            "k" => &wk,
+            _ => &wv,
+        };
+        let integer_dot = matmul_tolerance(vulkan, w, n_tokens, expected);
         for (i, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
-            let tol = tol_factor * a.abs().max(1.0);
+            let tol = (tol_factor * a.abs().max(1.0)).max(integer_dot(*a));
             assert!(
                 (a - b).abs() <= tol,
                 "{name}: mismatch at index {i}: cpu={a} gpu(batched)={b}"
@@ -6555,6 +7590,7 @@ fn cross_check_fused_attention_owns_v(
             q_bias: None,
             pairing: crate::engine::tensor::RopeLayout::Neox,
             normed: GpuInput::Cpu(&normed),
+            normed_q8: None,
             wq: &wq,
             q_norm: Some(&q_norm),
             kv: Some(FusedAttnProjection {
@@ -6724,6 +7760,7 @@ fn fused_attention_matches_cpu_reference_kv_dim_32() {
             q_bias: None,
             pairing: crate::engine::tensor::RopeLayout::Neox,
             normed: GpuInput::Cpu(&normed),
+            normed_q8: None,
             wq: &wq,
             q_norm: Some(&q_norm),
             kv: Some(FusedAttnProjection {
@@ -6888,6 +7925,7 @@ fn fused_attention_matches_cpu_reference_shared_v_with_freq_factors() {
         q_bias: None,
         pairing: crate::engine::tensor::RopeLayout::Neox,
         normed: GpuInput::Cpu(&normed),
+        normed_q8: None,
         wq: &wq,
         q_norm: Some(&q_norm),
         kv: Some(FusedAttnProjection {
@@ -7060,6 +8098,7 @@ fn fused_attention_two_layers_sharing_one_kv_cache_stay_independent() {
         q_bias: None,
         pairing: crate::engine::tensor::RopeLayout::Neox,
         normed: GpuInput::Cpu(&normed_a),
+        normed_q8: None,
         wq: &wq_a,
         q_norm: Some(&q_norm_a),
         kv: Some(FusedAttnProjection {
@@ -7113,6 +8152,7 @@ fn fused_attention_two_layers_sharing_one_kv_cache_stay_independent() {
         q_bias: None,
         pairing: crate::engine::tensor::RopeLayout::Neox,
         normed: GpuInput::Cpu(&normed_b),
+        normed_q8: None,
         wq: &wq_b,
         q_norm: Some(&q_norm_b),
         kv: None,
@@ -9276,6 +10316,7 @@ fn fused_attention_decode_matches_cpu_on_the_llama_shape() {
         q_bias: None,
         pairing,
         normed: GpuInput::Cpu(&normed),
+        normed_q8: None,
         wq: &wq,
         q_norm: None,
         kv: Some(FusedAttnProjection {
@@ -9660,6 +10701,255 @@ fn fused_layer_matches_cpu_reference_full_layer_with_ple() {
             assert!(
                 (a - b).abs() <= tol,
                 "step {step}: mismatch at index {i}: cpu={a} gpu={b}"
+            );
+        }
+    }
+}
+
+/// Cross-checks `fused_layer` against two layers that share one
+/// `LayerCache` (an owner and a cross-layer KV-donor, gemma4's real
+/// pattern — see `fused_attention_two_layers_sharing_one_kv_cache_stay_
+/// independent`) across *many* sequential decode steps, calling
+/// `fused_layer` for both layers every step exactly as `GemmaModel::
+/// forward` does (owner first, so the donor's attention this step sees
+/// the owner's just-pushed key/value). Every other `fused_layer` test
+/// only exercises one `wq`/`LayerCache` pair at a time; the real
+/// end-to-end bug this is chasing (correct at ~5 decode tokens,
+/// degenerate by ~60) only ever showed up on the real `E2B` model,
+/// which mixes owner and donor layers sharing caches — this test tries
+/// to reproduce that same shape synthetically, far cheaper than a full
+/// HTTP round trip per bisection step.
+/// The full fused decode layer at a model shape with word-reading types on
+/// every projection — the path where the attention norm and the FFN's
+/// producers write the 8-bit activations the integer-dot kernels read
+/// (`decode_mmvq`), and the float word-reading kernels otherwise — against
+/// the CPU reference over three steps. A wrong-input projection here is
+/// what the greedy check caught after Round 10's first wiring.
+#[test]
+fn fused_layer_model_shaped_on_the_word_reading_types_matches_cpu_reference() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+
+    let n_embd = 1536;
+    let n_head = 8;
+    let n_head_kv = 1;
+    let head_dim = 256;
+    let rope_dim = 256;
+    let ffn_len = 6144;
+    let per_layer_dim = 256;
+    let group_size = n_head / n_head_kv;
+    let kv_dim = n_head_kv * head_dim;
+    let capacity = 128;
+    let eps = 1e-6;
+    let rope_freq_base = 10000.0;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let layer_output_scale = 1.0 / (2.0f32).sqrt();
+
+    let mut seed = 0x0DD1AE4_u64;
+    let build = |ggml_type: u32, in_dim: usize, out_dim: usize, seed: &mut u64| {
+        let elems = block_elems(ggml_type);
+        let mut bytes = Vec::new();
+        for _ in 0..out_dim * (in_dim / elems) {
+            bytes.extend(build_block(ggml_type, seed));
+        }
+        test_quant_matrix(&bytes, ggml_type, in_dim, out_dim)
+    };
+    let rand_vec = |len: usize, seed: &mut u64| -> Vec<f32> {
+        (0..len)
+            .map(|_| (next_byte(seed) as f32 - 128.0) / 256.0)
+            .collect()
+    };
+    let near_one = |len: usize, seed: &mut u64| -> Vec<f32> {
+        rand_vec(len, seed).iter().map(|v| 1.0 + v * 0.1).collect()
+    };
+
+    let attn_norm = near_one(n_embd, &mut seed);
+    let wq = build(GGML_TYPE_Q2_K, n_embd, n_head * head_dim, &mut seed);
+    let q_norm = near_one(head_dim, &mut seed);
+    let wk = build(GGML_TYPE_Q3_K, n_embd, kv_dim, &mut seed);
+    let k_norm = near_one(head_dim, &mut seed);
+    let wv = build(GGML_TYPE_IQ3_S, n_embd, kv_dim, &mut seed);
+    let wo = build(GGML_TYPE_Q4_K, n_head * head_dim, n_embd, &mut seed);
+    let attn_post_norm = near_one(n_embd, &mut seed);
+    let ffn_norm = near_one(n_embd, &mut seed);
+    let ffn_gate = build(GGML_TYPE_IQ2_S, n_embd, ffn_len, &mut seed);
+    let ffn_up = build(GGML_TYPE_Q2_K, n_embd, ffn_len, &mut seed);
+    let ffn_down = build(GGML_TYPE_Q3_K, ffn_len, n_embd, &mut seed);
+    let ffn_post_norm = near_one(n_embd, &mut seed);
+    let ple_gate_w = build(GGML_TYPE_F32, n_embd, per_layer_dim, &mut seed);
+    let ple_proj_w = build(GGML_TYPE_F32, per_layer_dim, n_embd, &mut seed);
+    let ple_post_norm = near_one(n_embd, &mut seed);
+
+    let mut kv_cache = crate::engine::kv_cache::KvCache::new_with_dims(capacity, &[kv_dim]);
+    let mut reference_cache = crate::engine::kv_cache::KvCache::new_with_dims(capacity, &[kv_dim]);
+    for _ in 0..3 {
+        let k: Vec<f32> = rand_vec(kv_dim, &mut seed);
+        let v: Vec<f32> = rand_vec(kv_dim, &mut seed);
+        kv_cache.layers[0].push(&k, &v);
+        reference_cache.layers[0].push(&k, &v);
+    }
+
+    for step in 0..3 {
+        let pos = kv_cache.layers[0].len;
+        let window_start = 0;
+        let x = rand_vec(n_embd, &mut seed);
+        let per_layer_slice = rand_vec(per_layer_dim, &mut seed);
+
+        // CPU reference, matching `GemmaModel::forward`'s statement
+        // order exactly.
+        let mut normed = x.clone();
+        crate::engine::tensor::rmsnorm_inplace(&mut normed, &attn_norm, 1, n_embd, eps);
+
+        let mut q = CpuBackend.matmul_dequant(&normed, 1, &wq);
+        crate::engine::tensor::rmsnorm_inplace(&mut q, &q_norm, n_head, head_dim, eps);
+        crate::engine::tensor::rope_apply_scaled_inplace(
+            &mut q,
+            n_head,
+            head_dim,
+            rope_dim,
+            pos,
+            rope_freq_base,
+            None,
+        );
+        let mut k = CpuBackend.matmul_dequant(&normed, 1, &wk);
+        crate::engine::tensor::rmsnorm_inplace(&mut k, &k_norm, n_head_kv, head_dim, eps);
+        let mut v = CpuBackend.matmul_dequant(&normed, 1, &wv);
+        for row in v.chunks_mut(head_dim) {
+            let mean_sq: f32 = row.iter().map(|x| x * x).sum::<f32>() / head_dim as f32;
+            let s = 1.0 / (mean_sq + eps).sqrt();
+            for x in row.iter_mut() {
+                *x *= s;
+            }
+        }
+        crate::engine::tensor::rope_apply_scaled_inplace(
+            &mut k,
+            n_head_kv,
+            head_dim,
+            rope_dim,
+            pos,
+            rope_freq_base,
+            None,
+        );
+        reference_cache.layers[0].push(&k, &v);
+
+        let mut attn_out = vec![0f32; n_head * head_dim];
+        for h in 0..n_head {
+            let kv_head = h / group_size;
+            let qh = &q[h * head_dim..(h + 1) * head_dim];
+            let mut scores = Vec::with_capacity(pos + 1 - window_start);
+            for p in window_start..=pos {
+                let kh = reference_cache.layers[0].key_at(p, kv_head, head_dim);
+                scores.push(crate::engine::tensor::dot(qh, kh) * scale);
+            }
+            crate::engine::tensor::softmax_inplace(&mut scores);
+            let out = &mut attn_out[h * head_dim..(h + 1) * head_dim];
+            for (offset, &weight) in scores.iter().enumerate() {
+                let p = window_start + offset;
+                let vh = reference_cache.layers[0].value_at(p, kv_head, head_dim);
+                for (o, vi) in out.iter_mut().zip(vh.iter()) {
+                    *o += weight * vi;
+                }
+            }
+        }
+
+        let mut attn_proj = CpuBackend.matmul_dequant(&attn_out, 1, &wo);
+        crate::engine::tensor::rmsnorm_inplace(&mut attn_proj, &attn_post_norm, 1, n_embd, eps);
+        let mut xr = x.clone();
+        crate::engine::tensor::add_inplace(&mut xr, &attn_proj);
+        let attn_out_residual = xr.clone();
+
+        let mut ffn_normed = xr.clone();
+        crate::engine::tensor::rmsnorm_inplace(&mut ffn_normed, &ffn_norm, 1, n_embd, eps);
+        let mut gate = CpuBackend.matmul_dequant(&ffn_normed, 1, &ffn_gate);
+        let up = CpuBackend.matmul_dequant(&ffn_normed, 1, &ffn_up);
+        for g in gate.iter_mut() {
+            *g = crate::engine::tensor::gelu(*g);
+        }
+        crate::engine::tensor::mul_inplace(&mut gate, &up);
+        let mut ffn_out = CpuBackend.matmul_dequant(&gate, 1, &ffn_down);
+        crate::engine::tensor::rmsnorm_inplace(&mut ffn_out, &ffn_post_norm, 1, n_embd, eps);
+        xr = attn_out_residual;
+        crate::engine::tensor::add_inplace(&mut xr, &ffn_out);
+
+        let pe_in = xr.clone();
+        let mut g = CpuBackend.matmul_dequant(&xr, 1, &ple_gate_w);
+        for v in g.iter_mut() {
+            *v = crate::engine::tensor::gelu(*v);
+        }
+        crate::engine::tensor::mul_inplace(&mut g, &per_layer_slice);
+        let mut proj = CpuBackend.matmul_dequant(&g, 1, &ple_proj_w);
+        crate::engine::tensor::rmsnorm_inplace(&mut proj, &ple_post_norm, 1, n_embd, eps);
+        xr = pe_in;
+        crate::engine::tensor::add_inplace(&mut xr, &proj);
+
+        for v in xr.iter_mut() {
+            *v *= layer_output_scale;
+        }
+        let expected = xr;
+
+        let got = vulkan.fused_layer(FusedLayerInput {
+            stop_at_ffn_norm: false,
+            yarn: RopeYarn::IDENTITY,
+            normalize_v: true,
+            attn_gate: None,
+            q_bias: None,
+            pairing: crate::engine::tensor::RopeLayout::Neox,
+            activation: FfnActivation::Geglu,
+            x: GpuInput::Cpu(&x),
+            attn_norm: &attn_norm,
+            wq: &wq,
+            q_norm: Some(&q_norm),
+            kv: Some(FusedAttnProjection {
+                k_bias: None,
+                v_bias: None,
+                wk: &wk,
+                k_norm: Some(&k_norm),
+                wv: Some(&wv),
+            }),
+            n_head,
+            n_head_kv,
+            head_dim,
+            rope_dim,
+            rope_freq_base,
+            freq_factors: None,
+            eps,
+            pos,
+            window_start,
+            window: None,
+            scale,
+            cache: &mut kv_cache.layers[0],
+            wo: &wo,
+            attn_post_norm: Some(&attn_post_norm),
+            ffn_norm: &ffn_norm,
+            ffn_gate: &ffn_gate,
+            ffn_up: &ffn_up,
+            ffn_down: &ffn_down,
+            ffn_post_norm: Some(&ffn_post_norm),
+            ple: Some(FusedPle {
+                gate_w: &ple_gate_w,
+                proj_w: &ple_proj_w,
+                post_norm: &ple_post_norm,
+                per_layer_slice: GpuInput::Cpu(&per_layer_slice),
+                per_layer_dim: per_layer_slice.len(),
+            }),
+            layer_output_scale: Some(layer_output_scale),
+            post_norm_eps: None,
+            batch_slot: 0,
+            attn_ts: None,
+        });
+
+        // The projections' activations are 8-bit on this path, so the
+        // bound is a fraction of the output's magnitude, not of each
+        // element's.
+        assert_eq!(expected.len(), got.len());
+        let magnitude = expected.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+        for (i, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+            assert!(
+                (a - b).abs() <= 5e-2 * magnitude,
+                "step {step}: mismatch at index {i}: cpu={a} gpu={b} (magnitude {magnitude})"
             );
         }
     }
@@ -10240,6 +11530,7 @@ fn paged_fused_decode_matches_cpu_reference() {
             q_bias: None,
             pairing: crate::engine::tensor::RopeLayout::Neox,
             normed: GpuInput::Cpu(&normed),
+            normed_q8: None,
             wq: &wq,
             q_norm: Some(&q_norm),
             kv: Some(FusedAttnProjection {
@@ -10581,6 +11872,13 @@ fn mmq_q4k_gemm_matches_the_cpu_product() {
         (crate::engine::quant::GGML_TYPE_IQ3_S, 6144, 1536, 200),
         (crate::engine::quant::GGML_TYPE_IQ2_S, 1536, 6144, 256),
         (crate::engine::quant::GGML_TYPE_IQ2_S, 6144, 1536, 200),
+        // A 48-layer model's own shapes: an odd super-block count on the
+        // row (`3840 = 15 × 256`), the global layers' Q and single-head
+        // K/V widths, and the down projection's `15360`-wide row.
+        (GGML_TYPE_Q4_K, 3840, 8192, 128),
+        (GGML_TYPE_Q4_K, 3840, 512, 128),
+        (GGML_TYPE_Q4_K, 3840, 15360, 128),
+        (crate::engine::quant::GGML_TYPE_Q6_K, 15360, 3840, 128),
     ] {
         let mut bytes = Vec::new();
         let (_, block_elems) =
@@ -10898,6 +12196,14 @@ fn the_norm_pair_matches_the_two_scalar_norms() {
         // The pair.
         let y1p = gpu.upload_new(&vec![0.0f32; n_embd]);
         let y2p = gpu.upload_new(&vec![0.0f32; n_embd]);
+        // With the q8 epilogue asked for (`aux = 1`), on the rows the
+        // slots cover whole; its output is checked below against the CPU
+        // quantizer of the pair's own `y2`.
+        let q8_words = n_embd / 32 * 10;
+        let q8b = gpu.upload_new(&vec![0.0f32; q8_words]);
+        let quantize_here =
+            n_embd / 4 <= vulkan_shaders::NORM_WIDE_SLOTS * vulkan_shaders::NORM_WIDE_WG;
+        let meta_q8 = gpu.elem_meta_buffer_aux_extra(n_embd as u32, u32::from(quantize_here), eps);
         let mut encoder = gpu.new_encoder("norm pair parity: pair");
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -10911,7 +12217,8 @@ fn the_norm_pair_matches_the_two_scalar_norms() {
                 &w2b,
                 BindSrc::Slice(&y1p, 0, bytes),
                 BindSrc::Slice(&y2p, 0, bytes),
-                &meta,
+                &meta_q8,
+                &q8b,
             );
             pass.set_pipeline(&gpu.rmsnorm_add_norm_wide_pipeline);
             pass.set_bind_group(0, &bg, &[]);
@@ -10919,6 +12226,24 @@ fn the_norm_pair_matches_the_two_scalar_norms() {
         }
         let y1_pair = gpu.submit_and_readback_for_test(encoder, &y1p, n_embd);
         let y2_pair = gpu.readback_for_test(&y2p, n_embd);
+        if quantize_here {
+            let got: Vec<u32> = gpu
+                .readback_for_test(&q8b, q8_words)
+                .into_iter()
+                .map(f32::to_bits)
+                .collect();
+            let want = quantize_activation_q8(&y2_pair);
+            assert_eq!(got.len(), want.len());
+            for (blk, (g, w)) in got.chunks(10).zip(want.chunks(10)).enumerate() {
+                let (gd, wd) = (f32::from_bits(g[0]), f32::from_bits(w[0]));
+                assert!(
+                    (gd - wd).abs() <= 1e-6 * (1.0 + wd.abs()),
+                    "width {n_embd} q8 block {blk}: scale {gd} vs {wd}"
+                );
+                assert_eq!(g[1], w[1], "width {n_embd} q8 block {blk}: quant sum");
+                assert_eq!(&g[2..], &w[2..], "width {n_embd} q8 block {blk}: quants");
+            }
+        }
 
         // And the formula on the CPU, so a shared mistake cannot pass.
         let s1 = 1.0 / (x.iter().map(|v| v * v).sum::<f32>() / n_embd as f32 + eps).sqrt();
@@ -11141,4 +12466,206 @@ fn wide_projections_take_the_four_row_block_hoisted_pipeline() {
     assert_eq!(vulkan.decode_rows_per_workgroup(&wide, 1), 4);
     assert!(vulkan.block_hoisted_wide_for(&narrow, 1).is_none());
     assert!(vulkan.block_hoisted_wide_for(&wide, 64).is_none());
+}
+
+/// The activation+multiply with the q8 epilogue: the product itself
+/// matches the plain fused kernel's, and the q8 rows match the CPU
+/// quantizer of that product block for block — at a width that leaves a
+/// partial last workgroup.
+#[test]
+fn the_activation_mul_q8_matches_the_plain_kernel_and_the_cpu_quantizer() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(gpu) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    for silu in [false, true] {
+        let len = 6144usize + 32;
+        let a: Vec<f32> = (0..len).map(|i| ((i % 23) as f32 - 11.0) * 0.3).collect();
+        let b: Vec<f32> = (0..len).map(|i| ((i % 17) as f32 - 8.0) * 0.25).collect();
+        let bytes = (len as u64) * 4;
+        let ab = gpu.upload_new(&a);
+        let bb = gpu.upload_new(&b);
+        let y = gpu.upload_new(&vec![0.0f32; len]);
+        let q8_words = len / 32 * 10;
+        let q8 = gpu.upload_new(&vec![0.0f32; q8_words]);
+        let meta = gpu.elem_meta_buffer(len as u32, 0.0);
+        let mut encoder = gpu.new_encoder("activation q8");
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            let bg = gpu.norm_pair_bind_group(
+                BindSrc::Slice(&ab, 0, bytes),
+                &gpu.placeholder_ro,
+                BindSrc::Slice(&bb, 0, bytes),
+                &gpu.placeholder_ro,
+                BindSrc::Slice(&y, 0, bytes),
+                BindSrc::Slice(&q8, 0, (q8_words as u64) * 4),
+                &meta,
+                &gpu.q8_placeholder,
+            );
+            pass.set_pipeline(if silu {
+                &gpu.silu_mul_q8_pipeline
+            } else {
+                &gpu.gelu_mul_q8_pipeline
+            });
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((len as u32).div_ceil(64), 1, 1);
+        }
+        let product = gpu.submit_and_readback_for_test(encoder, &y, len);
+        let got: Vec<u32> = gpu
+            .readback_for_test(&q8, q8_words)
+            .into_iter()
+            .map(f32::to_bits)
+            .collect();
+        for i in 0..len {
+            let g = if silu {
+                a[i] / (1.0 + (-a[i]).exp())
+            } else {
+                0.5 * a[i]
+                    * (1.0
+                        + (0.7978846f32 * a[i] * (1.0 + 0.044715 * a[i] * a[i]))
+                            .clamp(-20.0, 20.0)
+                            .tanh())
+            };
+            let want = g * b[i];
+            assert!(
+                (product[i] - want).abs() <= 1e-4 * (1.0 + want.abs()),
+                "silu={silu} product at {i}: {} vs {want}",
+                product[i]
+            );
+        }
+        // WGSL's `round` is half-to-even and the CPU quantizer's rounds half
+        // away from zero, so a quant on an exact tie may differ by one, and
+        // the block's sum by as many as differ.
+        let want = quantize_activation_q8(&product);
+        for (blk, (g, w)) in got.chunks(10).zip(want.chunks(10)).enumerate() {
+            let (gd, wd) = (f32::from_bits(g[0]), f32::from_bits(w[0]));
+            assert!(
+                (gd - wd).abs() <= 1e-6 * (1.0 + wd.abs()),
+                "silu={silu} q8 block {blk}: scale {gd} vs {wd}"
+            );
+            let bytes = |word: u32| (0..4).map(move |k| ((word >> (8 * k)) & 0xFF) as u8 as i8);
+            let mut ties = 0i32;
+            for (gw, ww) in g[2..].iter().zip(&w[2..]) {
+                for (gq, wq) in bytes(*gw).zip(bytes(*ww)) {
+                    let d = (i32::from(gq) - i32::from(wq)).abs();
+                    assert!(d <= 1, "silu={silu} q8 block {blk}: quant {gq} vs {wq}");
+                    ties += d;
+                }
+            }
+            let ds = (g[1] as i32 - w[1] as i32).abs();
+            assert!(
+                ds <= ties,
+                "silu={silu} q8 block {blk}: quant sum off by {ds}"
+            );
+        }
+    }
+}
+
+/// The fused decode chain at a model shape with word-reading types on the
+/// FFN — the case that takes the producer-quantized integer-dot path
+/// (`FusedResources::ffn_q8`/`down_q8`) when `decode_mmvq` is on, and the
+/// float word-reading kernels otherwise. Against the CPU reference at the
+/// tolerance an 8-bit activation needs. The greedy check caught the first
+/// wiring of this path producing nothing but separators while every
+/// kernel's own test passed; this is the test that should have.
+#[test]
+fn fused_post_attention_decode_model_shaped_on_the_word_reading_types() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let n_embd = 1536;
+    let ffn_len = 6144;
+    let eps = 1e-6;
+    let mut seed = 0x0DD_u64;
+    let build = |ggml_type: u32, in_dim: usize, out_dim: usize, seed: &mut u64| {
+        let elems = block_elems(ggml_type);
+        let mut bytes = Vec::new();
+        for _ in 0..out_dim * (in_dim / elems) {
+            bytes.extend(build_block(ggml_type, seed));
+        }
+        test_quant_matrix(&bytes, ggml_type, in_dim, out_dim)
+    };
+    let wo = build(GGML_TYPE_Q4_K, n_embd, n_embd, &mut seed);
+    let ffn_gate = build(GGML_TYPE_Q2_K, n_embd, ffn_len, &mut seed);
+    let ffn_up = build(GGML_TYPE_IQ3_S, n_embd, ffn_len, &mut seed);
+    let ffn_down = build(GGML_TYPE_Q3_K, ffn_len, n_embd, &mut seed);
+    let rand_vec = |len: usize, seed: &mut u64| -> Vec<f32> {
+        (0..len)
+            .map(|_| (next_byte(seed) as f32 - 128.0) / 256.0)
+            .collect()
+    };
+    let attn_out = rand_vec(n_embd, &mut seed);
+    let residual = rand_vec(n_embd, &mut seed);
+    let near_one = |seed: &mut u64| -> Vec<f32> {
+        rand_vec(n_embd, seed)
+            .iter()
+            .map(|v| 1.0 + v * 0.1)
+            .collect()
+    };
+    let attn_post_norm = near_one(&mut seed);
+    let ffn_norm = near_one(&mut seed);
+    let ffn_post_norm = near_one(&mut seed);
+
+    let mut attn_proj = CpuBackend.matmul_dequant(&attn_out, 1, &wo);
+    crate::engine::tensor::rmsnorm_inplace(&mut attn_proj, &attn_post_norm, 1, n_embd, eps);
+    let mut x = residual.clone();
+    crate::engine::tensor::add_inplace(&mut x, &attn_proj);
+    let x1 = x.clone();
+    let mut ffn_normed = x.clone();
+    crate::engine::tensor::rmsnorm_inplace(&mut ffn_normed, &ffn_norm, 1, n_embd, eps);
+    let mut gate = CpuBackend.matmul_dequant(&ffn_normed, 1, &ffn_gate);
+    let up = CpuBackend.matmul_dequant(&ffn_normed, 1, &ffn_up);
+    for g in gate.iter_mut() {
+        *g = crate::engine::tensor::gelu(*g);
+    }
+    crate::engine::tensor::mul_inplace(&mut gate, &up);
+    let mut ffn_out = CpuBackend.matmul_dequant(&gate, 1, &ffn_down);
+    crate::engine::tensor::rmsnorm_inplace(&mut ffn_out, &ffn_post_norm, 1, n_embd, eps);
+    x = x1;
+    crate::engine::tensor::add_inplace(&mut x, &ffn_out);
+    let expected = x;
+
+    let got = vulkan.fused_post_attention(FusedPostAttentionInput {
+        stop_at_ffn_norm: false,
+        activation: FfnActivation::Geglu,
+        attn_out: GpuInput::Cpu(&attn_out),
+        residual: GpuInput::Cpu(&residual),
+        wo: &wo,
+        attn_post_norm: Some(&attn_post_norm),
+        ffn_norm: &ffn_norm,
+        ffn_gate: &ffn_gate,
+        ffn_up: &ffn_up,
+        ffn_down: &ffn_down,
+        ffn_post_norm: Some(&ffn_post_norm),
+        eps,
+        post_norm_eps: None,
+        ple: None,
+        layer_output_scale: None,
+        batch_slot: 0,
+    });
+    assert_eq!(expected.len(), got.len());
+    let scale = expected.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+    for (i, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+        assert!(
+            (a - b).abs() <= 3e-2 * scale,
+            "mismatch at index {i}: cpu={a} gpu(fused)={b} (scale {scale})"
+        );
+    }
+}
+
+/// A few tokens (under the coop threshold, under the thin-tile width) on
+/// the integer-dot path through the CPU-orchestrated batch — the shape a
+/// prompt's last short chunk takes.
+#[test]
+fn decode_matvec_integer_dot_a_few_tokens() {
+    for n_tokens in [2usize, 3, 5] {
+        cross_check_n_tokens(GGML_TYPE_Q2_K, 1536, 2055, n_tokens);
+        cross_check_n_tokens(GGML_TYPE_Q3_K, 1536, 2055, n_tokens);
+    }
 }

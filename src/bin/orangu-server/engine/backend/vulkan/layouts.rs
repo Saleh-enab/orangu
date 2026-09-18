@@ -27,6 +27,42 @@
 /// read-only, the raw quantized bytes), `x` (storage, read-only, the
 /// input activations), `y` (storage, read-write, the output), `meta`
 /// (uniform, the shapes — see `vulkan_shaders::PRELUDE`'s `Meta` struct).
+/// [`bind_group_layout`] plus binding 5: the token and row tables of an
+/// **indexed** integer-dot GEMM (`vulkan_shaders::shader_source_mmq_indexed`),
+/// which multiplies a stack of expert matrices by the rows each expert was
+/// routed in one dispatch.
+pub(super) fn indexed_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let storage = |read_only: bool| wgpu::BindingType::Buffer {
+        ty: wgpu::BufferBindingType::Storage { read_only },
+        has_dynamic_offset: false,
+        min_binding_size: None,
+    };
+    let entry = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty,
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("orangu-server indexed matmul bind group layout"),
+        entries: &[
+            entry(0, storage(true)),
+            entry(1, storage(true)),
+            entry(2, storage(false)),
+            entry(
+                3,
+                wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+            ),
+            entry(4, storage(true)),
+            entry(5, storage(true)),
+        ],
+    })
+}
+
 pub(super) fn bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     let storage = |read_only: bool| wgpu::BindingType::Buffer {
         ty: wgpu::BufferBindingType::Storage { read_only },
@@ -420,8 +456,9 @@ pub(super) fn kv_epilogue_bind_group_layout(device: &wgpu::Device) -> wgpu::Bind
 }
 
 /// Bind group layout for `vulkan_shaders::shader_source_rmsnorm_add_norm_wide`:
-/// `x`, `w1`, `residual`, `w2` read-only, `y1` and `y2` read-write, and the
-/// meta.
+/// `x`, `w1`, `residual`, `w2` read-only, `y1` and `y2` read-write, the
+/// meta, and the 8-bit form of `y2` (`q8`, written when the meta's `aux`
+/// asks for it).
 pub(super) fn norm_pair_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     let storage = |read_only: bool| wgpu::BindingType::Buffer {
         ty: wgpu::BufferBindingType::Storage { read_only },
@@ -451,6 +488,7 @@ pub(super) fn norm_pair_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGr
                     min_binding_size: None,
                 },
             ),
+            entry(7, storage(false)),
         ],
     })
 }

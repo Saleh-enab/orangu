@@ -373,6 +373,11 @@ const SWEEP_FORMATS: &[(&str, u32)] = &[
     ("Q5_0", crate::engine::quant::GGML_TYPE_Q5_0),
     ("Q5_1", crate::engine::quant::GGML_TYPE_Q5_1),
     ("Q8_0", crate::engine::quant::GGML_TYPE_Q8_0),
+    ("Q2_K", crate::engine::quant::GGML_TYPE_Q2_K),
+    ("Q3_K", crate::engine::quant::GGML_TYPE_Q3_K),
+    ("IQ4_XS", crate::engine::quant::GGML_TYPE_IQ4_XS),
+    ("IQ3_S", crate::engine::quant::GGML_TYPE_IQ3_S),
+    ("IQ2_S", crate::engine::quant::GGML_TYPE_IQ2_S),
     ("Q6_K", crate::engine::quant::GGML_TYPE_Q6_K),
     ("Q4_K", GGML_TYPE_Q4_K),
 ];
@@ -444,12 +449,15 @@ fn decode_matvec_format_sweep_gpu_versus_cpu() {
     // from the same starting state.
     let only = std::env::var("ORANGU_SWEEP_ONLY").ok();
     // Dispatches per timed pass for the kernel column. A short burst is read
-    // at whatever clock the device idles at; `ORANGU_SWEEP_KERNEL_REPS` makes
-    // the burst long enough to be read at the clock a decode runs at.
+    // at whatever clock the device idles at — at the default's old value
+    // (the 21 of `reps`) a 1536-row dispatch read 45–110 µs whatever its
+    // width, the card never leaving its idle clock, and the same dispatches
+    // read 34–60 at 64 — so the burst is long enough to be read at the
+    // clock a decode runs at. `ORANGU_SWEEP_KERNEL_REPS` overrides it.
     let kernel_reps: u32 = std::env::var("ORANGU_SWEEP_KERNEL_REPS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(reps as u32);
+        .unwrap_or(64);
     let mut best: std::collections::HashMap<&str, (f64, f64, f64)> =
         std::collections::HashMap::new();
     for _ in 0..2 {

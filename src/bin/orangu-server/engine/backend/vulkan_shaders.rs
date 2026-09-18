@@ -461,6 +461,26 @@ fn main_reduce_suffix(n_rows: usize, subgroup: bool) -> String {
 /// given up here, and it is cheap: `x` is a single `[in_dim]` row that stays
 /// in cache, while `weights` — the operand that actually has to stream — keeps
 /// the same per-lane contiguous run it always had.
+/// Blocks a lane takes per trip round the block loop of
+/// [`block_hoisted_suffix`] — the loads of all of them go out together, so
+/// a row's dependent memory round trips fall by this factor.
+/// `ORANGU_BLOCKS_PER_TRIP` (1, 2 or 4) pins it for measurement; the
+/// default is one. Two halved the isolated probe's time on the FFN gate
+/// shape and lost 28% on the same op inside a decode step (four lost
+/// 130%): a kernel measured over its own hot weights is not the kernel
+/// streaming cold ones behind thirty other dispatches, and the decode step
+/// is the measurement that counts.
+fn blocks_per_trip() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ORANGU_BLOCKS_PER_TRIP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| [1, 2, 4].contains(n))
+            .unwrap_or(1)
+    })
+}
+
 fn block_hoisted_suffix(n_rows: usize, subgroup: bool) -> String {
     let mut s = format!(
         "var<workgroup> partial_sums: array<f32, {}>;\n\n",
@@ -505,19 +525,33 @@ fn block_hoisted_suffix(n_rows: usize, subgroup: bool) -> String {
     // still amortized — `LANES_PER_BLOCK` times per block instead of
     // `BLOCK_ELEMS` — but not at the cost of the access pattern.
     s.push_str("\n    let sub = local % LANES_PER_BLOCK;\n    let slot = local / LANES_PER_BLOCK;\n    let blocks_in_flight = 64u / LANES_PER_BLOCK;\n");
-    s.push_str("    let n_blocks = params.in_dim / BLOCK_ELEMS;\n    var b: u32 = slot;\n    loop {\n        if (b >= n_blocks) {\n            break;\n        }\n");
-    s.push_str(
-        "        let block_off = b * BLOCK_BYTES;\n        let x_off = x_base + b * BLOCK_ELEMS;\n",
-    );
-    s.push_str(
-        "        partial0 = partial0 + block_dot(o0 * params.row_bytes + block_off, x_off, sub);\n",
-    );
-    for i in 1..n_rows {
+    // Every row and every block of a trip is computed unconditionally —
+    // a row past `out_dim` on a clamped row (its result is never stored),
+    // a block past the row on a clamped block with its contribution
+    // masked to zero — so the trip's loads for all of them sit in one
+    // basic block and go out together. Under a per-row `if`, each row's
+    // loads waited for the row before it: a trip of four rows was four
+    // memory latencies, not one.
+    for i in 0..n_rows {
         s.push_str(&format!(
-            "        if (o{i} < params.out_dim) {{\n            partial{i} = partial{i} + block_dot(o{i} * params.row_bytes + block_off, x_off, sub);\n        }}\n"
+            "    let oc{i} = min(o{i}, params.out_dim - 1u);\n"
         ));
     }
-    s.push_str("        b = b + blocks_in_flight;\n    }\n\n");
+    let trip = blocks_per_trip();
+    s.push_str("    let n_blocks = params.in_dim / BLOCK_ELEMS;\n    var b: u32 = slot;\n    loop {\n        if (b >= n_blocks) {\n            break;\n        }\n");
+    for u in 0..trip {
+        s.push_str(&format!(
+            "        let bu{u} = min(b + {u}u * blocks_in_flight, n_blocks - 1u);\n        let m{u} = select(0.0, 1.0, b + {u}u * blocks_in_flight < n_blocks);\n        let block_off{u} = bu{u} * BLOCK_BYTES;\n        let x_off{u} = x_base + bu{u} * BLOCK_ELEMS;\n"
+        ));
+        for i in 0..n_rows {
+            s.push_str(&format!(
+                "        partial{i} = partial{i} + m{u} * block_dot(oc{i} * params.row_bytes + block_off{u}, x_off{u}, sub);\n"
+            ));
+        }
+    }
+    s.push_str(&format!(
+        "        b = b + {trip}u * blocks_in_flight;\n    }}\n\n"
+    ));
     s.push_str(&reduce_combine_block(n_rows, subgroup));
     s.push_str("}\n");
     s
@@ -3216,6 +3250,78 @@ fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
 }
 "#;
 
+/// See `block_hoisted_words_middle`'s `ORANGU_Q2K_STUB`.
+const Q2_K_STUB_LOADS_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 84u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let w0 = byte_offset / 4u;
+    let hdr = weights[w0 + 20u];
+    let v_im = sub / 8u;
+    let l0 = 2u * (sub % 8u);
+    let sw0 = weights[w0 + 2u * v_im];
+    let sw1 = weights[w0 + 2u * v_im + 1u];
+    let qw = w0 + 4u + 8u * v_im + l0 / 4u;
+    let lo = weights[qw];
+    let hi = weights[qw + 4u];
+    let y = (x_off + 128u * v_im + l0) / 2u;
+    let b0 = xv2[y];
+    let b16 = xv2[y + 8u];
+    let b32 = xv2[y + 16u];
+    let b48 = xv2[y + 24u];
+    let b64 = xv2[y + 32u];
+    let b80 = xv2[y + 40u];
+    let b96 = xv2[y + 48u];
+    let b112 = xv2[y + 56u];
+    let w = f32(hdr ^ sw0 ^ sw1 ^ lo ^ hi);
+    return w * 1e-9 + b0.x + b16.y + b32.x + b48.y + b64.x + b80.y + b96.x + b112.y;
+}
+"#;
+
+/// See `block_hoisted_words_middle`'s `ORANGU_Q2K_STUB`.
+const Q2_K_STUB_ALU_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 84u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let hdr = byte_offset * 2654435761u + sub;
+    let d = f16_to_f32(hdr & 0x3FFFu);
+    let dmin = f16_to_f32((hdr >> 16u) & 0x3FFFu);
+    let v_im = sub / 8u;
+    let l0 = 2u * (sub % 8u);
+    let sw0 = hdr * 3u + 7u;
+    let sw1 = hdr * 5u + 11u;
+    let q = hdr * 7u + 13u;
+    let q0 = unpack4_f(q & 0x03030303u);
+    let q2 = unpack4_f((q >> 2u) & 0x03030303u);
+    let q4 = unpack4_f((q >> 4u) & 0x03030303u);
+    let q6 = unpack4_f((q >> 6u) & 0x03030303u);
+    let y = (x_off + 128u * v_im + l0) / 2u;
+    let b0 = xv2[y];
+    let b16 = xv2[y + 8u];
+    let b32 = xv2[y + 16u];
+    let b48 = xv2[y + 24u];
+    let b64 = xv2[y + 32u];
+    let b80 = xv2[y + 40u];
+    let b96 = xv2[y + 48u];
+    let b112 = xv2[y + 56u];
+    let sc0 = unpack4_f(sw0 & 0x0F0F0F0Fu);
+    let sc1 = unpack4_f(sw1 & 0x0F0F0F0Fu);
+    let mn0 = unpack4_f((sw0 >> 4u) & 0x0F0F0F0Fu);
+    let mn1 = unpack4_f((sw1 >> 4u) & 0x0F0F0F0Fu);
+    var sum1: f32 = dot(vec4<f32>(b0, b16) * vec4<f32>(sc0.x, sc0.x, sc0.y, sc0.y), q0);
+    sum1 = sum1 + dot(vec4<f32>(b32, b48) * vec4<f32>(sc0.z, sc0.z, sc0.w, sc0.w), q2);
+    sum1 = sum1 + dot(vec4<f32>(b64, b80) * vec4<f32>(sc1.x, sc1.x, sc1.y, sc1.y), q4);
+    sum1 = sum1 + dot(vec4<f32>(b96, b112) * vec4<f32>(sc1.z, sc1.z, sc1.w, sc1.w), q6);
+    var sum2: f32 = dot(vec4<f32>(b0, b16), vec4<f32>(mn0.x, mn0.x, mn0.y, mn0.y));
+    sum2 = sum2 + dot(vec4<f32>(b32, b48), vec4<f32>(mn0.z, mn0.z, mn0.w, mn0.w));
+    sum2 = sum2 + dot(vec4<f32>(b64, b80), vec4<f32>(mn1.x, mn1.x, mn1.y, mn1.y));
+    sum2 = sum2 + dot(vec4<f32>(b96, b112), vec4<f32>(mn1.z, mn1.z, mn1.w, mn1.w));
+    return d * sum1 - dmin * sum2;
+}
+"#;
+
 /// `block_q3_K` for [`block_hoisted_suffix`], read as words: the 2-bit
 /// fields as in `Q2_K`, the third bit from the `hmask` words (bit `4n + s`
 /// of each byte, set meaning "no `-4`"), the 6-bit scale assembled once.
@@ -3398,6 +3504,18 @@ fn block_hoisted_words_middle(ggml_type: u32) -> Option<&'static str> {
     if !crate::engine::env::flag_on_unless_disabled("ORANGU_BLOCK_DOT_WORDS") {
         return None;
     }
+    // `ORANGU_Q2K_STUB=loads|alu`: a **wrong** `Q2_K` routine for splitting
+    // the kernel's time — every load with the arithmetic reduced to a sum
+    // of the words, or the full arithmetic on words made up from the lane
+    // (the activations still read). Timing only; pair with
+    // `ORANGU_VK_NO_SELFCHECK=1` or the start-up check retires it.
+    if ggml_type == GGML_TYPE_Q2_K {
+        match std::env::var("ORANGU_Q2K_STUB").as_deref() {
+            Ok("loads") => return Some(Q2_K_STUB_LOADS_MIDDLE),
+            Ok("alu") => return Some(Q2_K_STUB_ALU_MIDDLE),
+            _ => {}
+        }
+    }
     Some(match ggml_type {
         t if t == GGML_TYPE_Q2_K => Q2_K_WORDS_MIDDLE,
         t if t == GGML_TYPE_Q3_K => Q3_K_WORDS_MIDDLE,
@@ -3406,6 +3524,430 @@ fn block_hoisted_words_middle(ggml_type: u32) -> Option<&'static str> {
         t if t == GGML_TYPE_IQ2_S => IQ2_S_WORDS_MIDDLE,
         _ => return None,
     })
+}
+
+/// [`PRELUDE_XV`]'s integer-dot twin: the activation row arrives already
+/// quantized to 8 bits (`shader_source_quantize_q8`'s layout at binding 1 —
+/// per 32-element block `[d, sumq, qs0..qs7]`, ten words), and a lane's
+/// sixteen elements are four `dot4I8Packed`s of a weight word against a
+/// quant word, rescaled by the block's `d`. The sum of the sixteen quants,
+/// where a type's minimum term needs it, is the same dot against `0x01010101`.
+const PRELUDE_Q8: &str = r#"
+struct Meta {
+    in_dim: u32,
+    out_dim: u32,
+    n_tokens: u32,
+    row_bytes: u32,
+}
+
+@group(0) @binding(0) var<storage, read> weights: array<u32>;
+@group(0) @binding(1) var<storage, read> q8x: array<u32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> params: Meta;
+
+fn read_u8(byte_offset: u32) -> u32 {
+    let word = weights[byte_offset >> 2u];
+    let shift = (byte_offset & 3u) * 8u;
+    return (word >> shift) & 0xFFu;
+}
+
+fn read_u16_even(byte_offset: u32) -> u32 {
+    return (weights[byte_offset >> 2u] >> ((byte_offset & 2u) * 8u)) & 0xFFFFu;
+}
+
+fn read_u32_at(byte_offset: u32) -> u32 {
+    let index = byte_offset >> 2u;
+    let shift = (byte_offset & 3u) * 8u;
+    let lo = weights[index] >> shift;
+    let hi = weights[index + 1u] << ((32u - shift) & 31u);
+    return lo | select(hi, 0u, shift == 0u);
+}
+
+// Four words starting at an even byte offset, from the five aligned words
+// that cover them.
+fn read_4words_even(byte_offset: u32) -> vec4<u32> {
+    let i = byte_offset >> 2u;
+    let w0 = weights[i];
+    let w1 = weights[i + 1u];
+    let w2 = weights[i + 2u];
+    let w3 = weights[i + 3u];
+    if ((byte_offset & 2u) == 0u) {
+        return vec4<u32>(w0, w1, w2, w3);
+    }
+    let w4 = weights[i + 4u];
+    return vec4<u32>((w0 >> 16u) | (w1 << 16u), (w1 >> 16u) | (w2 << 16u), (w2 >> 16u) | (w3 << 16u), (w3 >> 16u) | (w4 << 16u));
+}
+
+fn f16_to_f32(bits: u32) -> f32 {
+    return unpack2x16float(bits & 0xFFFFu).x;
+}
+
+// The quant words of the sixteen activations at element `e` (a multiple of
+// 16) and the block scale they carry.
+fn q8_words(e: u32) -> vec4<u32> {
+    let b = (e / 32u) * 10u + 2u + (e % 32u) / 4u;
+    return vec4<u32>(q8x[b], q8x[b + 1u], q8x[b + 2u], q8x[b + 3u]);
+}
+fn q8_scale(e: u32) -> f32 {
+    return bitcast<f32>(q8x[(e / 32u) * 10u]);
+}
+fn idot4(w: vec4<u32>, x: vec4<u32>) -> i32 {
+    return dot4I8Packed(w.x, x.x) + dot4I8Packed(w.y, x.y) + dot4I8Packed(w.z, x.z) + dot4I8Packed(w.w, x.w);
+}
+// The quant word of the four activations at element `e` (a multiple of 4).
+fn q8_word(e: u32) -> u32 {
+    return q8x[(e / 32u) * 10u + 2u + (e % 32u) / 4u];
+}
+// Bits 0..4 of `x` to bit 4 of bytes 0..4 — a nibble's fifth bit per lane.
+fn spread_bits4(x: u32) -> u32 {
+    return ((x & 1u) << 4u) | ((x & 2u) << 11u) | ((x & 4u) << 18u) | ((x & 8u) << 25u);
+}
+// Bytewise `v - k` for bytes below 128, as signed bytes.
+fn sub_bytes(v: u32, k: u32) -> u32 {
+    return ((v | 0x80808080u) - k) ^ 0x80808080u;
+}
+fn isum4(x: vec4<u32>) -> i32 {
+    return idot4(vec4<u32>(0x01010101u), x);
+}
+// Bits 0..4 of `x` to bit 0 of bytes 0..4.
+fn spread_bits(x: u32) -> u32 {
+    return (x & 1u) | ((x & 2u) << 7u) | ((x & 4u) << 14u) | ((x & 8u) << 21u);
+}
+// A lattice word's four small positive bytes, each negated where its bit
+// of the four-bit `signs` is set (two's complement per lane, no carry).
+fn iq_signed_bytes(g: u32, signs: u32) -> u32 {
+    let m = spread_bits(signs) * 0xFFu;
+    return (g ^ m) + (m & 0x01010101u);
+}
+"#;
+
+/// `block_q2_K` on the integer dot: a lane's sixteen elements are one
+/// sub-block half, four words at one shift; the minimum term is the quant
+/// sum.
+const Q2_K_I8_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 84u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let w0 = byte_offset / 4u;
+    let hdr = weights[w0 + 20u];
+    let d = f16_to_f32(hdr & 0xFFFFu);
+    let dmin = f16_to_f32(hdr >> 16u);
+    let n = sub / 8u;
+    let s = (sub % 8u) / 2u;
+    let h = sub % 2u;
+    let si = n * 8u + s * 2u + h;
+    let sc = (weights[w0 + si / 4u] >> (8u * (si % 4u))) & 0xFFu;
+    let qb = w0 + 4u + n * 8u + h * 4u;
+    let sh = 2u * s;
+    let q = (vec4<u32>(weights[qb], weights[qb + 1u], weights[qb + 2u], weights[qb + 3u]) >> vec4<u32>(sh)) & vec4<u32>(0x03030303u);
+    let e = x_off + sub * 16u;
+    let x = q8_words(e);
+    return q8_scale(e) * (d * f32(sc & 0xFu) * f32(idot4(q, x)) - dmin * f32(sc >> 4u) * f32(isum4(x)));
+}
+"#;
+
+/// `block_q3_K` on the integer dot: the 2-bit fields with the `hmask` bit
+/// as the third, minus four bytewise, signed into the dot.
+const Q3_K_I8_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 110u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d_all = f16_to_f32(read_u16_even(byte_offset + 108u));
+    let n = sub / 8u;
+    let s = (sub % 8u) / 2u;
+    let h = sub % 2u;
+    let lo_byte = read_u8(byte_offset + 96u + (sub % 8u));
+    let low = select(lo_byte >> 4u, lo_byte & 0xFu, sub < 8u);
+    let high = (read_u8(byte_offset + 104u + (sub % 4u)) >> (2u * (sub / 4u))) & 3u;
+    let dl = d_all * (f32(low | (high << 4u)) - 32.0);
+    let qs = read_4words_even(byte_offset + 32u + n * 32u + h * 16u);
+    let hm = read_4words_even(byte_offset + h * 16u);
+    let m = n * 4u + s;
+    let q2 = (qs >> vec4<u32>(2u * s)) & vec4<u32>(0x03030303u);
+    let hb = (hm >> vec4<u32>(m)) & vec4<u32>(0x01010101u);
+    let v = q2 | (hb << vec4<u32>(2u));
+    let q = ((v | vec4<u32>(0x80808080u)) - vec4<u32>(0x04040404u)) ^ vec4<u32>(0x80808080u);
+    let e = x_off + sub * 16u;
+    return q8_scale(e) * dl * f32(idot4(q, q8_words(e)));
+}
+"#;
+
+/// `block_iq4_xs` on the integer dot: each nibble through the value table
+/// to a signed byte.
+const IQ4_XS_I8_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 136u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn kv_byte(i: u32) -> u32 {
+    return (iq_grids[KVALUES_IQ4NL_OFF + (i >> 2u)] >> ((i & 3u) * 8u)) & 0xFFu;
+}
+fn kv_word(n: u32) -> u32 {
+    return kv_byte(n & 0xFu) | (kv_byte((n >> 8u) & 0xFu) << 8u) | (kv_byte((n >> 16u) & 0xFu) << 16u) | (kv_byte(n >> 24u) << 24u);
+}
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let w0 = byte_offset / 4u;
+    let hdr = weights[w0];
+    let d = f16_to_f32(hdr & 0xFFFFu);
+    let scales_h = hdr >> 16u;
+    let ib = sub / 2u;
+    let nsh = 4u * (sub % 2u);
+    let low = (weights[w0 + 1u] >> (8u * (ib / 2u) + 4u * (ib % 2u))) & 0xFu;
+    let high = (scales_h >> (2u * ib)) & 3u;
+    let dl = d * (f32(low | (high << 4u)) - 32.0);
+    let qb = w0 + 2u + 4u * ib;
+    let nib = (vec4<u32>(weights[qb], weights[qb + 1u], weights[qb + 2u], weights[qb + 3u]) >> vec4<u32>(nsh)) & vec4<u32>(0x0F0F0F0Fu);
+    let q = vec4<u32>(kv_word(nib.x), kv_word(nib.y), kv_word(nib.z), kv_word(nib.w));
+    let e = x_off + sub * 16u;
+    return q8_scale(e) * dl * f32(idot4(q, q8_words(e)));
+}
+"#;
+
+/// `block_iq3_s` on the integer dot: four lattice words with their sign
+/// nibbles applied.
+const IQ3_S_I8_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 110u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u16_even(byte_offset));
+    let ib = sub / 2u;
+    let h = sub % 2u;
+    let sc = (read_u8(byte_offset + 106u + ib / 2u) >> (4u * (ib % 2u))) & 0xFu;
+    let db = d * f32(1u + 2u * sc);
+    let qh = read_u8(byte_offset + 66u + ib);
+    let io = byte_offset + 2u + 8u * ib + 4u * h;
+    let idx = read_u16_even(io) | (read_u16_even(io + 2u) << 16u);
+    let sg = read_u16_even(byte_offset + 74u + 4u * ib + 2u * h);
+    let bit = 4u * h;
+    let g0 = iq_grids[IQ3S_GRID_OFF + ((idx & 0xFFu) | (((qh >> bit) & 1u) << 8u))];
+    let g1 = iq_grids[IQ3S_GRID_OFF + (((idx >> 8u) & 0xFFu) | (((qh >> (bit + 1u)) & 1u) << 8u))];
+    let g2 = iq_grids[IQ3S_GRID_OFF + (((idx >> 16u) & 0xFFu) | (((qh >> (bit + 2u)) & 1u) << 8u))];
+    let g3 = iq_grids[IQ3S_GRID_OFF + ((idx >> 24u) | (((qh >> (bit + 3u)) & 1u) << 8u))];
+    let q = vec4<u32>(iq_signed_bytes(g0, sg), iq_signed_bytes(g1, sg >> 4u), iq_signed_bytes(g2, sg >> 8u), iq_signed_bytes(g3, sg >> 12u));
+    let e = x_off + sub * 16u;
+    return q8_scale(e) * db * f32(idot4(q, q8_words(e)));
+}
+"#;
+
+/// `block_iq2_s` on the integer dot: two 64-bit lattice entries with their
+/// sign bytes, the half's scale nibble.
+const IQ2_S_I8_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 82u;
+const BLOCK_ELEMS: u32 = 256u;
+const LANES_PER_BLOCK: u32 = 16u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u16_even(byte_offset));
+    let ib = sub / 2u;
+    let h = sub % 2u;
+    let l0 = 2u * h;
+    let sc = (read_u8(byte_offset + 74u + ib) >> (4u * h)) & 0xFu;
+    let db = d * (0.5 + f32(sc)) * 0.25;
+    let qh = read_u8(byte_offset + 66u + ib);
+    let idx2 = read_u16_even(byte_offset + 2u + 4u * ib + l0);
+    let sg2 = read_u16_even(byte_offset + 34u + 4u * ib + l0);
+    let i0 = (idx2 & 0xFFu) | ((qh << (8u - 2u * l0)) & 0x300u);
+    let i1 = (idx2 >> 8u) | ((qh << (6u - 2u * l0)) & 0x300u);
+    let e0 = IQ2S_GRID_OFF + 2u * i0;
+    let e1 = IQ2S_GRID_OFF + 2u * i1;
+    let q = vec4<u32>(iq_signed_bytes(iq_grids[e0], sg2), iq_signed_bytes(iq_grids[e0 + 1u], sg2 >> 4u), iq_signed_bytes(iq_grids[e1], sg2 >> 8u), iq_signed_bytes(iq_grids[e1 + 1u], sg2 >> 12u));
+    let e = x_off + sub * 16u;
+    return q8_scale(e) * db * f32(idot4(q, q8_words(e)));
+}
+"#;
+
+/// The legacy types on the integer dot: a 32-element block is one q8
+/// block, and a lane's four elements one word of it. Lane `sub` (0..8)
+/// takes elements `4·sub..`: the low nibbles of bytes `4·sub..` for
+/// `sub < 4`, the high nibbles of bytes `4·(sub − 4)..` above — which is
+/// why the fifth-bit word's bits `4·sub..` are the lane's in either case.
+/// `qs` sits at a two-byte offset in every layout (`d` is an `f16`), so it
+/// is read through `read_u32_at`.
+const Q4_0_I8_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 18u;
+const BLOCK_ELEMS: u32 = 32u;
+const LANES_PER_BLOCK: u32 = 8u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u16_even(byte_offset));
+    let w = read_u32_at(byte_offset + 2u + 4u * (sub % 4u));
+    let nib = select(w & 0x0F0F0F0Fu, (w >> 4u) & 0x0F0F0F0Fu, sub >= 4u);
+    let e = x_off + 4u * sub;
+    return q8_scale(e) * d * f32(dot4I8Packed(sub_bytes(nib, 0x08080808u), q8_word(e)));
+}
+"#;
+
+/// See [`Q4_0_I8_MIDDLE`]; `m` is the stored minimum, applied through
+/// the four activations' quant sum.
+const Q4_1_I8_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 20u;
+const BLOCK_ELEMS: u32 = 32u;
+const LANES_PER_BLOCK: u32 = 8u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let hdr = weights[byte_offset / 4u];
+    let d = f16_to_f32(hdr & 0xFFFFu);
+    let m = f16_to_f32(hdr >> 16u);
+    let w = weights[byte_offset / 4u + 1u + (sub % 4u)];
+    let nib = select(w & 0x0F0F0F0Fu, (w >> 4u) & 0x0F0F0F0Fu, sub >= 4u);
+    let e = x_off + 4u * sub;
+    let xq = q8_word(e);
+    return q8_scale(e) * (d * f32(dot4I8Packed(nib, xq)) + m * f32(dot4I8Packed(0x01010101u, xq)));
+}
+"#;
+
+/// See [`Q4_0_I8_MIDDLE`]; the fifth bits from `qh` at bytes 2..6.
+const Q5_0_I8_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 22u;
+const BLOCK_ELEMS: u32 = 32u;
+const LANES_PER_BLOCK: u32 = 8u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u16_even(byte_offset));
+    let qh = read_u32_at(byte_offset + 2u);
+    let w = read_u32_at(byte_offset + 6u + 4u * (sub % 4u));
+    let nib = select(w & 0x0F0F0F0Fu, (w >> 4u) & 0x0F0F0F0Fu, sub >= 4u) | spread_bits4(qh >> (4u * sub));
+    let e = x_off + 4u * sub;
+    return q8_scale(e) * d * f32(dot4I8Packed(sub_bytes(nib, 0x10101010u), q8_word(e)));
+}
+"#;
+
+/// See [`Q5_0_I8_MIDDLE`] and [`Q4_1_I8_MIDDLE`].
+const Q5_1_I8_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 24u;
+const BLOCK_ELEMS: u32 = 32u;
+const LANES_PER_BLOCK: u32 = 8u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let hdr = weights[byte_offset / 4u];
+    let d = f16_to_f32(hdr & 0xFFFFu);
+    let m = f16_to_f32(hdr >> 16u);
+    let qh = weights[byte_offset / 4u + 1u];
+    let w = weights[byte_offset / 4u + 2u + (sub % 4u)];
+    let nib = select(w & 0x0F0F0F0Fu, (w >> 4u) & 0x0F0F0F0Fu, sub >= 4u) | spread_bits4(qh >> (4u * sub));
+    let e = x_off + 4u * sub;
+    let xq = q8_word(e);
+    return q8_scale(e) * (d * f32(dot4I8Packed(nib, xq)) + m * f32(dot4I8Packed(0x01010101u, xq)));
+}
+"#;
+
+/// `block_q8_0` on the integer dot: the lane's four bytes are already the
+/// signed quants.
+const Q8_0_I8_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 34u;
+const BLOCK_ELEMS: u32 = 32u;
+const LANES_PER_BLOCK: u32 = 8u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u16_even(byte_offset));
+    let w = read_u32_at(byte_offset + 2u + 4u * sub);
+    let e = x_off + 4u * sub;
+    return q8_scale(e) * d * f32(dot4I8Packed(w, q8_word(e)));
+}
+"#;
+
+/// The integer-dot `block_dot`s: the same contract as
+/// [`block_hoisted_middle`] against a q8 activation. The word-reading float
+/// forms above are bound by the arithmetic per element, not the loads; the
+/// packed dot does four multiply-adds per instruction and takes the weight
+/// bytes as they are.
+fn block_hoisted_i8_middle(ggml_type: u32) -> Option<&'static str> {
+    Some(match ggml_type {
+        t if t == GGML_TYPE_Q2_K => Q2_K_I8_MIDDLE,
+        t if t == GGML_TYPE_Q3_K => Q3_K_I8_MIDDLE,
+        t if t == GGML_TYPE_IQ4_XS => IQ4_XS_I8_MIDDLE,
+        t if t == GGML_TYPE_IQ3_S => IQ3_S_I8_MIDDLE,
+        t if t == GGML_TYPE_IQ2_S => IQ2_S_I8_MIDDLE,
+        t if t == GGML_TYPE_Q4_0 => Q4_0_I8_MIDDLE,
+        t if t == GGML_TYPE_Q4_1 => Q4_1_I8_MIDDLE,
+        t if t == GGML_TYPE_Q5_0 => Q5_0_I8_MIDDLE,
+        t if t == GGML_TYPE_Q5_1 => Q5_1_I8_MIDDLE,
+        t if t == GGML_TYPE_Q8_0 => Q8_0_I8_MIDDLE,
+        _ => return None,
+    })
+}
+
+/// The integer-dot block-hoisted decode kernel for `ggml_type`, or `None`
+/// for a type without one. Binding 1 is the q8 activation
+/// (`shader_source_quantize_q8`); the `main` and its row batching are
+/// [`block_hoisted_suffix`]'s.
+pub fn shader_source_reduce_block_hoisted_i8(
+    ggml_type: u32,
+    n_rows: usize,
+    subgroup: bool,
+) -> Option<String> {
+    let middle = block_hoisted_i8_middle(ggml_type)?;
+    let grids = if needs_iq_grids(ggml_type) {
+        IQ_GRID_PRELUDE
+    } else {
+        ""
+    };
+    let suffix = block_hoisted_suffix(n_rows, subgroup);
+    Some(format!("{PRELUDE_Q8}\n{grids}\n{middle}\n{suffix}"))
+}
+
+/// The word-reading `block_dot`s on the **light** skeleton: the 32-lane,
+/// sixteen-lanes-per-super-block, two-blocks-in-flight `main` of
+/// `shader_source_reduce_q4k_light` (the `Q5_K`/`Q6_K` twins' form), with a
+/// type's `block_dot(byte_offset, x_off, lane)` as the per-block routine.
+///
+/// The same `block_dot`s under [`block_hoisted_suffix`] — 64 lanes, four
+/// blocks in flight, `n_rows` rows — reach half the `Q4_K` light kernel's
+/// rate per byte inside a decode step, and every knob on that `main` was
+/// measured without moving it (rows, blocks per trip, the reduce, the
+/// element mapping, the integer dot). The light `main` is the one skeleton
+/// at parity with the reference in situ, so this puts the same routines on
+/// it — and measured level with the block-hoisted form in a decode step,
+/// which rules the skeleton out too. `ORANGU_KQ_LIGHT=1` selects it.
+pub fn shader_source_reduce_kq_light(
+    ggml_type: u32,
+    n_rows: usize,
+    subgroup: bool,
+) -> Option<String> {
+    let middle = block_hoisted_words_middle(ggml_type)?;
+    let grids = if needs_iq_grids(ggml_type) {
+        IQ_GRID_PRELUDE
+    } else {
+        ""
+    };
+    let mut s = format!("{PRELUDE_XV}\n{grids}\n{middle}\n");
+    s.push_str(&format!(
+        "\nvar<workgroup> psums: array<f32, {}>;\n\n",
+        n_rows * 32
+    ));
+    s.push_str("@compute @workgroup_size(32)\nfn main(\n    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>,\n    @builtin(num_workgroups) nwg: vec3<u32>,");
+    s.push_str(subgroup_entry_params(subgroup));
+    s.push_str("\n) {\n");
+    s.push_str(&format!(
+        "    let n_row_groups = (params.out_dim + {}u) / {n_rows}u;\n",
+        n_rows - 1
+    ));
+    s.push_str("    let flat = wid.x + wid.y * nwg.x + wid.z * nwg.x * nwg.y;\n    if (flat >= n_row_groups * params.n_tokens) {\n        return;\n    }\n");
+    s.push_str("    let rg = flat / params.n_tokens;\n    let t = flat % params.n_tokens;\n");
+    s.push_str(&format!("    let o0 = rg * {n_rows}u;\n"));
+    for i in 1..n_rows {
+        s.push_str(&format!("    let o{i} = o0 + {i}u;\n"));
+    }
+    // A row past the end is computed on a clamped row and never stored, so
+    // every row's loads of a trip sit in one basic block.
+    for i in 0..n_rows {
+        s.push_str(&format!(
+            "    let oc{i} = min(o{i}, params.out_dim - 1u);\n"
+        ));
+    }
+    s.push_str("    let tid = lid.x;\n    let itid = tid % 16u;\n    let ix = tid / 16u;\n");
+    s.push_str(
+        "    let num_blocks = params.in_dim / BLOCK_ELEMS;\n    let x_tok = t * params.in_dim;\n",
+    );
+    for i in 0..n_rows {
+        s.push_str(&format!("    var acc{i}: f32 = 0.0;\n"));
+    }
+    s.push_str("    var i: u32 = ix;\n    loop {\n        if (i >= num_blocks) {\n            break;\n        }\n        let xrb = x_tok + i * BLOCK_ELEMS;\n");
+    for r in 0..n_rows {
+        s.push_str(&format!(
+            "        acc{r} = acc{r} + block_dot(oc{r} * params.row_bytes + i * BLOCK_BYTES, xrb, itid);\n"
+        ));
+    }
+    s.push_str("        i = i + 2u;\n    }\n");
+    s.push_str(&light_reduce(n_rows, subgroup));
+    s.push_str("}\n");
+    Some(s)
 }
 
 /// The per-type half of [`block_hoisted_suffix`], or `None` for a type that
@@ -4686,7 +5228,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var sumq_lo: i32 = 0;
     var sumq_hi: i32 = 0;
-    let out_base = (t * (in_dim / 256u) + super_blk) * 96u;
+    // Super-blocks per row rounded **up**: a row that is not a whole number
+    // of them (a 704-wide expert down projection) still has a slot for its
+    // last, partial one, and the kernels read only the sub-blocks it has.
+    let out_base = (t * ((in_dim + 255u) / 256u) + super_blk) * 96u;
     var w: u32 = 0u;
     loop {
         if (w >= 8u) { break; }
@@ -4837,7 +5382,7 @@ fn main(
     let local = lid.x;
     let tr = local / 16u;
     let tt = local % 16u;
-    let n_super = params.in_dim / 256u;
+    let n_super = (params.in_dim + 255u) / 256u;
     let row_vec4s = params.row_bytes / 16u;
     let wbase = tr * 9u;
     let xbase = tt * 25u;
@@ -5023,6 +5568,19 @@ pub const MMQ_WIDE_KS: u32 = 2;
 pub const MMQ_WIDE_KS_Q6K: u32 = 2;
 
 pub fn shader_source_mmq_q4k_wide(rows: u32) -> String {
+    shader_source_mmq_q4k_wide_toks(rows, MMQ_WIDE_TILE_TOKENS)
+}
+
+/// [`shader_source_mmq_q4k_wide`] at `toks` tokens per tile: 128 for a
+/// dense prefill batch, 32 for the indexed expert GEMM, where a tile is one
+/// expert's routed tokens — a few dozen — and a 128-token tile would be
+/// three quarters padding.
+pub fn shader_source_mmq_q4k_wide_toks(rows: u32, toks: u32) -> String {
+    assert!(
+        toks.is_multiple_of(16) && toks <= 128,
+        "a tile is 16 tokens per lane pair per warp"
+    );
+    let tgroups = (toks / 16) as usize;
     // `ORANGU_MMQ_WIDE_KS`: the slice depth, for measuring it.
     let ks = std::env::var("ORANGU_MMQ_WIDE_KS")
         .ok()
@@ -5094,19 +5652,19 @@ fn main(
     let lane = tid % 64u;
     let tiwr = lane % 32u;
     let tiwc = lane / 32u;
-    let n_super = params.in_dim / 256u;
+    let n_super = (params.in_dim + 255u) / 256u;
     let row_vec4s = params.row_bytes / 16u;
     let n_slices = n_super * (8u / KS);
     let m4 = vec4<u32>(0x0F0F0F0Fu);
     let f4 = vec4<u32>(4u);
 "#,
         rows = rows,
-        toks = MMQ_WIDE_TILE_TOKENS,
+        toks = toks,
         wt_len = rows * ks * 7,
-        xt_len = MMQ_WIDE_TILE_TOKENS * ks * 11,
+        xt_len = toks * ks * 11,
     ));
     for cr in 0..trows {
-        for t in 0..32 {
+        for t in 0..tgroups * 4 {
             src.push_str(&format!("    var a{cr}_{t}: f32 = 0.0;\n"));
         }
     }
@@ -5121,7 +5679,9 @@ fn main(
     let row_total = rows * ks / 2;
     let row_items = row_total.div_ceil(128) as usize;
     let row_partial = !row_total.is_multiple_of(128);
-    let tok_items = ks as usize;
+    let tok_total = toks * ks;
+    let tok_items = tok_total.div_ceil(128) as usize;
+    let tok_partial = !tok_total.is_multiple_of(128);
     src.push_str(
         r#"
     var slice: u32 = 0u;
@@ -5222,16 +5782,23 @@ fn main(
             ));
         }
         for it in 0..tok_items {
+            // A partial last round (32-token tiles: 64 items over 128
+            // threads) clamps the item so the load stays in bounds and
+            // skips the store.
+            let clamp = if tok_partial && it + 1 == tok_items {
+                format!("min(tid + {}u, TOKS * KS - 1u)", it * 128)
+            } else {
+                format!("tid + {}u", it * 128)
+            };
             src.push_str(&format!(
-                "        let ti{it} = tid + {}u;
+                "        let ti{it} = {clamp};
         let tt{it} = ti{it} % TOKS;
         let tk{it} = ti{it} / TOKS;
         let tb{it} = ((tok0 + tt{it}) * n_super + sb) * 24u;
         let th{it} = q8x[tb{it} + k0 + tk{it}];
         let tq{it}a = q8x[tb{it} + 8u + 2u * (k0 + tk{it})];
         let tq{it}b = q8x[tb{it} + 9u + 2u * (k0 + tk{it})];
-",
-                it * 128
+"
             ));
         }
         for it in 0..row_items {
@@ -5269,8 +5836,13 @@ fn main(
         ));
         }
         for it in 0..tok_items {
+            let guard = if tok_partial && it + 1 == tok_items {
+                format!("if (tid + {}u < TOKS * KS) ", it * 128)
+            } else {
+                String::new()
+            };
             src.push_str(&format!(
-                r#"        {{
+                r#"        {guard}{{
             let e = (tk{it} * TOKS + tt{it}) * 11u;
             xt[e] = tq{it}a.x;
             xt[e + 1u] = tq{it}a.y;
@@ -5312,11 +5884,12 @@ fn main(
         ));
     }
     // The thread's thirty-two tokens, each against the four rows.
-    for g in 0..8 {
+    for g in 0..tgroups {
         for cc in 0..4 {
             let t = g * 4 + cc;
             src.push_str(&format!(
-                "            {{\n            let te = (k * TOKS + warp * 64u + {}u + tiwc * 4u) * 11u;\n",
+                "            {{\n            let te = (k * TOKS + warp * {}u + {}u + tiwc * 4u) * 11u;\n",
+                toks / 2,
                 g * 8 + cc
             ));
             for i in 0..8 {
@@ -5345,11 +5918,12 @@ fn main(
     }
 "#,
     );
-    for g in 0..8 {
+    for g in 0..tgroups {
         for cc in 0..4 {
             let t = g * 4 + cc;
             src.push_str(&format!(
-                "    {{\n    let tok = tok0 + warp * 64u + {}u + tiwc * 4u;\n    if (tok < params.n_tokens) {{\n",
+                "    {{\n    let tok = tok0 + warp * {}u + {}u + tiwc * 4u;\n    if (tok < params.n_tokens) {{\n",
+                toks / 2,
                 g * 8 + cc
             ));
             for cr in 0..trows {
@@ -5376,6 +5950,17 @@ fn main(
 /// bindings as the narrow kernel: the weights as words, since a 210-byte
 /// block may start two bytes into one.
 pub fn shader_source_mmq_q6k_wide(rows: u32) -> String {
+    shader_source_mmq_q6k_wide_toks(rows, MMQ_WIDE_TILE_TOKENS)
+}
+
+/// [`shader_source_mmq_q6k_wide`] at `toks` tokens per tile — see
+/// [`shader_source_mmq_q4k_wide_toks`].
+pub fn shader_source_mmq_q6k_wide_toks(rows: u32, toks: u32) -> String {
+    assert!(
+        toks.is_multiple_of(16) && toks <= 128,
+        "a tile is 16 tokens per lane pair per warp"
+    );
+    let tgroups = (toks / 16) as usize;
     let ks = std::env::var("ORANGU_MMQ_WIDE_KS_Q6K")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -5425,16 +6010,16 @@ fn main(
     let lane = tid % 64u;
     let tiwr = lane % 32u;
     let tiwc = lane / 32u;
-    let n_super = params.in_dim / 256u;
+    let n_super = (params.in_dim + 255u) / 256u;
     let n_slices = n_super * (8u / KS);
 "#,
         rows = rows,
-        toks = MMQ_WIDE_TILE_TOKENS,
+        toks = toks,
         wt_len = rows * ks * 11,
-        xt_len = MMQ_WIDE_TILE_TOKENS * ks * 13,
+        xt_len = toks * ks * 13,
     ));
     for cr in 0..trows {
-        for t in 0..32 {
+        for t in 0..tgroups * 4 {
             src.push_str(&format!("    var a{cr}_{t}: f32 = 0.0;\n"));
         }
     }
@@ -5558,11 +6143,12 @@ fn main(
             "            let s{cr}a = bitcast<f32>(wt[re{cr} + 8u]);\n            let s{cr}b = bitcast<f32>(wt[re{cr} + 9u]);\n"
         ));
     }
-    for g in 0..8 {
+    for g in 0..tgroups {
         for cc in 0..4 {
             let t = g * 4 + cc;
             src.push_str(&format!(
-                "            {{\n            let te = (k * TOKS + warp * 64u + {}u + tiwc * 4u) * 13u;\n",
+                "            {{\n            let te = (k * TOKS + warp * {}u + {}u + tiwc * 4u) * 13u;\n",
+                toks / 2,
                 g * 8 + cc
             ));
             for i in 0..8 {
@@ -5595,11 +6181,12 @@ fn main(
     }
 "#,
     );
-    for g in 0..8 {
+    for g in 0..tgroups {
         for cc in 0..4 {
             let t = g * 4 + cc;
             src.push_str(&format!(
-                "    {{\n    let tok = tok0 + warp * 64u + {}u + tiwc * 4u;\n    if (tok < params.n_tokens) {{\n",
+                "    {{\n    let tok = tok0 + warp * {}u + {}u + tiwc * 4u;\n    if (tok < params.n_tokens) {{\n",
+                toks / 2,
                 g * 8 + cc
             ));
             for cr in 0..trows {
@@ -5636,7 +6223,18 @@ fn main(
 /// a stride of 11; tokens as the `Q4_K` kernel's. Two sub-blocks per
 /// slice, for the occupancy the `Q4_K` measurement settled on.
 pub fn shader_source_mmq_wide_bytes(ggml_type: u32, rows: u32) -> String {
+    shader_source_mmq_wide_bytes_toks(ggml_type, rows, MMQ_WIDE_TILE_TOKENS)
+}
+
+/// [`shader_source_mmq_wide_bytes`] at `toks` tokens per tile — see
+/// [`shader_source_mmq_q4k_wide_toks`].
+pub fn shader_source_mmq_wide_bytes_toks(ggml_type: u32, rows: u32, toks: u32) -> String {
     use crate::engine::quant::*;
+    assert!(
+        toks.is_multiple_of(16) && toks <= 128,
+        "a tile is 16 tokens per lane pair per warp"
+    );
+    let tgroups = (toks / 16) as usize;
     let ks = 2u32;
     assert!(
         rows.is_multiple_of(32) && rows <= 128,
@@ -6054,20 +6652,20 @@ fn main(
     let lane = tid % 64u;
     let tiwr = lane % 32u;
     let tiwc = lane / 32u;
-    let n_super = params.in_dim / 256u;
+    let n_super = (params.in_dim + 255u) / 256u;
     let n_slices = params.in_dim / 32u / KS;
 "#,
         rows = rows,
-        toks = MMQ_WIDE_TILE_TOKENS,
+        toks = toks,
         ks = ks,
         block_bytes = block_bytes,
         subs = block_elems / 32,
         row_words = row_words,
         wt_len = rows * ks * row_words,
-        xt_len = MMQ_WIDE_TILE_TOKENS * ks * 11,
+        xt_len = toks * ks * 11,
     ));
     for cr in 0..trows {
-        for t in 0..32 {
+        for t in 0..tgroups * 4 {
             src.push_str(&format!("    var a{cr}_{t}: f32 = 0.0;\n"));
         }
     }
@@ -6157,11 +6755,12 @@ fn main(
             ));
         }
     }
-    for g in 0..8 {
+    for g in 0..tgroups {
         for cc in 0..4 {
             let t = g * 4 + cc;
             src.push_str(&format!(
-                "            {{\n            let te = (k * TOKS + warp * 64u + {}u + tiwc * 4u) * 11u;\n",
+                "            {{\n            let te = (k * TOKS + warp * {}u + {}u + tiwc * 4u) * 11u;\n",
+                toks / 2,
                 g * 8 + cc
             ));
             for i in 0..8 {
@@ -6209,11 +6808,12 @@ fn main(
     }
 "#,
     );
-    for g in 0..8 {
+    for g in 0..tgroups {
         for cc in 0..4 {
             let t = g * 4 + cc;
             src.push_str(&format!(
-                "    {{\n    let tok = tok0 + warp * 64u + {}u + tiwc * 4u;\n    if (tok < params.n_tokens) {{\n",
+                "    {{\n    let tok = tok0 + warp * {}u + {}u + tiwc * 4u;\n    if (tok < params.n_tokens) {{\n",
+                toks / 2,
                 g * 8 + cc
             ));
             for cr in 0..trows {
@@ -6226,6 +6826,78 @@ fn main(
         }
     }
     src.push_str("}\n");
+    src
+}
+
+/// An integer-dot GEMM kernel over a **stack of expert matrices**, each
+/// multiplied by the rows routed to it, in one dispatch — from the source
+/// of one of the wide kernels (`shader_source_mmq_q4k_wide`,
+/// `shader_source_mmq_q6k_wide`, `shader_source_mmq_wide_bytes`).
+///
+/// The wide kernels address three things by their workgroup id: the weight
+/// rows (`wid.x`), the activation rows and the output rows (both `wid.y`).
+/// This rewrites those three addresses to come from a table instead:
+///
+/// - `ids[8 * wid.y ..]` is the workgroup's **group entry** — the row the
+///   expert's rows start at in the stack, where its token list starts in
+///   `ids`, how many of that list's tokens this tile really has, where its
+///   output rows start, and (as `f32` bits) the scale its output rows are
+///   multiplied by — a per-expert output scalar, `1.0` when there is none;
+///   three words spare;
+/// - an activation row is `ids[list + t]`, the routed token's row in the
+///   one quantized activation buffer, so the activations are staged once
+///   for the whole layer rather than gathered per expert;
+/// - an output row is `out_base + t`, so every expert's rows land in one
+///   contiguous `[sum of counts, out_dim]` result.
+///
+/// Everything else — the staging, the dot, the tiles — is the wide kernel
+/// as generated, which is the point: the expert GEMM is the dense GEMM with
+/// three addresses looked up, not a kernel of its own to keep right.
+///
+/// The token lists are padded to a whole token tile with row `0`, a valid
+/// row whose products are computed and discarded by the count guard.
+pub fn shader_source_mmq_indexed(wide: String) -> String {
+    let src = wide.replacen(
+        "@group(0) @binding(3) var<uniform> params: Meta;",
+        "@group(0) @binding(3) var<uniform> params: Meta;\n\
+         @group(0) @binding(5) var<storage, read> ids: array<u32>;",
+        1,
+    );
+    assert!(
+        src.contains("@binding(5)"),
+        "the wide kernel's Meta binding"
+    );
+    let src = src.replacen(
+        "    let row0 = wid.x * ROWS;\n    let tok0 = wid.y * TOKS;\n",
+        "    let grp = wid.y * 8u;\n    let orow0 = wid.x * ROWS;\n    let row0 = orow0 + ids[grp];\n    \
+         let list_base = ids[grp + 1u];\n    let n_count = ids[grp + 2u];\n    let out_base = ids[grp + 3u];\n    \
+         let oscale = bitcast<f32>(ids[grp + 4u]);\n    let tok0 = 0u;\n",
+        1,
+    );
+    assert!(src.contains("let orow0"), "the wide kernel's tile origin");
+    // Activation rows through the token list.
+    let re = regex::Regex::new(r"\(tok0 \+ (\w+)\) \* n_super").expect("a literal pattern");
+    let src = re
+        .replace_all(&src, "ids[list_base + $1] * n_super")
+        .into_owned();
+    assert!(
+        !src.contains("(tok0 +"),
+        "every activation row goes through the list"
+    );
+    // Output rows through the group's base, guarded by its count.
+    let src = src.replace("if (tok < params.n_tokens) {", "if (tok < n_count) {");
+    let src = src.replace(
+        "y[tok * params.out_dim + row0 +",
+        "y[(out_base + tok) * params.out_dim + orow0 +",
+    );
+    assert!(
+        src.contains("(out_base + tok)"),
+        "the wide kernel's output rows"
+    );
+    // The output scale, on every store: `... = aN_M;` → `... = aN_M * oscale;`.
+    let re = regex::Regex::new(r"\] = (a\d+_\d+);").expect("a literal pattern");
+    let src = re.replace_all(&src, "] = $1 * oscale;").into_owned();
+    assert!(src.contains("* oscale;"), "the wide kernel's stores");
     src
 }
 
@@ -6334,7 +7006,7 @@ fn main(
     let local = lid.x;
     let tr = local / 16u;
     let tt = local % 16u;
-    let n_super = params.in_dim / 256u;
+    let n_super = (params.in_dim + 255u) / 256u;
     let wbase = tr * 17u;
     let xbase = tt * 25u;
     let sbase = tr * 17u;
@@ -8222,6 +8894,9 @@ pub fn shader_source_coop_tiled(ggml_type: u32, vec4_tiles: CoopVec4Tiles) -> Op
 /// sub-layer chain — `wo` through the next layer's normed input — can be
 /// recorded into one command encoder and read back once, instead of once
 /// per matmul call. See `VulkanBackend::fused_post_attention`.
+/// [`ELEM_META`] for a kernel assembled outside this module.
+pub const ELEM_META_SRC: &str = ELEM_META;
+
 const ELEM_META: &str = r#"
 struct ElemMeta {
     len: u32,
@@ -8607,6 +9282,135 @@ pub fn shader_source_sigmoid_gate() -> String {
 
 pub fn shader_source_gelu_mul() -> String {
     format!("{ELEM_META}\n{GELU_MUL_SHADER_BODY}")
+}
+
+/// The routed experts' outputs combined per token: `y[t] = sum over the
+/// token's picks r of w[t][r] * rows[slot[t][r]]`, where `rows` is the
+/// down projection's `[total, n_embd]` result in group order, `table`
+/// holds every token's `k` row slots and then, as `f32` bits, its `k`
+/// weights (the routing weight times any per-expert output scale; `0` for
+/// a pick the token does not have). `elem4` bindings: rows, table, the
+/// combined rows, the meta — `len = n_tokens * n_embd`, `aux = n_embd`,
+/// `extra = k`. Grid-stride like the activations.
+const MOE_COMBINE_SHADER_BODY: &str = r#"
+@group(0) @binding(0) var<storage, read> rows: array<f32>;
+@group(0) @binding(1) var<storage, read> table: array<u32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> em: ElemMeta;
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    let n_embd = em.aux;
+    let k = u32(em.extra);
+    let n_tokens = em.len / n_embd;
+    var i: u32 = gid.x;
+    let stride = nwg.x * 64u;
+    loop {
+        if (i >= em.len) {
+            break;
+        }
+        let t = i / n_embd;
+        let e = i % n_embd;
+        var acc: f32 = 0.0;
+        var r: u32 = 0u;
+        loop {
+            if (r >= k) { break; }
+            let slot = table[t * k + r];
+            let w = bitcast<f32>(table[n_tokens * k + t * k + r]);
+            acc = acc + w * rows[slot * n_embd + e];
+            r = r + 1u;
+        }
+        y[i] = acc;
+        i = i + stride;
+    }
+}
+"#;
+
+pub fn shader_source_moe_combine() -> String {
+    format!("{ELEM_META}\n{MOE_COMBINE_SHADER_BODY}")
+}
+
+/// The fused activation+multiply that also writes the product's 8-bit form
+/// (`shader_source_quantize_q8`'s layout, binding 3) for a down projection
+/// on the integer dot: each 64-thread workgroup owns 64 consecutive
+/// elements — two 32-element blocks — so a block's scale and quant sum are
+/// two 32-lane reductions through workgroup memory. One workgroup per 64
+/// elements (`len` a multiple of 32), no grid stride. `silu` selects the
+/// SwiGLU form. Two outputs, so it sits on the norm pair's layout: `a` at
+/// 0, `b` at 2, the product at 4, its q8 at 5, the meta at 6; 1, 3 and 7
+/// take placeholders.
+pub fn shader_source_activation_mul_q8(silu: bool) -> String {
+    let act = if silu {
+        "let g = v / (1.0 + exp(-v));"
+    } else {
+        "let sqrt_2_over_pi = 0.7978846;\n        let coef_a = 0.044715;\n        let g = 0.5 * v * (1.0 + tanh(clamp(sqrt_2_over_pi * v * (1.0 + coef_a * v * v), -20.0, 20.0)));"
+    };
+    format!(
+        r#"{ELEM_META}
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(4) var<storage, read_write> y: array<f32>;
+@group(0) @binding(5) var<storage, read_write> q8: array<u32>;
+@group(0) @binding(6) var<uniform> em: ElemMeta;
+
+var<workgroup> amax: array<f32, 64>;
+var<workgroup> sums: array<i32, 64>;
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {{
+    let i = gid.x;
+    let local = lid.x;
+    let inb = i < em.len;
+    var p: f32 = 0.0;
+    if (inb) {{
+        let v = a[i];
+        {act}
+        p = g * b[i];
+        y[i] = p;
+    }}
+    amax[local] = abs(p);
+    workgroupBarrier();
+    let c = (local / 32u) * 32u;
+    var m: f32 = 0.0;
+    var j: u32 = 0u;
+    loop {{
+        if (j >= 32u) {{ break; }}
+        m = max(m, amax[c + j]);
+        j = j + 1u;
+    }}
+    let d = m / 127.0;
+    let id = select(0.0, 1.0 / d, d > 0.0);
+    let q = clamp(i32(round(p * id)), -127, 127);
+    sums[local] = q;
+    workgroupBarrier();
+    // Four lanes pack a word each; lane 0 of the block its header.
+    let blk = i / 32u;
+    let e = local % 32u;
+    if (inb && (e % 4u) == 0u) {{
+        let word = (u32(sums[local]) & 0xFFu) | ((u32(sums[local + 1u]) & 0xFFu) << 8u)
+            | ((u32(sums[local + 2u]) & 0xFFu) << 16u) | ((u32(sums[local + 3u]) & 0xFFu) << 24u);
+        q8[blk * 10u + 2u + e / 4u] = word;
+    }}
+    if (inb && e == 0u) {{
+        var sum: i32 = 0;
+        j = 0u;
+        loop {{
+            if (j >= 32u) {{ break; }}
+            sum = sum + sums[c + j];
+            j = j + 1u;
+        }}
+        q8[blk * 10u] = bitcast<u32>(d);
+        q8[blk * 10u + 1u] = bitcast<u32>(sum);
+    }}
+}}
+"#
+    )
 }
 
 pub fn shader_source_scale() -> String {
@@ -9290,8 +10094,15 @@ pub fn shader_source_rmsnorm_add_norm_wide() -> String {
     src.push_str("@group(0) @binding(4) var<storage, read_write> y1: array<vec4<f32>>;\n");
     src.push_str("@group(0) @binding(5) var<storage, read_write> y2: array<vec4<f32>>;\n");
     src.push_str("@group(0) @binding(6) var<uniform> em: ElemMeta;\n");
+    // The 8-bit form of `y2` for the integer-dot matvecs that read it
+    // (`shader_source_quantize_q8`'s layout), written when `em.aux == 1`:
+    // eight adjacent lanes hold a 32-element block's eight `vec4`s, so its
+    // scale and quant sum are two eight-lane reductions through workgroup
+    // memory — the row never leaves the kernel that made it, and the
+    // consumers need no quantize dispatch of their own.
+    src.push_str("@group(0) @binding(7) var<storage, read_write> q8: array<u32>;\n");
     src.push_str(&format!(
-        "\nvar<workgroup> partial_sums: array<f32, {wg}>;\nvar<workgroup> stripe_sums: array<f32, {stripes}>;\n\n\
+        "\nvar<workgroup> partial_sums: array<f32, {wg}>;\nvar<workgroup> stripe_sums: array<f32, {stripes}>;\nvar<workgroup> q8_amax: array<f32, {wg}>;\nvar<workgroup> q8_sum: array<i32, {wg}>;\n\n\
          fn reduce_all(local: u32, partial: f32) -> f32 {{\n\
          \x20   partial_sums[local] = partial;\n    workgroupBarrier();\n\
          \x20   if (local < {stripes}u) {{\n        let base = local * {stripe}u;\n        var s: f32 = 0.0;\n"
@@ -9345,13 +10156,112 @@ pub fn shader_source_rmsnorm_add_norm_wide() -> String {
     );
     for i in 0..slots {
         src.push_str(&format!(
-            "    if (k{i} < n4) {{ y2[k{i}] = v{i} * scale2 * w2[k{i}]; }}\n"
+            "    if (k{i} < n4) {{ v{i} = v{i} * scale2 * w2[k{i}]; y2[k{i}] = v{i}; }}\n"
         ));
     }
     src.push_str(&format!(
-        "    k = local + {}u;\n    loop {{\n        if (k >= n4) {{ break; }}\n        y2[k] = y1[k] * scale2 * w2[k];\n        k = k + {wg}u;\n    }}\n}}\n",
+        "    k = local + {}u;\n    loop {{\n        if (k >= n4) {{ break; }}\n        y2[k] = y1[k] * scale2 * w2[k];\n        k = k + {wg}u;\n    }}\n",
         slots * wg
     ));
+    src.push_str(&q8_epilogue(slots, wg));
+    src.push_str("}\n");
+    src
+}
+
+/// The q8 epilogue the norm kernels share: with `em.aux == 1`, the row the
+/// slots hold as `v0..vN` (`k0..kN` their `vec4` indices, `n4` the row's
+/// `vec4` count) is written in `shader_source_quantize_q8`'s layout to
+/// `q8`. Eight adjacent lanes hold a 32-element block's eight `vec4`s, so
+/// a block's scale and quant sum are two eight-lane reductions through
+/// `q8_amax`/`q8_sum`. Only rows the slots cover whole (`n4 <= slots *
+/// wg`) are quantized here; the caller binds the q8 output only for those.
+fn q8_epilogue(slots: usize, wg: usize) -> String {
+    let mut src = String::from("    if (em.aux == 1u) {\n");
+    for i in 0..slots {
+        // A slot no lane of the row reaches is skipped whole — uniformly, so
+        // its barriers go with it: a 1536-wide row uses two of the eight.
+        src.push_str(&format!(
+            "        if ({}u < n4) {{\n        {{\n            let a = select(vec4<f32>(0.0), abs(v{i}), k{i} < n4);\n            q8_amax[local] = max(max(a.x, a.y), max(a.z, a.w));\n        }}\n        workgroupBarrier();\n        {{\n            let c = (local / 8u) * 8u;\n            var amax: f32 = q8_amax[c];\n",
+            i * wg
+        ));
+        for j in 1..8 {
+            src.push_str(&format!(
+                "            amax = max(amax, q8_amax[c + {j}u]);\n"
+            ));
+        }
+        src.push_str(&format!(
+            "            let d = amax / 127.0;\n            let id = select(0.0, 1.0 / d, d > 0.0);\n            let q = clamp(vec4<i32>(round(v{i} * id)), vec4<i32>(-127), vec4<i32>(127));\n            q8_sum[local] = q.x + q.y + q.z + q.w;\n            let word = (u32(q.x) & 0xFFu) | ((u32(q.y) & 0xFFu) << 8u) | ((u32(q.z) & 0xFFu) << 16u) | ((u32(q.w) & 0xFFu) << 24u);\n            let blk = k{i} / 8u;\n            if (k{i} < n4) {{ q8[blk * 10u + 2u + (k{i} % 8u)] = word; }}\n            workgroupBarrier();\n            if (k{i} < n4 && (local % 8u) == 0u) {{\n                var sum: i32 = 0;\n"
+        ));
+        for j in 0..8 {
+            src.push_str(&format!("                sum = sum + q8_sum[c + {j}u];\n"));
+        }
+        src.push_str(
+            "                q8[blk * 10u] = bitcast<u32>(d);\n                q8[blk * 10u + 1u] = bitcast<u32>(sum);\n            }\n            workgroupBarrier();\n        }\n        }\n",
+        );
+    }
+    src.push_str("    }\n");
+    src
+}
+
+/// The plain wide RMSNorm with the q8 epilogue, for the attention norm
+/// whose projections run on the integer dot: on the norm pair's layout
+/// (`x` at 0, `weight` at 1, `y` at 4, `q8` at 5, the meta at 6;
+/// placeholders at 2, 3 and 7). Same arithmetic as
+/// `shader_source_rmsnorm_wide`.
+pub fn shader_source_rmsnorm_wide_q8() -> String {
+    let wg = NORM_WIDE_WG;
+    let slots = NORM_WIDE_SLOTS;
+    let stripes = 16;
+    let stripe = wg / stripes;
+    let mut src = String::new();
+    src.push_str(ELEM_META);
+    src.push_str("\n@group(0) @binding(0) var<storage, read> x: array<vec4<f32>>;\n");
+    src.push_str("@group(0) @binding(1) var<storage, read> weight: array<vec4<f32>>;\n");
+    src.push_str("@group(0) @binding(4) var<storage, read_write> y: array<vec4<f32>>;\n");
+    src.push_str("@group(0) @binding(5) var<storage, read_write> q8: array<u32>;\n");
+    src.push_str("@group(0) @binding(6) var<uniform> em: ElemMeta;\n");
+    src.push_str(&format!(
+        "\nvar<workgroup> partial_sums: array<f32, {wg}>;\nvar<workgroup> stripe_sums: array<f32, {stripes}>;\nvar<workgroup> q8_amax: array<f32, {wg}>;\nvar<workgroup> q8_sum: array<i32, {wg}>;\n\n\
+         @compute @workgroup_size({wg})\nfn main(@builtin(local_invocation_id) lid: vec3<u32>) {{\n\
+         \x20   let local = lid.x;\n\
+         \x20   let n4 = em.len / 4u;\n"
+    ));
+    for i in 0..slots {
+        src.push_str(&format!(
+            "    let k{i} = local + {}u;\n    var v{i} = vec4<f32>(0.0);\n    if (k{i} < n4) {{ v{i} = x[k{i}]; }}\n",
+            i * wg
+        ));
+    }
+    src.push_str("    var partial: f32 = 0.0;\n");
+    for i in 0..slots {
+        src.push_str(&format!("    partial = partial + dot(v{i}, v{i});\n"));
+    }
+    src.push_str(&format!(
+        "    var k: u32 = local + {}u;\n    loop {{\n        if (k >= n4) {{ break; }}\n        let v = x[k];\n        partial = partial + dot(v, v);\n        k = k + {wg}u;\n    }}\n",
+        slots * wg
+    ));
+    src.push_str(&format!(
+        "    partial_sums[local] = partial;\n    workgroupBarrier();\n    if (local < {stripes}u) {{\n        let sb = local * {stripe}u;\n        var s: f32 = 0.0;\n"
+    ));
+    for j in 0..stripe {
+        src.push_str(&format!("        s = s + partial_sums[sb + {j}u];\n"));
+    }
+    src.push_str("        stripe_sums[local] = s;\n    }\n    workgroupBarrier();\n    var total: f32 = 0.0;\n");
+    for j in 0..stripes {
+        src.push_str(&format!("    total = total + stripe_sums[{j}u];\n"));
+    }
+    src.push_str("    let scale = 1.0 / sqrt(total / f32(em.len) + em.extra);\n");
+    for i in 0..slots {
+        src.push_str(&format!(
+            "    if (k{i} < n4) {{ v{i} = v{i} * scale * weight[k{i}]; y[k{i}] = v{i}; }}\n"
+        ));
+    }
+    src.push_str(&format!(
+        "    k = local + {}u;\n    loop {{\n        if (k >= n4) {{ break; }}\n        y[k] = x[k] * scale * weight[k];\n        k = k + {wg}u;\n    }}\n",
+        slots * wg
+    ));
+    src.push_str(&q8_epilogue(slots, wg));
+    src.push_str("}\n");
     src
 }
 

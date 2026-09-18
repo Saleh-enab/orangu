@@ -616,6 +616,38 @@ gemma 4 checkpoint."
                 config.architecture
             );
         }
+        // The streaming region the grouped expert GEMM will need, sized for
+        // the largest stack of any layer and created **now**, ahead of the
+        // weights: what is allocated first is what lands in the card's own
+        // memory, and a region that arrives after the weights have filled
+        // the card lands in host memory, where every expert dispatch reads
+        // it across the bus (measured: a fixed 40 ms per dispatch against
+        // 6 with the region resident).
+        if is_moe
+            && super::expert_gemm_min_tokens() > 0
+            && let Some(vulkan) = backend.as_wgpu()
+        {
+            let largest = layers
+                .iter()
+                .filter_map(|l| l.moe.as_ref())
+                .flat_map(|m| {
+                    let gate_up = match &m.gate_up {
+                        GemmaExpertGateUp::Fused { gate_up, .. } => {
+                            vec![gate_up.stack_matrix().raw_bytes().len()]
+                        }
+                        GemmaExpertGateUp::Separate { gate, up, .. } => vec![
+                            gate.stack_matrix().raw_bytes().len()
+                                + up.stack_matrix().raw_bytes().len(),
+                        ],
+                    };
+                    gate_up.into_iter().chain(std::iter::once(
+                        m.down_exps.stack_matrix().raw_bytes().len(),
+                    ))
+                })
+                .max()
+                .unwrap_or(0);
+            vulkan.reserve_stream_region(largest as u64);
+        }
 
         Ok(Self {
             config,
@@ -3360,7 +3392,9 @@ impl GemmaModel {
         // the split between "the routed branch" and "everything the layer
         // sends to the device around it".
         let t_experts = Instant::now();
-        let contribs = if super::gpu_experts() && self.backend.as_wgpu().is_some() {
+        let contribs = if (super::gpu_experts() || super::expert_gemm_wide(selection.len()))
+            && self.backend.as_wgpu().is_some()
+        {
             let (gate_proj, up_proj) = match &moe.gate_up {
                 GemmaExpertGateUp::Fused { gate_up, scale } => {
                     let n_ff = gate_up.out_dim / 2;
@@ -3399,6 +3433,16 @@ impl GemmaModel {
                 scale: moe.down_scale.as_deref(),
                 ..super::ExpertProjection::whole(&moe.down_exps)
             };
+            // The next MoE layer's gate/up stack, for the grouped path to
+            // stage while this layer's down projection runs.
+            let next = self
+                .layers
+                .get(il + 1)
+                .and_then(|l| l.moe.as_ref())
+                .map(|m| match &m.gate_up {
+                    GemmaExpertGateUp::Fused { gate_up, .. } => gate_up,
+                    GemmaExpertGateUp::Separate { gate, .. } => gate,
+                });
             super::evaluate_routed_experts_batched_views(
                 self.backend.as_ref(),
                 &selection,
@@ -3407,6 +3451,8 @@ impl GemmaModel {
                 Some(&gate_proj),
                 &up_proj,
                 &down_proj,
+                next,
+                Some(super::FusedActivation::Geglu),
                 |gate, up| {
                     let mut h = gate.to_vec();
                     tensor::gelu_inplace(&mut h);

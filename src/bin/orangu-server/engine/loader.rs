@@ -1096,6 +1096,32 @@ impl ExpertQuantMatrix {
         }
     }
 
+    /// Every expert as **one** [`QuantMatrix`]: the stacked tensor viewed
+    /// as the `[in_dim, n_expert * out_dim]` matrix it is laid out as, for
+    /// a kernel that multiplies a whole stack in one dispatch and finds an
+    /// expert's rows by offset (`VulkanBackend::matmul_experts`).
+    ///
+    /// Valid because the experts are contiguous: `expert_stride` is exactly
+    /// an expert's rows, which [`LoadedModel::expert_matrix`] checks against
+    /// the tensor's length when the stack is opened.
+    pub fn stack_matrix(&self) -> QuantMatrix {
+        assert_eq!(
+            self.expert_stride,
+            self.row_bytes * self.out_dim,
+            "a stack with padding between experts is not one matrix"
+        );
+        QuantMatrix {
+            bytes: self.bytes.clone(),
+            ggml_type: self.ggml_type,
+            start: self.start,
+            row_bytes: self.row_bytes,
+            in_dim: self.in_dim,
+            out_dim: self.n_expert * self.out_dim,
+            device: 0,
+            layer: NO_LAYER,
+        }
+    }
+
     /// One expert's still-quantized bytes, as they lie in the mapping.
     ///
     /// The unit a residency policy works in: `engine::expert_store` asks the

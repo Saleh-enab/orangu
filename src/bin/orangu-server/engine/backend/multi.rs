@@ -64,6 +64,28 @@
 //! `LayerCache::copy_prefix_from` drops the mirror, so no buffer can
 //! survive into a cache being reused elsewhere.
 //!
+//! # A host layer's projections, at prefill width
+//!
+//! A layer the plan left on the host runs its projections on the CPU — at
+//! one token that is right, the weights are already in RAM and the card
+//! would spend longer fetching them than multiplying. At prefill width it
+//! is not: the same weights multiply every token of the batch, so sending
+//! them across the bus once per call and running the GEMM on the card
+//! costs the upload plus a fraction of the host GEMM. Measured on a 48-layer
+//! model split 18:30 over a card and the host, a 257-token chunk spent
+//! 540 ms per host layer in three projections against 200 ms per device
+//! layer for the whole of attention and the FFN.
+//!
+//! So [`Self::matmul`] and [`Self::matmul_batch`] send a host layer's op to
+//! the first card's **streaming region** ([`VulkanBackend::matmul_batch_streamed`])
+//! once the batch is [`host_stream_min_tokens`] wide. The region is bounded
+//! and recycled, so the card's residency plan is untouched; the result
+//! comes back to the host exactly as the CPU's would, so nothing about the
+//! layer's attention or cache changes. Decode never takes it:
+//! [`Self::matmul_decode`] and [`Self::matmul_batch_decode`] route to the
+//! weight's own device regardless of width, for the reason
+//! [`Backend::matmul_decode`] exists at all.
+//!
 //! # Same backend, always
 //!
 //! Every device here comes from one API's own enumeration, so a set can
@@ -95,6 +117,26 @@ fn no_split_fusion() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| crate::engine::env::flag_on("ORANGU_NO_SPLIT_FUSION"))
 }
+
+/// The narrowest batch at which a host layer's projection is streamed to a
+/// card rather than run on the CPU — `ORANGU_HOST_STREAM_TOKENS`, default
+/// [`HOST_STREAM_TOKENS_DEFAULT`]; `0` keeps every host layer on the host.
+///
+/// A width rather than a switch, because the crossover is one: below it
+/// the upload outweighs the GEMM and above it the GEMM outweighs the
+/// upload, and a sweep of the value is how the default was set.
+pub(crate) fn host_stream_min_tokens() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ORANGU_HOST_STREAM_TOKENS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(HOST_STREAM_TOKENS_DEFAULT)
+    })
+}
+
+/// Where the streamed projection overtakes the host GEMM.
+const HOST_STREAM_TOKENS_DEFAULT: usize = 32;
 
 /// A `Backend` that forwards each operation to the device holding its
 /// weights.
@@ -132,6 +174,30 @@ impl MultiDeviceBackend {
         self.devices[index].as_ref()
     }
 
+    /// The card a host layer's wide projection streams to: the first
+    /// device in the set with a streaming region, which is the card the
+    /// plan filled first and so the one whose layers neighbour the host's.
+    ///
+    /// Not gated on [`no_split_fusion`]: that switch takes the *fused*
+    /// per-layer chains off a split model, and a streamed projection is a
+    /// plain matmul — the one kind of work that switch leaves on a device.
+    fn streamer(&self) -> Option<&VulkanBackend> {
+        self.devices.iter().find_map(|device| device.as_wgpu())
+    }
+
+    /// Whether `op` is a host layer's projection wide enough to stream —
+    /// see the module doc. Never true for a weight that already lives on a
+    /// card, and never for a type that card has no kernel for.
+    fn streams(&self, op: &MatmulOp<'_>) -> bool {
+        let min = host_stream_min_tokens();
+        min > 0
+            && op.n_tokens >= min
+            && self.backend_for(op.w).as_wgpu().is_none()
+            && self
+                .streamer()
+                .is_some_and(|card| card.supports_type(op.w.ggml_type()))
+    }
+
     /// Runs `ops` grouped by device, so each device still sees its share as
     /// one batch.
     ///
@@ -140,17 +206,30 @@ impl MultiDeviceBackend {
     /// command buffer and blocks once for a whole group, and routing each
     /// op individually would turn a layer's Q/K/V projections back into
     /// three round trips.
+    ///
+    /// With `stream`, a host layer's ops wide enough to stream
+    /// ([`Self::streams`]) form one more group, sent to the card's
+    /// streaming region as one batch — a layer's Q/K/V upload once and
+    /// submit once, the same as they would on their own device.
     fn batch_by_device(
         &self,
         ops: &[MatmulOp<'_>],
+        stream: bool,
         run: impl Fn(&dyn Backend, &[MatmulOp<'_>]) -> Vec<Vec<f32>>,
     ) -> Vec<Vec<f32>> {
         let mut results: Vec<Option<Vec<f32>>> = (0..ops.len()).map(|_| None).collect();
+        let streamed: Vec<usize> = if stream {
+            (0..ops.len()).filter(|&i| self.streams(&ops[i])).collect()
+        } else {
+            Vec::new()
+        };
         for device in 0..self.devices.len() {
             let mine: Vec<usize> = ops
                 .iter()
                 .enumerate()
-                .filter(|(_, op)| op.w.device().min(self.devices.len() - 1) == device)
+                .filter(|(i, op)| {
+                    op.w.device().min(self.devices.len() - 1) == device && !streamed.contains(i)
+                })
                 .map(|(i, _)| i)
                 .collect();
             if mine.is_empty() {
@@ -168,6 +247,22 @@ impl MultiDeviceBackend {
                 results[*slot] = Some(out);
             }
         }
+        if !streamed.is_empty() {
+            let card = self
+                .streamer()
+                .expect("an op streams only when the set has a card to stream to");
+            let group: Vec<MatmulOp<'_>> = streamed
+                .iter()
+                .map(|&i| MatmulOp {
+                    x: ops[i].x,
+                    n_tokens: ops[i].n_tokens,
+                    w: ops[i].w,
+                })
+                .collect();
+            for (slot, out) in streamed.iter().zip(card.matmul_batch_streamed(&group)) {
+                results[*slot] = Some(out);
+            }
+        }
         results
             .into_iter()
             .map(|out| out.expect("every op belongs to exactly one device"))
@@ -177,11 +272,20 @@ impl MultiDeviceBackend {
 
 impl Backend for MultiDeviceBackend {
     fn matmul(&self, x: &[f32], n_tokens: usize, w: &QuantMatrix) -> Vec<f32> {
+        let op = MatmulOp { x, n_tokens, w };
+        if self.streams(&op) {
+            return self
+                .streamer()
+                .expect("an op streams only when the set has a card to stream to")
+                .matmul_batch_streamed(std::slice::from_ref(&op))
+                .pop()
+                .expect("matmul_batch_streamed returns exactly one result per input op");
+        }
         self.backend_for(w).matmul(x, n_tokens, w)
     }
 
     fn matmul_batch(&self, ops: &[MatmulOp<'_>]) -> Vec<Vec<f32>> {
-        self.batch_by_device(ops, |backend, group| backend.matmul_batch(group))
+        self.batch_by_device(ops, true, |backend, group| backend.matmul_batch(group))
     }
 
     /// Routed to each device's *decode* entry point, not its `matmul` —
@@ -194,7 +298,9 @@ impl Backend for MultiDeviceBackend {
     }
 
     fn matmul_batch_decode(&self, ops: &[MatmulOp<'_>]) -> Vec<Vec<f32>> {
-        self.batch_by_device(ops, |backend, group| backend.matmul_batch_decode(group))
+        self.batch_by_device(ops, false, |backend, group| {
+            backend.matmul_batch_decode(group)
+        })
     }
 
     /// Always `None` — see the module doc. This is the single line that
