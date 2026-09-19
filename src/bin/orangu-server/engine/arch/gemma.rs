@@ -3949,7 +3949,7 @@ fn cpu_timestamps() -> bool {
     *ON.get_or_init(|| std::env::var_os("ORANGU_CPU_TIMESTAMPS").is_some())
 }
 
-fn prefill_kv_wait() -> bool {
+pub(crate) fn prefill_kv_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_PREFILL_KV_WAIT"))
 }
@@ -3961,7 +3961,7 @@ fn prefill_stream_ple_inputs() -> bool {
     crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_PLE_INPUTS")
 }
 
-fn prefill_layers_per_submit() -> usize {
+pub(crate) fn prefill_layers_per_submit() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
         std::env::var("ORANGU_PREFILL_LAYERS_PER_SUBMIT")

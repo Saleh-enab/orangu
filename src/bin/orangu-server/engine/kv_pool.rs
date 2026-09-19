@@ -1036,10 +1036,36 @@ impl KvPool {
         None
     }
 
-    /// Returns a region taken by [`Self::alloc_table`].
+    /// Returns a region taken by [`Self::alloc_table`], merged with the
+    /// free regions either side of it. Without the merge a sequence's
+    /// table came back as a fragment: after two short prompts between
+    /// two long ones the free list held every entry the long one needed
+    /// and no run long enough, and the long request ran without a table —
+    /// every device path then fell back to the per-request mirror on top
+    /// of the pages it still held, twice the KV on a card it filled.
     pub fn free_table(&self, base: usize, entries: usize) {
         let mut inner = self.inner.lock().expect("kv pool poisoned");
-        inner.free_tables.push((base, entries));
+        let mut base = base;
+        let mut end = base + entries;
+        loop {
+            let Some(i) = inner
+                .free_tables
+                .iter()
+                .position(|&(b, n)| b + n == base || b == end)
+            else {
+                break;
+            };
+            let (b, n) = inner.free_tables.swap_remove(i);
+            base = base.min(b);
+            end = end.max(b + n);
+        }
+        // What was handed out last is what `table_next` grew past; a run
+        // that ends there gives the tail back to it.
+        if end == inner.table_next {
+            inner.table_next = base;
+        } else {
+            inner.free_tables.push((base, end - base));
+        }
     }
 
     /// Writes a *range of rows* of one page, rather than the whole page.
@@ -2448,6 +2474,43 @@ mod tests {
         let (device, queue) = vulkan.device_and_queue();
         pool.attach_device(device, KvStorage::F16, 4);
         pool.write_table(queue, 2, &[0, 1, 2]);
+    }
+
+    /// Table regions given back merge with their neighbours, so a long
+    /// sequence after two short ones finds the run it needs — the shape
+    /// that used to leave a request paged without a table.
+    #[test]
+    fn freed_table_regions_merge_with_their_neighbours() {
+        use crate::engine::backend::vulkan_shaders::KvStorage;
+        let _gpu_lock = crate::engine::backend::vulkan::gpu_test_lock();
+        let Some(vulkan) = crate::engine::backend::vulkan::shared_test_backend() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let mut pool = KvPool::with_policy(
+            8,
+            16,
+            vec![LayerGeometry {
+                kv_dim: 32,
+                stride: 1,
+            }],
+            Policy::Lru,
+        );
+        let (device, _) = vulkan.device_and_queue();
+        pool.attach_device(device, KvStorage::F16, 8);
+        // A long sequence, then two short ones in its place, then the
+        // long one again.
+        let long = pool.alloc_table(7).expect("room for seven");
+        pool.free_table(long, 7);
+        let a = pool.alloc_table(3).expect("room for three");
+        let b = pool.alloc_table(3).expect("room for three more");
+        assert!(pool.alloc_table(7).is_none(), "six of eight are taken");
+        pool.free_table(a, 3);
+        pool.free_table(b, 3);
+        assert!(
+            pool.alloc_table(7).is_some(),
+            "the two freed runs and the tail merge into one of eight"
+        );
     }
 
     /// Attaching is optional, and a host-only pool must stay fully usable —

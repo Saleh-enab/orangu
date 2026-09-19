@@ -340,6 +340,15 @@ impl LlamaModel {
 /// Whether `ORANGU_NO_FUSED_QKV` restores the step-by-step Q/K/V, RoPE,
 /// KV-write and attention sequence.
 ///
+/// `ORANGU_LLAMA_RESIDENT_PREFILL=0` keeps a prefill chunk on the
+/// step-by-step path — the control arm for the device-resident stream.
+fn resident_prefill_off() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        !crate::engine::env::flag_on_unless_disabled("ORANGU_LLAMA_RESIDENT_PREFILL")
+    })
+}
+
 /// The control for the fused chain's A/B, and the fallback for anything the
 /// chain does not implement. Read once — an env lookup per layer per token
 /// would itself be measurable.
@@ -649,6 +658,7 @@ impl LlamaModel {
         let head_dim = self.head_dim();
 
         let mut encoder = vulkan.new_encoder("orangu-server llama decode");
+        vulkan.begin_op_step(&mut encoder);
         // Per-stage GPU timing for this step, when `ORANGU_GPU_TIMESTAMPS=1`
         // and the adapter has the query; inert otherwise. See
         // `VulkanBackend::begin_step_timestamps` for why the slot arithmetic
@@ -944,10 +954,15 @@ impl LlamaModel {
             // answers the second case and `None` the first.
             return self.record_split_decode(cache, tokens, start_pos, slot_id);
         };
+        // A decode step after a prompt whose last chunk parked its rows
+        // (a prompt served in one no-logits chunk, say) fills them first.
+        vulkan.fill_deferred_kv_rows(cache);
         let host_tail = self.tail_on_host();
         let tail = if host_tail { Tail::Host } else { Tail::Device };
         let (encoder, buf, offset) =
             self.record_decode_chain(vulkan, cache, tokens, start_pos, slot_id, tail)?;
+        let mut encoder = encoder;
+        vulkan.finish_op_step(&mut encoder);
         let logits = if host_tail {
             // `[n_embd]` back instead of `[n_vocab]` — on a 128k vocabulary
             // that is half a megabyte of readback this no longer does.
@@ -959,6 +974,7 @@ impl LlamaModel {
         if vulkan.gpu_timestamps() {
             vulkan.report_timestamps(start_pos, self.layers.len());
         }
+        vulkan.report_op_step(start_pos);
         Some(logits)
     }
 
@@ -1057,6 +1073,211 @@ impl LlamaModel {
     /// state for every token (`[n_tokens, n_embd]`) — the shared core of
     /// both next-token prediction ([`ModelForward::forward`]) and pooled
     /// embeddings ([`LlamaModel::forward_hidden_states`]).
+    /// The tokens' embedding rows, scaled by the family's multiplier
+    /// (Granite's; 1 elsewhere) — dequantized a token per task.
+    fn scaled_token_embeddings(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        use rayon::prelude::*;
+        let cfg = &self.config;
+        let n_embd = cfg.n_embd;
+        if let Some(&tok) = tokens.iter().find(|&&t| t as usize >= cfg.n_vocab) {
+            anyhow::bail!("token id {tok} is out of vocab range");
+        }
+        let scale = self.mul.embedding;
+        let mut x = vec![0f32; tokens.len() * n_embd];
+        x.par_chunks_mut(n_embd)
+            .zip(tokens.par_iter())
+            .for_each(|(dst, &tok)| {
+                let row = self.tok_embeddings.row(tok as usize);
+                for (d, r) in dst.iter_mut().zip(row.iter()) {
+                    *d = r * scale;
+                }
+            });
+        Ok(x)
+    }
+
+    /// Whether a prefill chunk of `n_tokens` runs on the device-resident
+    /// stream (`run_layers_resident`): every layer's chains on one card,
+    /// nothing of the layer on the host, and no diagnostic that wants the
+    /// host's copy.
+    fn resident_prefill_serves(&self, n_tokens: usize) -> bool {
+        // Any width above one: the step-by-step path's advantage at
+        // narrow widths was over the per-layer chain that read back at
+        // every layer, and the stream reads back nothing. (The sizer's
+        // 16-token probe chunk took the step path otherwise, and pushed
+        // its rows ahead of the previous chunk's parked ones.)
+        n_tokens > 1
+            && !no_fused_qkv()
+            && !no_fused_post_attention()
+            && !resident_prefill_off()
+            && self.mul.residual == 1.0
+            && crate::engine::dump_ffn_dir().is_none()
+            && orangu::npu_ffn::service().is_none()
+            && self
+                .backend
+                .as_wgpu()
+                .is_some_and(|v| v.prefill_fused_attention_enabled())
+            && self
+                .layers
+                .iter()
+                .all(|l| l.q_norm.is_none() && l.k_norm.is_none() && l.wo.device() == 0)
+    }
+
+    /// A prefill chunk with the **residual stream on the device**: `x` is
+    /// uploaded once, every layer is its attention chain and its
+    /// post-attention chain recorded back to back into a group of a few
+    /// layers per submission, the K/V rows come home once per chunk (and
+    /// for a chunk whose residual nobody reads, only after the next chunk's
+    /// chains are submitted), and `x` is read back only when `want_x`.
+    /// This is the shape `arch::gemma` runs; the step-by-step
+    /// [`Self::run_layers`] brought attention's output and the residual
+    /// home at every layer — two readbacks and a host turn per layer, with
+    /// the device idle through each. Measured on a 1B file at 2238 tokens:
+    /// 956 → 1690 tok/s.
+    ///
+    /// `None` when the stream is not in place for this chunk; the caller
+    /// takes the step-by-step path, whose result is the same.
+    fn run_layers_resident(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        want_x: bool,
+    ) -> Result<Option<Vec<f32>>> {
+        use crate::engine::backend::vulkan::{
+            AttnOutSrc, FusedAttnPrefillInput, FusedAttnPrefillKv,
+        };
+        let cfg = &self.config;
+        let n_tokens = tokens.len();
+        let n_embd = cfg.n_embd;
+        let head_dim = self.head_dim();
+        let n_head = cfg.n_head;
+        let n_head_kv = cfg.n_head_kv;
+        let kv_dim = n_head_kv * head_dim;
+        if !self.resident_prefill_serves(n_tokens) {
+            return Ok(None);
+        }
+        let Some(vulkan) = self.backend.as_wgpu() else {
+            return Ok(None);
+        };
+        let x = self.scaled_token_embeddings(tokens)?;
+        // The chunk's stage for every layer's K/V rows; declined when the
+        // chain must wait per layer (`ORANGU_PREFILL_KV_WAIT`).
+        let Some(mut kv_stage) = (!crate::engine::arch::gemma::prefill_kv_wait()).then(|| {
+            vulkan.kv_readback_stage((self.layers.len() * n_tokens * kv_dim * 2 * 4) as u64)
+        }) else {
+            return Ok(None);
+        };
+        cache.discard_pending_rows();
+        // The two buffers the residual alternates between; whole tiles
+        // past `n_tokens`, since a striped chain writes its padded tail.
+        let device_rows = crate::engine::backend::vulkan::prefill_rows_capacity(n_tokens);
+        let mut bufs: [wgpu::Buffer; 2] =
+            std::array::from_fn(|_| vulkan.prefill_rows_buffer(device_rows * n_embd));
+        vulkan.upload_rows(&bufs[0], &x);
+        vulkan.begin_op_span();
+        let layers_per_submit = crate::engine::arch::gemma::prefill_layers_per_submit();
+        let mut group_layers = 0usize;
+        let mut pending_kv: Vec<(usize, Vec<crate::engine::backend::vulkan::PendingKvRows>)> =
+            Vec::new();
+        vulkan.begin_prefill_group();
+        for (il, layer) in self.layers.iter().enumerate() {
+            let attn_input = FusedAttnPrefillInput {
+                x_gpu: Some((&bufs[0], 0)),
+                attn_norm: Some(layer.attn_norm.as_slice()),
+                q_bias: layer.q_bias.as_deref(),
+                pairing: self.rope.layout,
+                yarn: crate::engine::backend::vulkan::RopeYarn::from_params(&self.rope),
+                normalize_v: false,
+                attn_gate: None,
+                normed: &[],
+                n_tokens,
+                start_pos,
+                wq: &layer.wq,
+                q_norm: None,
+                kv: Some(FusedAttnPrefillKv {
+                    k_bias: layer.k_bias.as_deref(),
+                    v_bias: layer.v_bias.as_deref(),
+                    wk: &layer.wk,
+                    k_norm: None,
+                    wv: Some(&layer.wv),
+                }),
+                n_head,
+                n_head_kv,
+                head_dim,
+                rope_dim: cfg.rope_dim,
+                rope_freq_base: cfg.rope_freq_base,
+                freq_factors: self.rope_freq_factors.as_deref(),
+                eps: cfg.rms_eps,
+                n_swa: 0,
+                causal: true,
+                scale: self.attn_scale(),
+                want_attn_out_host: false,
+            };
+            let Some((attn, pending)) = vulkan.fused_attention_prefill_deferred(
+                attn_input,
+                &mut cache.layers[il],
+                &mut kv_stage,
+            ) else {
+                // Mid-chunk the stream cannot be given up: what was
+                // recorded is submitted, its rows brought home, and the
+                // caller starts the chunk over on the host path.
+                vulkan.end_prefill_group();
+                vulkan.fill_kv_rows(kv_stage, std::mem::take(&mut pending_kv), cache);
+                cache.discard_pending_rows();
+                return Ok(None);
+            };
+            if !pending.is_empty() {
+                pending_kv.push((il, pending));
+            }
+            let out = vulkan.fused_post_attention_prefill_rows(
+                AttnOutSrc::Gpu(&attn.attn_out_buf, 0, n_tokens),
+                AttnOutSrc::Gpu(&bufs[0], 0, n_tokens),
+                n_tokens,
+                &layer.wo,
+                None,
+                &layer.ffn_norm,
+                &layer.w_gate,
+                &layer.w_up,
+                &layer.w_down,
+                None,
+                cfg.rms_eps,
+                crate::engine::backend::vulkan::FfnActivation::Swiglu,
+                Some((&bufs[1], 0)),
+                None,
+                None,
+            );
+            if out.is_none() {
+                vulkan.end_prefill_group();
+                vulkan.fill_kv_rows(kv_stage, std::mem::take(&mut pending_kv), cache);
+                cache.discard_pending_rows();
+                return Ok(None);
+            }
+            bufs.swap(0, 1);
+            group_layers += 1;
+            if group_layers >= layers_per_submit.max(1) {
+                vulkan.end_prefill_group();
+                vulkan.begin_prefill_group();
+                group_layers = 0;
+            }
+        }
+        vulkan.end_prefill_group();
+        // The previous chunk's rows, parked while this chunk's chains were
+        // recorded and submitted — brought home now, while the device works.
+        vulkan.fill_deferred_kv_rows(cache);
+        let x = if want_x {
+            vulkan.readback_rows(&bufs[0], n_tokens * n_embd)
+        } else {
+            Vec::new()
+        };
+        if want_x {
+            vulkan.fill_kv_rows(kv_stage, pending_kv, cache);
+        } else {
+            vulkan.defer_kv_rows(kv_stage, pending_kv, cache);
+        }
+        vulkan.finish_op_span(start_pos);
+        Ok(Some(x))
+    }
+
     fn run_layers(
         &self,
         cache: &mut KvCache,
@@ -1071,18 +1292,13 @@ impl LlamaModel {
         let n_head_kv = cfg.n_head_kv;
         let kv_dim = n_head_kv * head_dim;
 
+        // Rows a resident chunk parked for the chunk after it are brought
+        // home before anything here pushes past them.
+        if let Some(vulkan) = self.backend.as_wgpu() {
+            vulkan.fill_deferred_kv_rows(cache);
+        }
         // Embedding lookup: x[t, :] = tok_embeddings[token[t], :].
-        let mut x = vec![0f32; n_tokens * n_embd];
-        for (t, &tok) in tokens.iter().enumerate() {
-            let tok = tok as usize;
-            anyhow::ensure!(tok < cfg.n_vocab, "token id {tok} is out of vocab range");
-            x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
-        }
-        if self.mul.embedding != 1.0 {
-            for v in x.iter_mut() {
-                *v *= self.mul.embedding;
-            }
-        }
+        let mut x = self.scaled_token_embeddings(tokens)?;
 
         // Grown once and reused across layers rather than allocated per layer:
         // at prefill widths this is megabytes a layer. The two norm scratch
@@ -1567,10 +1783,13 @@ impl ModelForward for LlamaModel {
                     // `slot_id + 1` just above.
                     slot_id + 1,
                 );
+                let mut encoder = encoder;
+                vulkan.finish_op_step(&mut encoder);
                 let next = vulkan.submit_and_readback_u32(encoder, &sample_buf);
                 if vulkan.gpu_timestamps() {
                     vulkan.report_timestamps(start_pos, self.layers.len());
                 }
+                vulkan.report_op_step(start_pos);
                 return Ok(super::ForwardOutcome::Token(next));
             }
             self.forward(cache, tokens, start_pos, slot_id)
@@ -1612,7 +1831,10 @@ impl ModelForward for LlamaModel {
             return Ok(logits);
         }
 
-        let x = self.run_layers(cache, tokens, start_pos)?;
+        let x = match self.run_layers_resident(cache, tokens, start_pos, true)? {
+            Some(x) => x,
+            None => self.run_layers(cache, tokens, start_pos)?,
+        };
 
         // Only the last token's hidden state is needed for next-token
         // logits — a batched prefill doesn't need every position's output.
@@ -1632,6 +1854,25 @@ impl ModelForward for LlamaModel {
             }
         }
         Ok(logits)
+    }
+
+    fn forward_no_logits(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Result<()> {
+        // A chunk before the last: on the resident stream its residual
+        // stays on the device and its K/V readback is parked for the next
+        // chunk to complete.
+        if self
+            .run_layers_resident(cache, tokens, start_pos, false)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.forward(cache, tokens, start_pos, slot_id).map(|_| ())
     }
 
     fn forward_hidden_states(&self, tokens: &[u32]) -> Result<Vec<f32>> {

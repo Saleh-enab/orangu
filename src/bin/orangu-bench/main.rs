@@ -436,6 +436,67 @@ impl Args {
 /// forever would turn "the server is not up" into a hang, and an HTTP error
 /// status is a real answer that must not be papered over. The retry is announced
 /// so a run that needed one is never mistaken for a clean one.
+/// A request the server declined outright with a client error — on
+/// orangu-server a prompt past the context it can hold on the device
+/// ("a longer prompt is refused rather than risking the device"). A point
+/// that meets one is recorded as refused and the run goes on to the next;
+/// it is a fact about the server's capacity, which a sweep wants beside the
+/// numbers rather than in place of them.
+#[derive(Debug)]
+struct Refused {
+    status: u16,
+    reason: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "server refused the request (HTTP {}): {}",
+            self.status, self.reason
+        )
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// The error a failed request becomes: a [`Refused`] for a 4xx, so a
+/// caller can tell a capacity refusal from a broken server, and the
+/// plain message otherwise.
+fn status_error(resp: reqwest::blocking::Response) -> anyhow::Error {
+    let status = resp.status();
+    if status.is_client_error() {
+        let reason = resp
+            .text()
+            .map(|t| t.trim().chars().take(200).collect::<String>())
+            .unwrap_or_default();
+        return anyhow::Error::new(Refused {
+            status: status.as_u16(),
+            reason,
+        });
+    }
+    anyhow::anyhow!("server returned HTTP {status}")
+}
+
+/// The refusal behind an error, when that is what it is.
+fn as_refused(err: &anyhow::Error) -> Option<&Refused> {
+    err.downcast_ref::<Refused>()
+}
+
+/// One point the server refused, in the table's row or the JSON stream —
+/// no rate, the reason instead — so the sweep's other points still land
+/// and the ceiling is on record beside them.
+fn report_refused(json: bool, kind: &str, n: u32, r: &Refused) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ kind: n, "refused": true, "http": r.status, "reason": r.reason })
+        );
+    } else {
+        println!("{n:>8} | refused (HTTP {}): {}", r.status, r.reason);
+    }
+}
+
 fn post_with_one_retry(
     client: &reqwest::blocking::Client,
     endpoint: &str,
@@ -766,7 +827,7 @@ fn run_prefill_once(
     let t0 = Instant::now();
     let resp = post_with_one_retry(client, &endpoint, &body)?;
     if !resp.status().is_success() {
-        anyhow::bail!("server returned HTTP {}", resp.status());
+        return Err(status_error(resp));
     }
 
     let mut reader = BufReader::new(resp);
@@ -887,7 +948,7 @@ fn run_embed_once(
         .send()
         .map_err(|_| anyhow::anyhow!("Error sending request to url ({endpoint})"))?;
     if !resp.status().is_success() {
-        anyhow::bail!("server returned HTTP {}", resp.status());
+        return Err(status_error(resp));
     }
     let v: serde_json::Value = resp.json()?;
     let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -965,7 +1026,7 @@ fn stream_and_time(
     let t0 = Instant::now();
     let resp = post_with_one_retry(client, &endpoint, body)?;
     if !resp.status().is_success() {
-        anyhow::bail!("server returned HTTP {}", resp.status());
+        return Err(status_error(resp));
     }
 
     let mut reader = BufReader::new(resp);
@@ -1924,18 +1985,36 @@ fn warm_up_for_sweep(client: &reqwest::blocking::Client, args: &Args) -> anyhow:
     } else {
         run_embed_once(client, &args.url, &p, &args.model)?;
     }
-    // Then the workload's own path, where there is one to warm.
-    let longest = args.pp.iter().chain(args.embed.iter()).copied().max();
-    if let Some(depth) = longest {
-        let prompt = build_prompt(depth);
-        for _ in 0..2 {
-            if args.embed.is_empty() {
-                // `cache_prompt: false` — a warmup that seeded the prefix
-                // cache would make the first measured rep a cache hit and
-                // report a lookup as a prefill.
-                run_prefill_once(client, &args.url, &prompt, &args.model, false)?;
-            } else {
-                run_embed_once(client, &args.url, &prompt, &args.model)?;
+    // Then the workload's own path, where there is one to warm — at the
+    // longest prompt the server takes: one past its context ceiling is
+    // refused, and its own point records that.
+    let mut lengths: Vec<u32> = args.pp.iter().chain(args.embed.iter()).copied().collect();
+    lengths.sort_unstable();
+    lengths.dedup();
+    if !lengths.is_empty() {
+        for depth in lengths.into_iter().rev() {
+            let prompt = build_prompt(depth);
+            let mut refused = false;
+            for _ in 0..2 {
+                let r = if args.embed.is_empty() {
+                    // `cache_prompt: false` — a warmup that seeded the prefix
+                    // cache would make the first measured rep a cache hit and
+                    // report a lookup as a prefill.
+                    run_prefill_once(client, &args.url, &prompt, &args.model, false).map(|_| ())
+                } else {
+                    run_embed_once(client, &args.url, &prompt, &args.model).map(|_| ())
+                };
+                match r {
+                    Ok(()) => {}
+                    Err(e) if as_refused(&e).is_some() => {
+                        refused = true;
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            if !refused {
+                break;
             }
         }
         return Ok(());
@@ -1947,18 +2026,27 @@ fn warm_up_for_sweep(client: &reqwest::blocking::Client, args: &Args) -> anyhow:
     // not. Generate once at the deepest requested context for the run's own
     // length, so what is recorded is the warm engine every rep after would
     // have measured anyway.
-    if let Some(depth) = args.depths.iter().copied().max()
-        && args.n_gen > 0
-    {
-        let prompt = build_prompt(depth);
-        run_once(
-            client,
-            &args.url,
-            &prompt,
-            args.n_gen,
-            &args.model,
-            args.temperature,
-        )?;
+    if args.n_gen > 0 {
+        // Deepest first; a depth the server refuses (past its context
+        // ceiling) is left to its own point to record, and the warm-up
+        // takes the next one down.
+        let mut depths: Vec<u32> = args.depths.clone();
+        depths.sort_unstable();
+        for depth in depths.into_iter().rev() {
+            let prompt = build_prompt(depth);
+            match run_once(
+                client,
+                &args.url,
+                &prompt,
+                args.n_gen,
+                &args.model,
+                args.temperature,
+            ) {
+                Ok(_) => break,
+                Err(e) if as_refused(&e).is_some() => continue,
+                Err(e) => return Err(e),
+            }
+        }
     }
     Ok(())
 }
@@ -2704,7 +2792,7 @@ fn run_pg_once(
     let t0 = Instant::now();
     let resp = post_with_one_retry(client, &endpoint, &body)?;
     if !resp.status().is_success() {
-        anyhow::bail!("server returned HTTP {}", resp.status());
+        return Err(status_error(resp));
     }
 
     let mut reader = BufReader::new(resp);
@@ -2789,18 +2877,29 @@ fn run_tg(
         // Discarded, for the reason `run_pp` documents.
         let _ = moe::take_stats(client, &args.url);
         let _ = moe::take_stages(client, &args.url);
+        let mut refused: Option<Refused> = None;
         for _ in 0..args.reps.max(1) {
             args.drop_page_cache(client);
-            let s = run_once(
+            let s = match run_once(
                 client,
                 &args.url,
                 &prompt,
                 args.n_gen,
                 &args.model,
                 args.temperature,
-            )?;
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    refused = Some(e.downcast::<Refused>()?);
+                    break;
+                }
+            };
             rates.push(s.tok_per_s());
             last_sample = Some(s);
+        }
+        if let Some(r) = refused {
+            report_refused(args.json, "depth", depth, &r);
+            continue;
         }
         let moe_stats = moe::take_stats(client, &args.url);
         let stage_stats = moe::take_stages(client, &args.url);
@@ -3584,11 +3683,22 @@ fn run_pp(
         // so what the read after the loop returns is this point alone.
         let _ = moe::take_stats(client, &args.url);
         let _ = moe::take_stages(client, &args.url);
+        let mut refused: Option<Refused> = None;
         for _ in 0..args.reps.max(1) {
             args.drop_page_cache(client);
-            let s = run_prefill_once(client, &args.url, &prompt, &args.model, false)?;
+            let s = match run_prefill_once(client, &args.url, &prompt, &args.model, false) {
+                Ok(s) => s,
+                Err(e) => {
+                    refused = Some(e.downcast::<Refused>()?);
+                    break;
+                }
+            };
             rates.push(s.tok_per_s());
             last = Some(s);
+        }
+        if let Some(r) = refused {
+            report_refused(args.json, "pp", len, &r);
+            continue;
         }
         let moe_stats = moe::take_stats(client, &args.url);
         let stage_stats = moe::take_stages(client, &args.url);
@@ -5144,7 +5254,7 @@ fn run_curve(
 
     let resp = post_with_one_retry(client, &endpoint, &body)?;
     if !resp.status().is_success() {
-        anyhow::bail!("server returned HTTP {}", resp.status());
+        return Err(status_error(resp));
     }
 
     // Arrival time of each generated token.

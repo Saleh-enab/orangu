@@ -4135,7 +4135,19 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             // is the control arm.
             memory_hints: match std::env::var("ORANGU_VULKAN_MEMORY_HINT").as_deref() {
                 Ok("performance") => wgpu::MemoryHints::Performance,
-                _ => wgpu::MemoryHints::MemoryUsage,
+                Ok("usage") => wgpu::MemoryHints::MemoryUsage,
+                Ok(v) if v.trim().parse::<u64>().is_ok() => wgpu::MemoryHints::Manual {
+                    suballocated_device_memory_block_size: (4 << 20)
+                        ..(v.trim().parse::<u64>().unwrap_or(16) << 20),
+                },
+                // Blocks of at most 16 MiB: the chains' per-call scratch
+                // and uploads churn, and a block stays with the card while
+                // one live allocation sits in it — with 64 MiB blocks a
+                // 4446-token prompt on a 1.9 GiB model held 1280 MiB of
+                // them with 383 live and filled the card.
+                _ => wgpu::MemoryHints::Manual {
+                    suballocated_device_memory_block_size: (4 << 20)..(16 << 20),
+                },
             },
             trace: Default::default(),
         }))
@@ -8154,7 +8166,20 @@ impl VulkanBackend {
 
         let (x_buffer, x_offset, output_buffer, output_offset) =
             if pool_prefill_regions() && n_tokens > 1 {
-                self.pooled_regions(align, x_len, output_len, region_slot)
+                // Sized for the whole stripe the width rounds up to, not
+                // the width: the sizer cuts a prompt into chunks of any
+                // width (327, 366, 386, 512, 94 …), and a region per
+                // distinct width was 380 MiB of a 4 GiB card on a 1.9 GiB
+                // model after one long prompt — the difference between its
+                // weights staying on the card through the prompt and not.
+                // Every width up to a stripe now shares one region.
+                let rows = prefill_rows_capacity(n_tokens);
+                self.pooled_regions(
+                    align,
+                    (rows * in_dim) as u64 * 4,
+                    (rows * out_dim) as u64 * 4,
+                    region_slot,
+                )
             } else {
                 let (x_buffer, x_offset) = self.x_arena.lock().expect("x arena poisoned").alloc(
                     &self.device,
@@ -20449,6 +20474,29 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             eprintln!(
                 "orangu-server: [{tag}]   {:>9.1} MiB {count:>5}x  {label}",
                 *bytes as f64 / (1024.0 * 1024.0)
+            );
+        }
+        // The blocks themselves, by size class: how many, and how much of
+        // them is live — the difference is what the allocator holds that
+        // nothing uses, which the card still has to find room for.
+        let mut classes: HashMap<u64, (usize, u64, u64)> = HashMap::new();
+        for b in &report.blocks {
+            let live: u64 = report.allocations[b.allocations.clone()]
+                .iter()
+                .map(|a| a.size)
+                .sum();
+            let e = classes.entry(b.size >> 20).or_default();
+            e.0 += 1;
+            e.1 += b.size;
+            e.2 += live;
+        }
+        let mut classes: Vec<_> = classes.into_iter().collect();
+        classes.sort_by_key(|(size, _)| std::cmp::Reverse(*size));
+        for (size_mib, (count, total, live)) in classes {
+            eprintln!(
+                "orangu-server: [{tag}]   blocks of {size_mib:>5} MiB: {count:>3}, {:>8.1} MiB held, {:>8.1} live",
+                total as f64 / (1024.0 * 1024.0),
+                live as f64 / (1024.0 * 1024.0)
             );
         }
     }

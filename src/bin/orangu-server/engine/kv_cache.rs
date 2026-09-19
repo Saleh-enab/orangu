@@ -212,11 +212,21 @@ impl SequencePages {
         }
         // Reserved up front, for the whole sequence's possible length: growing
         // it later would move the region, and the base is baked into every
-        // dispatch's meta uniform.
-        let table = pool
-            .device_pages()
-            .and_then(|_| pool.alloc_table(max_pages))
-            .map(|base| (base, max_pages));
+        // dispatch's meta uniform. A pool with device pages and no table
+        // room declines the sequence outright — one that went on without a
+        // table kept its pages *and* built the per-request mirror every
+        // device path falls back to, which is what the caller's contiguous
+        // cache would have cost on its own.
+        let table = match pool.device_pages() {
+            Some(_) => match pool.alloc_table(max_pages) {
+                Some(base) => Some((base, max_pages)),
+                None => {
+                    pool.release_reserved(max_pages);
+                    return None;
+                }
+            },
+            None => None,
+        };
         Some(Self {
             pool,
             table,
@@ -828,6 +838,20 @@ impl GpuLayerCache {
         let k_size = kv_bytes;
         let v_off = (k_off + k_size).next_multiple_of(align);
         let v_size = kv_bytes;
+        if crate::engine::env::flag_on("ORANGU_KV_TRACE") {
+            eprintln!(
+                "[kv-trace] contiguous mirror for {capacity} positions x {kv_dim}: {:.1} MiB (backtrace: {})",
+                2.0 * kv_bytes as f64 / (1024.0 * 1024.0),
+                std::backtrace::Backtrace::force_capture()
+                    .to_string()
+                    .lines()
+                    .filter(|l| l.contains("orangu_server::"))
+                    .take(6)
+                    .map(|l| l.trim().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" < ")
+            );
+        }
         let kv_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orangu-server kv cache (k|v)"),
             size: v_off + v_size,
