@@ -1285,6 +1285,17 @@ gemma 4 checkpoint."
         let n_embd = self.config.n_embd;
         let eps = self.rms_eps();
         let mut x = x0.to_vec();
+        // The chunk's host phases, for `ORANGU_CPU_TIMESTAMPS`: what the
+        // host does before its chains are recorded, the recording itself,
+        // the submission, and what it waits for afterwards. A device idle
+        // between chunks is one of these.
+        let phase_clock = (n_tokens > 1 && cpu_timestamps()).then(std::time::Instant::now);
+        let mut phases: Vec<(&str, f64)> = Vec::new();
+        let phase = |name: &'static str, phases: &mut Vec<(&str, f64)>| {
+            if let Some(t) = phase_clock {
+                phases.push((name, t.elapsed().as_secs_f64() * 1000.0));
+            }
+        };
         // A pass that ended early must not leave a prediction behind for the
         // next one to be credited with.
         crate::engine::route_ahead::reset();
@@ -1323,6 +1334,7 @@ gemma 4 checkpoint."
 
         let per_layer = self.n_embd_per_layer;
         let has_ple = per_layer > 0;
+        phase("stage", &mut phases);
         // The per-layer-embedding inputs: on the device, as one GEMM and one
         // dispatch recorded ahead of the first layer's chain, when the chunk
         // runs its chains there; on the host otherwise. The device form is
@@ -1378,6 +1390,7 @@ gemma 4 checkpoint."
         };
         // Whether the model has per-layer inputs at all, wherever they are.
         let ple_inputs_present = has_ple;
+        phase("ple", &mut phases);
 
         // CPU-side wall-clock around each GPU submission this
         // (CPU-orchestrated) prefill path makes — unlike the fused decode
@@ -1426,14 +1439,27 @@ gemma 4 checkpoint."
             }
         };
         // A batch starts on the device: its attention stage norms the rows
-        // there, and nothing of it runs on the host.
-        if batch.is_some() {
+        // there, and nothing of it runs on the host. So does a dense
+        // prefill chunk: with `x` on the host, the first layer's attention
+        // chain was the one chain that read its result back, and that wait
+        // is for the *latest* submission — the previous chunk — so the
+        // rest of this chunk was recorded with the device idle once the
+        // parked K/V readback stopped waiting for it (`fill_deferred_kv_rows`).
+        let starts_on_device = batch.is_some()
+            || (n_tokens > 1
+                && one.is_some()
+                && kv_stage.is_some()
+                && self.layers.iter().all(|l| l.moe.is_none()));
+        if starts_on_device {
             match (&stream_bufs, self.backend.as_wgpu()) {
                 (Some(bufs), Some(v)) => {
                     v.upload_rows(&bufs[0], &x);
                     x_dev = Some(bufs[0].clone());
                 }
-                _ => anyhow::bail!("a batched decode step needs the device-resident chains"),
+                _ if batch.is_some() => {
+                    anyhow::bail!("a batched decode step needs the device-resident chains")
+                }
+                _ => {}
             }
         }
         // How many layers' chains go into one submission while the stream is
@@ -2273,17 +2299,21 @@ gemma 4 checkpoint."
                 group_layers = 0;
             }
         }
+        phase("record", &mut phases);
         if let Some(v) = self.backend.as_wgpu() {
             v.end_prefill_group();
         }
+        phase("submit", &mut phases);
         // The previous chunk's rows, parked while this chunk's chains were
         // recorded and submitted — brought home now, while the device works.
         if let (Some(vulkan), Some(cache)) = (self.backend.as_wgpu(), one.as_deref_mut()) {
             vulkan.fill_deferred_kv_rows(cache);
         }
+        phase("fill-previous", &mut phases);
         if want_x {
             land(&mut x, &mut x_dev);
         }
+        phase("land", &mut phases);
         // Every group is submitted, so the rows are on their way. A chunk
         // whose residual nobody reads (`want_x` off — one before the last)
         // parks the readback for the next chunk to complete after *its*
@@ -2308,6 +2338,22 @@ gemma 4 checkpoint."
         }
         if let Some(vulkan) = self.backend.as_wgpu() {
             vulkan.finish_op_span(start_pos);
+        }
+        phase("kv", &mut phases);
+        if phase_clock.is_some() {
+            let mut last = 0.0;
+            let parts: Vec<String> = phases
+                .iter()
+                .map(|(name, at)| {
+                    let d = at - last;
+                    last = *at;
+                    format!("{name} {d:.1}")
+                })
+                .collect();
+            eprintln!(
+                "orangu-server: [cpu-trace] chunk pos {start_pos} n_tokens={n_tokens}: {} — total {last:.1}ms",
+                parts.join(", ")
+            );
         }
 
         Ok(x)
@@ -2619,20 +2665,7 @@ impl ModelForward for GemmaModel {
             "'{}' is an embeddings-only architecture and does not support text generation",
             self.config.architecture
         );
-        let n_tokens = tokens.len();
-        let n_embd = self.config.n_embd;
-        let mut x = vec![0f32; n_tokens * n_embd];
-        for (t, &tok) in tokens.iter().enumerate() {
-            let tok = tok as usize;
-            anyhow::ensure!(
-                tok < self.config.n_vocab,
-                "token id {tok} is out of vocab range"
-            );
-            x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
-        }
-        for v in x.iter_mut() {
-            *v *= (n_embd as f32).sqrt();
-        }
+        let x = self.scaled_token_embeddings(tokens)?;
         self.run_layers(
             Some(cache),
             None,
@@ -2705,18 +2738,7 @@ impl ModelForward for GemmaModel {
 
         // Embedding lookup, scaled by sqrt(n_embd) — every real-token input
         // path (Gemma never leaves this unscaled outside multimodal input).
-        let mut x = vec![0f32; n_tokens * n_embd];
-        for (t, &tok) in tokens.iter().enumerate() {
-            let tok = tok as usize;
-            anyhow::ensure!(
-                tok < self.config.n_vocab,
-                "token id {tok} is out of vocab range"
-            );
-            x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
-        }
-        for v in x.iter_mut() {
-            *v *= (n_embd as f32).sqrt();
-        }
+        let x = self.scaled_token_embeddings(tokens)?;
 
         // Per-layer embeddings (PLE), if this model has them: the decode/
         // GPU-fused branch folds the whole projection into the same
@@ -3123,6 +3145,29 @@ impl GemmaModel {
     /// instead) — it's a
     /// tiny embedding-table lookup, cheap enough to stay a plain CPU
     /// gather + upload rather than needing its own GPU kernel.
+    /// The tokens' embedding rows, scaled by `sqrt(n_embd)` — every
+    /// real-token input path (Gemma never leaves this unscaled outside
+    /// multimodal input). Dequantized a token per task.
+    fn scaled_token_embeddings(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        use rayon::prelude::*;
+        let n_embd = self.config.n_embd;
+        let n_vocab = self.config.n_vocab;
+        if let Some(&tok) = tokens.iter().find(|&&t| t as usize >= n_vocab) {
+            anyhow::bail!("token id {tok} is out of vocab range");
+        }
+        let scale = (n_embd as f32).sqrt();
+        let mut x = vec![0f32; tokens.len() * n_embd];
+        x.par_chunks_mut(n_embd)
+            .zip(tokens.par_iter())
+            .for_each(|(dst, &tok)| {
+                let row = self.tok_embeddings.row(tok as usize);
+                for (d, r) in dst.iter_mut().zip(row.iter()) {
+                    *d = r * scale;
+                }
+            });
+        Ok(x)
+    }
+
     fn gather_per_layer_tok_embd(&self, tokens: &[u32], n_tokens: usize) -> Vec<f32> {
         let per_layer = self.n_embd_per_layer;
         let n_layer = self.layers.len();
@@ -3131,14 +3176,19 @@ impl GemmaModel {
 
         let row_width = per_layer * n_layer;
         let mut gathered = vec![0f32; n_tokens * row_width];
-        for (t, &tok) in tokens.iter().enumerate() {
-            let row = per_layer_tok_embd.row(tok as usize);
-            let dst = &mut gathered[t * row_width..(t + 1) * row_width];
-            dst.copy_from_slice(&row);
-        }
-        for v in gathered.iter_mut() {
-            *v *= tok_embd_scale;
-        }
+        // One row per token, dequantized from the table — a chunk's worth
+        // is a few million elements, so the tokens go to every core: this
+        // was 16 ms of a 512-token chunk's host turn on one.
+        use rayon::prelude::*;
+        gathered
+            .par_chunks_mut(row_width)
+            .zip(tokens.par_iter())
+            .for_each(|(dst, &tok)| {
+                let row = per_layer_tok_embd.row(tok as usize);
+                for (d, r) in dst.iter_mut().zip(row.iter()) {
+                    *d = r * tok_embd_scale;
+                }
+            });
         gathered
     }
 
@@ -3890,6 +3940,13 @@ fn moe_head_enabled() -> bool {
 fn prefill_stream_dense() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_STREAM_DENSE"))
+}
+
+/// `ORANGU_CPU_TIMESTAMPS`: the host-side phase trace of a decode step and
+/// of a prefill chunk.
+fn cpu_timestamps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ORANGU_CPU_TIMESTAMPS").is_some())
 }
 
 fn prefill_kv_wait() -> bool {

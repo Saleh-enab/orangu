@@ -983,6 +983,9 @@ pub struct VulkanBackend {
     /// decode-step-scoped delta of this (see `Self::submission_count`)
     /// reflects how many GPU round trips a decode step makes.
     submission_count: std::sync::atomic::AtomicU64,
+    /// The last prefill group's submission (`end_prefill_group`), for a
+    /// readback parked on it to wait for exactly that.
+    last_group_submission: Mutex<Option<wgpu::SubmissionIndex>>,
     /// GPU RoPE (`vulkan_shaders::shader_source_rope`) — reuses
     /// `elem3_bind_group_layout` (its bindings match that shape).
     rope_pipeline: wgpu::ComputePipeline,
@@ -5155,6 +5158,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             subgroup_reduce,
             attn_split_reduce_pipeline,
             submission_count: std::sync::atomic::AtomicU64::new(0),
+            last_group_submission: Mutex::new(None),
             rope_pipeline,
             perhead_rmsnorm_pipeline,
             fused_norm_rope_pipeline,
@@ -8708,6 +8712,9 @@ pub struct KvReadbackStage {
 struct DeferredKvFill {
     stage: KvReadbackStage,
     pending: Vec<(usize, Vec<PendingKvRows>)>,
+    /// The submission that carries the rows' copies — what the fill waits
+    /// for, and no later one.
+    submission: Option<wgpu::SubmissionIndex>,
 }
 
 impl KvReadbackStage {
@@ -11546,6 +11553,35 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 // yield so a co-scheduled poller isn't starved between passes.
                 std::thread::yield_now();
             }
+        }
+    }
+
+    /// [`Self::wait_mapped`] for a map whose buffer was last written by
+    /// `submission`: blocks until that submission is done and no longer —
+    /// later submissions keep running.
+    fn wait_mapped_for(&self, wait: &MapWait, submission: wgpu::SubmissionIndex, context: &str) {
+        let deadline = std::time::Instant::now() + READBACK_WAIT_TIMEOUT;
+        loop {
+            self.poll_blocking_with(
+                wgpu::PollType::Wait {
+                    submission_index: Some(submission.clone()),
+                    timeout: None,
+                },
+                context,
+            );
+            wait.check(context);
+            if wait.is_done() {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                crate::device_lost::fail(
+                    context,
+                    format_args!(
+                        "the buffer map did not complete within {READBACK_WAIT_TIMEOUT:?}"
+                    ),
+                );
+            }
+            std::thread::yield_now();
         }
     }
 
@@ -14429,14 +14465,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // contract, so an earlier one still parked is brought home first.
         self.fill_deferred_kv_rows(cache);
         cache.defer_pending_rows();
-        cache.deferred_fill = Some(Box::new(DeferredKvFill { stage, pending }));
+        let submission = self
+            .last_group_submission
+            .lock()
+            .expect("group submission poisoned")
+            .clone();
+        cache.deferred_fill = Some(Box::new(DeferredKvFill {
+            stage,
+            pending,
+            submission,
+        }));
     }
 
-    /// Completes the readback [`Self::defer_kv_rows`] parked, if any.
+    /// Completes the readback [`Self::defer_kv_rows`] parked, if any —
+    /// waiting for the submission that parked it, not for whatever was
+    /// submitted since. Waiting for the latest submission here was the
+    /// device's idle between prefill chunks: the next chunk's group is
+    /// submitted first, so that wait lasted the whole of it, and the
+    /// chunk after was staged and recorded with the device empty (58 ms
+    /// of a 550 ms chunk).
     pub fn fill_deferred_kv_rows(&self, cache: &mut crate::engine::kv_cache::KvCache) {
         if let Some(parked) = cache.deferred_fill.take() {
             match parked.downcast::<DeferredKvFill>() {
-                Ok(fill) => self.fill_kv_rows(fill.stage, fill.pending, cache),
+                Ok(fill) => {
+                    self.fill_kv_rows_until(fill.stage, fill.pending, cache, fill.submission)
+                }
                 Err(_) => unreachable!("only this backend parks a readback on a cache"),
             }
         }
@@ -14453,12 +14506,27 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         pending: Vec<(usize, Vec<PendingKvRows>)>,
         cache: &mut crate::engine::kv_cache::KvCache,
     ) {
+        self.fill_kv_rows_until(stage, pending, cache, None)
+    }
+
+    /// [`Self::fill_kv_rows`] waiting for `submission` when given — the
+    /// one that carries the rows — rather than for the latest.
+    fn fill_kv_rows_until(
+        &self,
+        stage: KvReadbackStage,
+        pending: Vec<(usize, Vec<PendingKvRows>)>,
+        cache: &mut crate::engine::kv_cache::KvCache,
+        submission: Option<wgpu::SubmissionIndex>,
+    ) {
         const CONTEXT: &str = "reading back a prefill chunk's K/V rows";
         if stage.used > 0 {
             let trace = ple_trace();
             let t_wait = TraceClock::start();
             let wait = self.map_read(&stage.buffer);
-            self.wait_mapped(&wait, CONTEXT);
+            match submission {
+                Some(index) => self.wait_mapped_for(&wait, index, CONTEXT),
+                None => self.wait_mapped(&wait, CONTEXT),
+            }
             let wait_ms = t_wait.ms();
             let t_fill = TraceClock::start();
             {
@@ -19943,7 +20011,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     pub fn end_prefill_group(&self) {
         let taken = PREFILL_ENCODER.with(|slot| slot.borrow_mut().take());
         if let Some(encoder) = taken {
-            self.submit_intermediate(encoder);
+            let index = self.submit_intermediate(encoder);
+            *self
+                .last_group_submission
+                .lock()
+                .expect("group submission poisoned") = Some(index);
         }
     }
 
@@ -19984,11 +20056,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// the caller (`record_decode_forward`) so the existing
     /// `submit_and_readback_for`/`submit_and_readback_u32`/argmax tail, and
     /// its `ORANGU_CPU_TIMESTAMPS` instrumentation, is unchanged.
-    pub fn submit_intermediate(&self, encoder: wgpu::CommandEncoder) {
-        self.queue.submit(Some(encoder.finish()));
+    pub fn submit_intermediate(&self, encoder: wgpu::CommandEncoder) -> wgpu::SubmissionIndex {
+        let index = self.queue.submit(Some(encoder.finish()));
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::engine::decode_stages::record_submission();
+        index
     }
 
     /// Finishes and submits `encoder`, then reads back `w`'s own
