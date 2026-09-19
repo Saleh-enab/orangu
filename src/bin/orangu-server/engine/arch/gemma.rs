@@ -646,7 +646,13 @@ gemma 4 checkpoint."
                 })
                 .max()
                 .unwrap_or(0);
-            vulkan.reserve_stream_region(largest as u64);
+            let region = vulkan.expert_region_bytes_for(largest as u64);
+            log::info!(
+                "orangu-server: [vulkan] expert streaming region {} for stacks of up to {}",
+                orangu::format::format_bytes(region),
+                orangu::format::format_bytes(largest as u64)
+            );
+            vulkan.reserve_stream_region(region);
         }
 
         Ok(Self {
@@ -892,19 +898,35 @@ gemma 4 checkpoint."
         if self.n_embd_per_layer > 0 {
             return None;
         }
-        let runs = super::decode_device_runs(
+        let runs = super::decode_runs_with_host(
             self.backend.as_ref(),
             self.layers.iter().map(|layer| layer.wo.device()),
         )?;
-        if runs.len() < 2 {
+        if runs.len() < 2 || runs.iter().all(|(device, _)| device.is_none()) {
             return None;
         }
         let tail_device = self.output_weight.device();
 
         let mut hidden = x.to_vec();
         for (index, (device, layers)) in runs.iter().enumerate() {
-            let vulkan = self.backend.as_wgpu_on(*device)?;
-            let with_tail = index + 1 == runs.len() && *device == tail_device;
+            // A run of layers on the host: the step-by-step loop over just
+            // those layers, and the residual handed on.
+            let Some(device) = *device else {
+                hidden = self
+                    .run_layers(
+                        Some(&mut *cache),
+                        None,
+                        &hidden,
+                        std::slice::from_ref(&token),
+                        start_pos,
+                        true,
+                        layers.clone(),
+                    )
+                    .ok()?;
+                continue;
+            };
+            let vulkan = self.backend.as_wgpu_on(device)?;
+            let with_tail = index + 1 == runs.len() && device == tail_device;
             let mut encoder = vulkan.new_encoder("orangu-server gemma decode run");
             let (buf, offset) = self.record_one_sequence_decode(
                 vulkan,
@@ -1220,7 +1242,15 @@ gemma 4 checkpoint."
         tokens: &[u32],
         start_pos: usize,
     ) -> Result<Vec<f32>> {
-        self.run_layers(Some(cache), None, x0, tokens, start_pos, true)
+        self.run_layers(
+            Some(cache),
+            None,
+            x0,
+            tokens,
+            start_pos,
+            true,
+            0..self.layers.len(),
+        )
     }
 
     /// [`Self::run_layers_cpu`], or — with `batch` — one decode step of
@@ -1235,6 +1265,12 @@ gemma 4 checkpoint."
     /// chunk whose logits nobody needs does not, and then the rows the
     /// device holds at the end are left there — no readback, and the one
     /// wait of the chunk is the K/V fill's.
+    ///
+    /// `layers` is the range this call runs — every layer for a whole
+    /// pass, or the host tier's run of a split decode whose device runs
+    /// are recorded as chains (`Self::record_split_decode`), with `x0` the
+    /// residual as the run before it left it.
+    #[allow(clippy::too_many_arguments)]
     fn run_layers(
         &self,
         mut one: Option<&mut KvCache>,
@@ -1243,6 +1279,7 @@ gemma 4 checkpoint."
         tokens: &[u32],
         start_pos: usize,
         want_x: bool,
+        layers: std::ops::Range<usize>,
     ) -> Result<Vec<f32>> {
         let n_tokens = tokens.len();
         let n_embd = self.config.n_embd;
@@ -1407,7 +1444,13 @@ gemma 4 checkpoint."
         let layers_per_submit = prefill_layers_per_submit();
         let mut group_layers = 0usize;
 
-        for (il, layer) in self.layers.iter().enumerate() {
+        for (il, layer) in self
+            .layers
+            .iter()
+            .enumerate()
+            .take(layers.end)
+            .skip(layers.start)
+        {
             let head_dim = layer.head_dim;
             let freq_factors = (!layer.is_swa)
                 .then_some(self.rope_freqs.as_deref())
@@ -1468,6 +1511,15 @@ gemma 4 checkpoint."
             // below, which stays the reference implementation the fused one is
             // cross-checked against
             // (`fused_attention_prefill_matches_the_unfused_sequence_*`).
+            // Whether this layer's device half after attention runs as the
+            // MoE head chain (`VulkanBackend::moe_head_rows`), which reads the
+            // attention output on the device.
+            let moe_head_takes_device_attn = layer.moe.is_some()
+                && moe_head_enabled()
+                && self
+                    .backend
+                    .as_wgpu_on(layer.wo.device())
+                    .is_some_and(|v| v.moe_head_serves(n_tokens, n_embd));
             let t_fused = Instant::now();
             // Set when attention left its result on the GPU, so the
             // post-attention chain can read it there instead of taking it
@@ -1518,7 +1570,10 @@ gemma 4 checkpoint."
                         // `fused_post_attention_prefill`; only a MoE
                         // layer, whose FFN is CPU-orchestrated, needs
                         // attention's output on the host.
-                        want_attn_out_host: layer.moe.is_some(),
+                        // A MoE layer's output projection ran on the host
+                        // path from the host copy; with the head chain it
+                        // reads the device's.
+                        want_attn_out_host: layer.moe.is_some() && !moe_head_takes_device_attn,
                     };
                     match (batch.as_deref_mut(), one.as_deref_mut()) {
                         // `slot_id + 1`, as `forward` passes its own
@@ -1542,18 +1597,27 @@ gemma 4 checkpoint."
                         // On the device-resident stream the chain does not
                         // wait for its K/V rows; they are filled at the end
                         // of the chunk (`fill_kv_rows`).
-                        (None, Some(cache)) if x_dev.is_some() && kv_stage.is_some() => vulkan
-                            .fused_attention_prefill_deferred(
-                                attn_input,
-                                &mut cache.layers[cache_index],
-                                kv_stage.as_mut().expect("checked just above"),
-                            )
-                            .map(|(out, pending)| {
-                                if !pending.is_empty() {
-                                    pending_kv.push((cache_index, pending));
-                                }
-                                out
-                            }),
+                        // Or when the MoE head chain will take the
+                        // attention output from the device: then nothing
+                        // on the host needs it either, and the chain need
+                        // not be waited for.
+                        (None, Some(cache))
+                            if (x_dev.is_some() || moe_head_takes_device_attn)
+                                && kv_stage.is_some() =>
+                        {
+                            vulkan
+                                .fused_attention_prefill_deferred(
+                                    attn_input,
+                                    &mut cache.layers[cache_index],
+                                    kv_stage.as_mut().expect("checked just above"),
+                                )
+                                .map(|(out, pending)| {
+                                    if !pending.is_empty() {
+                                        pending_kv.push((cache_index, pending));
+                                    }
+                                    out
+                                })
+                        }
                         (None, Some(cache)) => vulkan
                             .fused_attention_prefill(attn_input, &mut cache.layers[cache_index]),
                         (None, None) => unreachable!("one of the two is always given"),
@@ -1826,16 +1890,67 @@ gemma 4 checkpoint."
                 }
             } else {
                 land(&mut x, &mut x_dev);
-                self.backend
-                    .matmul_into(&mut attn_proj, &attn_out, n_tokens, &layer.wo);
-                tensor::rmsnorm_inplace(
-                    &mut attn_proj,
-                    &layer.attn_post_norm,
-                    n_tokens,
-                    n_embd,
-                    eps,
-                );
-                tensor::add_inplace(&mut x, &attn_proj);
+                // A mixture-of-experts layer's device half after attention
+                // as one submission — the output projection, the post-norm
+                // and residual, the router and the shared MLP — instead of
+                // five, each waited for (`VulkanBackend::moe_head_rows`).
+                // What comes back is the residual the experts read, the
+                // router's logits and the shared branch's result.
+                let moe_head = match &layer.moe {
+                    Some(moe) if moe_head_enabled() => self
+                        .backend
+                        .as_wgpu_on(layer.wo.device())
+                        .and_then(|vulkan| {
+                            let t0 = Instant::now();
+                            let scale = 1.0 / (n_embd as f32).sqrt();
+                            let router_weight: Vec<f32> =
+                                moe.gate_inp_scale.iter().map(|s| s * scale).collect();
+                            let got = vulkan.moe_head_rows(
+                                match &fused_attn_buf {
+                                    Some(b) => crate::engine::backend::vulkan::AttnOutSrc::Gpu(
+                                        b, 0, n_tokens,
+                                    ),
+                                    None => {
+                                        crate::engine::backend::vulkan::AttnOutSrc::Host(&attn_out)
+                                    }
+                                },
+                                &x,
+                                n_tokens,
+                                &layer.wo,
+                                &layer.attn_post_norm,
+                                &router_weight,
+                                &moe.gate_inp,
+                                &layer.ffn_norm,
+                                &layer.ffn_gate,
+                                &layer.ffn_up,
+                                &layer.ffn_down,
+                                &moe.post_norm_1,
+                                eps,
+                            );
+                            trace_submission(il, "moe_head", n_tokens, t0);
+                            got
+                        }),
+                    _ => None,
+                };
+                let moe_head_logits = match moe_head {
+                    Some((x1, logits, pending)) => {
+                        x = x1;
+                        Some((logits, pending))
+                    }
+                    None => {
+                        self.backend
+                            .matmul_into(&mut attn_proj, &attn_out, n_tokens, &layer.wo);
+                        tensor::rmsnorm_inplace(
+                            &mut attn_proj,
+                            &layer.attn_post_norm,
+                            n_tokens,
+                            n_embd,
+                            eps,
+                        );
+                        tensor::add_inplace(&mut x, &attn_proj);
+                        None
+                    }
+                };
 
                 // FFN. Dense (GEGLU) for most Gemma variants; a MoE layer
                 // (`gemma-4-26B-A4B`) instead runs a dense shared MLP plus routed
@@ -1854,7 +1969,23 @@ gemma 4 checkpoint."
                     {
                         self.predict_next_routing(il + 1, next_moe, &x, n_tokens);
                     }
-                    let mut ffn_out = self.moe_ffn_result(il, layer, moe, &x, n_tokens, false);
+                    let mut ffn_out = match moe_head_logits {
+                        Some((logits, pending)) => {
+                            let t0 = Instant::now();
+                            let routed = self.moe_routed_branch(il, moe, &x, n_tokens, &logits);
+                            trace_submission(il, "moe_experts", n_tokens, t0);
+                            let t0 = Instant::now();
+                            let mut shared = self
+                                .backend
+                                .as_wgpu_on(layer.wo.device())
+                                .expect("the head chain ran on this device")
+                                .finish_rows(pending);
+                            trace_submission(il, "moe_shared_wait", n_tokens, t0);
+                            tensor::add_inplace(&mut shared, &routed);
+                            shared
+                        }
+                        None => self.moe_ffn_result(il, layer, moe, &x, n_tokens, false),
+                    };
                     tensor::rmsnorm_inplace(
                         &mut ffn_out,
                         &layer.ffn_post_norm,
@@ -2502,8 +2633,16 @@ impl ModelForward for GemmaModel {
         for v in x.iter_mut() {
             *v *= (n_embd as f32).sqrt();
         }
-        self.run_layers(Some(cache), None, &x, tokens, start_pos, false)
-            .map(|_| ())
+        self.run_layers(
+            Some(cache),
+            None,
+            &x,
+            tokens,
+            start_pos,
+            false,
+            0..self.layers.len(),
+        )
+        .map(|_| ())
     }
 
     fn forward(
@@ -2675,7 +2814,7 @@ impl ModelForward for GemmaModel {
         for v in x.iter_mut() {
             *v *= (n_embd as f32).sqrt();
         }
-        let mut h = self.run_layers(None, Some(rows), &x, tokens, 0, true)?;
+        let mut h = self.run_layers(None, Some(rows), &x, tokens, 0, true, 0..self.layers.len())?;
         tensor::rmsnorm_inplace(&mut h, &self.output_norm, n_tokens, n_embd, eps);
         let flat = self.backend.matmul(&h, n_tokens, &self.output_weight);
         anyhow::ensure!(
@@ -3238,6 +3377,116 @@ impl GemmaModel {
         result
     }
 
+    /// One token's routed experts as **two host regions**: every selected
+    /// expert's gate/up rows in one `CpuBackend::matmul_batch` (one
+    /// quantization of the shared input, one ramp and one tail), the
+    /// activation per expert, then every expert's down projection in one.
+    /// The per-expert path runs each expert's projections as regions of
+    /// its own inside a fan-out over experts. Measured level to slightly
+    /// behind it (see [`moe_decode_batch_enabled`]); the alternative kept
+    /// for the next machine.
+    ///
+    /// Straight to the CPU backend rather than through `self.backend`: the
+    /// experts are host tensors, and a device backend's batch would carry
+    /// them across the bus for a token.
+    fn routed_experts_one_token(
+        &self,
+        moe: &GemmaMoe,
+        expert_in: &[f32],
+        picks: &[(usize, f32)],
+    ) -> Vec<Vec<Vec<f32>>> {
+        use crate::engine::backend::{Backend as _, CpuBackend};
+        let n_embd = self.config.n_embd;
+        let (views, n_ff, gate_scale, up_scale): (Vec<(QuantMatrix, QuantMatrix)>, usize, _, _) =
+            match &moe.gate_up {
+                GemmaExpertGateUp::Fused { gate_up, scale } => {
+                    let n_ff = gate_up.out_dim / 2;
+                    (
+                        picks
+                            .iter()
+                            .map(|&(e, _)| {
+                                let m = gate_up.expert_matrix(e);
+                                (m.rows(0, n_ff), m.rows(n_ff, n_ff))
+                            })
+                            .collect(),
+                        n_ff,
+                        scale.as_deref(),
+                        scale.as_deref(),
+                    )
+                }
+                GemmaExpertGateUp::Separate {
+                    gate,
+                    up,
+                    gate_scale,
+                    up_scale,
+                } => (
+                    picks
+                        .iter()
+                        .map(|&(e, _)| (gate.expert_matrix(e), up.expert_matrix(e)))
+                        .collect(),
+                    gate.out_dim,
+                    gate_scale.as_deref(),
+                    up_scale.as_deref(),
+                ),
+            };
+        let mut ops = Vec::with_capacity(2 * picks.len());
+        for (g, u) in &views {
+            ops.push(MatmulOp {
+                x: expert_in,
+                n_tokens: 1,
+                w: g,
+            });
+            ops.push(MatmulOp {
+                x: expert_in,
+                n_tokens: 1,
+                w: u,
+            });
+        }
+        let mut gu = CpuBackend.matmul_batch(&ops).into_iter();
+        let mut hidden: Vec<Vec<f32>> = Vec::with_capacity(picks.len());
+        for &(e, _) in picks {
+            let mut gate = gu.next().expect("one gate per pick");
+            let up = gu.next().expect("one up per pick");
+            debug_assert_eq!(gate.len(), n_ff);
+            if let Some(s) = gate_scale {
+                gate.iter_mut().for_each(|v| *v *= s[e]);
+            }
+            let mut up = up;
+            if let Some(s) = up_scale {
+                up.iter_mut().for_each(|v| *v *= s[e]);
+            }
+            tensor::gelu_inplace(&mut gate);
+            tensor::mul_inplace(&mut gate, &up);
+            hidden.push(gate);
+        }
+        let downs: Vec<QuantMatrix> = picks
+            .iter()
+            .map(|&(e, _)| moe.down_exps.expert_matrix(e))
+            .collect();
+        let down_ops: Vec<MatmulOp<'_>> = downs
+            .iter()
+            .zip(&hidden)
+            .map(|(w, h)| MatmulOp {
+                x: h,
+                n_tokens: 1,
+                w,
+            })
+            .collect();
+        let outs = CpuBackend.matmul_batch(&down_ops);
+        vec![
+            picks
+                .iter()
+                .zip(outs)
+                .map(|(&(e, weight), mut out)| {
+                    debug_assert_eq!(out.len(), n_embd);
+                    let scale = moe.down_scale.as_ref().map_or(1.0, |s| s[e]) * weight;
+                    out.iter_mut().for_each(|v| *v *= scale);
+                    out
+                })
+                .collect(),
+        ]
+    }
+
     /// The dense shared-MLP branch of a MoE layer (GEGLU) — the exact
     /// dense-FFN computation, using this layer's
     /// `ffn_norm`/`ffn_gate`/`ffn_up`/`ffn_down`, then its own
@@ -3460,6 +3709,8 @@ impl GemmaModel {
                     h
                 },
             )
+        } else if selection.len() == 1 && moe_decode_batch_enabled() {
+            self.routed_experts_one_token(moe, &expert_in, &selection[0])
         } else {
             super::evaluate_routed_experts(&selection, |expert, members| {
                 // gate/up projection (fused or separate), dequantized once for
@@ -3617,6 +3868,25 @@ impl GemmaModel {
 /// unless `0`). Off, the stream is what it was before: only a layer with a
 /// PLE stage stays, and every other layer lands its rows on the host and
 /// takes its chains one waited-for call at a time — the control arm.
+/// Whether a decode token's routed experts run as two host regions
+/// (`GemmaModel::routed_experts_one_token`; `ORANGU_MOE_DECODE_BATCH=1`) —
+/// off: measured 3.7% *slower* than the per-expert fan-out once the
+/// per-32 types had their row-wide kernels (9.8 against 10.1 tok/s on the
+/// 26B-A4B), the eight experts in parallel each fanning out over rows
+/// being parallelism enough. Kept as the measured alternative.
+fn moe_decode_batch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_MOE_DECODE_BATCH"))
+}
+
+/// Whether a mixture-of-experts layer's device half after attention runs
+/// as one submission (`ORANGU_MOE_HEAD`, on unless `0`) — the control arm
+/// is the five separate calls.
+fn moe_head_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_MOE_HEAD"))
+}
+
 fn prefill_stream_dense() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_STREAM_DENSE"))

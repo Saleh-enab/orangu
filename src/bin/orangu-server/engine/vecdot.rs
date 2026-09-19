@@ -2892,6 +2892,21 @@ unsafe fn dot_row_avx2(ggml_type: u32, row: &[u8], act: &ActQ8) -> f32 {
 }
 
 fn dot_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8) -> f32 {
+    // The row-wide AVX2 kernels for the two legacy types a decode reads
+    // most — a tied `Q8_0` output head, a QAT file's `q4_0` experts — see
+    // `dot_k_row_impl` for why the per-32 form below is slower.
+    #[cfg(target_arch = "x86_64")]
+    if ISA == ISA_AVX2 || ISA == ISA_VNNI {
+        // Safety: both ISAs imply AVX2, checked at run time by the callers
+        // that instantiate them.
+        match ggml_type {
+            GGML_TYPE_Q8_0 => return unsafe { dot_q8_0_avx2(row, act) },
+            GGML_TYPE_Q4_0 => return unsafe { dot_q4_0_avx2(row, act) },
+            GGML_TYPE_Q5_0 => return unsafe { dot_q5_x_avx2::<false>(row, act) },
+            GGML_TYPE_Q5_1 => return unsafe { dot_q5_x_avx2::<true>(row, act) },
+            _ => {}
+        }
+    }
     match ggml_type {
         GGML_TYPE_Q8_0 => dot_q8_0::<ISA>(row, act),
         GGML_TYPE_Q5_0 => dot_q5_0::<ISA>(row, act),
@@ -3038,6 +3053,114 @@ fn dot_float<const KIND: u8>(row: &[u8], x: &[f32]) -> f32 {
 }
 
 /// `block_q8_0`: `{ d: f16, qs: [i8; 32] }` — already `int8`, no unpack at all.
+/// `Q8_0` against a q8 row, a 32-block per pass without a horizontal sum:
+/// the block's `int8` weights against the activations with the
+/// **weight's** sign folded into the activation (`vpmaddubsw` of `|w|`
+/// and `sign(w)·x`) — that way round because a stored byte can be `-128`,
+/// whose negation is itself, while a quantized activation never is —
+/// widened to eight `i32` lanes by a `vpmaddwd` against ones, scaled by
+/// the block's two `f32` scales into eight float lanes that are summed
+/// once at the end of the row.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q8_0_avx2(row: &[u8], act: &ActQ8) -> f32 {
+    use std::arch::x86_64::*;
+    const BLOCK_BYTES: usize = 2 + 32;
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let mut accf = _mm256_setzero_ps();
+        for (b, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
+            let dw = read_f16(block, 0);
+            let w = _mm256_loadu_si256(block.as_ptr().add(2) as *const __m256i);
+            let x = _mm256_loadu_si256(act.q.as_ptr().add(b * 32) as *const __m256i);
+            let p = _mm256_maddubs_epi16(_mm256_abs_epi8(w), _mm256_sign_epi8(x, w));
+            let sum = _mm256_madd_epi16(p, ones);
+            accf = _mm256_fmadd_ps(_mm256_set1_ps(dw * act.d[b]), _mm256_cvtepi32_ps(sum), accf);
+        }
+        hsum_ps_avx2(accf)
+    }
+}
+
+/// `Q4_0`: [`dot_q8_0_avx2`] with the block's 32 weights unpacked from 16
+/// bytes — the low nibbles are the first sixteen elements, the high the
+/// second — less 8.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q4_0_avx2(row: &[u8], act: &ActQ8) -> f32 {
+    use std::arch::x86_64::*;
+    const BLOCK_BYTES: usize = 2 + 16;
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let m4 = _mm256_set1_epi8(0x0F);
+        let eight = _mm256_set1_epi8(8);
+        let mut accf = _mm256_setzero_ps();
+        for (b, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
+            let dw = read_f16(block, 0);
+            let q = _mm_loadu_si128(block.as_ptr().add(2) as *const __m128i);
+            // Low nibbles in the low lane, high nibbles in the high lane.
+            let both = _mm256_set_m128i(_mm_srli_epi16(q, 4), q);
+            let w = _mm256_sub_epi8(_mm256_and_si256(both, m4), eight);
+            let x = _mm256_loadu_si256(act.q.as_ptr().add(b * 32) as *const __m256i);
+            let p = _mm256_maddubs_epi16(_mm256_abs_epi8(x), _mm256_sign_epi8(w, x));
+            let sum = _mm256_madd_epi16(p, ones);
+            accf = _mm256_fmadd_ps(_mm256_set1_ps(dw * act.d[b]), _mm256_cvtepi32_ps(sum), accf);
+        }
+        hsum_ps_avx2(accf)
+    }
+}
+
+/// `Q5_0` and `Q5_1` (`WITH_MIN`) a 32-block per pass: the nibbles with
+/// the fifth bit set from `qh` as [`unpack_block_q5_bits_avx2`] sets it,
+/// left **unsigned** (0..31) so the multiply is a plain `vpmaddubsw`
+/// against the activation, and the zero point applied afterwards as a
+/// scalar against the block's activation sum — `-16` for `Q5_0`, the
+/// block's `m` for `Q5_1` — which is exact because both are constant
+/// across the block. Eight float lanes across the row, one sum at the end.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q5_x_avx2<const WITH_MIN: bool>(row: &[u8], act: &ActQ8) -> f32 {
+    use std::arch::x86_64::*;
+    let block_bytes = if WITH_MIN { 2 + 2 + 4 + 16 } else { 2 + 4 + 16 };
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let nibble = _mm_set1_epi8(0x0F);
+        let byte_of_lane = _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
+            3, 3, 3,
+        );
+        let bit_of_lane = _mm256_setr_epi8(
+            1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64, -128, 1, 2, 4, 8, 16, 32, 64,
+            -128, 1, 2, 4, 8, 16, 32, 64, -128,
+        );
+        let sixteen = _mm256_set1_epi8(0x10);
+        let mut accf = _mm256_setzero_ps();
+        let mut total_min = 0f32;
+        for (b, block) in row.chunks_exact(block_bytes).enumerate() {
+            let dw = read_f16(block, 0);
+            let (m, at) = if WITH_MIN {
+                (read_f16(block, 2), 4)
+            } else {
+                (-16.0 * dw, 2)
+            };
+            let qh = u32::from_le_bytes([block[at], block[at + 1], block[at + 2], block[at + 3]]);
+            let v = _mm_loadu_si128(block.as_ptr().add(at + 4) as *const __m128i);
+            let lo = _mm_and_si128(v, nibble);
+            let hi = _mm_and_si128(_mm_srli_epi16::<4>(v), nibble);
+            let nibbles = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(lo), hi);
+            let bits = _mm256_set1_epi32(qh as i32);
+            let bytes = _mm256_shuffle_epi8(bits, byte_of_lane);
+            let set = _mm256_cmpeq_epi8(_mm256_and_si256(bytes, bit_of_lane), bit_of_lane);
+            let w = _mm256_or_si256(nibbles, _mm256_and_si256(set, sixteen));
+            let x = _mm256_loadu_si256(act.q.as_ptr().add(b * 32) as *const __m256i);
+            let p = _mm256_maddubs_epi16(w, x);
+            let sum = _mm256_madd_epi16(p, ones);
+            accf = _mm256_fmadd_ps(_mm256_set1_ps(dw * act.d[b]), _mm256_cvtepi32_ps(sum), accf);
+            total_min += act.d[b] * m * block_sum(act, b) as f32;
+        }
+        hsum_ps_avx2(accf) + total_min
+    }
+}
+
 fn dot_q8_0<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     const BLOCK_BYTES: usize = 2 + 32;
     let mut total = 0f32;
@@ -3344,6 +3467,22 @@ unsafe fn dot_k_row_avx2(ggml_type: u32, row: &[u8], act: &ActQ8KRow) -> f32 {
 }
 
 fn dot_k_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8KRow) -> f32 {
+    // The three types a `Q4_K_M` file is made of take the super-block-wide
+    // AVX2 kernels: the per-32 unpack-then-dot form below costs a horizontal
+    // sum and a scalar nibble loop per 32 elements, and measured on a 12B
+    // model's host layers it read weights at 24 GB/s where the block-wide
+    // form reads at the memory's own rate.
+    #[cfg(target_arch = "x86_64")]
+    if ISA == ISA_AVX2 || ISA == ISA_VNNI {
+        // Safety: both ISAs imply AVX2, and the callers that instantiate
+        // them checked it at run time.
+        match ggml_type {
+            GGML_TYPE_Q4_K => return unsafe { dot_k_row_q4_k_avx2(row, act) },
+            GGML_TYPE_Q5_K => return unsafe { dot_k_row_q5_k_avx2(row, act) },
+            GGML_TYPE_Q6_K => return unsafe { dot_k_row_q6_k_avx2(row, act) },
+            _ => {}
+        }
+    }
     match ggml_type {
         GGML_TYPE_Q2_K => dot_k_row_q2_k::<ISA>(row, act),
         GGML_TYPE_Q3_K => dot_k_row_q3_k::<ISA>(row, act),
@@ -3352,6 +3491,180 @@ fn dot_k_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8KRow) ->
         GGML_TYPE_Q6_K => dot_k_row_q6_k::<ISA>(row, act),
         GGML_TYPE_IQ4_XS => dot_k_row_iq4_xs::<ISA>(row, act),
         other => panic!("vecdot::dot_k_row called for unsupported ggml_type {other}"),
+    }
+}
+
+/// `Q4_K` against a q8 row, one **super-block per pass** in AVX2: the four
+/// 32-byte quant runs are split into their low and high nibbles as bytes
+/// (unsigned, 0..15), each multiplied against its 32 activations with
+/// `vpmaddubsw` (u8 × i8 pairs into i16 — at most 2 × 15 × 127, no
+/// saturation), widened by its 6-bit scale with `vpmaddwd`, and summed in
+/// one eight-lane `i32` accumulator across the super-block. One horizontal
+/// sum per super-block instead of one per 32 elements, and no unpacked
+/// `i8` array between the bytes and the multiply. The min term is the
+/// scalar it always was: eight scales times eight precomputed activation
+/// sums.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_k_row_q4_k_avx2(row: &[u8], act: &ActQ8KRow) -> f32 {
+    use std::arch::x86_64::*;
+    const BLOCK_BYTES: usize = 2 + 2 + 12 + 128;
+    unsafe {
+        let m4 = _mm256_set1_epi8(0x0F);
+        // The dot as eight float lanes across the whole row, summed once at
+        // the end; the min term as a scalar beside it.
+        let mut accf = _mm256_setzero_ps();
+        let mut total_min = 0f32;
+        for (s, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
+            let d = read_f16(block, 0);
+            let dmin = read_f16(block, 2);
+            let scales = &block[4..16];
+            let qs = block.as_ptr().add(16);
+            let x = act.q.as_ptr().add(s * SUPER_BLOCK);
+            let mut sc = [0i16; 8];
+            let mut imin = 0i32;
+            for (j, sc_j) in sc.iter_mut().enumerate() {
+                let (a, m) = get_scale_min_k4(j, scales);
+                *sc_j = a as i16;
+                imin += m as i32 * k_row_block_sum(act, s * SUBS + j);
+            }
+            let mut acc = _mm256_setzero_si256();
+            for g in 0..4 {
+                let q = _mm256_loadu_si256(qs.add(g * 32) as *const __m256i);
+                let lo = _mm256_and_si256(q, m4);
+                let hi = _mm256_and_si256(_mm256_srli_epi16(q, 4), m4);
+                let x0 = _mm256_loadu_si256(x.add(g * 64) as *const __m256i);
+                let x1 = _mm256_loadu_si256(x.add(g * 64 + 32) as *const __m256i);
+                let p0 = _mm256_maddubs_epi16(lo, x0);
+                let p1 = _mm256_maddubs_epi16(hi, x1);
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p0, _mm256_set1_epi16(sc[2 * g])));
+                acc =
+                    _mm256_add_epi32(acc, _mm256_madd_epi16(p1, _mm256_set1_epi16(sc[2 * g + 1])));
+            }
+            accf = _mm256_fmadd_ps(_mm256_set1_ps(act.d[s] * d), _mm256_cvtepi32_ps(acc), accf);
+            total_min += act.d[s] * dmin * imin as f32;
+        }
+        hsum_ps_avx2(accf) - total_min
+    }
+}
+
+/// `Q5_K`: [`dot_k_row_q4_k_avx2`] with the fifth bit or-ed in from the
+/// `qh` plane — bit `2g + half` of each `qh` byte, moved to bit 4.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_k_row_q5_k_avx2(row: &[u8], act: &ActQ8KRow) -> f32 {
+    use std::arch::x86_64::*;
+    const BLOCK_BYTES: usize = 2 + 2 + 12 + 32 + 128;
+    unsafe {
+        let m4 = _mm256_set1_epi8(0x0F);
+        let one = _mm256_set1_epi8(1);
+        let mut accf = _mm256_setzero_ps();
+        let mut total_min = 0f32;
+        for (s, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
+            let d = read_f16(block, 0);
+            let dmin = read_f16(block, 2);
+            let scales = &block[4..16];
+            let qh = _mm256_loadu_si256(block.as_ptr().add(16) as *const __m256i);
+            let qs = block.as_ptr().add(48);
+            let x = act.q.as_ptr().add(s * SUPER_BLOCK);
+            let mut sc = [0i16; 8];
+            let mut imin = 0i32;
+            for (j, sc_j) in sc.iter_mut().enumerate() {
+                let (a, m) = get_scale_min_k4(j, scales);
+                *sc_j = a as i16;
+                imin += m as i32 * k_row_block_sum(act, s * SUBS + j);
+            }
+            let mut acc = _mm256_setzero_si256();
+            for g in 0..4 {
+                let q = _mm256_loadu_si256(qs.add(g * 32) as *const __m256i);
+                // The fifth bits of the two halves: bits 2g and 2g+1 of qh,
+                // each brought to bit 4 (a byte shift right then left, as
+                // 16-bit shifts on a masked value).
+                let h0 = _mm256_slli_epi16(
+                    _mm256_and_si256(_mm256_srl_epi16(qh, _mm_cvtsi32_si128((2 * g) as i32)), one),
+                    4,
+                );
+                let h1 = _mm256_slli_epi16(
+                    _mm256_and_si256(
+                        _mm256_srl_epi16(qh, _mm_cvtsi32_si128((2 * g + 1) as i32)),
+                        one,
+                    ),
+                    4,
+                );
+                let lo = _mm256_or_si256(_mm256_and_si256(q, m4), h0);
+                let hi = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q, 4), m4), h1);
+                let x0 = _mm256_loadu_si256(x.add(g * 64) as *const __m256i);
+                let x1 = _mm256_loadu_si256(x.add(g * 64 + 32) as *const __m256i);
+                let p0 = _mm256_maddubs_epi16(lo, x0);
+                let p1 = _mm256_maddubs_epi16(hi, x1);
+                acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p0, _mm256_set1_epi16(sc[2 * g])));
+                acc =
+                    _mm256_add_epi32(acc, _mm256_madd_epi16(p1, _mm256_set1_epi16(sc[2 * g + 1])));
+            }
+            accf = _mm256_fmadd_ps(_mm256_set1_ps(act.d[s] * d), _mm256_cvtepi32_ps(acc), accf);
+            total_min += act.d[s] * dmin * imin as f32;
+        }
+        hsum_ps_avx2(accf) - total_min
+    }
+}
+
+/// `Q6_K` one super-block per pass in AVX2. Each of the eight 32-element
+/// runs is the low or high nibble of a `ql` half joined with two bits of
+/// `qh`, less 32 — signed, so the multiply is the `vpmaddubsw` of the
+/// *activation's* magnitude against the weight with the activation's sign
+/// folded in (`|x| · sign(x)·w == x·w`), the ggml arrangement. The scales
+/// are per 16, so each run's i16 pair sums are widened by two scales in
+/// one `vpmaddwd` against a lane-interleaved scale vector.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_k_row_q6_k_avx2(row: &[u8], act: &ActQ8KRow) -> f32 {
+    use std::arch::x86_64::*;
+    const BLOCK_BYTES: usize = 128 + 64 + 16 + 2;
+    unsafe {
+        let m4 = _mm256_set1_epi8(0x0F);
+        let m3 = _mm256_set1_epi8(3);
+        let bias = _mm256_set1_epi8(32);
+        let mut accf = _mm256_setzero_ps();
+        for (s, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
+            let ql = block.as_ptr();
+            let qh = block.as_ptr().add(128);
+            let sc = &block[192..208];
+            let d = read_f16(block, 208);
+            let x = act.q.as_ptr().add(s * SUPER_BLOCK);
+            let mut acc = _mm256_setzero_si256();
+            let mut r = 0usize;
+            for h in 0..2 {
+                let qhv = _mm256_loadu_si256(qh.add(h * 32) as *const __m256i);
+                for &(ql_add, hshift, high) in Q6K_RUNS.iter() {
+                    let qlv = _mm256_loadu_si256(ql.add(h * 64 + ql_add) as *const __m256i);
+                    let nib = if high {
+                        _mm256_and_si256(_mm256_srli_epi16(qlv, 4), m4)
+                    } else {
+                        _mm256_and_si256(qlv, m4)
+                    };
+                    let hb = _mm256_slli_epi16(
+                        _mm256_and_si256(_mm256_srl_epi16(qhv, _mm_cvtsi32_si128(hshift)), m3),
+                        4,
+                    );
+                    let w = _mm256_sub_epi8(_mm256_or_si256(nib, hb), bias);
+                    let xv = _mm256_loadu_si256(x.add(r * 32) as *const __m256i);
+                    // u8 × i8 with the sign on the weight side.
+                    let p = _mm256_maddubs_epi16(_mm256_abs_epi8(xv), _mm256_sign_epi8(w, xv));
+                    // Sixteen i16 pair sums: lanes 0..7 belong to the run's
+                    // first 16 elements, 8..15 to its second, so the scale
+                    // vector is the two scales over those halves.
+                    let s0 = sc[2 * r] as i8 as i16;
+                    let s1 = sc[2 * r + 1] as i8 as i16;
+                    let scv = _mm256_setr_epi16(
+                        s0, s0, s0, s0, s0, s0, s0, s0, s1, s1, s1, s1, s1, s1, s1, s1,
+                    );
+                    acc = _mm256_add_epi32(acc, _mm256_madd_epi16(p, scv));
+                    r += 1;
+                }
+            }
+            accf = _mm256_fmadd_ps(_mm256_set1_ps(act.d[s] * d), _mm256_cvtepi32_ps(acc), accf);
+        }
+        hsum_ps_avx2(accf)
     }
 }
 
@@ -4294,6 +4607,162 @@ mod tests {
                         err <= 0.02 * scale.max(1e-6),
                         "type {ggml_type} in_dim {in_dim}: got {got}, want {reference} \
                          (err {err}, term-magnitude {scale})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// What the decode row dot reads weights at, against what the memory
+    /// gives a plain sum: one thread and every thread, on a `Q4_K` matrix
+    /// too large for any cache. The number that says whether the kernel or
+    /// the memory bounds a host layer.
+    ///
+    /// `cargo test --release _scratch_measure_k_row_bandwidth -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn _scratch_measure_k_row_bandwidth() {
+        use rayon::prelude::*;
+        let in_dim = 3840usize;
+        let out_dim = 2048usize;
+        let n_mats = 16usize; // 16 × 11 MiB, well past the caches
+        let mats: Vec<Vec<u8>> = (0..n_mats)
+            .map(|m| {
+                let mut v = Vec::with_capacity(out_dim * in_dim * 144 / 256);
+                for r in 0..out_dim {
+                    v.extend(fixture_row(
+                        GGML_TYPE_Q4_K,
+                        in_dim,
+                        (m * out_dim + r) as u32,
+                    ));
+                }
+                v
+            })
+            .collect();
+        let row_bytes = in_dim * 144 / 256;
+        let x = activations(in_dim);
+        let act = quantize_act_k_row(&x);
+        let bytes = (n_mats * out_dim * row_bytes) as f64;
+        let mut out = vec![0f32; out_dim];
+        for threads in [1usize, 4, 8, 16] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                for m in &mats {
+                    pool.install(|| {
+                        out.par_chunks_mut(1)
+                            .with_min_len(64)
+                            .enumerate()
+                            .for_each(|(r, o)| {
+                                o[0] = dot_k_row(
+                                    GGML_TYPE_Q4_K,
+                                    &m[r * row_bytes..(r + 1) * row_bytes],
+                                    &act,
+                                );
+                            });
+                    });
+                }
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            eprintln!(
+                "  dot_k_row Q4_K, {threads:2} threads: {:6.1} GB/s",
+                bytes / 1e9 / best
+            );
+            // The memory's own rate: a plain u64 sum over the same bytes.
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                let mut total = 0u64;
+                for m in &mats {
+                    total = total.wrapping_add(pool.install(|| {
+                        m.par_chunks(64 * 1024)
+                            .map(|c| {
+                                c.as_chunks::<8>()
+                                    .0
+                                    .iter()
+                                    .map(|b| u64::from_le_bytes(*b))
+                                    .fold(0u64, u64::wrapping_add)
+                            })
+                            .reduce(|| 0, u64::wrapping_add)
+                    }));
+                }
+                std::hint::black_box(total);
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            eprintln!(
+                "  plain sum,      {threads:2} threads: {:6.1} GB/s",
+                bytes / 1e9 / best
+            );
+        }
+        std::hint::black_box(&out);
+    }
+
+    /// The super-block-wide AVX2 kernels compute the same integers as the
+    /// per-32 form they replace — the same products, the same scales — and
+    /// differ from it only in the order the super-blocks' floats are
+    /// summed (eight lanes across the row, one sum at the end), so they
+    /// agree to float reassociation: a wrong nibble half or a wrong scale
+    /// lane is off by whole terms, orders of magnitude past this bound.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn k_row_block_kernels_match_the_baseline_exactly() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for ggml_type in [GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K] {
+            for in_dim in [256usize, 2048, 5632] {
+                for seed in [1u32, 7, 99, 1234] {
+                    let row = fixture_row(ggml_type, in_dim, seed);
+                    let x = activations(in_dim);
+                    let act = quantize_act_k_row(&x);
+                    let baseline = dot_k_row_impl::<ISA_BASELINE>(ggml_type, &row, &act);
+                    // Safety: AVX2 checked above.
+                    let block = unsafe { dot_k_row_avx2(ggml_type, &row, &act) };
+                    // Against the terms' magnitude, not the result's: a dot
+                    // of random signs is a small difference of large sums,
+                    // and reassociation moves it by a part in 10^5 of those.
+                    let deq = quant::dequantize(ggml_type, &row, in_dim).unwrap();
+                    let scale: f32 = deq.iter().zip(&x).map(|(w, v)| (w * v).abs()).sum();
+                    assert!(
+                        (block - baseline).abs() <= 1e-5 * scale.max(1e-3),
+                        "type {ggml_type} in_dim {in_dim} seed {seed}: block {block} vs baseline {baseline} (terms {scale})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The row-wide AVX2 kernels for `Q8_0` and `Q4_0` against the per-32
+    /// baseline, to reassociation.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn row_block_kernels_match_the_baseline() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for ggml_type in [
+            GGML_TYPE_Q8_0,
+            GGML_TYPE_Q4_0,
+            GGML_TYPE_Q5_0,
+            GGML_TYPE_Q5_1,
+        ] {
+            for in_dim in [32usize, 2048, 3840] {
+                for seed in [1u32, 7, 99, 1234] {
+                    let row = fixture_row(ggml_type, in_dim, seed);
+                    let x = activations(in_dim);
+                    let act = quantize_act(&x);
+                    let baseline = dot_row_impl::<ISA_BASELINE>(ggml_type, &row, &act);
+                    // Safety: AVX2 checked above.
+                    let block = unsafe { dot_row_avx2(ggml_type, &row, &act) };
+                    let deq = quant::dequantize(ggml_type, &row, in_dim).unwrap();
+                    let scale: f32 = deq.iter().zip(&x).map(|(w, v)| (w * v).abs()).sum();
+                    assert!(
+                        (block - baseline).abs() <= 1e-5 * scale.max(1e-3),
+                        "type {ggml_type} in_dim {in_dim} seed {seed}: block {block} vs baseline {baseline} (terms {scale})"
                     );
                 }
             }

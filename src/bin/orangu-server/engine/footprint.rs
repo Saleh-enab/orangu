@@ -80,6 +80,13 @@ pub struct DeviceFootprint {
     /// How the KV mirror is stored, which halves or doubles every number
     /// above it. `None` on a backend with no GPU KV mirror at all.
     pub kv_storage: Option<KvStorage>,
+    /// Device bytes spoken for besides the weights: what other processes
+    /// held when the device was enumerated, and the region a model with
+    /// routed experts streams them through. Counted against the headroom,
+    /// because a KV pool sized without them filled the card to the last
+    /// page — after which the driver moved the pool's own pages out to
+    /// host memory and never back.
+    pub reserved_device_bytes: u64,
 }
 
 impl DeviceFootprint {
@@ -108,6 +115,7 @@ impl DeviceFootprint {
             slots,
             n_ctx_train: model.config.n_ctx_train,
             kv_storage,
+            reserved_device_bytes: 0,
         }
     }
 
@@ -154,6 +162,7 @@ impl DeviceFootprint {
             slots,
             n_ctx_train: config.n_ctx_train,
             kv_storage,
+            reserved_device_bytes: 0,
         }
     }
 
@@ -236,7 +245,11 @@ impl DeviceFootprint {
     /// `None` on the multi-device wrapper by design, so the split report
     /// carries the capacities out instead).
     pub fn headroom_in(&self, total_bytes: Option<u64>) -> Option<u64> {
-        Some(total_bytes?.saturating_sub(self.weights_device_bytes))
+        Some(
+            total_bytes?
+                .saturating_sub(self.weights_device_bytes)
+                .saturating_sub(self.reserved_device_bytes),
+        )
     }
 
     /// Whether this device has room for **no request at all** — the weights
@@ -321,9 +334,17 @@ impl DeviceFootprint {
             (Some(total), storage) => {
                 let headroom = self.headroom_on(device).unwrap_or(0);
                 let mut line = format!(
-                    "orangu-server: [{api}] {} of {} used by weights, {} free",
+                    "orangu-server: [{api}] {} of {} used by weights{}, {} free",
                     format_bytes(self.weights_device_bytes),
                     format_bytes(total),
+                    if self.reserved_device_bytes > 0 {
+                        format!(
+                            " and {} by the streaming region and other processes",
+                            format_bytes(self.reserved_device_bytes)
+                        )
+                    } else {
+                        String::new()
+                    },
                     format_bytes(headroom)
                 );
                 if let (Some(tokens), Some(storage)) = (self.kv_tokens_in(headroom), storage) {
@@ -391,6 +412,7 @@ impl DeviceFootprint {
         serde_json::json!({
             "weights_device_bytes": self.weights_device_bytes,
             "weights_host_bytes": self.weights_host_bytes,
+            "reserved_device_bytes": self.reserved_device_bytes,
             "kv_bytes_per_1k_tokens_per_slot": self.kv_bytes_per_step,
             "slots": self.slots,
             "device_total_bytes": total_bytes,
@@ -419,6 +441,7 @@ mod tests {
             vram_total_bytes: vram,
             id: None,
             driver: None,
+            vram_used_at_start: None,
         }
     }
 
@@ -430,6 +453,7 @@ mod tests {
             slots,
             n_ctx_train: 1_000_000,
             kv_storage: Some(KvStorage::F16),
+            reserved_device_bytes: 0,
         }
     }
 

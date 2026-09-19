@@ -1250,6 +1250,11 @@ fn prepare(args: Args) -> Result<Prepared> {
         &per_layer_bytes,
         weights_device_bytes,
     )?;
+    // A model with layers on the host is never prefilled narrower than the
+    // width at which those layers stream to the card — see `CHUNK_FLOOR`.
+    if split.as_ref().is_some_and(|s| s.plan.runs_on_host()) {
+        engine::generate::set_chunk_floor(engine::backend::multi::host_stream_min_tokens());
+    }
 
     log::info!(
         "{}",
@@ -1350,6 +1355,16 @@ fn prepare(args: Args) -> Result<Prepared> {
         );
     }
     let architecture = loaded.config.architecture.clone();
+    // The device's weight arena cuts its chunks to what is coming.
+    if let Some(wgpu) = backend.as_wgpu() {
+        let largest = loaded
+            .resident_tensor_sizes()
+            .filter(|(name, _)| !engine::backend::is_cpu_only_tensor(name))
+            .map(|(_, bytes)| bytes)
+            .max()
+            .unwrap_or(0);
+        wgpu.plan_weight_bytes(weights_device_bytes, largest);
+    }
     let model = build_model(&loaded, &backend)?;
 
     // What this model puts on the chosen device, against what that device
@@ -1400,12 +1415,15 @@ fn prepare(args: Args) -> Result<Prepared> {
         gpu_tuning = Some(split.to_json(&footprints, weights_host_bytes));
     }
     let footprint = backend.as_wgpu().map(|wgpu| {
-        engine::footprint::DeviceFootprint::measure(
+        let mut footprint = engine::footprint::DeviceFootprint::measure(
             &loaded,
             &model.new_kv_cache(1),
             Some(wgpu.kv_storage()),
             conf.slots,
-        )
+        );
+        footprint.reserved_device_bytes =
+            wgpu.stream_region_bytes() + wgpu.device_in_use().vram_used_at_start.unwrap_or(0);
+        footprint
     });
     if let (Some(footprint), Some(wgpu)) = (&footprint, backend.as_wgpu()) {
         for line in footprint.report(wgpu.api_tag(), wgpu.device_in_use()) {
@@ -1517,7 +1535,14 @@ fn prepare(args: Args) -> Result<Prepared> {
             // (2.13 GiB headroom), device pages of 1.06 GiB cost 47% of decode
             // with a spread fourteen times the contiguous path's, while 0.54
             // GiB and below ran at parity — so the usable share is under half
-            // and a quarter clears it with margin.
+            // and a quarter clears it with margin. The headroom now has the
+            // streaming region and other processes taken out first
+            // (`reserved_device_bytes`); a third of what is left was tried
+            // on a 26B-A4B file that fills the card and put the card at its
+            // last page during every prefill — a 512-token chunk's scratch
+            // is ~300 MiB on top of what is resident — after which decode
+            // ran 20% slower at every depth. The quarter is what leaves
+            // that room.
             let device_budget = backend.as_wgpu().and_then(|wgpu| {
                 footprint
                     .as_ref()?
@@ -1573,6 +1598,9 @@ fn prepare(args: Args) -> Result<Prepared> {
                 pool.host_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
                 pool.policy(),
             );
+            if let Some(wgpu) = backend.as_wgpu() {
+                wgpu.report_device_memory("vulkan");
+            }
             let index = engine::prefix_index::PrefixIndex::new(page_tokens);
             Some((Arc::new(pool), Arc::new(index)))
         })
@@ -3909,11 +3937,27 @@ fn apply_device_split(
     // room for the KV cache.
     let reported_capacities: Vec<Option<u64>> = set.iter().map(|c| c.vram_total_bytes).collect();
     let mut device_classes: Vec<DeviceClass> = set.iter().map(|c| c.class).collect();
+    // Planned against what the card has **left**, not what it has: memory
+    // other processes hold at start is not coming back, and a plan that
+    // ignores it puts the last layers into a card that then pages them
+    // per token. What is held is reported, so a slow split can be read
+    // against the card's other tenants.
     let mut capacities: Vec<Option<u64>> = set
         .iter()
         .map(|c| {
-            c.vram_total_bytes
-                .map(|total| (total as f64 * WEIGHTS_SHARE_OF_DEVICE) as u64)
+            let total = c.vram_total_bytes?;
+            let used = c.vram_used_bytes().unwrap_or(0).min(total);
+            if used > 0 {
+                eprintln!(
+                    "orangu-server: [{}] {}: {} of {} already in use by other processes; \
+                     planning against the rest",
+                    wgpu.api_tag(),
+                    c.name,
+                    orangu::format::format_bytes(used),
+                    orangu::format::format_bytes(total)
+                );
+            }
+            Some(((total - used) as f64 * WEIGHTS_SHARE_OF_DEVICE) as u64)
         })
         .collect();
     // The first device pays for every tensor outside a numbered layer —

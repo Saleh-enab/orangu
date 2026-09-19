@@ -283,6 +283,38 @@ pub fn adapter_device_local_bytes(adapter: &wgpu::Adapter) -> Option<u64> {
     (total > 0).then_some(total)
 }
 
+/// The size of the adapter's **host-visible device-local** heap — the
+/// window of the card's memory the host can map (a 256 MiB BAR here
+/// without resizable BAR) — or `None` where there is none or the API does
+/// not say. A persistently mapped buffer smaller than it lands in it, and
+/// one that fills it starves every later mapped allocation of the process.
+#[cfg(not(target_vendor = "apple"))]
+pub fn adapter_host_visible_device_local_bytes(adapter: &wgpu::Adapter) -> Option<u64> {
+    let hal = unsafe { adapter.as_hal::<Vulkan>()? };
+    let instance = hal.shared_instance().raw_instance();
+    let phys = hal.raw_physical_device();
+    let props = unsafe { instance.get_physical_device_memory_properties(phys) };
+    let types = &props.memory_types[..props.memory_type_count as usize];
+    let heaps = &props.memory_heaps[..props.memory_heap_count as usize];
+    let mut best: Option<u64> = None;
+    for t in types {
+        let flags = t.property_flags;
+        if flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            && flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
+            && let Some(heap) = heaps.get(t.heap_index as usize)
+        {
+            best = Some(best.map_or(heap.size, |b| b.max(heap.size)));
+        }
+    }
+    best
+}
+
+/// Apple build of [`adapter_host_visible_device_local_bytes`].
+#[cfg(target_vendor = "apple")]
+pub fn adapter_host_visible_device_local_bytes(_adapter: &wgpu::Adapter) -> Option<u64> {
+    None
+}
+
 /// Apple build of [`adapter_device_local_bytes`]. Unlike the two helpers
 /// above this one is genuinely reached — device selection runs on every
 /// platform — and answers "unknown", which the ranking policy already has

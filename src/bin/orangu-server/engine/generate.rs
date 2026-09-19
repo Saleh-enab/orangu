@@ -1853,6 +1853,30 @@ mod device_ceiling_tests {
 /// or any caller that never registered gets today's behaviour.
 static CHUNK_POLICY: std::sync::OnceLock<ChunkPolicy> = std::sync::OnceLock::new();
 
+/// The narrowest chunk the sizer may choose, recorded once at startup by
+/// [`set_chunk_floor`] — `0` (the constants below) unless the model has a
+/// reason to never be prefilled narrower.
+///
+/// A model split onto the host has one: a host layer's projections stream
+/// to the card from `ORANGU_HOST_STREAM_TOKENS` (32) tokens up and run on
+/// the CPU below, ten times slower per token. The sizer prices a chunk by
+/// the last one's rate, so a 16-token probe measured on the CPU says a
+/// 512-token chunk would take minutes, the next chunk stays under 32, and
+/// every chunk after it too — measured, a 1120-token prompt on a 31B model
+/// went in 47 chunks of ~24 tokens at 5.6 tok/s where 512-token chunks
+/// run at 17. With the floor at the streaming width the probe itself is
+/// measured on the fast path.
+static CHUNK_FLOOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// See [`CHUNK_FLOOR`].
+pub fn set_chunk_floor(floor: usize) {
+    let _ = CHUNK_FLOOR.set(floor);
+}
+
+fn chunk_floor() -> usize {
+    CHUNK_FLOOR.get().copied().unwrap_or(0)
+}
+
 /// Records what the selected backend answered for
 /// [`Backend::has_submission_timeout`]. Called once, from `main`, right after
 /// the backend is chosen.
@@ -1927,6 +1951,10 @@ fn prefill(
     // was measured, and what it cost is true whether or not a later one
     // failed.
     store_chunk_cost(cost);
+    // What the prefill borrowed from the card goes back before decode.
+    if let Some(vulkan) = model.vulkan_backend() {
+        vulkan.prompt_prefilled();
+    }
     out
 }
 
@@ -2107,7 +2135,7 @@ fn prefill_in_chunks(
     let mut width = snap(match policy {
         ChunkPolicy::Adaptive => cost
             .opening_width(start_pos, budget, batch)
-            .unwrap_or(PREFILL_PROBE_TOKENS.min(batch)),
+            .unwrap_or(PREFILL_PROBE_TOKENS.max(chunk_floor()).min(batch)),
         ChunkPolicy::Flat => batch,
     });
     // One line per prefill, not one per submission — which is the whole point.
@@ -2451,7 +2479,10 @@ fn clamp_chunk_width(fits: f64, max_width: usize) -> usize {
     } else {
         0
     };
-    fits.clamp(PREFILL_MIN_CHUNK_TOKENS.min(max_width), max_width)
+    fits.clamp(
+        PREFILL_MIN_CHUNK_TOKENS.max(chunk_floor()).min(max_width),
+        max_width,
+    )
 }
 
 /// Only a fraction of the configured budget is spent when sizing the next

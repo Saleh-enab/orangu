@@ -2719,10 +2719,13 @@ fn the_indexed_expert_gemm_matches_the_per_expert_cpu_product() {
                 scale: None,
             })
             .collect();
-        assert!(
-            vulkan.serves_experts(&ops),
-            "type {ggml_type} has an indexed kernel"
-        );
+        if !vulkan.serves_experts(&ops) {
+            // A device without the integer-dot kernels (no accelerated
+            // packed dot, or `ORANGU_PREFILL_MMQ=0`) has no indexed GEMM
+            // either; the routed experts stay on the host there.
+            eprintln!("type {ggml_type}: no indexed kernel on this device — nothing to check");
+            return;
+        }
         let got = vulkan.matmul_experts(&x, N_TOKENS, in_dim, &ops, &groups, &[]);
         assert_eq!(got.len(), ops.len());
         for (op_i, (op, per_group)) in ops.iter().zip(&got).enumerate() {
@@ -2980,6 +2983,13 @@ fn the_fused_routed_ffn_matches_the_cpu_computation_by_parts() {
         n_rows: N_EMBD,
         scale: None,
     };
+    if [&gate, &up, &down]
+        .into_iter()
+        .any(|op| !vulkan.serves_experts(std::slice::from_ref(op)))
+    {
+        eprintln!("no indexed kernel on this device — nothing to check");
+        return;
+    }
     let got = vulkan.moe_ffn_experts(
         &x,
         N_TOKENS,
@@ -2993,6 +3003,39 @@ fn the_fused_routed_ffn_matches_the_cpu_computation_by_parts() {
         &[],
     );
     assert_eq!(got.len(), groups.len());
+
+    // Packed into stripes of two experts (the region cut to just over two
+    // experts' gate/up rows): the same rows, group for group, as the
+    // stack placed whole — the stripes differ only in where the rows sit.
+    if vulkan.packs_experts() {
+        let two = 2 * (2 * N_FF * gu_stack.row_bytes()) as u64 + 3 * (256 + 16);
+        let striped = vulkan.with_expert_stripe_bytes(two, || {
+            vulkan.moe_ffn_experts(
+                &x,
+                N_TOKENS,
+                N_EMBD,
+                &gate,
+                &up,
+                &down,
+                &groups,
+                false,
+                None,
+                &[],
+            )
+        });
+        assert_eq!(striped.len(), got.len());
+        for (g, (a, b)) in got.iter().zip(&striped).enumerate() {
+            assert_eq!(a.len(), b.len(), "group {g}");
+            for (i, (p, q)) in a.iter().zip(b).enumerate() {
+                assert!(
+                    (p - q).abs() <= 1e-5 * p.abs().max(1e-3),
+                    "group {g} element {i}: whole {p} vs striped {q}"
+                );
+            }
+        }
+    } else {
+        eprintln!("no staging pair on this adapter; the striped form is not exercised");
+    }
 
     // Per-expert output scales on gate and up, applied by the GEMMs as
     // they store: against the by-parts reference with the same scales.
@@ -9025,6 +9068,18 @@ fn fused_attention_prefill_matches_the_unfused_sequence_past_the_mirror() {
     cross_check_fused_attention_prefill(300, true, 16);
 }
 
+/// One token deep in its context through the prefill chain — a decode
+/// step of a model whose layers step one by one — takes the split
+/// ("flash-decode") kernel over the window rather than the prefill
+/// kernels' one workgroup per query tile: at a thousand positions the
+/// latter was 0.9 ms a layer. Checked past the split's threshold, at a
+/// window that is not a whole number of its chunks.
+#[test]
+fn fused_attention_prefill_one_deep_token_takes_the_split_kernel() {
+    cross_check_fused_attention_prefill(1, true, 700);
+    cross_check_fused_attention_prefill(1, false, 333);
+}
+
 /// The deferred form on the contiguous mirror, past its floor as above,
 /// and on the page pool: the rows counted first and filled after the
 /// chunk must be, row for row, what the in-order path pushed.
@@ -9516,6 +9571,118 @@ fn fused_post_attention_prefill_swiglu_matches_across_a_stripe_boundary() {
 #[test]
 fn fused_post_attention_prefill_swiglu_matches_at_model_shaped_dims() {
     cross_check_fused_post_attention_shaped(91, 1536, 2048, 6144, false);
+}
+
+/// The MoE head chain (`moe_head_rows`) against the same computation as
+/// the separate device calls the host path makes: the output projection,
+/// post-norm and residual for `x1`; the router's weightless norm, scale
+/// and projection for the logits; the shared MLP with its post-norm. At
+/// one token (the decode shape) and a few, on float kernels so the two
+/// sides differ only by fusion.
+#[test]
+fn the_moe_head_chain_matches_the_separate_calls() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    if vulkan.q4_k_mmvq {
+        return;
+    }
+    vulkan.without_prefill_mmq(|| {
+        let (n_embd, attn_dim, ffn_len, n_expert) = (256usize, 512usize, 512usize, 8usize);
+        let eps = 1e-6f32;
+        let mut seed = 0x0E0E_u64;
+        let mut build = |in_dim: usize, out_dim: usize| {
+            let mut bytes = Vec::new();
+            for _ in 0..out_dim {
+                for _ in 0..(in_dim / 256) {
+                    bytes.extend(build_block(GGML_TYPE_Q4_K, &mut seed));
+                }
+            }
+            test_quant_matrix(&bytes, GGML_TYPE_Q4_K, in_dim, out_dim)
+        };
+        let wo = build(attn_dim, n_embd);
+        let gate_inp = build(n_embd, n_expert);
+        let gate = build(n_embd, ffn_len);
+        let up = build(n_embd, ffn_len);
+        let down = build(ffn_len, n_embd);
+        let mut rand_vec = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
+                .collect()
+        };
+        for n_tokens in [1usize, 3] {
+            let attn_out = rand_vec(n_tokens * attn_dim);
+            let residual = rand_vec(n_tokens * n_embd);
+            let attn_post_norm: Vec<f32> = rand_vec(n_embd).iter().map(|v| 1.0 + v * 0.1).collect();
+            let ffn_norm: Vec<f32> = rand_vec(n_embd).iter().map(|v| 1.0 + v * 0.1).collect();
+            let post_norm_1: Vec<f32> = rand_vec(n_embd).iter().map(|v| 1.0 + v * 0.1).collect();
+            let gate_inp_scale: Vec<f32> =
+                rand_vec(n_embd).iter().map(|v| 1.0 + v * 0.05).collect();
+            let scale = 1.0 / (n_embd as f32).sqrt();
+            let router_weight: Vec<f32> = gate_inp_scale.iter().map(|s| s * scale).collect();
+
+            // The separate calls.
+            let mut x1 = vulkan.matmul(&attn_out, n_tokens, &wo);
+            crate::engine::tensor::rmsnorm_inplace(&mut x1, &attn_post_norm, n_tokens, n_embd, eps);
+            crate::engine::tensor::add_inplace(&mut x1, &residual);
+            let mut tmp = x1.clone();
+            crate::engine::arch::gemma::rmsnorm_weightless_inplace(&mut tmp, n_tokens, n_embd, eps);
+            for row in tmp.chunks_mut(n_embd) {
+                for (v, s) in row.iter_mut().zip(&gate_inp_scale) {
+                    *v *= scale * s;
+                }
+            }
+            let logits = vulkan.matmul(&tmp, n_tokens, &gate_inp);
+            let mut normed = x1.clone();
+            crate::engine::tensor::rmsnorm_inplace(&mut normed, &ffn_norm, n_tokens, n_embd, eps);
+            let mut g = vulkan.matmul(&normed, n_tokens, &gate);
+            let u = vulkan.matmul(&normed, n_tokens, &up);
+            crate::engine::tensor::gelu_inplace(&mut g);
+            crate::engine::tensor::mul_inplace(&mut g, &u);
+            let mut shared = vulkan.matmul(&g, n_tokens, &down);
+            crate::engine::tensor::rmsnorm_inplace(
+                &mut shared,
+                &post_norm_1,
+                n_tokens,
+                n_embd,
+                eps,
+            );
+
+            let (got_x1, got_logits, pending) = vulkan
+                .moe_head_rows(
+                    AttnOutSrc::Host(&attn_out),
+                    &residual,
+                    n_tokens,
+                    &wo,
+                    &attn_post_norm,
+                    &router_weight,
+                    &gate_inp,
+                    &ffn_norm,
+                    &gate,
+                    &up,
+                    &down,
+                    &post_norm_1,
+                    eps,
+                )
+                .expect("the head chain runs on float kernels");
+            let got_shared = vulkan.finish_rows(pending);
+            for (name, got, want) in [
+                ("x1", &got_x1, &x1),
+                ("logits", &got_logits, &logits),
+                ("shared", &got_shared, &shared),
+            ] {
+                assert_eq!(got.len(), want.len(), "{name} at {n_tokens} tokens");
+                for (i, (a, b)) in want.iter().zip(got).enumerate() {
+                    assert!(
+                        (a - b).abs() <= 6e-2 * a.abs().max(1.0),
+                        "{name} at {n_tokens} tokens, element {i}: separate {a} vs chain {b}"
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Zero-padding a prefill stripe up to [`padded_stripe_len`] must not
@@ -11593,6 +11760,16 @@ fn paged_fused_prefill_matches_unfused_reference() {
     cross_check_fused_attention_prefill_paged(21, false, 5, true);
     // Starting exactly on a page boundary — no leading partial run.
     cross_check_fused_attention_prefill_paged(17, true, 8, true);
+}
+
+/// One deep token on the page pool takes the split kernel through the
+/// table (`fused_attention_prefill_one_deep_token_takes_the_split_kernel`
+/// is the contiguous form): past the split's threshold, a window that is
+/// not a whole number of pages or of split chunks, both V arrangements.
+#[test]
+fn paged_fused_prefill_one_deep_token_takes_the_split_kernel() {
+    cross_check_fused_attention_prefill_paged(1, true, 700, true);
+    cross_check_fused_attention_prefill_paged(1, false, 333, true);
 }
 
 /// **Evidence that the matmul kernels are not where this device goes wrong.**

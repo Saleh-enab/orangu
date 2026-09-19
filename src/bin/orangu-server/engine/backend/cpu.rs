@@ -446,6 +446,97 @@ impl CpuBackend {
     }
 }
 
+impl CpuBackend {
+    /// [`Backend::matmul_batch_into`]'s one-token form: every op's rows in
+    /// one parallel region, each op's activation quantized once (a shared
+    /// input once for all). `false` when an op is not a one-token K-quant
+    /// row dot, which is the per-op path's to handle.
+    fn matmul_batch_one_token_into(&self, outs: &mut [Vec<f32>], ops: &[MatmulOp<'_>]) -> bool {
+        // Two row kernels: the K-quants' per-super-block one and the per-32
+        // one every other fused type takes; an op of neither is the per-op
+        // path's.
+        let k_row = |op: &MatmulOp<'_>| vecdot::supports_k_row(op.w.ggml_type(), op.w.in_dim);
+        let flat = |op: &MatmulOp<'_>| vecdot::supports(op.w.ggml_type(), op.w.in_dim);
+        if !ops
+            .iter()
+            .all(|op| op.n_tokens == 1 && op.x.len() == op.w.in_dim && (k_row(op) || flat(op)))
+        {
+            return false;
+        }
+        for op in ops {
+            if let Some(layer) = op.w.layer() {
+                crate::engine::dense_residency::touch(layer);
+            }
+        }
+        // One quantized activation per distinct input, in whichever of the
+        // two layouts the ops reading it need.
+        struct Act {
+            key: (usize, usize),
+            k_row: Option<vecdot::ActQ8KRow>,
+            flat: Option<vecdot::ActQ8>,
+        }
+        let mut acts: Vec<Act> = Vec::new();
+        let act_of: Vec<usize> = ops
+            .iter()
+            .map(|op| {
+                let key = (op.x.as_ptr() as usize, op.x.len());
+                let i = match acts.iter().position(|a| a.key == key) {
+                    Some(i) => i,
+                    None => {
+                        acts.push(Act {
+                            key,
+                            k_row: None,
+                            flat: None,
+                        });
+                        acts.len() - 1
+                    }
+                };
+                if k_row(op) {
+                    if acts[i].k_row.is_none() {
+                        acts[i].k_row = Some(vecdot::quantize_act_k_row(op.x));
+                    }
+                } else if acts[i].flat.is_none() {
+                    acts[i].flat = Some(vecdot::quantize_act(op.x));
+                }
+                i
+            })
+            .collect();
+        // Every op's rows end to end; `starts[i]` is where op `i` begins.
+        let mut starts = Vec::with_capacity(ops.len() + 1);
+        let mut total = 0usize;
+        for op in ops {
+            starts.push(total);
+            total += op.w.out_dim;
+        }
+        starts.push(total);
+        let mut flat = vec![0f32; total];
+        flat.par_chunks_mut(1)
+            .with_min_len(super::matmul_min_rows())
+            .enumerate()
+            .for_each(|(i, dst)| {
+                let op_i = starts.partition_point(|&s| s <= i) - 1;
+                let op = &ops[op_i];
+                let o = i - starts[op_i];
+                let row_bytes = op.w.row_bytes();
+                let row = &op.w.raw_bytes()[o * row_bytes..(o + 1) * row_bytes];
+                let act = &acts[act_of[op_i]];
+                dst[0] = match &act.k_row {
+                    Some(k) if k_row(op) => vecdot::dot_k_row(op.w.ggml_type(), row, k),
+                    _ => vecdot::dot_row(
+                        op.w.ggml_type(),
+                        row,
+                        act.flat.as_ref().expect("quantized for this op above"),
+                    ),
+                };
+            });
+        for (i, out) in outs.iter_mut().enumerate() {
+            out.clear();
+            out.extend_from_slice(&flat[starts[i]..starts[i + 1]]);
+        }
+        true
+    }
+}
+
 impl Backend for CpuBackend {
     fn is_host(&self) -> bool {
         true
@@ -516,16 +607,33 @@ impl Backend for CpuBackend {
     }
 
     /// Per op and into the caller's buffers, which is the whole gain here:
-    /// `CpuBackend` has no submission batching to do — the same reason it
-    /// leaves [`Backend::matmul_batch`] at its default — so a batch is
+    /// `CpuBackend` has no submission batching to do, so a batch is
     /// exactly `n` independent matmuls, and each of them can write into a
-    /// buffer that outlives the layer.
+    /// buffer that outlives the layer. `matmul_batch` is this with fresh
+    /// buffers, so the one-token region below serves both.
     ///
     /// `resize_with` rather than rebuilding the outer `Vec`: the inner
     /// buffers are the ones worth keeping, and a batch's shape does not
     /// change from layer to layer.
+    ///
+    /// **Except at one token**, where a batch's ops are one parallel region
+    /// rather than one each. A layer's Q/K/V at decode are three matvecs of
+    /// 8.8, 4.4 and 4.4 MB; as three regions each is a few dozen 64-row
+    /// tasks over sixteen threads — a ramp, a tail and a join per op — and
+    /// the three together read their 18 MB at 18.6 GB/s where the layer's
+    /// 66 MB gate/up pair reads at 29 and the memory gives 35. One region
+    /// over every op's rows is the same work with one ramp and one tail.
+    fn matmul_batch(&self, ops: &[MatmulOp<'_>]) -> Vec<Vec<f32>> {
+        let mut outs = Vec::new();
+        self.matmul_batch_into(&mut outs, ops);
+        outs
+    }
+
     fn matmul_batch_into(&self, outs: &mut Vec<Vec<f32>>, ops: &[MatmulOp<'_>]) {
         outs.resize_with(ops.len(), Vec::new);
+        if ops.len() > 1 && self.matmul_batch_one_token_into(outs, ops) {
+            return;
+        }
         for (out, op) in outs.iter_mut().zip(ops) {
             guarded_matmul_op_into(out, op, |dst, x, n_tokens, w| {
                 self.matmul_into(dst, x, n_tokens, w)
@@ -614,6 +722,87 @@ mod tests {
                     "type {ggml_type} n_tokens {n_tokens}: matmul_decode_into differs"
                 );
             }
+        }
+    }
+
+    /// A one-token batch — the shape of a decode layer's Q/K/V — comes out
+    /// of the single-region path bit for bit as the ops would one at a
+    /// time: two ops on one input, a third on another, widths that are not
+    /// task multiples, and a mixed batch (a per-32 type among the K-quants)
+    /// that has to take the per-op path.
+    #[test]
+    fn a_one_token_batch_matches_the_ops_one_at_a_time() {
+        let mut seed = 0x0B47_C4ED_u64;
+        let in_dim = 256 * 3;
+        let mats: Vec<(u32, usize)> = vec![
+            (GGML_TYPE_Q4_K, 200),
+            (GGML_TYPE_Q4_K, 67),
+            (GGML_TYPE_Q4_K, 129),
+        ];
+        let ws: Vec<_> = mats
+            .iter()
+            .map(|&(t, out_dim)| {
+                let bytes = weights(t, in_dim, out_dim, &mut seed);
+                (bytes, t, out_dim)
+            })
+            .collect();
+        let ws: Vec<_> = ws
+            .iter()
+            .map(|(bytes, t, out_dim)| test_quant_matrix(bytes, *t, in_dim, *out_dim))
+            .collect();
+        let x1: Vec<f32> = (0..in_dim)
+            .map(|i| ((i % 29) as f32 - 14.0) * 0.037)
+            .collect();
+        let x2: Vec<f32> = (0..in_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.051)
+            .collect();
+        let ops = [
+            MatmulOp {
+                x: &x1,
+                n_tokens: 1,
+                w: &ws[0],
+            },
+            MatmulOp {
+                x: &x1,
+                n_tokens: 1,
+                w: &ws[1],
+            },
+            MatmulOp {
+                x: &x2,
+                n_tokens: 1,
+                w: &ws[2],
+            },
+        ];
+        let mut outs = Vec::new();
+        CpuBackend.matmul_batch_into(&mut outs, &ops);
+        assert_eq!(outs.len(), 3);
+        for (out, op) in outs.iter().zip(&ops) {
+            let want = CpuBackend.matmul(op.x, 1, op.w);
+            assert_eq!(
+                out.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|f| f.to_bits()).collect::<Vec<_>>()
+            );
+        }
+        // A `Q8_0` op in the batch: not a K-quant row dot, so the whole
+        // batch takes the per-op path — and still matches.
+        let q8 = weights(GGML_TYPE_Q8_0, in_dim, 40, &mut seed);
+        let q8 = test_quant_matrix(&q8, GGML_TYPE_Q8_0, in_dim, 40);
+        let mixed = [
+            MatmulOp {
+                x: &x1,
+                n_tokens: 1,
+                w: &ws[0],
+            },
+            MatmulOp {
+                x: &x1,
+                n_tokens: 1,
+                w: &q8,
+            },
+        ];
+        let mut outs = Vec::new();
+        CpuBackend.matmul_batch_into(&mut outs, &mixed);
+        for (out, op) in outs.iter().zip(&mixed) {
+            assert_eq!(*out, CpuBackend.matmul(op.x, 1, op.w));
         }
     }
 

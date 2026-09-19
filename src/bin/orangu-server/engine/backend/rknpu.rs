@@ -1288,6 +1288,7 @@ impl RknpuBackend {
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
             }),
+            vram_used_at_start: None,
         }]
     }
 

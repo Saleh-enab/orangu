@@ -172,6 +172,7 @@ impl OpenClBackend {
                     vram_total_bytes: device.global_mem_size().ok().filter(|size| *size > 0),
                     id: None,
                     driver: device.version().ok(),
+                    vram_used_at_start: None,
                 }
             })
             .collect()

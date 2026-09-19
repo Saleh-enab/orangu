@@ -389,9 +389,26 @@ pub(crate) fn decode_device_runs(
     backend: &dyn crate::engine::backend::Backend,
     layer_devices: impl Iterator<Item = usize>,
 ) -> Option<Vec<(usize, std::ops::Range<usize>)>> {
-    let mut runs: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
+    let runs = decode_runs_with_host(backend, layer_devices)?;
+    runs.iter()
+        .map(|(device, range)| device.map(|d| (d, range.clone())))
+        .collect()
+}
+
+/// [`decode_device_runs`] that keeps a run of layers **without** a device
+/// behind them — a CPU overflow tier's — as `None` rather than declining:
+/// for a caller that can run those layers itself, step by step on the
+/// host, and still record every device run as one chain. On a 12B split
+/// 13:35 over a card and the host, the card's layers as thirteen per-layer
+/// chains were 26 submissions and 13 readbacks a token; as one run they
+/// are one of each.
+pub(crate) fn decode_runs_with_host(
+    backend: &dyn crate::engine::backend::Backend,
+    layer_devices: impl Iterator<Item = usize>,
+) -> Option<Vec<(Option<usize>, std::ops::Range<usize>)>> {
+    let mut runs: Vec<(Option<usize>, std::ops::Range<usize>)> = Vec::new();
     for (il, device) in layer_devices.enumerate() {
-        backend.as_wgpu_on(device)?;
+        let device = backend.as_wgpu_on(device).map(|_| device);
         match runs.last_mut() {
             Some((prev, range)) if *prev == device => range.end = il + 1,
             _ => runs.push((device, il..il + 1)),
@@ -836,7 +853,10 @@ fn evaluate_routed_experts_batched_views_inner(
             n_rows: down.n_rows,
             scale: None,
         };
-        if !vulkan.serves_experts(&ops) || !vulkan.serves_experts(std::slice::from_ref(&down_op)) {
+        if !vulkan.serves_experts(&ops)
+            || !vulkan.serves_experts(std::slice::from_ref(&down_op))
+            || !vulkan.stream_region_ready()
+        {
             return None;
         }
         let groups: Vec<(usize, Vec<usize>)> = experts

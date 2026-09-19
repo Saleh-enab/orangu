@@ -137,7 +137,14 @@ type WeightSlot = (usize, u64, u64);
 
 /// Default size of one `WeightArena` chunk buffer — grown to fit a single
 /// tensor larger than this (e.g. a wide embedding table) when needed.
+/// Not smaller: at 128 MiB the chunks stopped being dedicated allocations
+/// and the allocator's own blocks grew by 0.75 GiB.
 const WEIGHT_ARENA_CHUNK_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Chunk size once the planned bytes are all placed — tensors the plan did
+/// not count are few and small, and a full chunk for the first of them
+/// would waste what the plan just saved.
+const WEIGHT_ARENA_OVERFLOW_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Backing store for `VulkanBackend::weight_buffer`: every weight tensor's
 /// quantized bytes, packed by offset into a handful of large chunk buffers
@@ -153,12 +160,22 @@ const WEIGHT_ARENA_CHUNK_BYTES: u64 = 512 * 1024 * 1024;
 /// for instead.
 struct WeightArena {
     chunks: Vec<wgpu::Buffer>,
-    /// Capacity, in bytes, of `chunks`'s last element.
-    current_chunk_capacity: u64,
-    /// Byte offset within `chunks`'s last element where the next tensor
-    /// should be placed; always a multiple of the offset alignment
-    /// `weight_buffer` computes from `Device::limits()`.
-    next_offset: u64,
+    /// Per chunk: its capacity and the byte offset where the next tensor
+    /// goes (a multiple of the offset alignment `weight_buffer` computes
+    /// from `Device::limits()`). A tensor takes the first chunk with room
+    /// for it, so a chunk's tail is not lost to the tensor that did not
+    /// fit it.
+    fill: Vec<(u64, u64)>,
+    /// The bytes the model will place here in all, and its largest tensor,
+    /// when the loader knows them ahead of the first tensor: a chunk is
+    /// then cut to what the *other* tensors still need, so the largest
+    /// (an embedding table, arriving last) opens its own rather than
+    /// stranding a full chunk's tail. On a card the model fills, that tail
+    /// was 328 MiB the KV pages and the expert region then fought the
+    /// driver for, and the pages that lost read four times slower.
+    planned: Option<(u64, u64)>,
+    placed_bytes: u64,
+    largest_placed: bool,
     slots: HashMap<WeightCacheKey, WeightSlot>,
 }
 
@@ -297,11 +314,23 @@ struct StreamArena {
 /// staging buffer filled by every core (16 ms) and copied by one
 /// `copy_buffer_to_buffer` takes 55 ms, and the fill can happen while the
 /// device is busy with the previous weight's work — which is what
-/// [`VulkanBackend::prefetch_weight`] does.
+/// [`VulkanBackend::prefetch_weight`] does. The copy is recorded where the
+/// caller wants it, too, which `write_buffer`'s (ahead of whatever is
+/// submitted next) cannot be.
 ///
 /// Two, so one can be filled while the copy out of the other is in flight;
 /// a buffer is mapped again only when it is next needed, and mapping waits
 /// for the copy that read it.
+///
+/// **Sized past the host-visible device heap on purpose.** A mappable
+/// buffer that fits that heap (a 256 MiB window here) is placed in it, and
+/// two halves of 128 MiB filled it — after which every `write_buffer` in
+/// the process spent 13 ms allocating its staging elsewhere, a decode
+/// step's 15 KB input included: the split 12B fell from 3.9 to 1.4 tok/s
+/// after one streamed prefill. A half larger than the heap cannot be
+/// placed in it and lands in system memory, which the DMA engine reads at
+/// the same rate. Without a known heap size the pair is not used at all
+/// and uploads take the belt.
 struct UploadStaging {
     buffer: wgpu::Buffer,
     capacity: u64,
@@ -599,12 +628,19 @@ pub struct VulkanBackend {
     /// until a streamed call first needs it, so a run that never streams
     /// pays no VRAM for it.
     stream_arena: Mutex<Option<StreamArena>>,
-    /// The mapped staging pair every streamed weight crosses the bus
-    /// through — see [`UploadStaging`].
-    stream_staging: Mutex<Vec<UploadStaging>>,
+    /// The streaming region's size when the model asked for one at load
+    /// (`reserve_stream_region`) and whether the last attempt to bring it
+    /// back found the card too full — see `stream_region_ready`.
+    stream_region: Mutex<(u64, bool)>,
     /// Device buffers the routed feed-forward reuses call to call, by
     /// size — see [`Self::moe_buffer`].
     moe_scratch: Mutex<Vec<(u64, wgpu::Buffer)>>,
+    /// The mapped staging pair every streamed weight crosses the bus
+    /// through — see [`UploadStaging`] — and the size a half must exceed to
+    /// stay out of the host-visible device heap; `None` when that heap's
+    /// size is unknown, and then the pair is never created.
+    stream_staging: Mutex<Vec<UploadStaging>>,
+    upload_staging_min: Option<u64>,
     /// Backing store for every `CachedOpResources::x_buffer` — see
     /// `ScratchArena`'s own doc comment for why this is a separate arena
     /// from `output_arena` rather than one shared pool.
@@ -1579,6 +1615,10 @@ thread_local! {
     /// — a last-bit difference becomes a large one. The chains run on the
     /// calling thread, so this reaches exactly the test that set it.
     static MMQ_OFF_ON_THIS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A test's stripe budget for the packed routed-expert region, in
+    /// bytes — `0` for the configured one. See
+    /// [`VulkanBackend::with_expert_stripe_bytes`].
+    static EXPERT_STRIPE_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// This thread's recycled scratch buffers, by byte size, and the ones
     /// out on loan to the current lease — see [`VulkanBackend::scratch_lease`].
     ///
@@ -2013,6 +2053,62 @@ const COOP_MIN_N_TOKENS: usize = 24;
 /// Below this many 128 × 128 workgroups the wide integer-dot kernel leaves
 /// compute units idle and the narrow one is faster; see
 /// `VulkanBackend::mmq_kernel_for`. Sweepable as `ORANGU_MMQ_WIDE_MIN_WG`.
+/// Whether the routed feed-forward places the next layer's stack while its
+/// own down projection runs — `ORANGU_EXPERT_PREFETCH`, on unless `0`.
+fn expert_prefetch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_EXPERT_PREFETCH"))
+}
+
+/// Whether the streaming region is given back to the card after each
+/// prompt and taken again at the next — `ORANGU_EXPERT_REGION_RELEASE`,
+/// on unless `0`. See `VulkanBackend::prompt_prefilled`.
+fn expert_region_release() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_EXPERT_REGION_RELEASE"))
+}
+
+/// What the card must have left, beyond the region itself, before the
+/// region is taken again (`ORANGU_EXPERT_REGION_HEADROOM_MIB`): a card
+/// filled to the last page stops moving anything back into its memory,
+/// and what the region displaced then stays displaced.
+fn stream_region_headroom_bytes() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ORANGU_EXPERT_REGION_HEADROOM_MIB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(256)
+            * 1024
+            * 1024
+    })
+}
+
+/// The routed-expert region's size, `ORANGU_EXPERT_REGION_MIB` (128): what
+/// one stripe of packed experts may take, and so what the card holds for
+/// the region. A layer's routed experts are copied into it only as far as
+/// it goes and multiplied stripe by stripe.
+fn expert_region_cap_bytes() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("ORANGU_EXPERT_REGION_MIB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&m| m > 0)
+            .unwrap_or(128)
+            * 1024
+            * 1024
+    })
+}
+
+/// Whether a layer's routed experts are packed into the region — only the
+/// experts the batch routes to, in stripes the region's size — rather than
+/// the whole stack uploaded at once. `ORANGU_EXPERT_PACK`, on unless `0`.
+fn expert_pack() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_EXPERT_PACK"))
+}
+
 /// Tokens per tile of the indexed expert GEMM — `ORANGU_EXPERT_GEMM_TOKS`
 /// (16, 32, 64 or 128), default 32. See `mmq_indexed_kernel_for`.
 fn expert_gemm_toks() -> u32 {
@@ -2136,6 +2232,17 @@ const ROLE_ATTN_QKV: usize = 100;
 const ROLE_FFN: usize = 200;
 const ROLE_POST_ATTN: usize = 300;
 const ROLE_PLE: usize = 400;
+/// [`VulkanBackend::moe_head_rows`]'s five ops.
+const ROLE_MOE_HEAD: usize = 500;
+
+/// Rows a submission will produce, not yet waited for — the MoE shared
+/// MLP's, running on the card while the host runs the experts. Taken with
+/// [`VulkanBackend::finish_rows`].
+pub struct PendingRows {
+    buffer: wgpu::Buffer,
+    wait: std::sync::Arc<MapWait>,
+    len: usize,
+}
 
 /// Whether prefill `x`/output regions are shared by shape instead of allocated
 /// per weight — **on**, opt out with `ORANGU_NO_POOL_PREFILL_REGIONS`. See
@@ -2937,12 +3044,14 @@ impl VulkanBackend {
             wgpu::DeviceType::Cpu => DeviceClass::Software,
             wgpu::DeviceType::Other => DeviceClass::Other,
         };
+        let id = (!info.device_pci_bus_id.is_empty()).then_some(info.device_pci_bus_id);
         DeviceCandidate {
             index,
             name: info.name,
             class,
             vram_total_bytes: vulkan_replay::adapter_device_local_bytes(adapter),
-            id: (!info.device_pci_bus_id.is_empty()).then_some(info.device_pci_bus_id),
+            vram_used_at_start: DeviceCandidate::vram_used_now(id.as_deref()),
+            id,
             driver: (!info.driver.is_empty()).then(|| {
                 if info.driver_info.is_empty() {
                     info.driver.clone()
@@ -3674,6 +3783,10 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         let info = adapter.get_info();
         let adapter_name = format!("{} ({:?})", info.name, info.backend);
         let wgpu_backend = info.backend;
+        // See `UploadStaging`: a half must not fit the host-visible device
+        // heap, so it is sized to one more MiB than that heap holds.
+        let upload_staging_min = vulkan_replay::adapter_host_visible_device_local_bytes(&adapter)
+            .map(|bar| bar + (1 << 20));
 
         // Request the adapter's own limits rather than wgpu's conservative
         // portable defaults (128MiB storage buffers) — a model's larger
@@ -4009,7 +4122,18 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             required_features,
             required_limits: limits,
             experimental_features: Default::default(),
-            memory_hints: Default::default(),
+            // Small memory blocks for the sub-allocated buffers (the
+            // activation arenas, the KV pool's layers): the default's
+            // 128–256 MiB blocks left ~400 MiB of a 4 GiB card reserved
+            // and empty, which on a model that fills the card is the
+            // difference between its streaming region fitting and not.
+            // Every large buffer (weights, region) is a dedicated
+            // allocation either way. `ORANGU_VULKAN_MEMORY_HINT=performance`
+            // is the control arm.
+            memory_hints: match std::env::var("ORANGU_VULKAN_MEMORY_HINT").as_deref() {
+                Ok("performance") => wgpu::MemoryHints::Performance,
+                _ => wgpu::MemoryHints::MemoryUsage,
+            },
             trace: Default::default(),
         }))
         .ok()?;
@@ -4940,12 +5064,16 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             pipelines_coop,
             pipelines_coop_tiled,
             stream_arena: Mutex::new(None),
-            stream_staging: Mutex::new(Vec::new()),
+            stream_region: Mutex::new((0, false)),
             moe_scratch: Mutex::new(Vec::new()),
+            stream_staging: Mutex::new(Vec::new()),
+            upload_staging_min,
             weight_cache: Mutex::new(WeightArena {
                 chunks: Vec::new(),
-                current_chunk_capacity: 0,
-                next_offset: 0,
+                fill: Vec::new(),
+                planned: None,
+                placed_bytes: 0,
+                largest_placed: false,
                 slots: HashMap::new(),
             }),
             x_arena: Mutex::new(ScratchArena::new()),
@@ -5782,7 +5910,8 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
     /// `encoder` rather than submitted on its own — so a weight can be
     /// placed over one the same submission has already finished reading
     /// (the routed feed-forward's down stack over its gate/up stack, in a
-    /// region that holds one of them).
+    /// region that holds one of them). Only with the staging pair; through
+    /// the belt the copy lands ahead of the next submission regardless.
     fn weight_buffer_streamed_into(
         &self,
         w: &QuantMatrix,
@@ -5827,7 +5956,11 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             return None;
         }
         let t = std::time::Instant::now();
-        self.copy_staged_weight(w, key, &arena.buffer, offset, size, encoder);
+        if self.upload_staging_min.is_some() {
+            self.copy_staged_weight(w, key, &arena.buffer, offset, size, encoder);
+        } else {
+            self.write_weight_bytes(&arena.buffer, offset, bytes);
+        }
         arena.upload_ns += t.elapsed().as_nanos();
         arena.next_offset = offset + size;
         arena.uploaded += size;
@@ -5836,14 +5969,25 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         Some((arena.buffer.clone(), offset, size))
     }
 
-    /// Fills a staging half with `w`'s bytes now, so the upload that places
-    /// `w` in the region later finds them staged and only records the
-    /// copy. Called with the device busy — after a submission and before
-    /// its readback wait — this is the fill hidden behind the compute.
+    /// Places `w` in the region **now**, its bytes written into the queue's
+    /// staging, so the upload lands with the next submission's copies and
+    /// the call that needs `w` finds it resident. Called with the device
+    /// busy — after a submission and before its readback wait — the
+    /// staging write is hidden behind the compute, and the copy the queue
+    /// runs ahead of the next submission is ordered after everything in
+    /// flight: placing `w` over a stack the in-flight submission is still
+    /// reading is safe, because the overwrite happens only once that
+    /// submission has finished.
     ///
-    /// Nothing happens for a weight already resident in the region, or one
-    /// already staged.
+    /// Nothing happens for a weight already resident.
     pub fn prefetch_weight(&self, w: &QuantMatrix) {
+        let Some(min) = self.upload_staging_min else {
+            // Through the belt the copy would land ahead of the next
+            // submission — the next layer's attention, whose host turn is
+            // shorter than the copy (measured 6% slower) — so a weight is
+            // written when it is placed, not before.
+            return;
+        };
         let (waddr, wlen) = w.cache_key();
         let bytes = w.raw_bytes();
         let key = (waddr, wlen, w.ggml_type(), bytes.len());
@@ -5863,12 +6007,18 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         {
             return;
         }
-        self.stage_into(&mut staging, key, bytes);
+        self.stage_into(&mut staging, min, key, bytes);
     }
 
     /// Stages `bytes` under `key` in the least recently used half, mapping
     /// it first if its last copy has not been waited for.
-    fn stage_into(&self, staging: &mut Vec<UploadStaging>, key: WeightCacheKey, bytes: &[u8]) {
+    fn stage_into(
+        &self,
+        staging: &mut Vec<UploadStaging>,
+        min: u64,
+        key: WeightCacheKey,
+        bytes: &[u8],
+    ) {
         let size = (bytes.len() as u64).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
         let clock = staging.iter().map(|s| s.used_at).max().unwrap_or(0) + 1;
         let make = |capacity: u64| UploadStaging {
@@ -5883,12 +6033,26 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             filled: None,
             used_at: 0,
         };
-        while staging.len() < 2 {
-            staging.push(make(size.max(expert_stream_bytes() / 2)));
+        // Two halves: one stack being copied, one being filled. Packed
+        // stripes copy from both a layer's stacks inside one submission,
+        // so the next layer's prefetch needs a third — mapping a half
+        // whose copies are still in flight waits for the whole submission,
+        // and the fill meant to hide behind the card's work sat after it
+        // instead (22 ms a layer, measured).
+        let halves = if self.packs_experts() { 3 } else { 2 };
+        while staging.len() < halves {
+            staging.push(make(size.max(min)));
         }
+        // The least recently used half that holds nothing waiting for
+        // its copy.
         let at = (0..staging.len())
+            .filter(|&i| staging[i].filled.is_none())
             .min_by_key(|&i| staging[i].used_at)
-            .expect("two halves");
+            .unwrap_or_else(|| {
+                (0..staging.len())
+                    .min_by_key(|&i| staging[i].used_at)
+                    .expect("the halves exist")
+            });
         if staging[at].capacity < size {
             staging[at] = make(size);
         }
@@ -5936,9 +6100,93 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         half.used_at = clock;
     }
 
+    /// The staging half holding `w` whole — filled now if
+    /// [`Self::prefetch_weight`] has not — for a caller that copies pieces
+    /// of it into the region. The half stays marked filled until
+    /// [`Self::release_staged`] says the copies are recorded.
+    fn staged_half(&self, w: &QuantMatrix) -> (usize, WeightCacheKey) {
+        let min = self.upload_staging_min.expect("the staging pair is in use");
+        let (waddr, wlen) = w.cache_key();
+        let bytes = w.raw_bytes();
+        let key = (waddr, wlen, w.ggml_type(), bytes.len());
+        let mut staging = self.stream_staging.lock().expect("upload staging poisoned");
+        let found = staging
+            .iter()
+            .position(|s| s.filled.is_some_and(|(k, _)| k == key));
+        let at = match found {
+            Some(at) => at,
+            None => {
+                self.stage_into(&mut staging, min, key, bytes);
+                staging
+                    .iter()
+                    .position(|s| s.filled.is_some_and(|(k, _)| k == key))
+                    .expect("just staged")
+            }
+        };
+        (at, key)
+    }
+
+    /// Records copies of `pieces` — `(source offset, region offset,
+    /// bytes)` — from staging half `at` into `region`. Pieces that follow
+    /// each other on both sides go as one copy: a batch routes to most of
+    /// a layer's experts, so its pieces come in runs, and one copy of a
+    /// run moves its bytes at the rate a whole stack does where a copy
+    /// per expert measured a third slower.
+    fn copy_staged_pieces(
+        &self,
+        at: usize,
+        key: WeightCacheKey,
+        pieces: &[(u64, u64, u64)],
+        region: &wgpu::Buffer,
+        encoder: &mut wgpu::CommandEncoder,
+    ) {
+        let mut staging = self.stream_staging.lock().expect("upload staging poisoned");
+        let half = &mut staging[at];
+        assert!(
+            half.filled.is_some_and(|(k, _)| k == key),
+            "the staging half still holds the stack the pieces come from"
+        );
+        let mut run: Option<(u64, u64, u64)> = None;
+        for &(src, dst, len) in pieces {
+            match run {
+                Some((s, d, l)) if s + l == src && d + l == dst => run = Some((s, d, l + len)),
+                Some((s, d, l)) => {
+                    encoder.copy_buffer_to_buffer(&half.buffer, s, region, d, l);
+                    run = Some((src, dst, len));
+                }
+                None => run = Some((src, dst, len)),
+            }
+        }
+        if let Some((s, d, l)) = run {
+            encoder.copy_buffer_to_buffer(&half.buffer, s, region, d, l);
+        }
+    }
+
+    /// Counts a packed stripe's bytes and rewinds against the region's
+    /// upload accounting (`stream_upload_rate`).
+    fn note_stream_upload(&self, bytes: u64, stripes: usize) {
+        if let Some(arena) = self
+            .stream_arena
+            .lock()
+            .expect("stream arena poisoned")
+            .as_mut()
+        {
+            arena.uploaded += bytes;
+            arena.uploads += stripes as u64;
+            arena.epochs += stripes as u64;
+        }
+    }
+
+    /// The half's stack has been copied from; it may be refilled.
+    fn release_staged(&self, at: usize) {
+        let mut staging = self.stream_staging.lock().expect("upload staging poisoned");
+        staging[at].filled = None;
+    }
+
     /// Copies `w`'s staged bytes into the region at `offset` — staging
-    /// them first if [`Self::prefetch_weight`] has not — as a submission of
-    /// its own, ordered ahead of whatever dispatch is recorded next.
+    /// them first if [`Self::prefetch_weight`] has not — into `encoder`,
+    /// or as a submission of its own ordered ahead of whatever dispatch
+    /// is recorded next.
     fn copy_staged_weight(
         &self,
         w: &QuantMatrix,
@@ -5948,6 +6196,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         size: u64,
         encoder: Option<&mut wgpu::CommandEncoder>,
     ) {
+        let min = self.upload_staging_min.expect("the staging pair is in use");
         let mut staging = self.stream_staging.lock().expect("upload staging poisoned");
         let at = match staging
             .iter()
@@ -5955,7 +6204,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         {
             Some(at) => at,
             None => {
-                self.stage_into(&mut staging, key, w.raw_bytes());
+                self.stage_into(&mut staging, min, key, w.raw_bytes());
                 staging
                     .iter()
                     .position(|s| s.filled.is_some_and(|(k, _)| k == key))
@@ -5991,11 +6240,31 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
     /// bytes this appends land inside the tensor's own padded region — no
     /// kernel ever addresses them, and the next tensor starts at its own
     /// aligned offset well past them.
+    ///
+    /// Written in 4 MiB pieces from every core: `write_buffer` copies its
+    /// bytes into the queue's staging on the calling thread, and one
+    /// thread's copy of a 270 MiB expert stack ran at 2.3 GB/s where
+    /// sixteen run at 3–4.5 (`_scratch_measure_upload_routes`). A
+    /// persistently mapped staging buffer filled the same way was faster
+    /// still (4.8 GB/s) and was tried — and it sat in the card's
+    /// host-visible heap, whose 256 MiB it exhausted, after which every
+    /// `write_buffer` in the process took 13 ms for its staging (a decode
+    /// step's 15 KB input vector included: the split 12B fell from 3.9 to
+    /// 1.4 tok/s after one streamed prefill). The queue's own staging is
+    /// transient and leaves that heap as it found it.
     fn write_weight_bytes(&self, buffer: &wgpu::Buffer, offset: u64, bytes: &[u8]) {
+        use rayon::prelude::*;
         const ALIGN: usize = wgpu::COPY_BUFFER_ALIGNMENT as usize;
+        const PIECE: usize = 4 << 20;
         let head = bytes.len() - bytes.len() % ALIGN;
         if head > 0 {
-            self.queue.write_buffer(buffer, offset, &bytes[..head]);
+            bytes[..head]
+                .par_chunks(PIECE)
+                .enumerate()
+                .for_each(|(i, piece)| {
+                    self.queue
+                        .write_buffer(buffer, offset + (i * PIECE) as u64, piece);
+                });
         }
         if head < bytes.len() {
             let mut tail = [0u8; ALIGN];
@@ -6026,10 +6295,22 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         for chunk in arena.chunks.drain(..) {
             chunk.destroy();
         }
-        arena.current_chunk_capacity = 0;
-        arena.next_offset = 0;
+        arena.fill.clear();
+        arena.placed_bytes = 0;
+        arena.largest_placed = false;
         drop(arena);
         self.poll_blocking("release_weight_cache");
+    }
+
+    /// Tells the weight arena how many bytes of weights the model will
+    /// place on this device and how large the largest tensor is, so its
+    /// chunks are cut to fit (see `WeightArena::planned`). The start-up
+    /// probes' few MiB are already in the arena by then and count against
+    /// the plan like any tensor.
+    pub fn plan_weight_bytes(&self, bytes: u64, largest: u64) {
+        let mut arena = self.weight_cache.lock().expect("weight cache poisoned");
+        arena.planned = Some((bytes + arena.placed_bytes, largest));
+        arena.largest_placed = false;
     }
 
     fn weight_buffer(&self, w: &QuantMatrix) -> (wgpu::Buffer, u64, u64) {
@@ -6065,25 +6346,64 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         // a separate requirement from the 16-byte size padding above.
         let align = (self.device.limits().min_storage_buffer_offset_alignment as u64).max(16);
 
-        let fits_current_chunk = !arena.chunks.is_empty()
-            && arena.next_offset.next_multiple_of(align) + size <= arena.current_chunk_capacity;
-        if !fits_current_chunk {
-            let capacity = WEIGHT_ARENA_CHUNK_BYTES.max(size);
-            let chunk = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("orangu-server weight arena chunk"),
-                size: capacity,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            arena.chunks.push(chunk);
-            arena.current_chunk_capacity = capacity;
-            arena.next_offset = 0;
-        }
+        let chunk_index = match arena
+            .fill
+            .iter()
+            .position(|&(capacity, next)| next.next_multiple_of(align) + size <= capacity)
+        {
+            Some(i) => i,
+            None => {
+                // What the plan says the tensors other than its largest
+                // still need, when there is a plan; a full chunk without
+                // one, a small one once the plan is used up, and a tensor
+                // larger than any of these gets a chunk of its own size.
+                let capacity = match arena.planned {
+                    None => WEIGHT_ARENA_CHUNK_BYTES,
+                    Some((total, largest)) => {
+                        let remaining = total.saturating_sub(arena.placed_bytes);
+                        let pending_largest = if arena.largest_placed { 0 } else { largest };
+                        if remaining == 0 {
+                            WEIGHT_ARENA_OVERFLOW_CHUNK_BYTES
+                        } else {
+                            remaining
+                                .saturating_sub(pending_largest)
+                                .min(WEIGHT_ARENA_CHUNK_BYTES)
+                        }
+                    }
+                }
+                .max(size);
+                if crate::engine::env::flag_on("ORANGU_VRAM_REPORT") {
+                    eprintln!(
+                        "orangu-server: [vulkan] weight arena chunk {}: {:.1} MiB (planned {:?} MiB, placed {:.1} MiB, tensor {:.1} MiB)",
+                        arena.chunks.len(),
+                        capacity as f64 / (1024.0 * 1024.0),
+                        arena.planned.map(|(t, l)| (t >> 20, l >> 20)),
+                        arena.placed_bytes as f64 / (1024.0 * 1024.0),
+                        size as f64 / (1024.0 * 1024.0)
+                    );
+                }
+                let chunk = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("orangu-server weight arena chunk"),
+                    size: capacity,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                arena.chunks.push(chunk);
+                arena.fill.push((capacity, 0));
+                arena.chunks.len() - 1
+            }
+        };
 
-        let chunk_index = arena.chunks.len() - 1;
-        let offset = arena.next_offset.next_multiple_of(align);
+        let offset = arena.fill[chunk_index].1.next_multiple_of(align);
         self.write_weight_bytes(&arena.chunks[chunk_index], offset, bytes);
-        arena.next_offset = offset + size;
+        arena.fill[chunk_index].1 = offset + size;
+        arena.placed_bytes += size;
+        if arena
+            .planned
+            .is_some_and(|(_, largest)| size + 16 >= largest)
+        {
+            arena.largest_placed = true;
+        }
         arena.slots.insert(key, (chunk_index, offset, size));
         (arena.chunks[chunk_index].clone(), offset, size)
     }
@@ -8702,6 +9022,25 @@ pub struct ExpertOp<'a> {
     pub scale: Option<&'a [f32]>,
 }
 
+/// Cuts `groups`, in order, into runs whose experts' packed bytes —
+/// `per_expert` each — fit `budget`: per run its range of `groups` and
+/// each group's slot in the region. `per_expert` fits `budget` by the
+/// caller's check, so every run holds at least one group.
+fn expert_stripes(
+    groups: &[(usize, Vec<usize>)],
+    per_expert: u64,
+    budget: u64,
+) -> Vec<(std::ops::Range<usize>, Vec<usize>)> {
+    let per_stripe = ((budget / per_expert) as usize).max(1);
+    (0..groups.len())
+        .step_by(per_stripe)
+        .map(|start| {
+            let end = (start + per_stripe).min(groups.len());
+            (start..end, (0..end - start).collect())
+        })
+        .collect()
+}
+
 /// An indexed expert GEMM's plan: per op its kernel, table and grid; and
 /// the rows every op produces.
 type ExpertGemmPlan = (Vec<MmqKernel>, Vec<Vec<u32>>, Vec<(u32, u32, u32)>, usize);
@@ -9223,6 +9562,20 @@ impl VulkanBackend {
         ops: &[ExpertOp<'_>],
         groups: &[(usize, Vec<usize>)],
     ) -> ExpertGemmPlan {
+        self.plan_expert_gemm_packed(ops, groups, None, 0)
+    }
+
+    /// [`Self::plan_expert_gemm`] over a stripe: `slots` is, per group,
+    /// where its expert's rows sit in the region (its expert index when
+    /// the stack is there whole), and `out_base` where the stripe's first
+    /// row lands in the result.
+    fn plan_expert_gemm_packed(
+        &self,
+        ops: &[ExpertOp<'_>],
+        groups: &[(usize, Vec<usize>)],
+        slots: Option<&[usize]>,
+        out_base: usize,
+    ) -> ExpertGemmPlan {
         let kernels: Vec<MmqKernel> = ops
             .iter()
             .map(|op| {
@@ -9239,9 +9592,10 @@ impl VulkanBackend {
             let n_tiles: usize = groups.iter().map(|(_, t)| t.len().div_ceil(toks)).sum();
             let mut entries: Vec<u32> = Vec::with_capacity(n_tiles * 8);
             let mut lists: Vec<u32> = Vec::new();
-            let mut out_base = 0usize;
-            for (expert, tokens) in groups {
-                let row_base = expert * op.rows_per_expert + op.first_row;
+            let mut out_base = out_base;
+            for (g, (expert, tokens)) in groups.iter().enumerate() {
+                let slot = slots.map_or(*expert, |s| s[g]);
+                let row_base = slot * op.rows_per_expert + op.first_row;
                 let list_start = n_tiles * 8 + lists.len();
                 let scale = op.scale.map_or(1.0f32, |s| s[*expert]).to_bits();
                 for tile in 0..tokens.len().div_ceil(toks) {
@@ -9571,38 +9925,72 @@ impl VulkanBackend {
         let (dn_kernels, dn_tables, dn_grids, _) = self.plan_expert_gemm(&down_ops, &ranges);
         let t_start = std::time::Instant::now();
 
-        // The region holds **one** stack at a time: gate/up (one tensor
-        // when fused) is placed now, its copy submitted ahead; the down
-        // stack is placed over it with its copy recorded into this
-        // submission *after* the gate/up dispatches, which the queue runs
-        // in order. A region for the pair would be another 270 MiB on a
-        // card this model already fills — measured, that spilled the
-        // region to host memory and every dispatch read its weights over
-        // the bus.
+        // Packed: only the routed experts cross the bus, into a region
+        // the size of one stripe, and a stripe's copies and dispatches
+        // follow the previous stripe's inside one submission. Whole: the
+        // region holds **one** stack at a time — gate/up (one tensor when
+        // fused) is placed now, and the down stack is placed over it once
+        // the gate/up half has been submitted; its bytes go through the
+        // queue's staging, whose copies run ahead of the *next*
+        // submission and so after the gate/up dispatches. Two submissions
+        // per layer, then, with nothing read back between them. A region
+        // for the pair would be another 270 MiB on a card this model
+        // already fills — measured, that spilled the region to host memory
+        // and every dispatch read its weights over the bus.
         let t_upload = std::time::Instant::now();
         let before = self.stream_upload_rate().map_or(0, |r| r.0);
-        self.ensure_stream_capacity(&[gate.stack, up.stack]);
-        self.ensure_stream_capacity(&[down.stack]);
-        self.reserve_stream_space(&[
-            MatmulOp {
-                x: &[],
-                n_tokens: 0,
-                w: gate.stack,
-            },
-            MatmulOp {
-                x: &[],
-                n_tokens: 0,
-                w: up.stack,
-            },
-        ]);
-        let w_gate = self
-            .weight_buffer_streamed(gate.stack)
-            .expect("the streaming region holds a stack");
-        let w_up = self
-            .weight_buffer_streamed(up.stack)
-            .expect("the streaming region holds a stack");
+        let align = (self.device.limits().min_storage_buffer_offset_alignment as u64).max(16);
+        let packed = if self.packs_experts() {
+            let budget = self.expert_stripe_bytes();
+            let gu_stacks: Vec<&ExpertOp<'_>> = if gate.stack.cache_key() == up.stack.cache_key() {
+                vec![gate]
+            } else {
+                vec![gate, up]
+            };
+            let gu_per_expert: u64 = gu_stacks
+                .iter()
+                .map(|op| (op.rows_per_expert * op.stack.row_bytes()) as u64)
+                .sum();
+            let dn_per_expert = (down.rows_per_expert * down.stack.row_bytes()) as u64;
+            // Each stack of a stripe starts at an aligned offset and is
+            // bound padded to 16; the budget has to cover both.
+            let overhead = (gu_stacks.len() as u64 + 1) * (align + 16);
+            let fits = |per: u64| per > 0 && per.is_multiple_of(4) && per + overhead <= budget;
+            (fits(gu_per_expert) && fits(dn_per_expert)).then(|| {
+                let gu = expert_stripes(groups, gu_per_expert, budget.saturating_sub(overhead));
+                let dn = expert_stripes(groups, dn_per_expert, budget.saturating_sub(overhead));
+                (gu_stacks, gu, dn)
+            })
+        } else {
+            None
+        };
+        let (w_gate, w_up) = if packed.is_some() {
+            (None, None)
+        } else {
+            self.ensure_stream_capacity(&[gate.stack, up.stack]);
+            self.ensure_stream_capacity(&[down.stack]);
+            self.reserve_stream_space(&[
+                MatmulOp {
+                    x: &[],
+                    n_tokens: 0,
+                    w: gate.stack,
+                },
+                MatmulOp {
+                    x: &[],
+                    n_tokens: 0,
+                    w: up.stack,
+                },
+            ]);
+            let w_gate = self
+                .weight_buffer_streamed(gate.stack)
+                .expect("the streaming region holds a stack");
+            let w_up = self
+                .weight_buffer_streamed(up.stack)
+                .expect("the streaming region holds a stack");
+            (Some(w_gate), Some(w_up))
+        };
         let upload_ms = t_upload.elapsed().as_secs_f64() * 1000.0;
-        let uploaded = self.stream_upload_rate().map_or(0, |r| r.0) - before;
+        let mut uploaded = self.stream_upload_rate().map_or(0, |r| r.0) - before;
 
         let x_buffer = self.moe_buffer(x.len());
         self.queue
@@ -9654,30 +10042,10 @@ impl VulkanBackend {
                 label: Some("orangu-server routed FFN encoder"),
             });
         self.op_stamp_encoder(&mut encoder, "moe.gap");
-        let keep_gu: Vec<(wgpu::Buffer, wgpu::BindGroup)>;
-        let keep_dn: Vec<(wgpu::Buffer, wgpu::BindGroup)>;
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("orangu-server routed FFN pass"),
-                timestamp_writes: None,
-            });
-            self.record_mmq_quantize(&mut pass, &quantize_bg, quantize_wg);
-            self.op_stamp(&mut pass, "moe.quantize");
-            let mut keep: Vec<(wgpu::Buffer, wgpu::BindGroup)> = Vec::new();
-            for (i, (op, w)) in gu_ops.iter().zip([w_gate, w_up]).enumerate() {
-                keep.push(self.record_expert_gemm(
-                    &mut pass,
-                    op,
-                    gu_kernels[i],
-                    &gu_tables[i],
-                    gu_grids[i],
-                    w,
-                    &q8,
-                    (&y_gu, (i as u64) * (gu_len as u64) * 4, (gu_len as u64) * 4),
-                    in_dim,
-                    total,
-                ));
-            }
+        let mut keep_gu: Vec<(wgpu::Buffer, wgpu::BindGroup)> = Vec::new();
+        let mut keep_dn: Vec<(wgpu::Buffer, wgpu::BindGroup)> = Vec::new();
+        let stripes = packed.as_ref().map_or(0, |(_, gu, dn)| gu.len() + dn.len());
+        let activation = |pass: &mut wgpu::ComputePass<'_>| {
             pass.set_pipeline(if silu {
                 &self.silu_mul_pipeline
             } else {
@@ -9691,40 +10059,11 @@ impl VulkanBackend {
                 1,
                 1,
             );
-            self.op_stamp(&mut pass, "moe.activation");
-            self.record_mmq_quantize(&mut pass, &quantize_h_bg, quantize_h_wg);
-            self.op_stamp(&mut pass, "moe.quantize");
-            drop(pass);
-            keep_gu = keep;
-        }
-        // The down stack over the gate/up one, its copy ordered after the
-        // dispatches above.
-        self.reserve_stream_space(&[MatmulOp {
-            x: &[],
-            n_tokens: 0,
-            w: down.stack,
-        }]);
-        let w_down = self
-            .weight_buffer_streamed_into(down.stack, Some(&mut encoder))
-            .expect("the streaming region holds a stack");
-        self.op_stamp_encoder(&mut encoder, "moe.down_copy");
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("orangu-server routed FFN down pass"),
-                timestamp_writes: None,
-            });
-            let keep: Vec<(wgpu::Buffer, wgpu::BindGroup)> = vec![self.record_expert_gemm(
-                &mut pass,
-                &down_ops[0],
-                dn_kernels[0],
-                &dn_tables[0],
-                dn_grids[0],
-                w_down,
-                &q8_h,
-                (&y, 0, (out_len as u64) * 4),
-                n_ff,
-                total,
-            )];
+            self.op_stamp(pass, "moe.activation");
+            self.record_mmq_quantize(pass, &quantize_h_bg, quantize_h_wg);
+            self.op_stamp(pass, "moe.quantize");
+        };
+        let combine_pass = |pass: &mut wgpu::ComputePass<'_>| {
             if let Some((_, _, _, bg, len)) = &combined {
                 pass.set_pipeline(&self.moe_combine_pipeline);
                 pass.set_bind_group(0, bg, &[]);
@@ -9735,11 +10074,207 @@ impl VulkanBackend {
                     1,
                     1,
                 );
-                self.op_stamp(&mut pass, "moe.combine");
+                self.op_stamp(pass, "moe.combine");
             }
-            self.record_heater(&mut pass);
+            self.record_heater(pass);
+        };
+        if let Some((gu_stacks, gu_stripes, dn_stripes)) = packed {
+            let region = self
+                .stream_arena
+                .lock()
+                .expect("stream arena poisoned")
+                .as_ref()
+                .expect("expert_stripe_bytes placed the region")
+                .buffer
+                .clone();
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("orangu-server routed FFN quantize pass"),
+                    timestamp_writes: None,
+                });
+                self.record_mmq_quantize(&mut pass, &quantize_bg, quantize_wg);
+                self.op_stamp(&mut pass, "moe.quantize");
+            }
+            // Gate/up: the stack(s) staged whole, the stripe's experts
+            // copied into the region in slot order, one dispatch per op.
+            let halves: Vec<(usize, WeightCacheKey)> = gu_stacks
+                .iter()
+                .map(|op| self.staged_half(op.stack))
+                .collect();
+            let mut out_base = 0usize;
+            for (range, slots) in &gu_stripes {
+                let stripe: &[(usize, Vec<usize>)] = &groups[range.clone()];
+                let mut base = 0u64;
+                let mut bindings: Vec<(wgpu::Buffer, u64, u64)> = Vec::new();
+                for (op, (at, key)) in gu_stacks.iter().zip(&halves) {
+                    let per = (op.rows_per_expert * op.stack.row_bytes()) as u64;
+                    let pieces: Vec<(u64, u64, u64)> = stripe
+                        .iter()
+                        .zip(slots)
+                        .map(|((expert, _), &slot)| {
+                            (*expert as u64 * per, base + slot as u64 * per, per)
+                        })
+                        .collect();
+                    self.copy_staged_pieces(*at, *key, &pieces, &region, &mut encoder);
+                    let size = (slots.len() as u64 * per).next_multiple_of(16);
+                    uploaded += size;
+                    bindings.push((region.clone(), base, size));
+                    base = (base + size).next_multiple_of(align);
+                }
+                self.op_stamp_encoder(&mut encoder, "moe.stripe_copy");
+                let (kernels, tables, grids, _) =
+                    self.plan_expert_gemm_packed(&gu_ops, stripe, Some(slots), out_base);
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("orangu-server routed FFN pass"),
+                    timestamp_writes: None,
+                });
+                for (i, op) in gu_ops.iter().enumerate() {
+                    // A fused pair binds the one stack; separate stacks
+                    // bind their own.
+                    let w = bindings[i.min(bindings.len() - 1)].clone();
+                    keep_gu.push(self.record_expert_gemm(
+                        &mut pass,
+                        op,
+                        kernels[i],
+                        &tables[i],
+                        grids[i],
+                        w,
+                        &q8,
+                        (&y_gu, (i as u64) * (gu_len as u64) * 4, (gu_len as u64) * 4),
+                        in_dim,
+                        total,
+                    ));
+                }
+                drop(pass);
+                out_base += stripe.iter().map(|(_, t)| t.len()).sum::<usize>();
+            }
+            for (at, _) in &halves {
+                self.release_staged(*at);
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("orangu-server routed FFN activation pass"),
+                    timestamp_writes: None,
+                });
+                activation(&mut pass);
+            }
+            // Down: the same over the product's rows, in group order.
+            let (dn_at, dn_key) = self.staged_half(down.stack);
+            let per = (down.rows_per_expert * down.stack.row_bytes()) as u64;
+            let mut out_base = 0usize;
+            let mut row_base = 0usize;
+            for (range, slots) in &dn_stripes {
+                let stripe: Vec<(usize, Vec<usize>)> = ranges[range.clone()].to_vec();
+                let pieces: Vec<(u64, u64, u64)> = stripe
+                    .iter()
+                    .zip(slots)
+                    .map(|((expert, _), &slot)| (*expert as u64 * per, slot as u64 * per, per))
+                    .collect();
+                self.copy_staged_pieces(dn_at, dn_key, &pieces, &region, &mut encoder);
+                let size = (slots.len() as u64 * per).next_multiple_of(16);
+                uploaded += size;
+                self.op_stamp_encoder(&mut encoder, "moe.stripe_copy");
+                let (kernels, tables, grids, _) =
+                    self.plan_expert_gemm_packed(&down_ops, &stripe, Some(slots), out_base);
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("orangu-server routed FFN down pass"),
+                    timestamp_writes: None,
+                });
+                keep_dn.push(self.record_expert_gemm(
+                    &mut pass,
+                    &down_ops[0],
+                    kernels[0],
+                    &tables[0],
+                    grids[0],
+                    (region.clone(), 0, size),
+                    &q8_h,
+                    (&y, 0, (out_len as u64) * 4),
+                    n_ff,
+                    total,
+                ));
+                drop(pass);
+                let rows: usize = stripe.iter().map(|(_, t)| t.len()).sum();
+                out_base += rows;
+                row_base += rows;
+            }
+            debug_assert_eq!(row_base, total);
+            self.release_staged(dn_at);
+            self.note_stream_upload(uploaded, gu_stripes.len() + dn_stripes.len());
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server routed FFN combine pass"),
+                timestamp_writes: None,
+            });
+            combine_pass(&mut pass);
             drop(pass);
-            keep_dn = keep;
+        } else {
+            let (w_gate, w_up) = (w_gate.expect("placed whole"), w_up.expect("placed whole"));
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("orangu-server routed FFN pass"),
+                    timestamp_writes: None,
+                });
+                self.record_mmq_quantize(&mut pass, &quantize_bg, quantize_wg);
+                self.op_stamp(&mut pass, "moe.quantize");
+                for (i, (op, w)) in gu_ops.iter().zip([w_gate, w_up]).enumerate() {
+                    keep_gu.push(self.record_expert_gemm(
+                        &mut pass,
+                        op,
+                        gu_kernels[i],
+                        &gu_tables[i],
+                        gu_grids[i],
+                        w,
+                        &q8,
+                        (&y_gu, (i as u64) * (gu_len as u64) * 4, (gu_len as u64) * 4),
+                        in_dim,
+                        total,
+                    ));
+                }
+                activation(&mut pass);
+            }
+            // The down stack over the gate/up one. With the staging pair its
+            // copy is recorded here, after the dispatches above, in the same
+            // submission; through the belt a copy lands ahead of the next
+            // submission, so the gate/up half is submitted first and the down
+            // half becomes a submission of its own — nothing is read back
+            // between them either way.
+            if self.upload_staging_min.is_none() {
+                self.queue.submit(Some(encoder.finish()));
+                self.submission_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::engine::decode_stages::record_submission();
+                encoder = self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("orangu-server routed FFN down encoder"),
+                    });
+            }
+            self.reserve_stream_space(&[MatmulOp {
+                x: &[],
+                n_tokens: 0,
+                w: down.stack,
+            }]);
+            let w_down = self
+                .weight_buffer_streamed_into(down.stack, Some(&mut encoder))
+                .expect("the streaming region holds a stack");
+            self.op_stamp_encoder(&mut encoder, "moe.down_copy");
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server routed FFN down pass"),
+                timestamp_writes: None,
+            });
+            keep_dn.push(self.record_expert_gemm(
+                &mut pass,
+                &down_ops[0],
+                dn_kernels[0],
+                &dn_tables[0],
+                dn_grids[0],
+                w_down,
+                &q8_h,
+                (&y, 0, (out_len as u64) * 4),
+                n_ff,
+                total,
+            ));
+            combine_pass(&mut pass);
+            drop(pass);
         }
         let is_combined = combined.is_some();
         let t_submit = std::time::Instant::now();
@@ -9752,13 +10287,15 @@ impl VulkanBackend {
         // the next layer's attention, whose host turn is shorter than the
         // copy, and the chunk was 6% slower for it.
         let (all, _) = self.submit_and_readback_meanwhile(encoder, src, 0, src_len, || {
-            for w in prefetch {
-                self.prefetch_weight(w);
+            if expert_prefetch() {
+                for w in prefetch {
+                    self.prefetch_weight(w);
+                }
             }
         });
         if ple_trace() {
             eprintln!(
-                "orangu-server: [prefill-trace]   expert-ffn groups={} rows={total} \
+                "orangu-server: [prefill-trace]   expert-ffn groups={} rows={total} stripes={stripes} \
                  upload={:.1} MiB in {upload_ms:.1}ms, submit+readback {:.1}ms, total {:.1}ms",
                 groups.len(),
                 uploaded as f64 / (1024.0 * 1024.0),
@@ -9926,15 +10463,183 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// experts asks for it at load time.
     pub fn reserve_stream_region(&self, bytes: u64) {
         let align = (self.device.limits().min_storage_buffer_offset_alignment as u64).max(16);
-        self.ensure_stream_capacity_bytes(bytes.next_multiple_of(16).next_multiple_of(align));
+        let bytes = bytes.next_multiple_of(16).next_multiple_of(align);
+        self.stream_region.lock().expect("stream region poisoned").0 = bytes;
+        self.ensure_stream_capacity_bytes(bytes);
+    }
+
+    /// Whether the routed experts go to the card packed and striped
+    /// (`expert_pack`, and the staging pair the copies read from).
+    pub fn packs_experts(&self) -> bool {
+        expert_pack() && self.upload_staging_min.is_some()
+    }
+
+    /// What the region should be for a model whose largest expert stack is
+    /// `largest` bytes: the stack when it is uploaded whole, the cap when
+    /// the experts are packed into it stripe by stripe.
+    pub fn expert_region_bytes_for(&self, largest: u64) -> u64 {
+        if self.packs_experts() {
+            largest.min(expert_region_cap_bytes())
+        } else {
+            largest
+        }
+    }
+
+    /// The stripe budget a routed-expert call packs against: a test's
+    /// override on this thread, else the region — created at the cap
+    /// when no model reserved one.
+    fn expert_stripe_bytes(&self) -> u64 {
+        let forced = EXPERT_STRIPE_BYTES.with(|c| c.get());
+        if forced > 0 {
+            return forced;
+        }
+        let capacity = self
+            .stream_arena
+            .lock()
+            .expect("stream arena poisoned")
+            .as_ref()
+            .map_or(0, |a| a.capacity);
+        if capacity > 0 {
+            return capacity;
+        }
+        self.ensure_stream_capacity_bytes(expert_region_cap_bytes());
+        expert_region_cap_bytes()
+    }
+
+    /// Runs `f` with the packed expert region's stripes cut to `bytes` on
+    /// this thread — so a test can make a five-expert layer take several
+    /// stripes.
+    #[cfg(test)]
+    pub(crate) fn with_expert_stripe_bytes<T>(&self, bytes: u64, f: impl FnOnce() -> T) -> T {
+        EXPERT_STRIPE_BYTES.with(|c| c.set(bytes));
+        let out = f();
+        EXPERT_STRIPE_BYTES.with(|c| c.set(0));
+        out
+    }
+
+    /// The streaming region's size when the model reserved one at load,
+    /// else 0 — what the card holds for it whether or not a prompt is
+    /// using it right now.
+    pub fn stream_region_bytes(&self) -> u64 {
+        self.stream_region.lock().expect("stream region poisoned").0
+    }
+
+    /// Whether the streaming region is in place for a routed-expert batch,
+    /// taking it again if a prompt gave it back — unless the card has less
+    /// left than the region and `stream_region_headroom_bytes`, in which
+    /// case the batch runs on the host: a region created into a full card
+    /// lands in host memory and reads across the bus at every dispatch, and
+    /// what it displaces reads that way for the rest of the process.
+    pub fn stream_region_ready(&self) -> bool {
+        let (bytes, declined) = *self.stream_region.lock().expect("stream region poisoned");
+        if bytes == 0 {
+            return true;
+        }
+        if self
+            .stream_arena
+            .lock()
+            .expect("stream arena poisoned")
+            .as_ref()
+            .is_some_and(|a| a.capacity >= bytes)
+        {
+            return true;
+        }
+        if declined {
+            return false;
+        }
+        let device = self.device_in_use();
+        let fits = match (device.vram_total_bytes, device.vram_used_bytes()) {
+            (Some(total), Some(used)) => {
+                total.saturating_sub(used) >= bytes + stream_region_headroom_bytes()
+            }
+            _ => true,
+        };
+        if !fits {
+            log::info!(
+                "orangu-server: [vulkan] the expert streaming region ({}) does not fit what the                  card has left; this prompt's routed experts run on the host",
+                orangu::format::format_bytes(bytes)
+            );
+            self.stream_region.lock().expect("stream region poisoned").1 = true;
+            return false;
+        }
+        self.ensure_stream_capacity_bytes(bytes);
+        true
+    }
+
+    /// A prompt's prefill is done: the streaming region goes back to the
+    /// card, so a decode step's K/V pages and weights have it, and the next
+    /// prompt takes it again (`stream_region_ready`). Measured on a
+    /// 26B-A4B file filling a 4 GiB card: with the region held across
+    /// prompts, a deep prompt after a shallow one decoded at 7.3 tok/s for
+    /// the rest of the process against 10.1 with it released — the region
+    /// had displaced KV pages into host memory and, the card full, the
+    /// driver never brought them back.
+    pub fn prompt_prefilled(&self) {
+        let mut region = self.stream_region.lock().expect("stream region poisoned");
+        region.1 = false;
+        if region.0 == 0 || !expert_region_release() {
+            return;
+        }
+        drop(region);
+        let taken = self
+            .stream_arena
+            .lock()
+            .expect("stream arena poisoned")
+            .take();
+        let Some(arena) = taken else {
+            return;
+        };
+        // Entries bound to the region would keep its buffer alive; they are
+        // rebuilt against the next one on their next use.
+        self.op_cache
+            .lock()
+            .expect("op cache poisoned")
+            .retain(|_, entry| {
+                entry
+                    .lock()
+                    .expect("op cache entry poisoned")
+                    .weight_binding
+                    .0
+                    != arena.buffer
+            });
+        let mut back = self.stream_arena.lock().expect("stream arena poisoned");
+        // The counters carry on: `stream_upload_rate` reports the process.
+        *back = Some(StreamArena {
+            buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("orangu-server expert stream arena (released)"),
+                size: 16,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            capacity: 0,
+            next_offset: 0,
+            slots: HashMap::new(),
+            uploaded: arena.uploaded,
+            upload_ns: arena.upload_ns,
+            uploads: arena.uploads,
+            epochs: arena.epochs + 1,
+            hits: arena.hits,
+            calls: arena.calls,
+            ops: arena.ops,
+        });
     }
 
     /// [`Self::ensure_stream_capacity`] for a size in bytes.
     fn ensure_stream_capacity_bytes(&self, need: u64) {
+        // A model that reserved a region asked for exactly that size;
+        // anything else gets at least `expert_stream_bytes`.
+        let reserved = self.stream_region.lock().expect("stream region poisoned").0;
+        let sized = |need: u64| {
+            if reserved > 0 && need == reserved {
+                need
+            } else {
+                need.max(expert_stream_bytes())
+            }
+        };
         let mut slot = self.stream_arena.lock().expect("stream arena poisoned");
         match slot.as_mut() {
             Some(arena) if arena.capacity < need => {
-                let capacity = need.max(expert_stream_bytes());
+                let capacity = sized(need);
                 arena.buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("orangu-server expert stream arena"),
                     size: capacity,
@@ -9950,7 +10655,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             None => {
                 // Created at the size the pair needs; `weight_buffer_streamed`
                 // would otherwise size it to the first weight alone.
-                let capacity = need.max(expert_stream_bytes());
+                let capacity = sized(need);
                 *slot = Some(StreamArena {
                     buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
                         label: Some("orangu-server expert stream arena"),
@@ -14599,15 +15304,56 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         }
 
+        // One query over a long window: the prefill kernels give a query
+        // tile one workgroup and walk the window in it, which at a
+        // thousand positions is 0.9 ms a layer for a decode token (a
+        // dispatch of 16 workgroups on a card of 22 compute units). The
+        // split kernel the whole-step decode chain uses parallelises over
+        // positions instead; here it reads the chain's own roped Q and
+        // the rows the chain just wrote.
+        let split_window = (n_tokens == 1).then(|| {
+            let pos = start_pos;
+            // The rule `engine::attention::derived_window` states for a
+            // causal query: the `n_swa` positions ending at its own.
+            let window_start = if causal && n_swa > 0 {
+                pos.saturating_sub(n_swa - 1)
+            } else {
+                0
+            };
+            (pos, window_start)
+        });
+        let split_window = split_window.filter(|&(pos, ws)| {
+            causal && pos + 1 - ws >= crate::engine::attention::min_gpu_decode_pos()
+        });
+        if let Some((pos, window_start)) = split_window {
+            self.record_attention_split_parts(
+                &mut encoder,
+                q_g.output_src(),
+                BindSrc::Slice(&kv_buf, k_off, k_size),
+                BindSrc::Slice(&kv_buf, v_off, v_size),
+                out_slice,
+                pos,
+                window_start,
+                n_head,
+                n_head_kv,
+                head_dim,
+                scale,
+                paged
+                    .as_ref()
+                    .map(|p| (&p.table, p.table_base, p.page_tokens)),
+            );
+        }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("orangu-server fused prefill attention pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&attn_pipeline);
-            pass.set_bind_group(0, &attn_bg, &[]);
-            pass.dispatch_workgroups(grid_x, grid_y, 1);
-            self.op_stamp(&mut pass, "pp.attn.attention");
+            if split_window.is_none() {
+                pass.set_pipeline(&attn_pipeline);
+                pass.set_bind_group(0, &attn_bg, &[]);
+                pass.dispatch_workgroups(grid_x, grid_y, 1);
+                self.op_stamp(&mut pass, "pp.attn.attention");
+            }
             if let Some(g) = &gate_g {
                 // `attn_out *= sigmoid(gate)`, in place, before anything
                 // reads attention's rows.
@@ -15219,6 +15965,319 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// caller supplies it as `per_layer` — `[n_tokens, gate.out_dim]`,
     /// already gathered for *this* layer out of the per-token, per-layer
     /// input block.
+    /// A mixture-of-experts layer's **device half after attention**, as two
+    /// submissions and one wait on the critical path: the first is the
+    /// output projection, the post-attention norm and residual add (`x1`)
+    /// and the router's norm and projection (the logits), read back
+    /// together; the second — submitted before that readback is waited for
+    /// — is the whole shared MLP from `x1` on the device, its norm, gate,
+    /// up, GEGLU, down and post-norm, left pending. The host routes and
+    /// runs the experts from `x1` while the shared MLP runs on the card,
+    /// then takes the pending result ([`PendingRows::finish`]).
+    ///
+    /// These were five submissions a layer, each with its own readback
+    /// wait: the output projection, the router, the shared gate/up pair,
+    /// the shared down, and the attention chain before them. On a 30-layer
+    /// model at decode the host turn between the attention chains measured
+    /// 3.8 ms a layer against 0.75 ms of device work in them. Folding the
+    /// shared MLP into the *same* wait as the router was measured too, and
+    /// lost 15%: it serialised the shared MLP with the experts, which the
+    /// separate calls had overlapped through `rayon::join`. Two submissions
+    /// keep the overlap and drop the waits.
+    ///
+    /// `router_weight` is the router's per-element scale as a norm weight:
+    /// the router reads `rmsnorm(x1) * scale / sqrt(n_embd)`, which is the
+    /// norm kernel with that product as its weight. `n_tokens` up to one
+    /// stripe; a wider call takes the separate paths.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_head_rows(
+        &self,
+        attn_out: AttnOutSrc<'_>,
+        residual: &[f32],
+        n_tokens: usize,
+        wo: &QuantMatrix,
+        attn_post_norm: &[f32],
+        router_weight: &[f32],
+        gate_inp: &QuantMatrix,
+        ffn_norm: &[f32],
+        gate: &QuantMatrix,
+        up: &QuantMatrix,
+        down: &QuantMatrix,
+        shared_post_norm: &[f32],
+        eps: f32,
+    ) -> Option<(Vec<f32>, Vec<f32>, PendingRows)> {
+        if self.q4_k_mmvq {
+            return None;
+        }
+        let n_embd = wo.out_dim;
+        let n_expert = gate_inp.out_dim;
+        let ffn_len = gate.out_dim;
+        if n_tokens == 0
+            || n_tokens > max_matmul_tokens_per_submission().min(self.max_stripe_tokens_for(n_embd))
+        {
+            return None;
+        }
+        let rows = n_tokens as u32;
+        let row_elems = n_tokens * n_embd;
+
+        let wo_op = MatmulOp {
+            x: match attn_out {
+                AttnOutSrc::Host(a) => a,
+                AttnOutSrc::Gpu(..) => &[],
+            },
+            n_tokens,
+            w: wo,
+        };
+        let empty = |w| MatmulOp {
+            x: &[],
+            n_tokens,
+            w,
+        };
+        let _region_guard = self.prefill_region_guard();
+        let wo_entry = self.op_entry_at(&wo_op, 0, ROLE_MOE_HEAD);
+        let router_entry = self.op_entry_at(&empty(gate_inp), 0, ROLE_MOE_HEAD + 1);
+        let gate_entry = self.op_entry_at(&empty(gate), 0, ROLE_MOE_HEAD + 2);
+        let up_entry = self.op_entry_at(&empty(up), 0, ROLE_MOE_HEAD + 3);
+        let down_entry = self.op_entry_at(&empty(down), 0, ROLE_MOE_HEAD + 4);
+        let wo_g = wo_entry.lock().expect("op cache entry poisoned");
+        let router_g = router_entry.lock().expect("op cache entry poisoned");
+        let gate_g = gate_entry.lock().expect("op cache entry poisoned");
+        let up_g = up_entry.lock().expect("op cache entry poisoned");
+        let down_g = down_entry.lock().expect("op cache entry poisoned");
+
+        if let AttnOutSrc::Host(a) = attn_out {
+            self.queue
+                .write_buffer(&wo_g.x_buffer, wo_g.x_offset, bytemuck::cast_slice(a));
+        }
+        let residual_buf = self.upload_new(residual);
+        let attn_post_norm_w = self.upload_new(attn_post_norm);
+        let router_w = self.upload_new(router_weight);
+        let ffn_norm_w = self.upload_new(ffn_norm);
+        let shared_post_norm_w = self.upload_new(shared_post_norm);
+        let x1 = self.scratch_buffer(row_elems);
+        let ffn_normed = self.scratch_buffer(row_elems);
+        let shared = self.scratch_buffer(row_elems);
+        // `x1 ++ logits`, for one readback.
+        let head_len = row_elems + n_tokens * n_expert;
+        let head_out = self.scratch_buffer(head_len);
+        let meta_embd = self.elem_meta_buffer(n_embd as u32, eps);
+        let meta_ffn = self.elem_meta_buffer((n_tokens * ffn_len) as u32, 0.0);
+        let normed_bytes = (row_elems as u64) * 4;
+
+        let bg_attn_resid = self.elem5_bind_group(
+            wo_g.output_src(),
+            &attn_post_norm_w,
+            &residual_buf,
+            &x1,
+            &meta_embd,
+        );
+        // The router's norm writes straight into its projection's input.
+        let bg_router_norm = self.elem4_bind_group(
+            &x1,
+            &router_w,
+            BindSrc::Slice(&router_g.x_buffer, router_g.x_offset, normed_bytes),
+            &meta_embd,
+        );
+        let bg_ffn_norm = self.elem4_bind_group(&x1, &ffn_norm_w, &ffn_normed, &meta_embd);
+        let mmq_ffn = (self.mmq_for(gate, n_tokens) && self.mmq_for(up, n_tokens)).then(|| {
+            let (q8, qbg, qwg, qmeta) =
+                self.mmq_stage(BindSrc::Whole(&ffn_normed), n_tokens, gate.in_dim);
+            let gate_op = self.mmq_op(gate, &gate_g, &q8);
+            let up_op = self.mmq_op(up, &up_g, &q8);
+            (q8, qbg, qwg, qmeta, gate_op, up_op)
+        });
+        let bg_gelu_mul = self.elem4_bind_group(
+            gate_g.output_src(),
+            up_g.output_src(),
+            BindSrc::Slice(
+                &down_g.x_buffer,
+                down_g.x_offset,
+                ((n_tokens * ffn_len) as u64) * 4,
+            ),
+            &meta_ffn,
+        );
+        let mmq_down = self.mmq_for(down, n_tokens).then(|| {
+            let (q8, qbg, qwg, qmeta) = self.mmq_stage(
+                BindSrc::Slice(
+                    &down_g.x_buffer,
+                    down_g.x_offset,
+                    ((n_tokens * ffn_len) as u64) * 4,
+                ),
+                n_tokens,
+                down.in_dim,
+            );
+            let op = self.mmq_op(down, &down_g, &q8);
+            (q8, qbg, qwg, qmeta, op)
+        });
+        let bg_shared_norm = self.elem4_bind_group(
+            down_g.output_src(),
+            &shared_post_norm_w,
+            &shared,
+            &meta_embd,
+        );
+
+        // Submission one: the head.
+        let (mut encoder, _grouped) = self.take_prefill_encoder("orangu-server MoE head encoder");
+        self.op_stamp_encoder(&mut encoder, "pp.gap");
+        if let AttnOutSrc::Gpu(src, off, src_rows) = attn_out {
+            let real = (src_rows * wo.in_dim) as u64 * 4;
+            encoder.copy_buffer_to_buffer(src, off, &wo_g.x_buffer, wo_g.x_offset, real);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server MoE head pass"),
+                timestamp_writes: None,
+            });
+            self.record_matmul(&mut pass, wo, &wo_g);
+            self.op_stamp(&mut pass, "moe.wo");
+            pass.set_pipeline(self.rmsnorm_add_rows_for(n_embd));
+            pass.set_bind_group(0, &bg_attn_resid, &[]);
+            pass.dispatch_workgroups(rows, 1, 1);
+            self.op_stamp(&mut pass, "moe.attn_post_norm_add");
+            pass.set_pipeline(self.rmsnorm_rows_for(n_embd));
+            pass.set_bind_group(0, &bg_router_norm, &[]);
+            pass.dispatch_workgroups(rows, 1, 1);
+            pass.set_bind_group(0, &bg_ffn_norm, &[]);
+            pass.dispatch_workgroups(rows, 1, 1);
+            self.op_stamp(&mut pass, "moe.norms");
+            self.record_matmul(&mut pass, gate_inp, &router_g);
+            self.op_stamp(&mut pass, "moe.router");
+        }
+        encoder.copy_buffer_to_buffer(&x1, 0, &head_out, 0, normed_bytes);
+        let (rb, ro, rl) = match router_g.output_src() {
+            BindSrc::Slice(b, o, l) => (b, o, l),
+            BindSrc::Whole(b) => (b, 0, (n_tokens * n_expert) as u64 * 4),
+        };
+        encoder.copy_buffer_to_buffer(rb, ro, &head_out, normed_bytes, rl);
+        let head_bytes = (head_len as u64) * 4;
+        let head_readback = self.take_readback(head_bytes);
+        encoder.copy_buffer_to_buffer(&head_out, 0, &head_readback, 0, head_bytes);
+        self.queue.submit(Some(encoder.finish()));
+        self.submission_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::engine::decode_stages::record_submission();
+        let head_wait = self.map_read(&head_readback);
+
+        // Submission two: the shared MLP, pending.
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("orangu-server MoE shared MLP encoder"),
+            });
+        encoder.copy_buffer_to_buffer(
+            &ffn_normed,
+            0,
+            &gate_g.x_buffer,
+            gate_g.x_offset,
+            normed_bytes,
+        );
+        encoder.copy_buffer_to_buffer(&ffn_normed, 0, &up_g.x_buffer, up_g.x_offset, normed_bytes);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server MoE shared MLP pass"),
+                timestamp_writes: None,
+            });
+            match &mmq_ffn {
+                Some((_, qbg, qwg, _, gate_op, up_op)) => {
+                    self.record_mmq_quantize(&mut pass, qbg, *qwg);
+                    self.record_mmq(&mut pass, &gate_op.0, gate_op.1, gate_op.2);
+                    self.record_mmq(&mut pass, &up_op.0, up_op.1, up_op.2);
+                }
+                None => {
+                    self.record_matmul(&mut pass, gate, &gate_g);
+                    self.record_matmul(&mut pass, up, &up_g);
+                }
+            }
+            self.op_stamp(&mut pass, "moe.shared.gate_up");
+            pass.set_pipeline(self.ffn_activation_pipeline(FfnActivation::Geglu));
+            pass.set_bind_group(0, &bg_gelu_mul, &[]);
+            pass.dispatch_workgroups(self.strided_workgroups(n_tokens * ffn_len), 1, 1);
+            match &mmq_down {
+                Some((_, qbg, qwg, _, op)) => {
+                    self.record_mmq_quantize(&mut pass, qbg, *qwg);
+                    self.record_mmq(&mut pass, &op.0, op.1, op.2);
+                }
+                None => self.record_matmul(&mut pass, down, &down_g),
+            }
+            self.op_stamp(&mut pass, "moe.shared.down");
+            pass.set_pipeline(self.rmsnorm_rows_for(n_embd));
+            pass.set_bind_group(0, &bg_shared_norm, &[]);
+            pass.dispatch_workgroups(rows, 1, 1);
+            self.op_stamp(&mut pass, "moe.shared.post_norm");
+        }
+        let shared_readback = self.take_readback(normed_bytes);
+        encoder.copy_buffer_to_buffer(&shared, 0, &shared_readback, 0, normed_bytes);
+        self.queue.submit(Some(encoder.finish()));
+        self.submission_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::engine::decode_stages::record_submission();
+        let shared_wait = self.map_read(&shared_readback);
+
+        // The head's readback, polled: a blocking wait would wait for the
+        // shared MLP too.
+        self.wait_mapped_polling(&head_wait, "reading back the MoE head");
+        let all: Vec<f32> = {
+            let data = self.mapped_bytes(&head_readback, "reading back the MoE head");
+            bytemuck::cast_slice(&data).to_vec()
+        };
+        head_readback.unmap();
+        self.put_readback(head_bytes, head_readback);
+        let x1_v = all[..row_elems].to_vec();
+        let logits = all[row_elems..].to_vec();
+        Some((
+            x1_v,
+            logits,
+            PendingRows {
+                buffer: shared_readback,
+                wait: shared_wait,
+                len: row_elems,
+            },
+        ))
+    }
+
+    /// Whether [`Self::moe_head_rows`] will take a call of `n_tokens` on a
+    /// model of `n_embd` — the conditions it declines on, for a caller that
+    /// has to decide before recording the attention chain whether its
+    /// output is needed on the host.
+    pub fn moe_head_serves(&self, n_tokens: usize, n_embd: usize) -> bool {
+        !self.q4_k_mmvq
+            && n_tokens > 0
+            && n_tokens
+                <= max_matmul_tokens_per_submission().min(self.max_stripe_tokens_for(n_embd))
+    }
+
+    /// Takes a [`PendingRows`]: waits for its submission and copies the
+    /// rows out.
+    pub fn finish_rows(&self, pending: PendingRows) -> Vec<f32> {
+        const CONTEXT: &str = "reading back the MoE shared MLP";
+        self.wait_mapped(&pending.wait, CONTEXT);
+        let out: Vec<f32> = {
+            let data = self.mapped_bytes(&pending.buffer, CONTEXT);
+            bytemuck::cast_slice(&data)[..pending.len].to_vec()
+        };
+        pending.buffer.unmap();
+        self.put_readback((pending.len as u64) * 4, pending.buffer);
+        out
+    }
+
+    /// [`Self::wait_mapped`] that polls rather than blocks: a blocking
+    /// poll waits for the *latest* submission, and this readback's may not
+    /// be it.
+    fn wait_mapped_polling(&self, wait: &MapWait, context: &str) {
+        let deadline = std::time::Instant::now() + READBACK_WAIT_TIMEOUT;
+        loop {
+            self.poll_blocking_with(wgpu::PollType::Poll, context);
+            wait.check(context);
+            if wait.is_done() {
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                crate::device_lost::fail(context, "the map did not complete within the timeout");
+            }
+            std::thread::yield_now();
+        }
+    }
+
     pub fn fused_ple_prefill(
         &self,
         x: &[f32],
@@ -15960,6 +17019,42 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         let q_buf = self.upload_new(q);
         let out_buf = self.scratch_buffer(n_head * head_dim);
+        self.record_attention_split_parts(
+            encoder,
+            BindSrc::Whole(&q_buf),
+            BindSrc::Slice(&kv_refs.buffer, kv_refs.k_off, kv_refs.k_size),
+            BindSrc::Slice(&kv_refs.buffer, kv_refs.v_off, kv_refs.v_size),
+            BindSrc::Whole(&out_buf),
+            pos,
+            window_start,
+            n_head,
+            n_head_kv,
+            head_dim,
+            scale,
+            None,
+        );
+        out_buf
+    }
+
+    /// [`Self::record_attention_split`] over bound buffers: the query on
+    /// the device already (a prefill chain's roped Q at one token), the
+    /// K and V halves, and where the `[n_head * head_dim]` output goes.
+    #[allow(clippy::too_many_arguments)]
+    fn record_attention_split_parts(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        q: BindSrc<'_>,
+        k: BindSrc<'_>,
+        v: BindSrc<'_>,
+        out: BindSrc<'_>,
+        pos: usize,
+        window_start: usize,
+        n_head: usize,
+        n_head_kv: usize,
+        head_dim: usize,
+        scale: f32,
+        paged: Option<(&wgpu::Buffer, u32, u32)>,
+    ) {
         let k_num = self.attn_split_k;
         let partial_ml = self.scratch_buffer(n_head * k_num as usize * 2);
         let partial_acc = self.scratch_buffer(n_head * k_num as usize * head_dim);
@@ -15973,8 +17068,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             k_num,
             scale,
             // Contiguous: `kv_slot` is the identity and reads neither of these.
-            kv_page_base: 0,
-            kv_page_tokens: 0,
+            // Paged: `(table, table_base, page_tokens)` — K and V are the
+            // pool's halves, addressed through the table.
+            kv_page_base: paged.map_or(0, |p| p.1),
+            kv_page_tokens: paged.map_or(0, |p| p.2),
             _pad0: 0,
             _pad1: 0,
             _pad2: 0,
@@ -15988,37 +17085,42 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         self.queue
             .write_buffer(&split_meta_buf, 0, bytemuck::bytes_of(&split_meta));
 
+        let mut split_entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: q.resource(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: k.resource(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: v.resource(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: partial_ml.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: partial_acc.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: split_meta_buf.as_entire_binding(),
+            },
+        ];
+        if let Some((table, _, _)) = paged {
+            split_entries.push(wgpu::BindGroupEntry {
+                binding: 6,
+                resource: table.as_entire_binding(),
+            });
+        }
         let split_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("orangu-server attention split bind group"),
-            layout: &self.attn_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: q_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: BindSrc::Slice(&kv_refs.buffer, kv_refs.k_off, kv_refs.k_size)
-                        .resource(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: BindSrc::Slice(&kv_refs.buffer, kv_refs.v_off, kv_refs.v_size)
-                        .resource(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: partial_ml.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: partial_acc.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: split_meta_buf.as_entire_binding(),
-                },
-            ],
+            layout: self.attn_bind_layout_for(paged.is_some()),
+            entries: &split_entries,
         });
 
         let reduce_meta = AttnReduceMeta {
@@ -16036,11 +17138,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         self.queue
             .write_buffer(&reduce_meta_buf, 0, bytemuck::bytes_of(&reduce_meta));
         let reduce_bind_group =
-            self.elem4_bind_group(&partial_ml, &partial_acc, &out_buf, &reduce_meta_buf);
+            self.elem4_bind_group(&partial_ml, &partial_acc, out, &reduce_meta_buf);
 
         let group = (n_head / n_head_kv).max(1);
-        let split_pipeline =
-            self.attn_split_pipeline_for(head_dim, group, vulkan_shaders::KvPaging::Contiguous);
+        let paging = if paged.is_some() {
+            vulkan_shaders::KvPaging::Paged
+        } else {
+            vulkan_shaders::KvPaging::Contiguous
+        };
+        let split_pipeline = self.attn_split_pipeline_for(head_dim, group, paging);
         let phase1_x = if self.attn_gqa && group > 1 {
             n_head_kv as u32
         } else {
@@ -16057,8 +17163,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             pass.set_pipeline(&self.attn_split_reduce_pipeline);
             pass.set_bind_group(0, &reduce_bind_group, &[]);
             pass.dispatch_workgroups(n_head as u32, 1, 1);
+            self.op_stamp(&mut pass, "pp.attn.attention_split");
         }
-        out_buf
     }
 
     /// Builds (never cached itself — callers cache the whole
@@ -19238,6 +20344,38 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 report.blocks.len(),
                 report.allocations.len(),
                 report.total_reserved_bytes as f64 / (1024.0 * 1024.0)
+            );
+        }
+        self.report_device_memory("gpu-ops");
+    }
+
+    /// The live device allocations grouped by label, largest first —
+    /// what is competing for the card when a kernel that read fast an hour
+    /// ago reads slowly now (`ORANGU_VRAM_REPORT=1`).
+    pub fn report_device_memory(&self, tag: &str) {
+        if !crate::engine::env::flag_on("ORANGU_VRAM_REPORT") {
+            return;
+        }
+        let Some(report) = self.device.generate_allocator_report() else {
+            return;
+        };
+        let mut by_label: HashMap<String, (usize, u64)> = HashMap::new();
+        for a in &report.allocations {
+            let e = by_label.entry(a.name.clone()).or_default();
+            e.0 += 1;
+            e.1 += a.size;
+        }
+        let mut rows: Vec<_> = by_label.into_iter().collect();
+        rows.sort_by_key(|(_, (_, bytes))| std::cmp::Reverse(*bytes));
+        eprintln!(
+            "orangu-server: [{tag}] device memory: {:.1} MiB allocated in {:.1} MiB of blocks",
+            report.total_allocated_bytes as f64 / (1024.0 * 1024.0),
+            report.total_reserved_bytes as f64 / (1024.0 * 1024.0)
+        );
+        for (label, (count, bytes)) in rows.iter().take(16) {
+            eprintln!(
+                "orangu-server: [{tag}]   {:>9.1} MiB {count:>5}x  {label}",
+                *bytes as f64 / (1024.0 * 1024.0)
             );
         }
     }

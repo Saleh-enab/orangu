@@ -247,6 +247,13 @@ impl SequencePages {
                 return None;
             }
             self.pool.write_table(queue, base, &inner.pages);
+            if crate::engine::env::flag_on("ORANGU_KV_TRACE") {
+                eprintln!(
+                    "[kv-trace] table at {base}: {} pages {:?}",
+                    inner.pages.len(),
+                    inner.pages
+                );
+            }
             inner.table_synced = inner.pages.len();
         }
         Some((base, inner.pages.len()))

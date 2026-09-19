@@ -149,6 +149,7 @@ impl CudaBackend {
                         vram_total_bytes: Self::device_memory_at(index),
                         id: None,
                         driver: None,
+                        vram_used_at_start: None,
                     })
                     .collect(),
             )

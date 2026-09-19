@@ -126,7 +126,7 @@ pub fn min_gpu_tokens() -> usize {
     })
 }
 
-fn min_gpu_decode_pos() -> usize {
+pub(crate) fn min_gpu_decode_pos() -> usize {
     static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
         std::env::var("ORANGU_DECODE_ATTENTION_MIN_POS")
@@ -474,6 +474,30 @@ fn attention_batched<const N: usize, W>(
     debug_assert!(row > 0 && out.len().is_multiple_of(row));
     let n_kv = n_head.div_ceil(group_size);
 
+    // One query: the parallelism below is across queries, and there is
+    // none to have. A decode step deep in its context reads the window's
+    // whole K and V — 18 MB a layer at a thousand positions — on one core,
+    // at a third of what the memory gives; this splits the window over the
+    // pool instead.
+    if out.len() == row {
+        let (window_start, window_end) = window(0);
+        let n_pos = (window_end + 1).saturating_sub(window_start);
+        if n_pos >= DECODE_SPLIT_MIN_POS {
+            attention_decode_split::<N>(
+                out,
+                q,
+                cache,
+                n_head,
+                group_size,
+                head_dim,
+                scale,
+                window_start,
+                n_pos,
+            );
+            return;
+        }
+    }
+
     out.par_chunks_mut(row)
         .enumerate()
         .for_each_init(Vec::<f32>::new, |scores, (t, out_t)| {
@@ -579,6 +603,149 @@ fn attention_batched<const N: usize, W>(
                 offset += 1;
             }
         });
+}
+
+/// One task's result in [`attention_decode_split`]: its K/V head, its
+/// chunk, per head of the group the score maximum and the sum of
+/// exponentials against it, and the weighted V sums.
+type ChunkPartial = (usize, usize, Vec<(f32, f32)>, Vec<f32>);
+
+/// Positions a decode window must have before it is split over the pool
+/// — below this the one-thread pass is shorter than a fork and join.
+const DECODE_SPLIT_MIN_POS: usize = 64;
+
+/// Positions per task of [`attention_decode_split`]: K and V of a chunk
+/// are a few hundred KiB, a fair share of the window for a pool of
+/// sixteen at a thousand positions and still several tasks at a hundred.
+const DECODE_SPLIT_CHUNK: usize = 128;
+
+/// One query's attention with the window split into position chunks, one
+/// task per (K/V head, chunk), each keeping its own softmax statistics —
+/// the running maximum, the sum of exponentials against it, and the
+/// weighted V sum — merged per head at the end. The "flash-decoding"
+/// shape the device kernel has for the same case (`gpu_attention_split`),
+/// and the same arithmetic as [`attention_batched`] per chunk: `N`
+/// positions' scores per query load, the exponentials against the chunk's
+/// own maximum rather than the window's, which the merge accounts for.
+///
+/// Not bit-identical to the one-thread pass — the exponentials are taken
+/// against a different maximum and the sums are in a different order —
+/// but within float reassociation of it, which the test below holds it
+/// to.
+#[allow(clippy::too_many_arguments)]
+fn attention_decode_split<const N: usize>(
+    out: &mut [f32],
+    q: &[f32],
+    cache: &LayerCache,
+    n_head: usize,
+    group_size: usize,
+    head_dim: usize,
+    scale: f32,
+    window_start: usize,
+    n_pos: usize,
+) {
+    let n_kv = n_head.div_ceil(group_size);
+    let n_chunks = n_pos.div_ceil(DECODE_SPLIT_CHUNK);
+    // Per (kv head, chunk): for each head of the group, (max, sum) and
+    // the `head_dim` accumulator.
+    let partials: Vec<ChunkPartial> = (0..n_kv * n_chunks)
+        .into_par_iter()
+        .map(|task| {
+            let kv_head = task / n_chunks;
+            let chunk = task % n_chunks;
+            let c_start = chunk * DECODE_SPLIT_CHUNK;
+            let c_len = (n_pos - c_start).min(DECODE_SPLIT_CHUNK);
+            let h_start = kv_head * group_size;
+            let h_end = ((kv_head + 1) * group_size).min(n_head);
+            let heads = h_end - h_start;
+            let mut scores = vec![0f32; heads * c_len];
+            let mut offset = 0;
+            while offset + N <= c_len {
+                let p = window_start + c_start + offset;
+                let kh: [&[f32]; N] =
+                    std::array::from_fn(|j| cache.key_at(p + j, kv_head, head_dim));
+                for (hi, h) in (h_start..h_end).enumerate() {
+                    let qh = &q[h * head_dim..(h + 1) * head_dim];
+                    let got = tensor::dot_multi(qh, kh);
+                    for (j, sc) in got.iter().enumerate() {
+                        scores[hi * c_len + offset + j] = sc * scale;
+                    }
+                }
+                offset += N;
+            }
+            while offset < c_len {
+                let p = window_start + c_start + offset;
+                let kh = cache.key_at(p, kv_head, head_dim);
+                for (hi, h) in (h_start..h_end).enumerate() {
+                    let qh = &q[h * head_dim..(h + 1) * head_dim];
+                    scores[hi * c_len + offset] = tensor::dot(qh, kh) * scale;
+                }
+                offset += 1;
+            }
+            let mut stats = Vec::with_capacity(heads);
+            for hi in 0..heads {
+                let row = &mut scores[hi * c_len..(hi + 1) * c_len];
+                let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut l = 0f32;
+                for v in row.iter_mut() {
+                    *v = (*v - m).exp();
+                    l += *v;
+                }
+                stats.push((m, l));
+            }
+            let mut acc = vec![0f32; heads * head_dim];
+            let mut offset = 0;
+            while offset + N <= c_len {
+                let p = window_start + c_start + offset;
+                let vh: [&[f32]; N] =
+                    std::array::from_fn(|j| cache.value_at(p + j, kv_head, head_dim));
+                for hi in 0..heads {
+                    let weights: [f32; N] =
+                        std::array::from_fn(|j| scores[hi * c_len + offset + j]);
+                    tensor::axpy_multi(&mut acc[hi * head_dim..(hi + 1) * head_dim], vh, weights);
+                }
+                offset += N;
+            }
+            while offset < c_len {
+                let p = window_start + c_start + offset;
+                let vh = cache.value_at(p, kv_head, head_dim);
+                for hi in 0..heads {
+                    tensor::axpy_inplace(
+                        &mut acc[hi * head_dim..(hi + 1) * head_dim],
+                        vh,
+                        scores[hi * c_len + offset],
+                    );
+                }
+                offset += 1;
+            }
+            (kv_head, chunk, stats, acc)
+        })
+        .collect();
+
+    // Merge: per head, the window's maximum, then every chunk rescaled
+    // against it.
+    out.fill(0.0);
+    for kv_head in 0..n_kv {
+        let h_start = kv_head * group_size;
+        let h_end = ((kv_head + 1) * group_size).min(n_head);
+        for (hi, h) in (h_start..h_end).enumerate() {
+            let m = partials
+                .iter()
+                .filter(|p| p.0 == kv_head)
+                .map(|p| p.2[hi].0)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mut l = 0f32;
+            let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
+            for p in partials.iter().filter(|p| p.0 == kv_head) {
+                let (pm, pl) = p.2[hi];
+                let w = (pm - m).exp();
+                l += pl * w;
+                tensor::axpy_inplace(out_h, &p.3[hi * head_dim..(hi + 1) * head_dim], w);
+            }
+            let inv = if l > 0.0 { 1.0 / l } else { 0.0 };
+            out_h.iter_mut().for_each(|v| *v *= inv);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -852,6 +1019,42 @@ mod tests {
                          n_tokens {n_tokens}: position-outer attention is not \
                          bit-identical to the head-outer form"
                     );
+                }
+            }
+        }
+    }
+
+    /// One query over a window long enough to be split across the pool
+    /// (`attention_decode_split`) agrees with the head-outer reference to
+    /// float reassociation — at a window that is not a whole number of
+    /// chunks, a sliding one that starts mid-cache, one K/V head and
+    /// several, and a head count that is not a multiple of the group.
+    #[test]
+    fn a_split_decode_window_matches_the_head_outer_form() {
+        for &(n_head, n_head_kv) in &[(8usize, 1usize), (16, 8), (6, 3), (1, 1)] {
+            for &head_dim in &[64usize, 256] {
+                for &(window_start, n_pos) in &[(0usize, 300usize), (37, 129), (0, 64), (5, 1000)] {
+                    let mut seed = 0xA77E_u32 ^ (n_head * 7 + head_dim + n_pos) as u32;
+                    let kv = build(window_start + n_pos, n_head_kv, head_dim, &mut seed);
+                    let cache = &kv.layers[0];
+                    let group_size = n_head / n_head_kv;
+                    let row = n_head * head_dim;
+                    let q: Vec<f32> = (0..row).map(|i| ((i % 23) as f32 - 11.0) / 11.0).collect();
+                    let win = |_t: usize| (window_start, window_start + n_pos - 1);
+                    let mut got = vec![0f32; row];
+                    multi_head_attention(
+                        &mut got, &q, cache, n_head, group_size, head_dim, 0.08, win,
+                    );
+                    let mut want = vec![0f32; row];
+                    reference(
+                        &mut want, &q, cache, n_head, group_size, head_dim, 0.08, win,
+                    );
+                    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                        assert!(
+                            (g - w).abs() <= 1e-5 * (1.0 + w.abs()),
+                            "n_head {n_head} n_head_kv {n_head_kv} head_dim {head_dim} window                              {window_start}+{n_pos} element {i}: split {g} vs reference {w}"
+                        );
+                    }
                 }
             }
         }

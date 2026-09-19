@@ -160,9 +160,37 @@ pub struct DeviceCandidate {
     /// through two backends at once.
     pub id: Option<String>,
     pub driver: Option<String>,
+    /// [`Self::vram_used_bytes`] as it read when the device was
+    /// enumerated, before this process put anything on it: what other
+    /// processes hold, which a plan for the card subtracts. `None` where
+    /// the platform does not say.
+    pub vram_used_at_start: Option<u64>,
 }
 
 impl DeviceCandidate {
+    /// [`Self::vram_used_bytes`] for a device that has just been
+    /// enumerated, to fill `vram_used_at_start`.
+    pub fn vram_used_now(id: Option<&str>) -> Option<u64> {
+        let path = format!("/sys/bus/pci/devices/{}/mem_info_vram_used", id?);
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    /// Device memory **already in use by other processes** when asked — a
+    /// compositor's surfaces, a browser, a video player — read from the
+    /// kernel driver's own accounting where the platform exposes it
+    /// (`amdgpu`'s `mem_info_vram_used` under the device's PCI node).
+    /// `None` where it does not, which a caller must read as "unknown",
+    /// not as "nothing".
+    ///
+    /// It exists because a split model is planned against a card's
+    /// capacity, and a plan that fills 80% of a 4 GiB card while a video
+    /// player holds 0.7 GiB of it does not fit: every token then moves
+    /// buffers in and out of the card, and a decode that ran at 4 tok/s
+    /// with the card to itself ran at 1.2 beside a playing video.
+    pub fn vram_used_bytes(&self) -> Option<u64> {
+        Self::vram_used_now(self.id.as_deref())
+    }
+
     /// One line for the startup inventory, e.g.
     /// `0: AMD Radeon RX 5500M [discrete, 4.00 GiB, 0000:03:00.0]`.
     pub fn describe(&self) -> String {
@@ -508,6 +536,7 @@ mod tests {
             vram_total_bytes: vram,
             id: None,
             driver: None,
+            vram_used_at_start: None,
         }
     }
 
