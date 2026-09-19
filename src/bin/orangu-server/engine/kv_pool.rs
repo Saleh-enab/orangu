@@ -1047,14 +1047,11 @@ impl KvPool {
         let mut inner = self.inner.lock().expect("kv pool poisoned");
         let mut base = base;
         let mut end = base + entries;
-        loop {
-            let Some(i) = inner
-                .free_tables
-                .iter()
-                .position(|&(b, n)| b + n == base || b == end)
-            else {
-                break;
-            };
+        while let Some(i) = inner
+            .free_tables
+            .iter()
+            .position(|&(b, n)| b + n == base || b == end)
+        {
             let (b, n) = inner.free_tables.swap_remove(i);
             base = base.min(b);
             end = end.max(b + n);

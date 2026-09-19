@@ -2619,6 +2619,237 @@ pub struct DecodeRow<'a> {
     pub slot: usize,
 }
 
+/// `ORANGU_RESIDENT_PREFILL_CHECK=1`: a chunk's residual from the
+/// device-resident stream against the step-by-step path's, per row —
+/// the largest relative error and the row it is on. A last-bit
+/// difference (the norms and RoPE on the device) is a few parts in a
+/// thousand; a wrong parameter is whole rows off.
+pub(crate) fn resident_prefill_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_RESIDENT_PREFILL_CHECK"))
+}
+
+pub(crate) fn report_resident_check(
+    resident: &[f32],
+    step: &[f32],
+    n_embd: usize,
+    start_pos: usize,
+) {
+    let rows = resident.len() / n_embd.max(1);
+    let mut worst = (0.0f32, 0usize);
+    // And the whole chunk's: root-mean-square difference over root-mean-
+    // square value, which a single outlying element cannot dominate.
+    let (mut diff2, mut val2) = (0.0f64, 0.0f64);
+    for (x, y) in resident.iter().zip(step) {
+        diff2 += f64::from((x - y) * (x - y));
+        val2 += f64::from(y * y);
+    }
+    let rms = (diff2 / val2.max(1e-30)).sqrt();
+    for t in 0..rows {
+        let a = &resident[t * n_embd..(t + 1) * n_embd];
+        let b = &step[t * n_embd..(t + 1) * n_embd];
+        let mag = b.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-6);
+        let err = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+            / mag;
+        if err > worst.0 {
+            worst = (err, t);
+        }
+    }
+    eprintln!(
+        "orangu-server: [resident-check] chunk at {start_pos}, {rows} rows: rms {rms:.2e}, worst row {} off by {:.2e} of its magnitude",
+        worst.1, worst.0
+    );
+}
+
+/// One layer of a dense transformer as the device-resident prefill stream
+/// runs it — see [`run_layers_resident`]. The architectures that use the
+/// stream (`llama`, `phi`, `mistral`) each build one per layer from their
+/// own weights; nothing here is architecture-specific.
+pub(crate) struct ResidentLayer<'a> {
+    pub attn_norm: &'a [f32],
+    pub wq: &'a crate::engine::loader::QuantMatrix,
+    pub wk: &'a crate::engine::loader::QuantMatrix,
+    pub wv: &'a crate::engine::loader::QuantMatrix,
+    pub q_bias: Option<&'a [f32]>,
+    pub k_bias: Option<&'a [f32]>,
+    pub v_bias: Option<&'a [f32]>,
+    pub pairing: crate::engine::tensor::RopeLayout,
+    pub yarn: crate::engine::backend::vulkan::RopeYarn,
+    pub rope_dim: usize,
+    pub rope_freq_base: f32,
+    pub freq_factors: Option<&'a [f32]>,
+    pub n_swa: usize,
+    pub scale: f32,
+    pub wo: &'a crate::engine::loader::QuantMatrix,
+    pub ffn_norm: &'a [f32],
+    pub ffn_gate: &'a crate::engine::loader::QuantMatrix,
+    pub ffn_up: &'a crate::engine::loader::QuantMatrix,
+    pub ffn_down: &'a crate::engine::loader::QuantMatrix,
+    pub activation: crate::engine::backend::vulkan::FfnActivation,
+}
+
+/// A prefill chunk with the **residual stream on the device**: `x` (the
+/// scaled token embeddings, `[n_tokens, n_embd]`) is uploaded once, every
+/// layer is its attention chain and its post-attention chain recorded back
+/// to back into a group of a few layers per submission, the K/V rows come
+/// home once per chunk (and for a chunk whose residual nobody reads, only
+/// after the next chunk's chains are submitted), and `x` is read back only
+/// when `want_x`. This is the shape `arch::gemma` runs; the step-by-step
+/// paths brought attention's output and the residual home at every layer
+/// — two readbacks and a host turn per layer, with the device idle through
+/// each. Measured on a 1B file at 2238 tokens: 956 → 1690 tok/s.
+///
+/// `layer(il)` describes layer `il`. `None` when the stream is not in place
+/// for this chunk (no stage for the rows, or a chain declined mid-chunk:
+/// what was recorded is submitted and its rows brought home first); the
+/// caller then takes its step-by-step path, whose result is the same.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_layers_resident<'a>(
+    vulkan: &crate::engine::backend::VulkanBackend,
+    cache: &mut KvCache,
+    tokens: &[u32],
+    x: &[f32],
+    start_pos: usize,
+    want_x: bool,
+    n_head: usize,
+    n_head_kv: usize,
+    head_dim: usize,
+    eps: f32,
+    n_layer: usize,
+    layer: impl Fn(usize) -> ResidentLayer<'a>,
+) -> Result<Option<Vec<f32>>> {
+    use crate::engine::backend::vulkan::{AttnOutSrc, FusedAttnPrefillInput, FusedAttnPrefillKv};
+    let n_tokens = tokens.len();
+    let n_embd = x.len() / n_tokens.max(1);
+    let kv_dim = n_head_kv * head_dim;
+    // The chunk's stage for every layer's K/V rows; declined when the
+    // chain must wait per layer (`ORANGU_PREFILL_KV_WAIT`).
+    let Some(mut kv_stage) = (!gemma::prefill_kv_wait())
+        .then(|| vulkan.kv_readback_stage((n_layer * n_tokens * kv_dim * 2 * 4) as u64))
+    else {
+        return Ok(None);
+    };
+    cache.discard_pending_rows();
+    // The two buffers the residual alternates between; whole tiles past
+    // `n_tokens`, since a striped chain writes its padded tail.
+    let device_rows = crate::engine::backend::vulkan::prefill_rows_capacity(n_tokens);
+    let mut bufs: [wgpu::Buffer; 2] =
+        std::array::from_fn(|_| vulkan.prefill_rows_buffer(device_rows * n_embd));
+    vulkan.upload_rows(&bufs[0], x);
+    vulkan.begin_op_span();
+    let layers_per_submit = gemma::prefill_layers_per_submit();
+    let mut group_layers = 0usize;
+    let mut pending_kv: Vec<(usize, Vec<crate::engine::backend::vulkan::PendingKvRows>)> =
+        Vec::new();
+    // Mid-chunk the stream cannot be given up: what was recorded is
+    // submitted, its rows brought home, and the caller starts the chunk
+    // over on its own path.
+    let give_up =
+        |vulkan: &crate::engine::backend::VulkanBackend,
+         cache: &mut KvCache,
+         kv_stage: crate::engine::backend::vulkan::KvReadbackStage,
+         pending: Vec<(usize, Vec<crate::engine::backend::vulkan::PendingKvRows>)>| {
+            vulkan.end_prefill_group();
+            vulkan.fill_kv_rows(kv_stage, pending, cache);
+            cache.discard_pending_rows();
+        };
+    vulkan.begin_prefill_group();
+    for il in 0..n_layer {
+        let l = layer(il);
+        let attn_input = FusedAttnPrefillInput {
+            x_gpu: Some((&bufs[0], 0)),
+            attn_norm: Some(l.attn_norm),
+            q_bias: l.q_bias,
+            pairing: l.pairing,
+            yarn: l.yarn,
+            normalize_v: false,
+            attn_gate: None,
+            normed: &[],
+            n_tokens,
+            start_pos,
+            wq: l.wq,
+            q_norm: None,
+            kv: Some(FusedAttnPrefillKv {
+                k_bias: l.k_bias,
+                v_bias: l.v_bias,
+                wk: l.wk,
+                k_norm: None,
+                wv: Some(l.wv),
+            }),
+            n_head,
+            n_head_kv,
+            head_dim,
+            rope_dim: l.rope_dim,
+            rope_freq_base: l.rope_freq_base,
+            freq_factors: l.freq_factors,
+            eps,
+            n_swa: l.n_swa,
+            causal: true,
+            scale: l.scale,
+            want_attn_out_host: false,
+        };
+        let Some((attn, pending)) = vulkan.fused_attention_prefill_deferred(
+            attn_input,
+            &mut cache.layers[il],
+            &mut kv_stage,
+        ) else {
+            give_up(vulkan, cache, kv_stage, std::mem::take(&mut pending_kv));
+            return Ok(None);
+        };
+        if !pending.is_empty() {
+            pending_kv.push((il, pending));
+        }
+        let out = vulkan.fused_post_attention_prefill_rows(
+            AttnOutSrc::Gpu(&attn.attn_out_buf, 0, n_tokens),
+            AttnOutSrc::Gpu(&bufs[0], 0, n_tokens),
+            n_tokens,
+            l.wo,
+            None,
+            l.ffn_norm,
+            l.ffn_gate,
+            l.ffn_up,
+            l.ffn_down,
+            None,
+            eps,
+            l.activation,
+            Some((&bufs[1], 0)),
+            None,
+            None,
+        );
+        if out.is_none() {
+            give_up(vulkan, cache, kv_stage, std::mem::take(&mut pending_kv));
+            return Ok(None);
+        }
+        bufs.swap(0, 1);
+        group_layers += 1;
+        if group_layers >= layers_per_submit.max(1) {
+            vulkan.end_prefill_group();
+            vulkan.begin_prefill_group();
+            group_layers = 0;
+        }
+    }
+    vulkan.end_prefill_group();
+    // The previous chunk's rows, parked while this chunk's chains were
+    // recorded and submitted — brought home now, while the device works.
+    vulkan.fill_deferred_kv_rows(cache);
+    let x = if want_x {
+        vulkan.readback_rows(&bufs[0], n_tokens * n_embd)
+    } else {
+        Vec::new()
+    };
+    if want_x {
+        vulkan.fill_kv_rows(kv_stage, pending_kv, cache);
+    } else {
+        vulkan.defer_kv_rows(kv_stage, pending_kv, cache);
+    }
+    vulkan.finish_op_span(start_pos);
+    Ok(Some(x))
+}
+
 pub trait ModelForward: Send + Sync {
     fn config(&self) -> &ModelConfig;
 

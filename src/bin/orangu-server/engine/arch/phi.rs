@@ -552,6 +552,9 @@ impl PhiModel {
             // at all, or the model is split.
             return self.record_split_decode(cache, tokens, start_pos, slot_id);
         };
+        // A decode step after a prompt whose last chunk parked its rows
+        // fills them first.
+        vulkan.fill_deferred_kv_rows(cache);
         let (encoder, _, _) =
             self.record_decode_chain(vulkan, cache, tokens, start_pos, slot_id)?;
         let logits = vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1);
@@ -631,12 +634,120 @@ impl PhiModel {
         Some(vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1))
     }
 
+    /// Whether a prefill chunk runs on the device-resident stream
+    /// (`super::run_layers_resident`): every layer's chains on one card and
+    /// no diagnostic wanting the host's copy. `ORANGU_LLAMA_RESIDENT_PREFILL=0`
+    /// is the control arm, shared with the `llama` family.
+    fn resident_prefill_serves(&self, n_tokens: usize) -> bool {
+        n_tokens > 1
+            && !crate::engine::arch::llama::no_fused_qkv()
+            && !crate::engine::arch::llama::no_fused_post_attention()
+            && !crate::engine::arch::llama::resident_prefill_off()
+            && crate::engine::dump_ffn_dir().is_none()
+            && orangu::npu_ffn::service().is_none()
+            && self
+                .backend
+                .as_wgpu()
+                .is_some_and(|v| v.prefill_fused_attention_enabled())
+            && self.layers.iter().all(|l| l.wo.device() == 0)
+    }
+
+    /// The token embedding rows, a token per task.
+    fn token_embeddings(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        use rayon::prelude::*;
+        let n_embd = self.config.n_embd;
+        let n_vocab = self.config.n_vocab;
+        if let Some(&tok) = tokens.iter().find(|&&t| t as usize >= n_vocab) {
+            anyhow::bail!("token id {tok} is out of vocab range");
+        }
+        let mut x = vec![0f32; tokens.len() * n_embd];
+        x.par_chunks_mut(n_embd)
+            .zip(tokens.par_iter())
+            .for_each(|(dst, &tok)| dst.copy_from_slice(&self.tok_embeddings.row(tok as usize)));
+        Ok(x)
+    }
+
+    /// The device-resident prefill stream — see [`super::run_layers_resident`].
+    fn run_layers_resident(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        want_x: bool,
+    ) -> Result<Option<Vec<f32>>> {
+        let cfg = &self.config;
+        if !self.resident_prefill_serves(tokens.len()) {
+            return Ok(None);
+        }
+        let Some(vulkan) = self.backend.as_wgpu() else {
+            return Ok(None);
+        };
+        // Rows a resident chunk parked are brought home before anything
+        // here pushes past them.
+        vulkan.fill_deferred_kv_rows(cache);
+        let x = self.token_embeddings(tokens)?;
+        let n_embd = cfg.n_embd;
+        let kv_dim = self.kv_dim();
+        let head_dim = self.head_dim();
+        // The fused QKV and gate/up tensors as row views, once per chunk.
+        let views: Vec<_> = self
+            .layers
+            .iter()
+            .map(|layer| (layer.qkv_views(n_embd, kv_dim), layer.ffn_gate_up()))
+            .collect();
+        let yarn = self.rope_yarn();
+        super::run_layers_resident(
+            vulkan,
+            cache,
+            tokens,
+            &x,
+            start_pos,
+            want_x,
+            cfg.n_head,
+            cfg.n_head_kv,
+            head_dim,
+            cfg.rms_eps,
+            self.layers.len(),
+            |il| {
+                let layer = &self.layers[il];
+                let ((wq, wk, wv), (gate, up)) = &views[il];
+                super::ResidentLayer {
+                    attn_norm: &layer.attn_norm,
+                    wq,
+                    wk,
+                    wv,
+                    q_bias: None,
+                    k_bias: None,
+                    v_bias: None,
+                    pairing: tensor::RopeLayout::Neox,
+                    yarn,
+                    rope_dim: cfg.rope_dim,
+                    rope_freq_base: cfg.rope_freq_base,
+                    freq_factors: self.rope_freq_factors.as_deref(),
+                    n_swa: 0,
+                    scale: 1.0 / (head_dim as f32).sqrt(),
+                    wo: &layer.wo,
+                    ffn_norm: &layer.ffn_norm,
+                    ffn_gate: gate,
+                    ffn_up: up,
+                    ffn_down: &layer.w_down,
+                    activation: crate::engine::backend::vulkan::FfnActivation::Swiglu,
+                }
+            },
+        )
+    }
+
     fn run_layers(
         &self,
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
     ) -> Result<Vec<f32>> {
+        // Rows a resident chunk parked for the chunk after it are brought
+        // home before anything here pushes past them.
+        if let Some(vulkan) = self.backend.as_wgpu() {
+            vulkan.fill_deferred_kv_rows(cache);
+        }
         let cfg = &self.config;
         let n_tokens = tokens.len();
         let n_embd = cfg.n_embd;
@@ -950,12 +1061,43 @@ impl ModelForward for PhiModel {
         let cfg = &self.config;
         let n_tokens = tokens.len();
         let n_embd = cfg.n_embd;
-        let x = self.run_layers(cache, tokens, start_pos)?;
+        let x = match self.run_layers_resident(cache, tokens, start_pos, true)? {
+            Some(x) if super::resident_prefill_check() => {
+                // The same chunk again on the step path, into a copy of the
+                // cache, and the two residuals compared.
+                let mut again = cache.duplicate();
+                again.truncate(start_pos);
+                let step = self.run_layers(&mut again, tokens, start_pos)?;
+                super::report_resident_check(&x, &step, n_embd, start_pos);
+                x
+            }
+            Some(x) => x,
+            None => self.run_layers(cache, tokens, start_pos)?,
+        };
 
         let last = &mut x[(n_tokens - 1) * n_embd..].to_vec();
         tensor::rmsnorm_inplace(last, &self.output_norm, 1, n_embd, cfg.rms_eps);
         let logits = self.backend.matmul(last, 1, &self.output_weight);
         Ok(logits)
+    }
+
+    fn forward_no_logits(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Result<()> {
+        // A chunk before the last: on the resident stream its residual
+        // stays on the device and its K/V readback is parked for the next
+        // chunk to complete.
+        if self
+            .run_layers_resident(cache, tokens, start_pos, false)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.forward(cache, tokens, start_pos, slot_id).map(|_| ())
     }
 
     fn forward_hidden_states(&self, tokens: &[u32]) -> Result<Vec<f32>> {
