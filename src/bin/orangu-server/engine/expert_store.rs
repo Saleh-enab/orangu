@@ -77,6 +77,9 @@ use crate::engine::loader::ExpertQuantMatrix;
 /// that nothing then used — is about the *predictor*, not about any one store.
 static PREFETCHED_EXPERTS: AtomicU64 = AtomicU64::new(0);
 static PREFETCHED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Bytes hinted since the process started — never drained, unlike the
+/// stats above, so the first-pass rule (`read_ahead_applies`) can count.
+static HINTED_BYTES_EVER: AtomicU64 = AtomicU64::new(0);
 
 /// One expert's slice of one per-expert tensor.
 ///
@@ -319,6 +322,7 @@ impl ExpertStore for MmapExpertStore {
             crate::engine::page_cache::advise_willneed(span);
             PREFETCHED_EXPERTS.fetch_add(1, Ordering::Relaxed);
             PREFETCHED_BYTES.fetch_add(span.len() as u64, Ordering::Relaxed);
+            HINTED_BYTES_EVER.fetch_add(span.len() as u64, Ordering::Relaxed);
         }
     }
 
@@ -867,6 +871,7 @@ impl ExpertStore for TieredExpertStore {
             crate::engine::page_cache::advise_willneed(span);
             PREFETCHED_EXPERTS.fetch_add(1, Ordering::Relaxed);
             PREFETCHED_BYTES.fetch_add(span.len() as u64, Ordering::Relaxed);
+            HINTED_BYTES_EVER.fetch_add(span.len() as u64, Ordering::Relaxed);
         }
     }
 
@@ -922,6 +927,10 @@ fn residency_probe_enabled() -> bool {
 /// loads a model hints nothing.
 static STREAMING: OnceLock<bool> = OnceLock::new();
 
+/// The bytes that stay in host memory, for the first pass's read-ahead —
+/// see [`read_ahead_selected`].
+static HOST_WEIGHT_BYTES: OnceLock<u64> = OnceLock::new();
+
 /// Records whether the routed experts (`host_weight_bytes`, the bytes that
 /// stay in host memory whatever the backend) can be held by `total_ram`.
 ///
@@ -933,7 +942,23 @@ static STREAMING: OnceLock<bool> = OnceLock::new();
 pub fn set_streaming_regime(host_weight_bytes: u64, total_ram: u64) -> bool {
     let streaming = host_weight_bytes > total_ram;
     let _ = STREAMING.set(streaming);
+    let _ = HOST_WEIGHT_BYTES.set(host_weight_bytes);
     streaming
+}
+
+/// Whether the read-ahead hint applies now: always in the streaming
+/// regime, and otherwise until one model's worth of experts has been
+/// hinted — a model that fits the page cache still has to get there once,
+/// and a first pass by demand faults ran at 30 MB/s on a drive that
+/// reads sequentially at 400 (a 20 GiB file: eleven minutes for the
+/// first prompt, 0.5 tok/s for its first answer). One pass of hints on a
+/// model already in the cache is a few thousand `madvise` calls, nothing.
+fn read_ahead_applies() -> bool {
+    if streaming_regime() {
+        return true;
+    }
+    let host = HOST_WEIGHT_BYTES.get().copied().unwrap_or(0);
+    host > 0 && HINTED_BYTES_EVER.load(Ordering::Relaxed) < host
 }
 
 /// Whether the routed experts are streamed from disk — see
@@ -965,7 +990,7 @@ pub fn read_ahead_on() -> bool {
 /// Advisory in the sense the store's `prefetch` is: it takes no lease and
 /// raises no heat, and a store that reads around the page cache ignores it.
 pub fn read_ahead_selected(selection: &[Vec<(usize, f32)>], tensors: &[&ExpertQuantMatrix]) {
-    if !streaming_regime() || !read_ahead_on() {
+    if !read_ahead_applies() || !read_ahead_on() {
         return;
     }
     let union = selected_union(selection);

@@ -1375,6 +1375,73 @@ impl LoadedModel {
             .map(|(name, loc)| (name.as_str(), loc.len as u64))
     }
 
+    /// Reads the tensors `keep` names into the page cache, in file order,
+    /// through the file rather than the mapping, twice.
+    ///
+    /// For the tensors that stay in host memory (the routed experts of a
+    /// mixture-of-experts model): a model whose file is not in the page
+    /// cache is otherwise brought in by the first request's demand faults,
+    /// one page under each dot that needs it — measured at 30 MB/s on a
+    /// drive that reads sequentially at 400, eleven minutes of the first
+    /// prompt on a 20 GiB file. Through the file, not by touching the
+    /// mapping: a walk over the mapping faults page by page too (37 MB/s
+    /// on a compressed file system, where each fault decompresses its
+    /// extent alone), where `read` in large pieces lets the kernel's
+    /// read-ahead and decompression run wide. And twice, because once is
+    /// not enough when other files hold the cache: a page read once sits
+    /// on the kernel's inactive list and is the first evicted under the
+    /// process's own allocations, so a single pass lost its pages behind
+    /// itself (19 GiB read for a 16 GiB file, the second request as slow
+    /// as the first); the second read promotes them. Returns the bytes
+    /// read once; tensors whose bytes are not a mapped file (rewritten
+    /// ones) are skipped.
+    pub fn touch_tensors(&self, keep: impl Fn(&str) -> bool) -> u64 {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut spans: Vec<(std::path::PathBuf, u64, usize)> = self
+            .tensors
+            .iter()
+            .filter(|(name, _)| keep(name))
+            .filter_map(|(_, loc)| {
+                let bytes: &[u8] = &loc.bytes[loc.start..loc.start + loc.len];
+                let (path, offset) =
+                    super::page_cache::locate(bytes.as_ptr() as usize, bytes.len())?;
+                Some((path, offset, loc.len))
+            })
+            .collect();
+        spans.sort();
+        let mut buf = vec![0u8; 8 << 20];
+        let mut total = 0u64;
+        for _ in 0..2 {
+            let mut open: Option<(std::path::PathBuf, std::fs::File)> = None;
+            for (path, offset, len) in &spans {
+                if open.as_ref().is_none_or(|(p, _)| p != path) {
+                    let Ok(file) = std::fs::File::open(path) else {
+                        continue;
+                    };
+                    open = Some((path.clone(), file));
+                }
+                let Some((_, file)) = open.as_mut() else {
+                    continue;
+                };
+                if file.seek(SeekFrom::Start(*offset)).is_err() {
+                    continue;
+                }
+                let mut left = *len;
+                while left > 0 {
+                    let want = left.min(buf.len());
+                    match file.read(&mut buf[..want]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            left -= n;
+                            total += n as u64;
+                        }
+                    }
+                }
+            }
+        }
+        total / 2
+    }
+
     /// The first `blk.<n>` index belonging to a trailing multi-token-
     /// prediction block, or `None` when the file declares none — which is
     /// most files.

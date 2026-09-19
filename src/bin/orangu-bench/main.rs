@@ -307,7 +307,12 @@ struct Args {
     sweep_env: Vec<String>,
 
     /// Seconds to wait for a swept server to come up.
-    #[arg(long, default_value_t = 300, value_name = "SECONDS")]
+    ///
+    /// Generous, because a server that reads a 24 GiB file into memory
+    /// before it listens takes minutes when the file is cold, and a sweep
+    /// that gave up at five minutes lost both of a model's profiles to a
+    /// slow disk rather than to anything the run was measuring.
+    #[arg(long, default_value_t = 900, value_name = "SECONDS")]
     sweep_start_timeout: u64,
 
     /// Re-render an already-collapsed `.folded` profile to SVG; measure nothing.

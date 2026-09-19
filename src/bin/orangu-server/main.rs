@@ -1394,6 +1394,18 @@ fn prepare(args: Args) -> Result<Prepared> {
                     "faulted in as it is used (ORANGU_EXPERT_WILLNEED=0)"
                 }
             );
+        } else if host_bytes > 0 && engine::env::flag_on_unless_disabled("ORANGU_HOST_PRELOAD") {
+            // A model that fits is read into the page cache now, before the
+            // first request finds it by demand faults — see
+            // `LoadedModel::touch_tensors`. `ORANGU_HOST_PRELOAD=0` leaves the
+            // first request to do it.
+            let t = std::time::Instant::now();
+            let touched = loaded.touch_tensors(engine::backend::is_cpu_only_tensor);
+            log::info!(
+                "orangu-server: [experts] {} of host-resident weights read into memory in {:.1}s",
+                orangu::format::format_bytes(touched),
+                t.elapsed().as_secs_f64()
+            );
         }
     }
     // A split model has no single device to measure, so it reports what
