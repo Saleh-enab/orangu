@@ -4197,7 +4197,9 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
 /// 32 rows a workgroup. **An even number of blocks per row only**: with
 /// an odd count a row's start is two bytes off every other row and the
 /// phase would depend on the row as well as the block (every width this
-/// model family has is a multiple of 256).
+/// model family has is a multiple of 256). **A 16-lane subgroup only**:
+/// the lane's block index and the subgroup's row slice count to 16, and
+/// nothing rescales them for a wider device — its test skips elsewhere.
 ///
 /// **Probe-only.** Measured on the Mali-G720 (`ternary_t_kernel_time`,
 /// warm, best of 12): the FFN gate shape 951 µs against the 8-lane
@@ -4329,7 +4331,8 @@ pub fn shader_source_quantize_ternary_o() -> String {
 /// lane's four words fall in at most two blocks. The block scale reaches
 /// every lane of the block by `subgroupShuffle` from the lane that loaded
 /// it. Four subgroups a workgroup, eight rows each, reduced within the
-/// subgroup. **Block count a multiple of eight only.**
+/// subgroup. **Block count a multiple of eight only**, and, like
+/// [`shader_source_ternary_t`], **a 16-lane subgroup only**.
 ///
 /// **Probe-only.** Measured on the Mali-G720 (`ternary_o_kernel_time`):
 /// 7978 µs at the gate shape with the shuffles — `subgroupShuffle` is

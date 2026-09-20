@@ -4434,6 +4434,9 @@ pub struct ActQ8KRow {
     /// Per-[`QK_PRISM`] `sum(q)` — the `-1` bias of a ternary block folded
     /// into one subtraction. Summed once here rather than from `sums` per
     /// (row, block), which was a fifth of the Prism decode kernel's time.
+    /// Read only by the `sdot` row kernels; elsewhere the block dot unpacks
+    /// the offset weights and needs no sum.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     prism_sums: Vec<i32>,
 }
 

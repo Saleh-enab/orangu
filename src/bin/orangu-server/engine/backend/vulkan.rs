@@ -1458,6 +1458,11 @@ pub struct VulkanBackend {
     /// so the raw-Vulkan replay capture can rebuild the *same* matmul WGSL
     /// `pipeline_for` selected.
     supports_subgroup: bool,
+    /// The adapter's subgroup width as `(min, max)` lanes — equal on a
+    /// device with one fixed width (16 on Mali, 32 on Apple), a range where
+    /// the driver picks per pipeline. What `attn_coop`'s 32-lane check and
+    /// the 16-lane probe kernels' tests read.
+    subgroup_lanes: (u32, u32),
     /// Thin-tile multi-position reduce kernel enabled (`ORANGU_THIN_TILE`) —
     /// for `2 ≤ n_tokens < coop_min_n_tokens`, serve the
     /// matmul with `thin_tile_pipelines` (dequant amortized `thin_tile_size`-
@@ -3735,6 +3740,8 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                 // again: this is what the adapter offers, that is what this
                 // process chose.
                 "supports_subgroup": self.supports_subgroup,
+                "subgroup_min_size": self.subgroup_lanes.0,
+                "subgroup_max_size": self.subgroup_lanes.1,
                 "attn_split": self.attn_split,
                 "attn_coop": self.attn_coop,
                 "attn_gqa": self.attn_gqa,
@@ -4119,7 +4126,8 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         // be narrower — Mali, 16 wide — reduces half of it and the kernel is
         // wrong by construction, not by miscompilation; the classic kernels
         // reduce through workgroup memory and do not care.
-        let subgroup_wide_enough = info.subgroup_min_size >= 32;
+        let subgroup_lanes = (info.subgroup_min_size, info.subgroup_max_size);
+        let subgroup_wide_enough = subgroup_lanes.0 >= 32;
         if supports_subgroup && !subgroup_wide_enough {
             log::info!(
                 "orangu-server: [vulkan] {} subgroups are {} lanes wide; the cooperative \
@@ -5438,6 +5446,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             tiled_prefill,
             coop_min_n_tokens,
             supports_subgroup,
+            subgroup_lanes,
             thin_tile,
             thin_tile_size,
             thin_tile_min_k,

@@ -11026,12 +11026,26 @@ fn ternary_t_check(in_dim: usize, out_dim: usize, n_tokens: usize, time: bool) {
 
 /// `octet`: the octet kernel (`shader_source_ternary_o`) over its own
 /// layout instead of the two-phase one.
+///
+/// Both kernels are written for a 16-lane subgroup (`shader_source_
+/// ternary_t`'s doc): a lane's block index, a subgroup's row slice and the
+/// octet kernel's sixteen-`vec4`-plus-four row walk all count to 16. On a
+/// wider subgroup half the rows come back zero and the rest sum blocks
+/// twice — wrong by construction, as `attn_coop` is on a narrower one — so
+/// the check runs only where the width is exactly 16, and says so.
 fn ternary_t_check_kind(in_dim: usize, out_dim: usize, n_tokens: usize, time: bool, octet: bool) {
     let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
     };
+    if vulkan.subgroup_lanes != (16, 16) {
+        eprintln!(
+            "skipping: the 16-lane ternary probe kernels on subgroups of {}..={} lanes",
+            vulkan.subgroup_lanes.0, vulkan.subgroup_lanes.1
+        );
+        return;
+    }
     let ggml_type = GGML_TYPE_PQ2_0;
     let mut seed = 0x1D07_u64;
     let mut bytes = Vec::new();
