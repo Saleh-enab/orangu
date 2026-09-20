@@ -507,7 +507,7 @@ fn _scratch_measure_attention_dispatch_cost() {
         causal: 0,
         kv_page_base: 0,
         kv_page_tokens: 0,
-        _pad0: 0,
+        kv_ring_rows: 0,
         _pad1: 0,
         _pad2: 0,
     };
@@ -787,7 +787,7 @@ fn measure_split_k_dispatch_ms(vulkan: &VulkanBackend, k_num: u32) -> f64 {
         scale,
         kv_page_base: 0,
         kv_page_tokens: 0,
-        _pad0: 0,
+        kv_ring_rows: 0,
         _pad1: 0,
         _pad2: 0,
     };
@@ -3028,11 +3028,11 @@ fn _scratch_measure_expert_gemm() {
             &x,
             n_tokens,
             gate_up.in_dim,
-            &gu_ops[0],
+            Some(&gu_ops[0]),
             &gu_ops[1],
             &down_op,
             &groups,
-            false,
+            MoeActivation::Geglu,
             None,
             &[&gu_stack, &down_stack],
         );
@@ -3137,11 +3137,11 @@ fn the_fused_routed_ffn_matches_the_cpu_computation_by_parts() {
         &x,
         N_TOKENS,
         N_EMBD,
-        &gate,
+        Some(&gate),
         &up,
         &down,
         &groups,
-        false,
+        MoeActivation::Geglu,
         None,
         &[],
     );
@@ -3157,11 +3157,11 @@ fn the_fused_routed_ffn_matches_the_cpu_computation_by_parts() {
                 &x,
                 N_TOKENS,
                 N_EMBD,
-                &gate,
+                Some(&gate),
                 &up,
                 &down,
                 &groups,
-                false,
+                MoeActivation::Geglu,
                 None,
                 &[],
             )
@@ -3188,17 +3188,17 @@ fn the_fused_routed_ffn_matches_the_cpu_computation_by_parts() {
         &x,
         N_TOKENS,
         N_EMBD,
-        &ExpertOp {
+        Some(&ExpertOp {
             scale: Some(&gate_scale),
             ..gate
-        },
+        }),
         &ExpertOp {
             scale: Some(&up_scale),
             ..up
         },
         &down,
         &groups,
-        false,
+        MoeActivation::Geglu,
         None,
         &[],
     );
@@ -3257,11 +3257,11 @@ fn the_fused_routed_ffn_matches_the_cpu_computation_by_parts() {
             &x,
             N_TOKENS,
             N_EMBD,
-            &gate,
+            Some(&gate),
             &up,
             &down,
             &groups,
-            false,
+            MoeActivation::Geglu,
             Some(&combine),
             &[],
         )
@@ -5532,6 +5532,7 @@ fn fused_post_attention_matches_cpu_reference_with_ple() {
         ffn_norm: &ffn_norm,
         ffn_gate: &ffn_gate,
         ffn_up: &ffn_up,
+        ffn_gate_up: None,
         ffn_down: &ffn_down,
         ffn_post_norm: Some(&ffn_post_norm),
         eps,
@@ -5632,6 +5633,7 @@ fn fused_post_attention_matches_cpu_reference_without_ple() {
         ffn_norm: &ffn_norm,
         ffn_gate: &ffn_gate,
         ffn_up: &ffn_up,
+        ffn_gate_up: None,
         ffn_down: &ffn_down,
         ffn_post_norm: Some(&ffn_post_norm),
         eps,
@@ -5759,6 +5761,7 @@ fn fused_post_attention_repeated_calls_use_fresh_data_not_cached_data() {
             ffn_norm: &ffn_norm,
             ffn_gate: &ffn_gate,
             ffn_up: &ffn_up,
+            ffn_gate_up: None,
             ffn_down: &ffn_down,
             ffn_post_norm: Some(&ffn_post_norm),
             eps,
@@ -6238,7 +6241,11 @@ fn paged_prefill_agrees_at_len(page: usize, pages: usize, positions: usize) {
     let mut pool = KvPool::with_policy(
         pool_pages,
         page_tokens,
-        vec![LayerGeometry { kv_dim, stride: 1 }],
+        vec![LayerGeometry {
+            kv_dim,
+            stride: 1,
+            ring: None,
+        }],
         Policy::Lru,
     );
     let (device, queue) = vulkan.device_and_queue();
@@ -6396,7 +6403,11 @@ fn paged_attention_matches_the_contiguous_kernel_through_a_shuffled_table() {
     let mut pool = KvPool::with_policy(
         POOL_PAGES,
         PAGE,
-        vec![LayerGeometry { kv_dim, stride: 1 }],
+        vec![LayerGeometry {
+            kv_dim,
+            stride: 1,
+            ring: None,
+        }],
         Policy::Lru,
     );
     let (device, queue) = vulkan.device_and_queue();
@@ -8805,7 +8816,11 @@ fn cross_check_fused_attention_prefill_paged_float_mode(
         let mut pool = KvPool::with_policy(
             pool_pages,
             PAGE,
-            vec![LayerGeometry { kv_dim, stride: 1 }],
+            vec![LayerGeometry {
+                kv_dim,
+                stride: 1,
+                ring: None,
+            }],
             Policy::Lru,
         );
         let (device, queue) = vulkan.device_and_queue();
@@ -8935,6 +8950,228 @@ fn cross_check_fused_attention_prefill_paged_float_mode(
         drop(cache);
         pool.release(&held);
     }
+}
+
+/// A **ring mirror** (`LayerCache::set_mirror_ring`) against the plain
+/// one: the same rows, the same queries, the same kernels — only the row a
+/// position lives at differs — so every output must be bit-identical. The
+/// ring is sized so it wraps several times over the test: the fused prefill
+/// chain writing chunks through the wrap, the single-query kernel reading
+/// a window that straddles it, and the host-path prefill kernel over a
+/// window that does too. A ring that never wrapped would prove nothing.
+#[test]
+fn ring_mirror_matches_the_plain_mirror_across_the_wrap() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    if vulkan.q4_k_mmvq {
+        eprintln!("skipping: ORANGU_Q4K_MMVQ selects the unfused fallback path");
+        return;
+    }
+    let (n_embd, n_head, n_head_kv, head_dim) = (256usize, 4usize, 2usize, 64usize);
+    let (rope_dim, rope_freq_base, eps) = (64usize, 10000.0f32, 1e-6f32);
+    let kv_dim = n_head_kv * head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let n_swa = 5usize;
+    let chunk = 8usize;
+    let capacity = 96usize;
+    let mut seed = 0x0051_D1E5_u64;
+    let mut build = |in_dim: usize, out_dim: usize| {
+        let mut bytes = Vec::new();
+        for _ in 0..out_dim {
+            for _ in 0..(in_dim / 256) {
+                bytes.extend(build_block(GGML_TYPE_Q4_K, &mut seed));
+            }
+        }
+        test_quant_matrix(&bytes, GGML_TYPE_Q4_K, in_dim, out_dim)
+    };
+    let wq = build(n_embd, n_head * head_dim);
+    let wk = build(n_embd, kv_dim);
+    let wv = build(n_embd, kv_dim);
+    let mut rand_vec = |n: usize| -> Vec<f32> {
+        (0..n)
+            .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
+            .collect()
+    };
+    let q_norm: Vec<f32> = rand_vec(head_dim).iter().map(|v| 1.0 + v * 0.1).collect();
+    let k_norm: Vec<f32> = rand_vec(head_dim).iter().map(|v| 1.0 + v * 0.1).collect();
+
+    let mut plain = crate::engine::kv_cache::KvCache::new_with_dims(capacity, &[kv_dim]);
+    let mut ring = crate::engine::kv_cache::KvCache::new_with_dims(capacity, &[kv_dim]);
+    ring.set_mirror_ring(0, n_swa, chunk);
+    // 5 + 8 rounds up to 16 rows: the ring wraps every 16 positions.
+    assert_eq!(ring.layers[0].ring_rows(), Some(16));
+    assert_eq!(ring.max_positions_per_call(), Some(16 - n_swa));
+    // The same ring layer served by a page pool: its rows go to the pool's
+    // host pages (for sharing and slot save) and its device copy stays this
+    // request's ring — the pool allocates it no device pages.
+    let mut probe = crate::engine::kv_cache::KvCache::new_with_dims(1, &[kv_dim]);
+    probe.set_mirror_ring(0, n_swa, chunk);
+    let geom = crate::engine::kv_pool::LayerGeometry::of(&probe);
+    assert_eq!(geom[0].ring, Some(16));
+    let pool_pages = 64;
+    let mut pool = crate::engine::kv_pool::KvPool::with_policy(
+        pool_pages,
+        8,
+        geom.clone(),
+        crate::engine::kv_pool::Policy::Lru,
+    );
+    let (device, _) = vulkan.device_and_queue();
+    assert!(pool.attach_device(device, vulkan.kv_storage(), pool_pages * 4));
+    assert_eq!(
+        crate::engine::kv_pool::device_page_bytes(&geom, 8, vulkan.kv_storage()),
+        0,
+        "a ring layer costs the pool no device bytes"
+    );
+    let pool = std::sync::Arc::new(pool);
+    let mut paged_ring = crate::engine::kv_cache::KvCache::new_with_dims(capacity, &[kv_dim]);
+    paged_ring.set_mirror_ring(0, n_swa, chunk);
+    let mut paged_ring = paged_ring
+        .try_into_paged(pool.clone())
+        .unwrap_or_else(|_| panic!("test pool has room"));
+    assert_eq!(paged_ring.layers[0].ring_rows(), Some(16));
+
+    let exact = |label: &str, a: &[f32], b: &[f32]| {
+        assert_eq!(a.len(), b.len(), "{label}: length");
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert!(x == y, "{label}: plain={x} ring={y} at {i}");
+        }
+    };
+
+    // Chunks through the fused chain, the window bounded as a gemma
+    // sliding-window layer's is.
+    let mut pos = 0usize;
+    for chunk_index in 0..5 {
+        let n_tokens = if chunk_index % 2 == 0 { chunk } else { 3 };
+        let normed = rand_vec(n_tokens * n_embd);
+        let input = |cache: &mut crate::engine::kv_cache::KvCache| {
+            let input = FusedAttnPrefillInput {
+                x_gpu: None,
+                attn_norm: None,
+                yarn: RopeYarn::IDENTITY,
+                q_bias: None,
+                pairing: crate::engine::tensor::RopeLayout::Neox,
+                normalize_v: true,
+                attn_gate: None,
+                normed: &normed,
+                n_tokens,
+                start_pos: pos,
+                wq: &wq,
+                q_norm: Some(&q_norm),
+                kv: Some(FusedAttnPrefillKv {
+                    k_bias: None,
+                    v_bias: None,
+                    wk: &wk,
+                    k_norm: Some(&k_norm),
+                    wv: Some(&wv),
+                }),
+                n_head,
+                n_head_kv,
+                head_dim,
+                rope_dim,
+                rope_freq_base,
+                freq_factors: None,
+                eps,
+                n_swa,
+                causal: true,
+                scale,
+                want_attn_out_host: true,
+            };
+            vulkan
+                .fused_attention_prefill(input, &mut cache.layers[0])
+                .expect("fused prefill attention returned None on a supported path")
+        };
+        let a = input(&mut plain);
+        let b = input(&mut ring);
+        let c = input(&mut paged_ring);
+        paged_ring.commit_pages();
+        exact(
+            &format!("chunk {chunk_index} attn_out"),
+            &a.attn_out,
+            &b.attn_out,
+        );
+        exact(&format!("chunk {chunk_index} k_rows"), &a.k_rows, &b.k_rows);
+        exact(
+            &format!("chunk {chunk_index} paged attn_out"),
+            &a.attn_out,
+            &c.attn_out,
+        );
+        exact(
+            &format!("chunk {chunk_index} paged k_rows"),
+            &a.k_rows,
+            &c.k_rows,
+        );
+        pos += n_tokens;
+        assert_eq!(plain.layers[0].len, pos);
+        assert_eq!(ring.layers[0].len, pos);
+        assert_eq!(paged_ring.layers[0].len, pos);
+    }
+    assert!(
+        !paged_ring.layers[0].is_pool_backed(),
+        "a ring layer's device copy is never the pool's"
+    );
+
+    // Single queries at the wrap: the window straddles rows 15|0.
+    for _ in 0..6 {
+        let k = rand_vec(kv_dim);
+        let v = rand_vec(kv_dim);
+        plain.layers[0].push(&k, &v);
+        ring.layers[0].push(&k, &v);
+        paged_ring.layers[0].push(&k, &v);
+        let q = rand_vec(n_head * head_dim);
+        let window_start = pos.saturating_sub(n_swa - 1);
+        let run = |cache: &mut crate::engine::kv_cache::KvCache| {
+            vulkan.gpu_attention(GpuAttentionInput {
+                q: &q,
+                cache: &mut cache.layers[0],
+                pos,
+                window_start,
+                n_head,
+                n_head_kv,
+                head_dim,
+                scale,
+            })
+        };
+        let a = run(&mut plain);
+        let b = run(&mut ring);
+        let c = run(&mut paged_ring);
+        exact(&format!("single query at {pos}"), &a, &b);
+        exact(&format!("paged single query at {pos}"), &a, &c);
+        pos += 1;
+    }
+
+    // The host-path prefill kernel over rows pushed from the host.
+    let n_tokens = 7;
+    let mut q = Vec::new();
+    for _ in 0..n_tokens {
+        let k = rand_vec(kv_dim);
+        let v = rand_vec(kv_dim);
+        plain.layers[0].push(&k, &v);
+        ring.layers[0].push(&k, &v);
+        paged_ring.layers[0].push(&k, &v);
+        q.extend(rand_vec(n_head * head_dim));
+    }
+    let run = |cache: &mut crate::engine::kv_cache::KvCache| {
+        vulkan.gpu_attention_prefill(
+            &q,
+            &mut cache.layers[0],
+            pos,
+            n_tokens,
+            n_head,
+            n_head_kv,
+            head_dim,
+            n_swa,
+            true,
+            scale,
+        )
+    };
+    let a = run(&mut plain);
+    let b = run(&mut ring);
+    let c = run(&mut paged_ring);
+    exact("host-path prefill", &a, &b);
+    exact("paged host-path prefill", &a, &c);
 }
 
 /// The `llama`/`mistral` shape through the same fused chain: **no** per-head
@@ -12750,6 +12987,7 @@ fn cross_check_fused_layer_llama_shaped(biases: &str) {
             ffn_norm: &ffn_norm,
             ffn_gate: &ffn_gate,
             ffn_up: &ffn_up,
+            ffn_gate_up: None,
             ffn_down: &ffn_down,
             ffn_post_norm: None,
             ple: None,
@@ -12929,6 +13167,7 @@ fn fused_layer_muse_shaped_matches_cpu_reference() {
             ffn_norm: &ffn_norm,
             ffn_gate: &ffn_gate,
             ffn_up: &ffn_up,
+            ffn_gate_up: None,
             ffn_down: &ffn_down,
             ffn_post_norm: Some(&ffn_post_norm),
             ple: None,
@@ -13164,6 +13403,7 @@ fn fused_post_attention_decode_matches_prefill_on_the_llama_shape() {
         ffn_norm: &ffn_norm,
         ffn_gate: &ffn_gate,
         ffn_up: &ffn_up,
+        ffn_gate_up: None,
         ffn_down: &ffn_down,
         ffn_post_norm: None,
         eps,
@@ -13424,6 +13664,7 @@ fn fused_layer_matches_cpu_reference_full_layer_with_ple() {
             ffn_norm: &ffn_norm,
             ffn_gate: &ffn_gate,
             ffn_up: &ffn_up,
+            ffn_gate_up: None,
             ffn_down: &ffn_down,
             ffn_post_norm: Some(&ffn_post_norm),
             ple: Some(FusedPle {
@@ -13670,6 +13911,7 @@ fn fused_layer_model_shaped_on_the_word_reading_types_matches_cpu_reference() {
             ffn_norm: &ffn_norm,
             ffn_gate: &ffn_gate,
             ffn_up: &ffn_up,
+            ffn_gate_up: None,
             ffn_down: &ffn_down,
             ffn_post_norm: Some(&ffn_post_norm),
             ple: Some(FusedPle {
@@ -13961,6 +14203,7 @@ fn fused_layer_kv_donor_matches_cpu_reference_many_steps() {
             ffn_norm: &l0.ffn_norm,
             ffn_gate: &l0.ffn_gate,
             ffn_up: &l0.ffn_up,
+            ffn_gate_up: None,
             ffn_down: &l0.ffn_down,
             ffn_post_norm: Some(&l0.ffn_post_norm),
             ple: None,
@@ -14008,6 +14251,7 @@ fn fused_layer_kv_donor_matches_cpu_reference_many_steps() {
             ffn_norm: &l1.ffn_norm,
             ffn_gate: &l1.ffn_gate,
             ffn_up: &l1.ffn_up,
+            ffn_gate_up: None,
             ffn_down: &l1.ffn_down,
             ffn_post_norm: Some(&l1.ffn_post_norm),
             ple: None,
@@ -14177,7 +14421,11 @@ fn paged_fused_decode_matches_cpu_reference() {
     let mut pool = KvPool::with_policy(
         pool_pages,
         page_tokens,
-        vec![LayerGeometry { kv_dim, stride: 1 }],
+        vec![LayerGeometry {
+            kv_dim,
+            stride: 1,
+            ring: None,
+        }],
         Policy::Lru,
     );
     let (device, queue) = vulkan.device_and_queue();
@@ -14612,6 +14860,15 @@ fn mmq_q4k_gemm_matches_the_cpu_product() {
         (crate::engine::quant::GGML_TYPE_Q4_1, 1536, 6144, 200),
         (crate::engine::quant::GGML_TYPE_Q5_0, 1536, 6144, 200),
         (crate::engine::quant::GGML_TYPE_Q5_1, 1536, 6144, 200),
+        // A single-head K/V width, which no wide or half tile serves: the
+        // byte-unpacked types take the narrow 64 × 32 shape there, as
+        // `Q4_K` does, with a partial token tile and both block parities.
+        (crate::engine::quant::GGML_TYPE_Q4_1, 1536, 256, 90),
+        (crate::engine::quant::GGML_TYPE_Q4_0, 1536, 256, 90),
+        (crate::engine::quant::GGML_TYPE_Q8_0, 1536, 256, 40),
+        (crate::engine::quant::GGML_TYPE_Q5_K, 1536, 256, 90),
+        (crate::engine::quant::GGML_TYPE_Q3_K, 1536, 256, 90),
+        (crate::engine::quant::GGML_TYPE_IQ2_S, 1536, 256, 90),
         // The sixteen-value scale types take the dot per half; `Q3_K`'s
         // 110-byte block puts odd blocks two bytes into a word.
         (crate::engine::quant::GGML_TYPE_Q2_K, 1536, 6144, 256),
@@ -15395,6 +15652,7 @@ fn fused_post_attention_decode_model_shaped_on_the_word_reading_types() {
         ffn_norm: &ffn_norm,
         ffn_gate: &ffn_gate,
         ffn_up: &ffn_up,
+        ffn_gate_up: None,
         ffn_down: &ffn_down,
         ffn_post_norm: Some(&ffn_post_norm),
         eps,
@@ -15421,5 +15679,264 @@ fn decode_matvec_integer_dot_a_few_tokens() {
     for n_tokens in [2usize, 3, 5] {
         cross_check_n_tokens(GGML_TYPE_Q2_K, 1536, 2055, n_tokens);
         cross_check_n_tokens(GGML_TYPE_Q3_K, 1536, 2055, n_tokens);
+    }
+}
+
+/// The gate and up projections as one dispatch (`ffn_gate_up`, a
+/// `QuantMatrix::adjacent_pair` view) against the two-dispatch form and
+/// the CPU reference, at a llama-family shape: SwiGLU, no post-norms, and
+/// a `Q8_0` pair so the integer-dot form of the pair runs where the
+/// device has it. The halves are views of one tensor, which is exactly
+/// what a checkpoint that stores `ffn_gate` then `ffn_up` hands the arch.
+#[test]
+fn fused_post_attention_gate_up_pair_matches_the_two_dispatches() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+
+    let n_embd = 960;
+    let ffn_len = 2560;
+    let eps = 1e-5;
+    let mut seed = 0x6A7E_u64;
+    // `Q8_0` blocks at one small scale: random scales put the activations
+    // in the billions, where the 8-bit activation rounding of the
+    // integer-dot path is all a float reference can see.
+    let build = |in_dim: usize, out_dim: usize, seed: &mut u64| {
+        let scale = half::f16::from_f32(1.0 / 64.0).to_le_bytes();
+        let mut bytes = Vec::new();
+        for _ in 0..out_dim * (in_dim / 32) {
+            bytes.extend_from_slice(&scale);
+            bytes.extend((0..32).map(|_| next_byte(seed)));
+        }
+        test_quant_matrix(&bytes, GGML_TYPE_Q8_0, in_dim, out_dim)
+    };
+    let wo = build(n_embd, n_embd, &mut seed);
+    // One tensor holding gate's rows then up's; the halves are row views.
+    let gate_up = build(n_embd, 2 * ffn_len, &mut seed);
+    let ffn_gate = gate_up.rows(0, ffn_len);
+    let ffn_up = gate_up.rows(ffn_len, ffn_len);
+    let pair = QuantMatrix::adjacent_pair(&ffn_gate, &ffn_up).expect("the halves are adjacent");
+    assert_eq!(pair.cache_key(), gate_up.cache_key());
+    let ffn_down = build(ffn_len, n_embd, &mut seed);
+    let rand_vec = |len: usize, seed: &mut u64| -> Vec<f32> {
+        (0..len)
+            .map(|_| (next_byte(seed) as f32 - 128.0) / 64.0)
+            .collect()
+    };
+    let attn_out = rand_vec(n_embd, &mut seed);
+    let residual = rand_vec(n_embd, &mut seed);
+    let ffn_norm = rand_vec(n_embd, &mut seed);
+
+    let attn_proj = CpuBackend.matmul_dequant(&attn_out, 1, &wo);
+    let mut x = residual.clone();
+    crate::engine::tensor::add_inplace(&mut x, &attn_proj);
+    let mut ffn_normed = x.clone();
+    crate::engine::tensor::rmsnorm_inplace(&mut ffn_normed, &ffn_norm, 1, n_embd, eps);
+    let mut gate = CpuBackend.matmul_dequant(&ffn_normed, 1, &ffn_gate);
+    let up = CpuBackend.matmul_dequant(&ffn_normed, 1, &ffn_up);
+    for g in gate.iter_mut() {
+        *g = crate::engine::tensor::silu(*g);
+    }
+    crate::engine::tensor::mul_inplace(&mut gate, &up);
+    let ffn_out = CpuBackend.matmul_dequant(&gate, 1, &ffn_down);
+    crate::engine::tensor::add_inplace(&mut x, &ffn_out);
+    let expected = x;
+
+    let run = |gate_up: Option<&QuantMatrix>| {
+        vulkan.fused_post_attention(FusedPostAttentionInput {
+            stop_at_ffn_norm: false,
+            activation: FfnActivation::Swiglu,
+            attn_out: GpuInput::Cpu(&attn_out),
+            residual: GpuInput::Cpu(&residual),
+            wo: &wo,
+            attn_post_norm: None,
+            ffn_norm: &ffn_norm,
+            ffn_gate: &ffn_gate,
+            ffn_up: &ffn_up,
+            ffn_gate_up: gate_up,
+            ffn_down: &ffn_down,
+            ffn_post_norm: None,
+            eps,
+            post_norm_eps: None,
+            ple: None,
+            layer_output_scale: None,
+            // Its own slot: the two-dispatch entry for this `wo` is keyed
+            // by slot, and the pair must not inherit resources built
+            // without it.
+            batch_slot: gate_up.map_or(0, |_| 1),
+        })
+    };
+    let paired = run(Some(&pair));
+    let split = run(None);
+    assert_eq!(expected.len(), paired.len());
+    // The two device forms are the same rows through the same kernel and
+    // must agree exactly; against the float reference both carry the
+    // 8-bit activation rounding of the integer-dot path, which is of the
+    // row's scale, not the element's — an element near zero is a
+    // cancellation of terms that size.
+    let scale = expected.iter().fold(0f32, |m, v| m.max(v.abs()));
+    for (i, ((a, b), c)) in expected.iter().zip(&paired).zip(&split).enumerate() {
+        assert_eq!(b, c, "pair vs split at {i}");
+        let tol = 2e-2 * scale;
+        assert!((a - b).abs() <= tol, "pair vs cpu at {i}: cpu={a} pair={b}");
+    }
+}
+
+/// The one-submission routed feed-forward without a gate projection
+/// (`MoeActivation::ReluSquared` — `down(relu(up(x))²)`, the shape of a
+/// `nemotron_h_moe` expert) against the same computation by parts on the
+/// CPU, with the rows combined on the card. The up stack alone crosses
+/// the bus and the activation reads one projection; everything else is
+/// the gated form's, which is what the test is for.
+#[test]
+fn the_fused_routed_ffn_without_a_gate_matches_the_cpu_computation() {
+    use crate::engine::backend::vulkan::{ExpertOp, MoeCombine};
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    const N_EXPERT: usize = 5;
+    const N_TOKENS: usize = 200;
+    const N_EMBD: usize = 512;
+    const N_FF: usize = 128;
+    let mut seed = 0x05EE_D0FF_u64;
+    let up_blocks = N_EXPERT * N_FF * (N_EMBD / block_elems(GGML_TYPE_Q4_K));
+    let up_bytes: Vec<u8> = (0..up_blocks)
+        .flat_map(|_| build_block(GGML_TYPE_Q4_K, &mut seed))
+        .collect();
+    let up_stack = test_quant_matrix(&up_bytes, GGML_TYPE_Q4_K, N_EMBD, N_EXPERT * N_FF);
+    let q8_0 = crate::engine::quant::GGML_TYPE_Q8_0;
+    let dn_blocks = N_EXPERT * N_EMBD * (N_FF / block_elems(q8_0));
+    let dn_bytes: Vec<u8> = (0..dn_blocks)
+        .flat_map(|_| build_block(q8_0, &mut seed))
+        .collect();
+    let dn_stack = test_quant_matrix(&dn_bytes, q8_0, N_FF, N_EXPERT * N_EMBD);
+    let x: Vec<f32> = (0..N_TOKENS * N_EMBD)
+        .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 65536.0)
+        .collect();
+    let mut groups: Vec<(usize, Vec<usize>)> = (0..N_EXPERT).map(|e| (e, Vec::new())).collect();
+    for t in 0..N_TOKENS {
+        groups[t % 3].1.push(t);
+        groups[3 + (t % 2)].1.push(t);
+    }
+    let up = ExpertOp {
+        stack: &up_stack,
+        rows_per_expert: N_FF,
+        first_row: 0,
+        n_rows: N_FF,
+        scale: None,
+    };
+    let down = ExpertOp {
+        stack: &dn_stack,
+        rows_per_expert: N_EMBD,
+        first_row: 0,
+        n_rows: N_EMBD,
+        scale: None,
+    };
+    if [&up, &down]
+        .into_iter()
+        .any(|op| !vulkan.serves_experts(std::slice::from_ref(op)))
+    {
+        eprintln!("no indexed kernel on this device — nothing to check");
+        return;
+    }
+    let got = vulkan.moe_ffn_experts(
+        &x,
+        N_TOKENS,
+        N_EMBD,
+        None,
+        &up,
+        &down,
+        &groups,
+        MoeActivation::ReluSquared,
+        None,
+        &[],
+    );
+    assert_eq!(got.len(), groups.len());
+    for ((expert, tokens), result) in groups.iter().zip(&got) {
+        let mut gathered = Vec::with_capacity(tokens.len() * N_EMBD);
+        for &t in tokens {
+            gathered.extend_from_slice(&x[t * N_EMBD..(t + 1) * N_EMBD]);
+        }
+        let wu = up_stack.rows(expert * N_FF, N_FF);
+        let wd = dn_stack.rows(expert * N_EMBD, N_EMBD);
+        let mut h = CpuBackend.matmul_dequant(&gathered, tokens.len(), &wu);
+        for v in h.iter_mut() {
+            let r = v.max(0.0);
+            *v = r * r;
+        }
+        let want = CpuBackend.matmul_dequant(&h, tokens.len(), &wd);
+        for t in 0..tokens.len() {
+            let row = &want[t * N_EMBD..(t + 1) * N_EMBD];
+            let mag = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-3);
+            for o in 0..N_EMBD {
+                let i = t * N_EMBD + o;
+                assert!(
+                    (result[i] - want[i]).abs() / mag <= 5e-2,
+                    "expert {expert} member {t} row {o}: fused {} vs cpu {} (row magnitude {mag})",
+                    result[i],
+                    want[i]
+                );
+            }
+        }
+    }
+
+    // Combined on the card: two picks per token, weighted 0.25 and 0.75.
+    let k = 2;
+    let mut table = vec![0u32; 2 * N_TOKENS * k];
+    let mut base = 0usize;
+    for (g, (_, tokens)) in groups.iter().enumerate() {
+        for (m, &t) in tokens.iter().enumerate() {
+            let rank = if g < 3 { 0 } else { 1 };
+            table[t * k + rank] = (base + m) as u32;
+            table[N_TOKENS * k + t * k + rank] =
+                if rank == 0 { 0.25f32 } else { 0.75f32 }.to_bits();
+        }
+        base += tokens.len();
+    }
+    let combine = MoeCombine {
+        table,
+        n_tokens: N_TOKENS,
+        k,
+    };
+    let combined = vulkan
+        .moe_ffn_experts(
+            &x,
+            N_TOKENS,
+            N_EMBD,
+            None,
+            &up,
+            &down,
+            &groups,
+            MoeActivation::ReluSquared,
+            Some(&combine),
+            &[],
+        )
+        .pop()
+        .expect("the combined rows");
+    let mut want = vec![0f32; N_TOKENS * N_EMBD];
+    for (g, (_, tokens)) in groups.iter().enumerate() {
+        let w = if g < 3 { 0.25 } else { 0.75 };
+        for (m, &t) in tokens.iter().enumerate() {
+            for e in 0..N_EMBD {
+                want[t * N_EMBD + e] += w * got[g][m * N_EMBD + e];
+            }
+        }
+    }
+    for t in 0..N_TOKENS {
+        let row = &want[t * N_EMBD..(t + 1) * N_EMBD];
+        let mag = row.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-3);
+        for e in 0..N_EMBD {
+            let i = t * N_EMBD + e;
+            assert!(
+                (combined[i] - want[i]).abs() / mag <= 1e-3,
+                "token {t} element {e}: combined {} vs summed rows {}",
+                combined[i],
+                want[i]
+            );
+        }
     }
 }

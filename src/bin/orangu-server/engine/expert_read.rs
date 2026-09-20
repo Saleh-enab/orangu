@@ -87,7 +87,10 @@ pub fn source() -> Source {
 
 /// Alignment for `O_DIRECT`. A page is a multiple of every logical block size
 /// a real device reports, so it satisfies the requirement without having to
-/// interrogate the device for its own.
+/// interrogate the device for its own. macOS has no `O_DIRECT` and no
+/// alignment rule for its `F_NOCACHE` reads, but widening to pages costs it
+/// nothing and keeps the two platforms reading the same ranges.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 const DIRECT_ALIGN: u64 = 4096;
 
 /// The read granule, in bytes — `[orangu-server].read_size`.
@@ -106,6 +109,7 @@ pub fn set_read_size(kib: usize) {
 }
 
 /// The read granule in bytes, never below one page.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_size() -> u64 {
     READ_SIZE
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -129,6 +133,7 @@ fn read_size() -> u64 {
 /// neighbours.
 ///
 /// Separated from the I/O so the arithmetic can be tested without a file.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn read_window(offset: u64, len: usize, granule: u64) -> (u64, usize) {
     let want = (offset + len as u64).next_multiple_of(DIRECT_ALIGN)
         - (offset / DIRECT_ALIGN * DIRECT_ALIGN);
@@ -159,18 +164,29 @@ pub fn read_expert(span: &[u8]) -> Vec<u8> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_via_file(span: &[u8], direct: bool) -> Option<Vec<u8>> {
     use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
 
     let (path, offset) = crate::engine::page_cache::locate(span.as_ptr() as usize, span.len())?;
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
+    // Bypassing the page cache: `O_DIRECT` at the open on Linux, `F_NOCACHE`
+    // through `fcntl` after it on macOS, which has no `O_DIRECT`.
+    #[cfg(target_os = "linux")]
     if direct {
+        use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_DIRECT);
     }
     let file = options.open(&path).ok()?;
+    #[cfg(target_os = "macos")]
+    if direct {
+        // Safety: a plain `fcntl` on a descriptor this function just opened
+        // and still owns.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } < 0 {
+            return None;
+        }
+    }
 
     // Widen outward to the configured granule. `O_DIRECT` needs page
     // alignment at minimum; the buffered path does not, but sharing one code
@@ -208,7 +224,7 @@ fn read_via_file(span: &[u8], direct: bool) -> Option<Vec<u8>> {
     Some(buffer.as_slice()[lead..lead + span.len()].to_vec())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn read_via_file(_span: &[u8], _direct: bool) -> Option<Vec<u8>> {
     None
 }
@@ -220,13 +236,13 @@ fn read_via_file(_span: &[u8], _direct: bool) -> Option<Vec<u8>> {
 /// `std::alloc` with an explicit `Layout` rather than by over-allocating a
 /// `Vec` and offsetting into it, so the alignment is a property of the
 /// allocation rather than of arithmetic done at every use.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct AlignedBuffer {
     ptr: *mut u8,
     layout: std::alloc::Layout,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl AlignedBuffer {
     fn new(size: usize) -> Option<Self> {
         let layout = std::alloc::Layout::from_size_align(size, DIRECT_ALIGN as usize).ok()?;
@@ -247,7 +263,7 @@ impl AlignedBuffer {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
         // Safety: `ptr` came from `alloc` with exactly this layout.
@@ -355,7 +371,7 @@ mod tests {
     fn an_unregistered_address_falls_back_to_the_mapping() {
         let bytes: Vec<u8> = (0..=255u8).cycle().take(9000).collect();
         assert_eq!(read_expert(&bytes), bytes);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             assert!(read_via_file(&bytes, false).is_none());
             assert!(read_via_file(&bytes, true).is_none());
@@ -365,7 +381,7 @@ mod tests {
     /// `O_DIRECT` rejects an unaligned destination outright, so the buffer's
     /// alignment is a correctness property rather than a tuning detail.
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn the_read_buffer_is_page_aligned() {
         for size in [4096usize, 8192, 4096 * 7] {
             let buffer = AlignedBuffer::new(size).expect("allocation");

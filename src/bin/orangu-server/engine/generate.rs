@@ -1615,6 +1615,14 @@ fn prefill_batch() -> usize {
     prefill_batch_override().unwrap_or(PREFILL_BATCH_DEFAULT)
 }
 
+/// The widest prefill chunk the sizer will choose, as configured — what a
+/// cache sized for "the window plus one chunk" (`LayerCache::set_mirror_ring`)
+/// is sized against. A wider chunk asked for by another route is bounded
+/// back to the cache's own limit (`KvCache::max_positions_per_call`).
+pub(crate) fn prefill_chunk_ceiling() -> usize {
+    prefill_batch()
+}
+
 /// `ORANGU_PREFILL_BATCH` if it was set, `None` if it was not — the
 /// distinction [`flat_width`] needs and [`prefill_batch`] throws away. An
 /// operator who wrote `512` gets 512 everywhere; one who wrote nothing gets a
@@ -2093,7 +2101,22 @@ fn prefill_in_chunks(
     //
     // The last column is the same prompt once the device was asked what
     // width it wanted rather than told: 62 submissions became 17.
-    let snap = |width: usize| npu_width.unwrap_or(width);
+    // A cache whose windowed layers keep a ring of the window plus one chunk
+    // (`LayerCache::set_mirror_ring`) cannot take a wider chunk than the
+    // ring was sized for: the chunk's last positions would overwrite the
+    // window its first ones attend over. Bounded here, once, for every
+    // route to a chunk width — the configured batch, the one-pass short
+    // prompt, and the streaming regime's whole-prompt pass.
+    let ring_bound = cache.max_positions_per_call();
+    let batch = match ring_bound {
+        Some(bound) if batch == 0 => bound,
+        Some(bound) => batch.min(bound),
+        None => batch,
+    };
+    let snap = |width: usize| match ring_bound {
+        Some(bound) => npu_width.unwrap_or(width).min(bound).max(1),
+        None => npu_width.unwrap_or(width),
+    };
     // The one shape that needs no bounding: a prompt that fits in a single
     // chunk *and* starts at position zero is the least work a prefill can be.
     // `batch == 0` is an explicit opt-out — see [`prefill_batch`].

@@ -406,9 +406,20 @@ pub(crate) fn decode_runs_with_host(
     backend: &dyn crate::engine::backend::Backend,
     layer_devices: impl Iterator<Item = usize>,
 ) -> Option<Vec<(Option<usize>, std::ops::Range<usize>)>> {
+    decode_runs_with_host_of(backend, layer_devices.map(Some))
+}
+
+/// [`decode_runs_with_host`] where the caller has already ruled a layer
+/// out of its device's chain (`None`): it joins a host run whatever device
+/// its weights are on. `gemma` uses this for a layer whose KV cache is
+/// another device's.
+pub(crate) fn decode_runs_with_host_of(
+    backend: &dyn crate::engine::backend::Backend,
+    layer_devices: impl Iterator<Item = Option<usize>>,
+) -> Option<Vec<(Option<usize>, std::ops::Range<usize>)>> {
     let mut runs: Vec<(Option<usize>, std::ops::Range<usize>)> = Vec::new();
     for (il, device) in layer_devices.enumerate() {
-        let device = backend.as_wgpu_on(device).map(|_| device);
+        let device = device.filter(|&device| backend.as_wgpu_on(device).is_some());
         match runs.last_mut() {
             Some((prev, range)) if *prev == device => range.end = il + 1,
             _ => runs.push((device, il..il + 1)),
@@ -653,6 +664,7 @@ pub(crate) fn evaluate_routed_experts_batched(
 /// `nemotron`'s squared-ReLU experts are the only ones here with this shape,
 /// and it was the last architecture on the unbatched per-expert path for no
 /// better reason than that the batched helper had `gate` in its signature.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_routed_experts_batched_gateless(
     backend: &dyn crate::engine::backend::Backend,
     selection: &[Vec<(usize, f32)>],
@@ -660,6 +672,7 @@ pub(crate) fn evaluate_routed_experts_batched_gateless(
     n_embd: usize,
     up_exps: &crate::engine::loader::ExpertQuantMatrix,
     down_exps: &crate::engine::loader::ExpertQuantMatrix,
+    fused: Option<FusedActivation>,
     activate: impl Fn(&[f32]) -> Vec<f32> + Sync,
 ) -> Vec<Vec<Vec<f32>>> {
     evaluate_routed_experts_batched_views(
@@ -671,7 +684,7 @@ pub(crate) fn evaluate_routed_experts_batched_gateless(
         &ExpertProjection::whole(up_exps),
         &ExpertProjection::whole(down_exps),
         None,
-        None,
+        fused,
         |_, up| activate(up),
     )
 }
@@ -738,6 +751,24 @@ pub(crate) enum FusedActivation {
     Geglu,
     /// `silu(gate) * up`.
     Swiglu,
+    /// `relu(up)²`, with no gate projection.
+    ReluSquared,
+}
+
+impl FusedActivation {
+    /// Whether the activation reads a gate projection beside the up one.
+    fn takes_gate(self) -> bool {
+        !matches!(self, FusedActivation::ReluSquared)
+    }
+
+    fn on_device(self) -> crate::engine::backend::vulkan::MoeActivation {
+        use crate::engine::backend::vulkan::MoeActivation;
+        match self {
+            FusedActivation::Geglu => MoeActivation::Geglu,
+            FusedActivation::Swiglu => MoeActivation::Swiglu,
+            FusedActivation::ReluSquared => MoeActivation::ReluSquared,
+        }
+    }
 }
 
 /// The body of [`evaluate_routed_experts_batched_views`], split out only so
@@ -868,7 +899,7 @@ fn evaluate_routed_experts_batched_views_inner(
         // one the card runs (the gate and up scales, if any, are the
         // GEMMs' own); otherwise gate/up here and the down projection
         // after the host's activation, below.
-        if let (Some(_), Some(act)) = (gate, fused) {
+        if let Some(act) = fused.filter(|a| a.takes_gate() == gate.is_some()) {
             let next: Vec<&crate::engine::loader::QuantMatrix> = next_stack.iter().collect();
             // The combine table: each token's picks as row slots into the
             // group-ordered rows, and the weight each row carries — the
@@ -888,16 +919,21 @@ fn evaluate_routed_experts_batched_views_inner(
                 base += group.len();
             }
             let combine = crate::engine::backend::vulkan::MoeCombine { table, n_tokens, k };
+            let (gate_op, up_op) = match ops.as_slice() {
+                [g, u] => (Some(g), u),
+                [u] => (None, u),
+                _ => unreachable!("one or two projections ahead of the activation"),
+            };
             let combined = vulkan
                 .moe_ffn_experts(
                     hidden,
                     n_tokens,
                     n_embd,
-                    &ops[0],
-                    &ops[1],
+                    gate_op,
+                    up_op,
                     &down_op,
                     &groups,
-                    act == FusedActivation::Swiglu,
+                    act.on_device(),
                     Some(&combine),
                     &next,
                 )
@@ -2062,6 +2098,96 @@ pub(crate) fn expert_streaming() -> bool {
     *ON.get_or_init(|| env_flag("ORANGU_EXPERT_STREAM"))
 }
 
+/// Holds the card's clock up across a decode step whose turns alternate
+/// between the host and the card (`ORANGU_CLOCK_HOLD`, on unless `0`) —
+/// see `backend::vulkan_clock`. Returns a guard that releases the hold
+/// when dropped; nothing without a Vulkan device or on a wider step.
+pub(crate) fn hold_clock_for_step(
+    backend: &dyn crate::engine::backend::Backend,
+    n_tokens: usize,
+) -> Option<ClockHoldGuard<'_>> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_CLOCK_HOLD"));
+    if !on || n_tokens != 1 {
+        return None;
+    }
+    // A split model's wrapper answers `as_wgpu` with nothing, and a
+    // split dense model is not armed on purpose: its token is mostly the
+    // host's row dots, the card's share too small for the hold to pay
+    // (measured level to 12% behind, the holder's power taken from the
+    // host on a shared budget). The mixtures, whose device share is half
+    // the token, are what this is for.
+    let vulkan = backend.as_wgpu()?;
+    vulkan.hold_clock(true);
+    Some(ClockHoldGuard { vulkan })
+}
+
+pub(crate) struct ClockHoldGuard<'a> {
+    vulkan: &'a crate::engine::backend::vulkan::VulkanBackend,
+}
+
+impl Drop for ClockHoldGuard<'_> {
+    fn drop(&mut self) {
+        self.vulkan.hold_clock(false);
+    }
+}
+
+/// The KV cache one token costs across a file's layers, in `f32`
+/// elements, before the model is built — what a requested context is
+/// priced from. The plain form is `n_layer · n_head_kv · head_dim · 2`;
+/// gemma's layers differ in heads and head width along the depth
+/// (`gemma::kv_elements_per_token`), and a plain count over-prices it.
+pub(crate) fn kv_elements_per_token(loaded: &crate::engine::loader::LoadedModel) -> usize {
+    match crate::engine::loader::resolve_arch_family(&loaded.config.architecture) {
+        Ok(crate::engine::loader::ArchFamily::Gemma) => gemma::kv_elements_per_token(loaded),
+        _ => loaded.config.n_layer * loaded.config.n_head_kv * loaded.config.head_dim * 2,
+    }
+}
+
+/// The other half of [`kv_elements_per_token`]: what one request's mirror
+/// holds whatever its context — the windowed layers' rings, on a family
+/// that keeps them (`gemma::kv_fixed_elements`); zero elsewhere.
+pub(crate) fn kv_fixed_elements(
+    loaded: &crate::engine::loader::LoadedModel,
+    context: usize,
+) -> usize {
+    match crate::engine::loader::resolve_arch_family(&loaded.config.architecture) {
+        Ok(crate::engine::loader::ArchFamily::Gemma) => gemma::kv_fixed_elements(loaded, context),
+        _ => 0,
+    }
+}
+
+/// Reserves the expert streaming region the grouped device GEMM will need,
+/// sized for the largest projection stack of any layer (`stacks`: each
+/// layer's gate+up bytes and its down bytes), **now**, ahead of the
+/// weights: what is allocated first is what lands in the card's own
+/// memory, and a region that arrives after the weights have filled the
+/// card lands in host memory, where every expert dispatch reads it across
+/// the bus. Nothing without the grouped path (`expert_gemm_min_tokens`
+/// zero, or no device).
+pub(crate) fn reserve_expert_region(
+    backend: &dyn crate::engine::backend::Backend,
+    stacks: impl Iterator<Item = u64>,
+) {
+    if expert_gemm_min_tokens() == 0 {
+        return;
+    }
+    let Some(vulkan) = backend.as_wgpu() else {
+        return;
+    };
+    let largest = stacks.max().unwrap_or(0);
+    if largest == 0 {
+        return;
+    }
+    let region = vulkan.expert_region_bytes_for(largest);
+    log::info!(
+        "orangu-server: [vulkan] expert streaming region {} for stacks of up to {}",
+        orangu::format::format_bytes(region),
+        orangu::format::format_bytes(largest)
+    );
+    vulkan.reserve_stream_region(region);
+}
+
 /// The narrowest batch at which a layer's routed experts run as one
 /// indexed GEMM per projection on the card, the expert stack streamed there
 /// once per batch — `ORANGU_EXPERT_GEMM_TOKENS`, default
@@ -2799,6 +2925,13 @@ pub(crate) fn run_layers_resident<'a>(
         };
     vulkan.begin_prefill_group();
     for il in 0..n_layer {
+        // This layer's device scratch, recycled from the last layer's
+        // rather than allocated afresh — see `VulkanBackend::scratch_lease`.
+        // Without it every layer of a chunk held its own intermediates
+        // until the chunk's submission retired: 368 buffers and 1.7 GiB on
+        // a 28-layer model at 512 tokens, past the card, and the driver
+        // paged the pool out to host memory for the rest of the prompt.
+        let _scratch_lease = vulkan.scratch_lease();
         let l = layer(il);
         let attn_input = FusedAttnPrefillInput {
             x_gpu: Some((&bufs[0], 0)),
@@ -2842,6 +2975,13 @@ pub(crate) fn run_layers_resident<'a>(
         };
         if !pending.is_empty() {
             pending_kv.push((il, pending));
+        }
+        // The gate/up pair placed ahead of its halves, so the decode chain's
+        // one-dispatch form (`FusedPostAttentionInput::ffn_gate_up`) finds
+        // the bytes on the card once and the halves bind into them — a
+        // prompt is the first thing to touch a layer's weights.
+        if let Some(pair) = ffn_gate_up_pair(l.ffn_gate, l.ffn_up) {
+            vulkan.place_weight(&pair);
         }
         let out = vulkan.fused_post_attention_prefill_rows(
             AttnOutSrc::Gpu(&attn.attn_out_buf, 0, n_tokens),
@@ -4127,4 +4267,90 @@ mod scratch_ffn_cost {
         );
         Ok(())
     }
+}
+
+/// The layer counts after which the decode step submits what it has
+/// recorded so far — see `GemmaModel::record_decode_forward` and
+/// `LlamaModel::record_decode_run`.
+///
+/// Recording is CPU work, and only the part recorded *before the first
+/// submission* is exposed; everything after it is recorded while the
+/// device runs what came before. Equal chunks (`ORANGU_DECODE_CHUNKS`)
+/// expose a third of the token's recording, which at a few
+/// microseconds a dispatch is measurable against a token of a few
+/// milliseconds. So by default the first chunk is two layers and each
+/// next chunk is three times the last (`ORANGU_DECODE_FIRST_CHUNK` sets
+/// the first; `0` keeps the equal split): the device starts after two
+/// layers' recording, and the submissions stay few. Two rather than one:
+/// a single-layer first submission is a burst too short for a card that
+/// has parked its clocks between requests, and a request that started
+/// that way was seen running its whole length at the parked rate; two
+/// layers never did.
+pub(crate) fn decode_chunk_ends(n_layers: usize) -> Vec<usize> {
+    static FIRST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let first = *FIRST.get_or_init(|| {
+        std::env::var("ORANGU_DECODE_FIRST_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2)
+    });
+    if first == 0 || std::env::var_os("ORANGU_DECODE_CHUNKS").is_some() {
+        let chunks = decode_submit_chunks(n_layers);
+        let per = n_layers.div_ceil(chunks.max(1));
+        return (1..chunks)
+            .map(|c| c * per)
+            .filter(|&e| e < n_layers)
+            .collect();
+    }
+    let mut ends = Vec::new();
+    let mut end = first.min(n_layers);
+    let mut width = first.max(1);
+    while end < n_layers {
+        ends.push(end);
+        width *= 3;
+        end += width;
+    }
+    ends
+}
+
+/// How many `queue.submit()` calls one decode step's layer loop is
+/// split across (`ORANGU_DECODE_CHUNKS`). Read once and cached. Clamped to
+/// `1..=n_layers` — `1` submits the whole token once, and no more than
+/// one submit per layer is meaningful. A malformed value falls back to
+/// the default rather than erroring a live decode. More chunks overlap
+/// more of the CPU-side submission cost with GPU execution but add a
+/// little per-submission barrier overhead, so the default sits below one
+/// submit per layer.
+fn decode_submit_chunks(n_layers: usize) -> usize {
+    // The CPU↔GPU submission overlap this buys saturates early:
+    // throughput climbs as chunks go from 1 to 3 and is flat from 3
+    // upward. `3` sits at that knee, so it keeps the full overlap while
+    // paying only 3 `queue.submit()` calls (and allocating only 3 command
+    // encoders) per token — cutting the per-token `vkQueueSubmit` *and*
+    // `radv_BeginCommandBuffer`-`memset` cost, both of which scale with
+    // the submitted-command-buffer count.
+    const DEFAULT_CHUNKS: usize = 3;
+    static CHUNKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let requested = *CHUNKS.get_or_init(|| {
+        std::env::var("ORANGU_DECODE_CHUNKS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(DEFAULT_CHUNKS)
+    });
+    requested.clamp(1, n_layers.max(1))
+}
+
+/// A layer's gate and up projections as one matrix where the checkpoint
+/// lays them out adjacently (`QuantMatrix::adjacent_pair`), for the fused
+/// decode chain's one-dispatch form. `None` where they are not, or under
+/// `ORANGU_FFN_GATE_UP=0`, the control arm.
+pub(crate) fn ffn_gate_up_pair(
+    gate: &crate::engine::loader::QuantMatrix,
+    up: &crate::engine::loader::QuantMatrix,
+) -> Option<crate::engine::loader::QuantMatrix> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_FFN_GATE_UP"));
+    on.then(|| crate::engine::loader::QuantMatrix::adjacent_pair(gate, up))
+        .flatten()
 }

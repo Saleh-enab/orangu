@@ -69,8 +69,13 @@ pub struct DeviceFootprint {
     /// routed-expert tensors, which have no GPU path (see
     /// `engine::backend::device_resident_split`).
     pub weights_host_bytes: u64,
-    /// The GPU-side KV mirror for `CONTEXT_STEP` tokens of one sequence.
+    /// The GPU-side KV mirror for `CONTEXT_STEP` tokens of one sequence —
+    /// the layers whose mirror grows with the context.
     pub kv_bytes_per_step: u64,
+    /// The mirror bytes one sequence holds whatever its context: the layers
+    /// whose mirror is a ring of their attention window
+    /// (`LayerCache::set_mirror_ring`), full from the first window onward.
+    pub kv_fixed_bytes: u64,
     /// How many sequences can be resident at once — `[orangu-server].slots`.
     /// Each carries its own KV cache.
     pub slots: usize,
@@ -108,10 +113,16 @@ impl DeviceFootprint {
         let kv_bytes_per_step = kv_storage
             .map(|storage| probe.gpu_mirror_bytes(CONTEXT_STEP, model.config.n_head, storage))
             .unwrap_or(0);
+        let kv_fixed_bytes = kv_storage
+            .map(|storage| {
+                probe.gpu_mirror_fixed_bytes_where(model.config.n_head, storage, |_| true)
+            })
+            .unwrap_or(0);
         Self {
             weights_device_bytes,
             weights_host_bytes,
             kv_bytes_per_step,
+            kv_fixed_bytes,
             slots,
             n_ctx_train: model.config.n_ctx_train,
             kv_storage,
@@ -142,22 +153,22 @@ impl DeviceFootprint {
         layer_device: &[usize],
         device: usize,
     ) -> Self {
+        // A layer the plan does not mention is on the head device, which is
+        // where `LoadedModel::device_for_tensor` puts anything it has no
+        // placement for.
+        let on_device = |layer: usize| layer_device.get(layer).copied().unwrap_or(0) == device;
         let kv_bytes_per_step = kv_storage
             .map(|storage| {
-                probe.gpu_mirror_bytes_where(
-                    CONTEXT_STEP,
-                    config.n_head,
-                    storage,
-                    // A layer the plan does not mention is on the head device,
-                    // which is where `LoadedModel::device_for_tensor` puts
-                    // anything it has no placement for.
-                    |layer| layer_device.get(layer).copied().unwrap_or(0) == device,
-                )
+                probe.gpu_mirror_bytes_where(CONTEXT_STEP, config.n_head, storage, on_device)
             })
+            .unwrap_or(0);
+        let kv_fixed_bytes = kv_storage
+            .map(|storage| probe.gpu_mirror_fixed_bytes_where(config.n_head, storage, on_device))
             .unwrap_or(0);
         Self {
             weights_device_bytes,
             weights_host_bytes: 0,
+            kv_fixed_bytes,
             kv_bytes_per_step,
             slots,
             n_ctx_train: config.n_ctx_train,
@@ -230,7 +241,10 @@ impl DeviceFootprint {
         if per_step == 0 {
             return None;
         }
-        Some((headroom / per_step * CONTEXT_STEP as u64) as usize)
+        // The ring layers take their share first; what is left grows with
+        // the context.
+        let fixed = self.kv_fixed_bytes.checked_mul(self.slots as u64)?;
+        Some((headroom.saturating_sub(fixed) / per_step * CONTEXT_STEP as u64) as usize)
     }
 
     /// The device's capacity less the weights, or `None` when the capacity
@@ -414,6 +428,7 @@ impl DeviceFootprint {
             "weights_host_bytes": self.weights_host_bytes,
             "reserved_device_bytes": self.reserved_device_bytes,
             "kv_bytes_per_1k_tokens_per_slot": self.kv_bytes_per_step,
+            "kv_bytes_fixed_per_slot": self.kv_fixed_bytes,
             "slots": self.slots,
             "device_total_bytes": total_bytes,
             "headroom_bytes": self.headroom_in(total_bytes),
@@ -450,6 +465,7 @@ mod tests {
             weights_device_bytes: weights,
             weights_host_bytes: 0,
             kv_bytes_per_step: kv_per_step,
+            kv_fixed_bytes: 0,
             slots,
             n_ctx_train: 1_000_000,
             kv_storage: Some(KvStorage::F16),

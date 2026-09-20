@@ -865,6 +865,41 @@ impl QuantMatrix {
         }
     }
 
+    /// `a`'s rows followed by `b`'s as one matrix — a view over the bytes
+    /// both already occupy, with no copy, when `b` starts exactly where `a`
+    /// ends in the same mapping and the two share a type and a row width.
+    /// `None` otherwise: a checkpoint lays its tensors out in name order,
+    /// so a layer's `ffn_gate` and `ffn_up` are usually adjacent and its
+    /// `attn_q`/`attn_k`/`attn_v` are not, and a quantization that gives
+    /// the two different types separates them too.
+    ///
+    /// The point of the view is one dispatch where there were two: a
+    /// decode-shaped product against `[in, 2 * out]` reads the same bytes
+    /// as two against `[in, out]` and costs one dispatch's fixed price
+    /// rather than two, which a small model feels. The device backend
+    /// places the view once and binds `a` and `b` as sub-ranges of it
+    /// (`VulkanBackend::weight_buffer`), so nothing is uploaded twice.
+    pub fn adjacent_pair(a: &QuantMatrix, b: &QuantMatrix) -> Option<QuantMatrix> {
+        let same_mapping = Arc::ptr_eq(&a.bytes, &b.bytes);
+        let a_end = a.start + a.row_bytes * a.out_dim;
+        (same_mapping
+            && a.ggml_type == b.ggml_type
+            && a.in_dim == b.in_dim
+            && a.row_bytes == b.row_bytes
+            && a.device == b.device
+            && b.start == a_end)
+            .then(|| QuantMatrix {
+                bytes: a.bytes.clone(),
+                ggml_type: a.ggml_type,
+                start: a.start,
+                row_bytes: a.row_bytes,
+                in_dim: a.in_dim,
+                out_dim: a.out_dim + b.out_dim,
+                device: a.device,
+                layer: a.layer,
+            })
+    }
+
     /// A stable identity for this tensor's byte range, valid for as long as
     /// the underlying `mmap` is kept alive (the model's whole lifetime) —
     /// lets a GPU backend cache an uploaded copy of this matrix keyed by

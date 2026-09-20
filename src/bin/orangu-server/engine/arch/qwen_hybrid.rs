@@ -1505,16 +1505,23 @@ impl HybridFfn for MoeFfn {
         // instead of issuing them one expert at a time — see
         // `super::evaluate_routed_experts_batched` for why that is the
         // whole question, and why it is only for the GPU.
+        // Wide batches take the grouped device GEMM the way gemma's do
+        // (`super::expert_gemm_wide`): the whole routed feed-forward as one
+        // submission per layer, the activation fused on the card.
         let routed_branch = || {
-            if super::gpu_experts() && backend.as_wgpu().is_some() {
-                super::evaluate_routed_experts_batched(
+            if (super::gpu_experts() || super::expert_gemm_wide(selection.len()))
+                && backend.as_wgpu().is_some()
+            {
+                super::evaluate_routed_experts_batched_views(
                     backend,
                     &selection,
                     normed,
                     n_embd,
-                    &ffn.gate_exps,
-                    &ffn.up_exps,
-                    &ffn.down_exps,
+                    Some(&super::ExpertProjection::whole(&ffn.gate_exps)),
+                    &super::ExpertProjection::whole(&ffn.up_exps),
+                    &super::ExpertProjection::whole(&ffn.down_exps),
+                    None,
+                    Some(super::FusedActivation::Swiglu),
                     |gate, up| {
                         let mut h: Vec<f32> = gate.iter().map(|&g| tensor::silu(g)).collect();
                         tensor::mul_inplace(&mut h, up);
@@ -2344,9 +2351,25 @@ impl Trunk<MoeFfn> {
             .context("missing expert_used_count")? as usize;
         // The MoE FFN claims no folded weight: a file that folds its
         // experts fails `FoldLedger::finish` naming the first of them.
-        Self::load(loaded, backend, |i, _fold| {
+        let trunk = Self::load(loaded, backend, |i, _fold| {
             MoeFfn::load(&LayerTensors { loaded, i }, n_expert_used)
-        })
+        })?;
+        // The expert streaming region ahead of the weights — see
+        // `super::reserve_expert_region`.
+        super::reserve_expert_region(
+            trunk.backend.as_ref(),
+            trunk.layers.iter().flat_map(|layer| {
+                let ffn = match layer {
+                    Layer::Recurrent(_, ffn) | Layer::FullAttn(_, ffn) => ffn,
+                };
+                [
+                    (ffn.gate_exps.stack_matrix().raw_bytes().len()
+                        + ffn.up_exps.stack_matrix().raw_bytes().len()) as u64,
+                    ffn.down_exps.stack_matrix().raw_bytes().len() as u64,
+                ]
+            }),
+        );
+        Ok(trunk)
     }
 }
 

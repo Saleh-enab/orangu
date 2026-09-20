@@ -207,6 +207,12 @@ pub fn page_tokens() -> usize {
 pub struct LayerGeometry {
     pub kv_dim: usize,
     pub stride: usize,
+    /// `Some(rows)` for a layer whose device copy is a per-request ring of
+    /// that many rows (`LayerCache::set_mirror_ring`) rather than the
+    /// pool's pages: it holds only its attention window, so the pool keeps
+    /// its rows on the host — for sharing and slot save — and allocates it
+    /// no device pages. `None` for a layer served from the device pages.
+    pub ring: Option<usize>,
 }
 
 impl LayerGeometry {
@@ -236,13 +242,14 @@ impl LayerGeometry {
             .map(|l| Self {
                 kv_dim: l.kv_dim(),
                 stride: l.row_stride(),
+                ring: l.mirror_ring_rows(),
             })
             .collect()
     }
 }
 
 /// Device bytes `floats` elements occupy in `storage`.
-fn device_bytes_for(
+pub(crate) fn device_bytes_for(
     floats: usize,
     storage: crate::engine::backend::vulkan_shaders::KvStorage,
 ) -> u64 {
@@ -267,6 +274,8 @@ pub fn device_page_bytes(
 ) -> u64 {
     layers
         .iter()
+        // A ring layer's device copy is per request, not per page.
+        .filter(|l| l.ring.is_none())
         .map(|l| 2 * device_bytes_for(l.floats_per_page(page_tokens), storage))
         .sum()
 }
@@ -921,8 +930,13 @@ impl KvPool {
             // Keys and values in one buffer per layer, as the per-request
             // mirror already does: a per-token decode submission re-validates
             // every referenced buffer, so two regions of one is cheaper than
-            // two buffers.
-            let size = elem_bytes(per_page * self.num_pages) * 2;
+            // two buffers. A ring layer keeps a placeholder so the layers
+            // stay indexable; `device_page_offsets` never names it.
+            let size = if geom.ring.is_some() {
+                0
+            } else {
+                elem_bytes(per_page * self.num_pages) * 2
+            };
             layers.push(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("orangu-server kv pool layer"),
                 size: size.max(4),
@@ -967,6 +981,9 @@ impl KvPool {
     /// shader's `k_cache`/`v_cache` bindings mean the same thing under either.
     pub fn device_page_offsets(&self, layer: usize, page: u32) -> Option<(u64, u64, u64)> {
         let d = self.device.as_ref()?;
+        if self.layers[layer].ring.is_some() {
+            return None;
+        }
         let per_page = self.layers[layer].floats_per_page(self.page_tokens);
         let stride = device_bytes_for(per_page, d.storage);
         let half = stride * self.num_pages as u64;
@@ -1691,10 +1708,12 @@ mod tests {
                 LayerGeometry {
                     kv_dim: 8,
                     stride: 1,
+                    ring: None,
                 },
                 LayerGeometry {
                     kv_dim: 8,
                     stride: 1,
+                    ring: None,
                 },
             ],
         )
@@ -1827,10 +1846,12 @@ mod tests {
                 LayerGeometry {
                     kv_dim: 4,
                     stride: 1,
+                    ring: None,
                 },
                 LayerGeometry {
                     kv_dim: 4,
                     stride: 4,
+                    ring: None,
                 },
             ],
         );
@@ -1849,6 +1870,7 @@ mod tests {
         let g = LayerGeometry {
             kv_dim: 2,
             stride: 3,
+            ring: None,
         };
         // 8 tokens at stride 3 is 2 whole rows plus a partial one.
         assert_eq!(g.floats_per_page(8), 3 * 2);
@@ -1870,6 +1892,7 @@ mod tests {
             vec![LayerGeometry {
                 kv_dim: 8,
                 stride: 1,
+                ring: None,
             }],
             policy,
         )
@@ -2215,11 +2238,13 @@ mod tests {
             vec![
                 LayerGeometry {
                     kv_dim: 64,
-                    stride: 1
+                    stride: 1,
+                    ring: None,
                 },
                 LayerGeometry {
                     kv_dim: 32,
-                    stride: 4
+                    stride: 4,
+                    ring: None,
                 },
             ]
         );
@@ -2232,6 +2257,7 @@ mod tests {
         let layers = vec![LayerGeometry {
             kv_dim: 16,
             stride: 1,
+            ring: None,
         }];
         // 8 tokens per page x 16 floats x 4 bytes x 2 (k and v) = 1024 bytes.
         assert_eq!(page_bytes(&layers, 8), 1024);
@@ -2257,6 +2283,7 @@ mod tests {
         let layers = vec![LayerGeometry {
             kv_dim: 16,
             stride: 1,
+            ring: None,
         }];
         const BUDGET: u64 = 64 * 1024;
         const SLOTS: u64 = 4;
@@ -2355,10 +2382,12 @@ mod tests {
                 LayerGeometry {
                     kv_dim: 8,
                     stride: 1,
+                    ring: None,
                 },
                 LayerGeometry {
                     kv_dim: 8,
                     stride: 1,
+                    ring: None,
                 },
             ],
             Policy::Lru,
@@ -2416,6 +2445,7 @@ mod tests {
             vec![LayerGeometry {
                 kv_dim: 32,
                 stride: 1,
+                ring: None,
             }],
             Policy::Lru,
         );
@@ -2465,6 +2495,7 @@ mod tests {
             vec![LayerGeometry {
                 kv_dim: 32,
                 stride: 1,
+                ring: None,
             }],
             Policy::Lru,
         );
@@ -2490,6 +2521,7 @@ mod tests {
             vec![LayerGeometry {
                 kv_dim: 32,
                 stride: 1,
+                ring: None,
             }],
             Policy::Lru,
         );

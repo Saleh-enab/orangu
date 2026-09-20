@@ -307,6 +307,20 @@ fn attention_timed(
             .collect::<Vec<_>>(),
     );
 
+    // Rows the fused decode chain wrote to the device mirror alone are not
+    // in the host buffers, so while any exist the CPU loop below would
+    // attend over a cache with holes in it. The device that holds them is
+    // the only place this layer's attention can run, whatever the shape
+    // thresholds say — and it is always `params.device` (a layer sharing
+    // another's cache names the donor's device), so the assertion is on the
+    // caller, not on the hardware.
+    let device_only = cache.has_device_only_rows();
+    debug_assert!(
+        !device_only || params.backend.as_wgpu_on(params.device).is_some(),
+        "the cache holds rows only its device can read, and this layer's attention has no \
+         device to run on"
+    );
+
     // A single query with a long window is a different kernel from a wide
     // batch with short ones, and the split ("flash-decode") shader is the one
     // shaped for it: it parallelises over *positions* rather than over queries,
@@ -316,7 +330,9 @@ fn attention_timed(
         && vulkan.prefill_attention_enabled()
     {
         let (window_start, window_end) = window(0);
-        if window_end >= window_start && window_end + 1 - window_start >= min_gpu_decode_pos() {
+        if window_end >= window_start
+            && (device_only || window_end + 1 - window_start >= min_gpu_decode_pos())
+        {
             // `resize` without a preceding `clear`: `copy_from_slice`
             // overwrites every element, so zeroing them first is a wasted
             // pass over the whole row. `clear` would force one, because
@@ -338,7 +354,7 @@ fn attention_timed(
         }
     }
 
-    if n_tokens >= min_gpu_tokens()
+    if (device_only || n_tokens >= min_gpu_tokens())
         && let Some(vulkan) = params.backend.as_wgpu_on(params.device)
         && vulkan.prefill_attention_enabled()
     {

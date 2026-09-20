@@ -204,6 +204,7 @@ pub fn bundled_configuration(
         // A bundle serves whoever runs it; refusing on its owner's behalf is
         // not a decision it can make.
         queue_limit: 0,
+        context: None,
         // A bundle carries one model. Pairing it with a draft would mean
         // embedding a second, which is a different product decision than
         // "the server and a model as one file".
@@ -741,6 +742,14 @@ pub struct ServerConfiguration {
     /// before the server starts refusing with `503`. `0` — the default —
     /// queues without bound, which is the behaviour before this key existed.
     pub queue_limit: usize,
+    /// `[orangu-server].context`: the context, in tokens, one request must
+    /// be able to hold on the device. Unset, the model's layers all go to
+    /// the card when they fit and the context is whatever the card has
+    /// left; set, layers move to the host until the card has room for this
+    /// many tokens of KV cache beside the weights it keeps — the same
+    /// trade the reference engines make to serve a long context on a small
+    /// card, and slower per token for it, which is why it is a choice.
+    pub context: Option<usize>,
     /// `[orangu-server].draft_model`: a second, smaller model whose guesses
     /// the served model verifies — speculative decoding. A model spec, the
     /// same shape as [`model`](Self::model).
@@ -1084,6 +1093,20 @@ pub fn load_server_configuration(
         None => 0,
     };
 
+    let context = match section.get("context") {
+        Some(value) => {
+            let context = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|err| anyhow!("invalid value for [{SERVER_SECTION}].context: {err}"))?;
+            if context == 0 {
+                return Err(anyhow!("[{SERVER_SECTION}].context must be at least 1"));
+            }
+            Some(context)
+        }
+        None => None,
+    };
+
     let draft_model = section
         .get("draft_model")
         .map(|value| value.trim().to_string())
@@ -1303,6 +1326,7 @@ pub fn load_server_configuration(
         kv_cache,
         read_size,
         queue_limit,
+        context,
         draft_model,
         draft_tokens,
         text_encoder,
@@ -2315,6 +2339,33 @@ mod tests {
             let conf = load_server_configuration(file.path(), None, false).unwrap();
             assert_eq!(conf.device_split, expected, "device_split = {value}");
         }
+    }
+
+    /// `context` is a token count, absent by default, and zero is refused
+    /// rather than read as "none".
+    #[test]
+    fn loads_the_context_key() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\ncontext = 8192\n"
+        )
+        .unwrap();
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.context, Some(8192));
+
+        let mut absent = tempfile::NamedTempFile::new().unwrap();
+        writeln!(absent, "[orangu-server]\nmodels = /srv/models\n").unwrap();
+        assert_eq!(
+            load_server_configuration(absent.path(), None, false)
+                .unwrap()
+                .context,
+            None
+        );
+
+        let mut zero = tempfile::NamedTempFile::new().unwrap();
+        writeln!(zero, "[orangu-server]\nmodels = /srv/models\ncontext = 0\n").unwrap();
+        assert!(load_server_configuration(zero.path(), None, false).is_err());
     }
 
     /// One device runs the model unless something says otherwise — a config

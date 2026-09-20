@@ -282,6 +282,13 @@ then on anyone who can route to the port can start runs on that machine.
 input is a shell command to start a server with, and this console never takes
 one.
 
+`--per-rep` adds a line under each decode row with every repetition's
+rate in the order it ran. The best and the mean each hide a first
+repetition well under the rest — a server still settling after its
+load, a card whose clock has not ramped — and a row whose repetitions
+read `2.1 / 10.8 / 10.9` is a different finding from one that reads
+`7.9 / 7.9 / 8.0` with the same mean.
+
 ### Prefill mode (`--pp`) — prompt processing, not decode
 
 `--pp` sweeps *prompt lengths* and reports **prompt-processing** throughput —
@@ -662,9 +669,10 @@ asks the server at `--url` for its largest shard, which is usually what you
 want and needs a server running. `--storage-span` is how much to read at each
 size, per pass, and `--storage-ramp` how much to read and discard first.
 
-Reads are `O_DIRECT`, so the page cache is neither consulted nor populated:
-the probe measures the device rather than memcpy, and it does not evict a
-model a later benchmark is about to want.
+Reads bypass the page cache (`O_DIRECT` on Linux, `F_NOCACHE` on macOS),
+so it is neither consulted nor populated: the probe measures the device
+rather than memcpy, and it does not evict a model a later benchmark is about
+to want. On other platforms the probe declines rather than measure the cache.
 
 **Every size is measured twice, ascending then descending**, and the table
 reports both passes with their spread. This is not redundancy. A drive that
@@ -1052,6 +1060,7 @@ Options:
       --reps <N>                       Repetitions per depth; the reported rate is the best run with mean±sd [default: 3]
       --drop-model-cache               Evict the model from the page cache before every repetition
       --no-warmup                      Skip the initial warmup run
+      --per-rep                        Also print every repetition's rate, in order, after each row
       --timeout <SECONDS>              Per-request timeout in seconds [default: 600]
       --model <ID>                     Model id to request
       --json                           Emit machine-readable JSON

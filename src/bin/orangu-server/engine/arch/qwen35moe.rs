@@ -76,6 +76,9 @@ impl ModelForward for Qwen35MoeModel {
         start_pos: usize,
         _slot_id: usize,
     ) -> Result<Vec<f32>> {
+        // A decode step alternates between the card and the host's expert
+        // turns; the card's clock is held up through it.
+        let _clock = super::hold_clock_for_step(self.trunk.backend.as_ref(), tokens.len());
         self.trunk.forward(cache, tokens, start_pos)
     }
 

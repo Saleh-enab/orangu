@@ -803,11 +803,16 @@ pub struct VulkanBackend {
     moe_combine_pipeline: wgpu::ComputePipeline,
     /// See [`Self::record_heater`] — a probe's pipeline, built on first use.
     heater_pipeline: std::sync::OnceLock<wgpu::ComputePipeline>,
+    /// The clock holder (`vulkan_clock`), opened on first use.
+    clock_hold: std::sync::OnceLock<Option<super::vulkan_clock::ClockHold>>,
     /// The SwiGLU twin of [`Self::gelu_mul_pipeline`], for the
     /// Llama/Qwen2/Mistral/Phi families. Same bindings and same workgroup
     /// size, so [`Self::ffn_activation_pipeline`] selects between them and
     /// nothing else in a fused chain changes.
     silu_mul_pipeline: wgpu::ComputePipeline,
+    /// `vulkan_shaders::shader_source_relu_squared`, the gate-less expert
+    /// activation of the routed feed-forward (`MoeActivation::ReluSquared`).
+    relu_squared_pipeline: wgpu::ComputePipeline,
     /// `vulkan_shaders::shader_source_sigmoid_gate` — attention's output
     /// gated in place by the sigmoid of its own projection.
     sigmoid_gate_pipeline: wgpu::ComputePipeline,
@@ -909,6 +914,9 @@ pub struct VulkanBackend {
     /// shader_source_rmsnorm_add_norm_wide`); taken wherever the wide norms
     /// are unless `ORANGU_NORM_PAIRS=0`.
     rmsnorm_add_norm_wide_pipeline: wgpu::ComputePipeline,
+    /// The pair without the post-norm — the residual add and the FFN
+    /// norm as one dispatch, for a layer whose branch is added as it is.
+    add_norm_wide_pipeline: wgpu::ComputePipeline,
     norm_pair_bind_group_layout: wgpu::BindGroupLayout,
     norm_pairs: bool,
     /// Every buffer/bind group `fused_post_attention` needs *except* the
@@ -936,6 +944,10 @@ pub struct VulkanBackend {
     /// split-k is off, which is not the default — compiling its paged form for
     /// every server that will never dispatch it is a startup cost for nothing.
     attn_paged_pipeline: std::sync::OnceLock<wgpu::ComputePipeline>,
+    /// [`Self::attn_pipeline`] addressing a ring mirror
+    /// (`vulkan_shaders::KvPaging::Ring`), built on first use like the
+    /// paged one.
+    attn_ring_pipeline: std::sync::OnceLock<wgpu::ComputePipeline>,
     /// Whether the **standalone** prefill attention dispatch
     /// ([`Self::gpu_attention_prefill`]) is used where the fused layer below
     /// declines. **On by default**; opt out with `ORANGU_NO_PREFILL_ATTN=1`.
@@ -1150,6 +1162,9 @@ pub struct VulkanBackend {
     /// costs nothing at start-up. `None` when the integer-dot GEMMs are off
     /// (`prefill_mmq`), or `Some(empty)` before any is built.
     mmq_bytes_pipelines: Option<Mutex<HashMap<(u32, u32), wgpu::ComputePipeline>>>,
+    /// [`MmqKernel::Toks`] pipelines by `(type, rows, toks)`, built on
+    /// first use like the byte-unpacked ones.
+    mmq_toks_pipelines: Mutex<HashMap<(u32, u32, u32), wgpu::ComputePipeline>>,
     /// The **indexed** form of the wide integer-dot kernels
     /// (`vulkan_shaders::shader_source_mmq_indexed`), one per wide kernel,
     /// built on first use: a stack of expert matrices against the rows
@@ -2191,6 +2206,51 @@ fn expert_pack() -> bool {
     *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_EXPERT_PACK"))
 }
 
+impl VulkanBackend {
+    /// Places `w` in the permanent weight arena now, ahead of whatever
+    /// would place it (or a part of it) later — for a pair whose halves
+    /// must bind into it rather than be uploaded on their own.
+    pub(crate) fn place_weight(&self, w: &QuantMatrix) {
+        self.weight_buffer(w);
+    }
+
+    /// Whether `w`'s bytes are on the card already, whole or as a range
+    /// containing it.
+    fn weight_placed(&self, w: &QuantMatrix) -> bool {
+        let (waddr, wlen) = w.cache_key();
+        let arena = self.weight_cache.lock().expect("weight cache poisoned");
+        arena.slots.keys().any(|&(addr, len, ty, _)| {
+            ty == w.ggml_type() && addr <= waddr && waddr + wlen <= addr + len
+        })
+    }
+
+    /// Whether a layer's gate/up pair runs as one dispatch
+    /// (`ORANGU_FFN_GATE_UP`, on unless `0`): the halves' outputs are bound
+    /// as sub-ranges of the pair's, which needs the half's byte length on
+    /// the device's binding alignment — and the pair's bytes must be on
+    /// the card **once**: placed as the pair, or not yet at all. A half
+    /// placed on its own (a path that never saw the pair) makes the pair a
+    /// second copy of a third of the model, which on a card near its
+    /// capacity lands in host memory and is read over the bus. Then the
+    /// two dispatches it is.
+    fn ffn_gate_up_serves(&self, pair: &QuantMatrix, gate: &QuantMatrix, up: &QuantMatrix) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on =
+            *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_FFN_GATE_UP"));
+        let align = (self.device.limits().min_storage_buffer_offset_alignment as u64).max(1);
+        on && ((gate.out_dim as u64) * 4).is_multiple_of(align)
+            && (self.weight_placed(pair) || !(self.weight_placed(gate) || self.weight_placed(up)))
+    }
+}
+
+/// Whether a layer without a post-norm takes the add+norm pair kernel
+/// (`ORANGU_ADD_NORM_PAIR`, on unless `0`) — the control arm is the
+/// separate add and norm dispatches.
+fn add_norm_pair() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_ADD_NORM_PAIR"))
+}
+
 /// Tokens per tile of the indexed expert GEMM — `ORANGU_EXPERT_GEMM_TOKS`
 /// (16, 32, 64 or 128), default 32. See `mmq_indexed_kernel_for`.
 fn expert_gemm_toks() -> u32 {
@@ -2212,6 +2272,16 @@ fn mmq_wide_min_workgroups() -> usize {
             .and_then(|v| v.parse().ok())
             .unwrap_or(32)
     })
+}
+
+/// A pipeline cache key's two bits for how a kernel addresses the cache —
+/// see `vulkan_shaders::KvPaging`.
+fn paging_code(paging: vulkan_shaders::KvPaging) -> u32 {
+    match paging {
+        vulkan_shaders::KvPaging::Contiguous => 0,
+        vulkan_shaders::KvPaging::Paged => 1,
+        vulkan_shaders::KvPaging::Ring => 2,
+    }
 }
 
 /// The token stripe of one `wgpu` prefill submission: [`WGPU_STRIPE_TOKENS`]
@@ -3443,35 +3513,56 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
     }
 
     /// The un-split attention pipeline, contiguous or paged.
-    fn attn_pipeline_for(&self, paged: bool) -> &wgpu::ComputePipeline {
-        if !paged {
-            return &self.attn_pipeline;
-        }
-        self.attn_paged_pipeline.get_or_init(|| {
+    fn attn_pipeline_for(&self, paging: vulkan_shaders::KvPaging) -> &wgpu::ComputePipeline {
+        let (slot, layout, label) = match paging {
+            vulkan_shaders::KvPaging::Contiguous => return &self.attn_pipeline,
+            vulkan_shaders::KvPaging::Paged => (
+                &self.attn_paged_pipeline,
+                &self.attn_paged_pipeline_layout,
+                "paged",
+            ),
+            vulkan_shaders::KvPaging::Ring => {
+                (&self.attn_ring_pipeline, &self.attn_pipeline_layout, "ring")
+            }
+        };
+        slot.get_or_init(|| {
             let module = self
                 .device
                 .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("orangu-server paged attention shader"),
+                    label: Some(&format!("orangu-server {label} attention shader")),
                     source: wgpu::ShaderSource::Wgsl(
                         vulkan_shaders::shader_source_attention(
                             self.kv_storage,
                             self.subgroup_reduce,
                             2048,
-                            vulkan_shaders::KvPaging::Paged,
+                            paging,
                         )
                         .into(),
                     ),
                 });
             self.device
                 .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("orangu-server paged attention pipeline"),
-                    layout: Some(&self.attn_paged_pipeline_layout),
+                    label: Some(&format!("orangu-server {label} attention pipeline")),
+                    layout: Some(layout),
                     module: &module,
                     entry_point: Some("main"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     cache: None,
                 })
         })
+    }
+
+    /// Which addressing a layer's attention kernels take: the pool's pages
+    /// through a block table, a ring mirror through a mask, or the plain
+    /// mirror. One selector, so every kernel of a layer agrees.
+    fn kv_paging_for(paged: bool, ring_rows: Option<u32>) -> vulkan_shaders::KvPaging {
+        if paged {
+            vulkan_shaders::KvPaging::Paged
+        } else if ring_rows.is_some() {
+            vulkan_shaders::KvPaging::Ring
+        } else {
+            vulkan_shaders::KvPaging::Contiguous
+        }
     }
 
     /// The bind group layout matching [`Self::attn_layout_for`].
@@ -4498,6 +4589,10 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             &elem4_pipeline_layout,
             vulkan_shaders::shader_source_silu_mul(),
         );
+        let relu_squared_pipeline = build_elem_pipeline(
+            &elem3_pipeline_layout,
+            vulkan_shaders::shader_source_relu_squared(),
+        );
         let sigmoid_gate_pipeline = build_elem_pipeline(
             &elem3_pipeline_layout,
             vulkan_shaders::shader_source_sigmoid_gate(),
@@ -4586,6 +4681,10 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         let rmsnorm_add_norm_wide_pipeline = build_elem_pipeline(
             &norm_pair_pipeline_layout,
             vulkan_shaders::shader_source_rmsnorm_add_norm_wide(),
+        );
+        let add_norm_wide_pipeline = build_elem_pipeline(
+            &norm_pair_pipeline_layout,
+            vulkan_shaders::shader_source_add_norm_wide(false),
         );
         // The activation+multiply with the q8 epilogue, for a down
         // projection on the integer dot — see `FusedResources::down_q8`.
@@ -5334,8 +5433,10 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             add_pipeline,
             mul_pipeline,
             gelu_mul_pipeline,
+            relu_squared_pipeline,
             moe_combine_pipeline,
             heater_pipeline: std::sync::OnceLock::new(),
+            clock_hold: std::sync::OnceLock::new(),
             silu_mul_pipeline,
             sigmoid_gate_pipeline,
             bias_add_pipeline,
@@ -5364,6 +5465,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             kv_epilogue_bind_group_layout,
             head_wide,
             rmsnorm_add_norm_wide_pipeline,
+            add_norm_wide_pipeline,
             norm_pair_bind_group_layout,
             norm_pairs,
             fused_cache: Mutex::new(HashMap::new()),
@@ -5372,6 +5474,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             attn_paged_pipeline_layout,
             attn_pipeline,
             attn_paged_pipeline: std::sync::OnceLock::new(),
+            attn_ring_pipeline: std::sync::OnceLock::new(),
             prefill_attn: (!crate::engine::env::flag_on("ORANGU_NO_PREFILL_ATTN")),
             prefill_fused_attn: crate::engine::env::flag_on_unless_disabled(
                 "ORANGU_PREFILL_FUSED_ATTN",
@@ -5410,6 +5513,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             mmq_q6k_wide_pipeline,
             mmq_q6k_mid_pipeline,
             mmq_bytes_pipelines: mmq_wide.then(|| Mutex::new(HashMap::new())),
+            mmq_toks_pipelines: Mutex::new(HashMap::new()),
             mmq_indexed_pipelines: Mutex::new(HashMap::new()),
             indexed_bind_group_layout,
             checked_mmq,
@@ -6621,6 +6725,26 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         if let Some(&(chunk, offset, size)) = arena.slots.get(&key) {
             return (arena.chunks[chunk].clone(), offset, size);
         }
+        // Each tensor's own placement offset also has to respect the
+        // device's storage-buffer offset alignment (typically 256 bytes),
+        // a separate requirement from the 16-byte size padding below.
+        let align = (self.device.limits().min_storage_buffer_offset_alignment as u64).max(16);
+        // Inside a range already placed — a member of a pair placed as one
+        // (`QuantMatrix::adjacent_pair`): bound as a sub-range of it rather
+        // than uploaded again, when the device can bind at that offset.
+        let within = arena
+            .slots
+            .iter()
+            .find_map(|(&(addr, len, ty, _), &(chunk, offset, _))| {
+                let sub = (ty == w.ggml_type() && addr <= waddr && waddr + wlen <= addr + len)
+                    .then(|| offset + (waddr - addr) as u64)?;
+                sub.is_multiple_of(align).then_some((chunk, sub))
+            });
+        if let Some((chunk, offset)) = within {
+            let size = (bytes.len() as u64).next_multiple_of(16);
+            arena.slots.insert(key, (chunk, offset, size));
+            return (arena.chunks[chunk].clone(), offset, size);
+        }
         // Pad to a multiple of 16: `array<u32>`-bound kernels (the default
         // scalar reduce/coop pipelines) only ever needed a multiple of 4,
         // but the wide-load kernels bind this
@@ -6641,10 +6765,6 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         // region's *allocated* size covers both binding types' alignment
         // requirements.
         let size = (bytes.len() as u64).next_multiple_of(16);
-        // Each tensor's own placement offset also has to respect the
-        // device's storage-buffer offset alignment (typically 256 bytes),
-        // a separate requirement from the 16-byte size padding above.
-        let align = (self.device.limits().min_storage_buffer_offset_alignment as u64).max(16);
 
         let chunk_index = match arena
             .fill
@@ -9302,6 +9422,11 @@ pub struct FusedPostAttentionInput<'a> {
     pub ffn_norm: &'a [f32],
     pub ffn_gate: &'a QuantMatrix,
     pub ffn_up: &'a QuantMatrix,
+    /// `ffn_gate` and `ffn_up` as one matrix (`QuantMatrix::adjacent_pair`)
+    /// where the checkpoint lays them out that way: the decode chain then
+    /// runs the two projections as one dispatch over `[in, 2 * ff]`,
+    /// gate's rows first. `None` runs them as two.
+    pub ffn_gate_up: Option<&'a QuantMatrix>,
     pub ffn_down: &'a QuantMatrix,
     /// `None` on an architecture with no post-norm on the FFN residual — see
     /// [`Self::attn_post_norm`].
@@ -9809,6 +9934,8 @@ pub struct FusedLayerInput<'a> {
     pub ffn_norm: &'a [f32],
     pub ffn_gate: &'a QuantMatrix,
     pub ffn_up: &'a QuantMatrix,
+    /// See [`FusedPostAttentionInput::ffn_gate_up`].
+    pub ffn_gate_up: Option<&'a QuantMatrix>,
     pub ffn_down: &'a QuantMatrix,
     pub ffn_post_norm: Option<&'a [f32]>,
     /// See [`FusedPostAttentionInput::activation`].
@@ -9872,6 +9999,25 @@ type ExpertGemmPlan = (Vec<MmqKernel>, Vec<Vec<u32>>, Vec<(u32, u32, u32)>, usiz
 /// every token, `k` row slots into the group-ordered rows, then `k`
 /// weights as `f32` bits — the routing weight times the expert's output
 /// scale, `0` where a token has fewer picks than `k`.
+/// The activation between a routed expert's projections and its down
+/// projection, run on the card by `VulkanBackend::moe_ffn_experts`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeActivation {
+    /// `gelu(gate) * up`.
+    Geglu,
+    /// `silu(gate) * up`.
+    Swiglu,
+    /// `relu(up)²` — no gate projection at all.
+    ReluSquared,
+}
+
+impl MoeActivation {
+    /// Whether the activation reads a gate projection beside the up one.
+    pub fn takes_gate(self) -> bool {
+        !matches!(self, MoeActivation::ReluSquared)
+    }
+}
+
 pub struct MoeCombine {
     pub table: Vec<u32>,
     pub n_tokens: usize,
@@ -9897,6 +10043,16 @@ pub(crate) enum MmqKernel {
     /// type) at `rows` × `toks` per tile, for a stack of expert matrices —
     /// see [`VulkanBackend::matmul_experts`].
     Indexed {
+        ggml_type: u32,
+        rows: u32,
+        toks: u32,
+    },
+    /// A wide kernel (`Q4_K`, `Q6_K` or a byte-unpacked type) at `rows` ×
+    /// `toks` per tile with `toks` below the full 128 — for a batch the
+    /// full tile would mostly pad: 156 tokens are two 128-token tiles, 256
+    /// rows of work for 156, and every projection of a short prompt paid
+    /// that. See [`VulkanBackend::mmq_toks_for`].
+    Toks {
         ggml_type: u32,
         rows: u32,
         toks: u32,
@@ -9928,6 +10084,7 @@ impl MmqKernel {
                 vulkan_shaders::MMQ_WIDE_TILE_TOKENS,
             ),
             MmqKernel::Bytes { rows, .. } => (rows, vulkan_shaders::MMQ_WIDE_TILE_TOKENS),
+            MmqKernel::Toks { rows, toks, .. } => (rows, toks),
             MmqKernel::Indexed { rows, toks, .. } => (rows, toks),
         }
     }
@@ -9945,6 +10102,7 @@ impl MmqKernel {
             MmqKernel::Bytes { rows: 128, .. } => "mmq-bytes-wide",
             MmqKernel::Bytes { .. } => "mmq-bytes-mid",
             MmqKernel::Indexed { .. } => "mmq-indexed",
+            MmqKernel::Toks { .. } => "mmq-toks",
         }
     }
 }
@@ -10169,10 +10327,18 @@ impl VulkanBackend {
         let (narrow, wide, mid) = match ggml_type {
             GGML_TYPE_Q6_K => (Some(MmqKernel::Q6k), MmqKernel::Q6kWide, MmqKernel::Q6kMid),
             GGML_TYPE_Q4_K => (Some(MmqKernel::Q4k), MmqKernel::Q4kWide, MmqKernel::Q4kMid),
-            // The other types have the wide tiles only; a projection too
-            // narrow for either stays on the float kernel.
+            // The other types: the wide tiles, and for a projection too
+            // narrow for either the 64 × 32 shape the `Q4_K` narrow kernel
+            // has, from the same generator. Without it a 256-wide K or V
+            // projection had no integer-dot kernel — and the attention
+            // chain takes its three projections on one path or none, so
+            // Q, K and V all ran on the float kernel, three times slower.
             t if vulkan_shaders::mmq_wide_bytes_types().contains(&t) => (
-                None,
+                Some(MmqKernel::Toks {
+                    ggml_type: t,
+                    rows: vulkan_shaders::MMQ_TILE_ROWS,
+                    toks: vulkan_shaders::MMQ_Q4K_TILE_TOKENS,
+                }),
                 MmqKernel::Bytes {
                     ggml_type: t,
                     rows: vulkan_shaders::MMQ_WIDE_TILE_ROWS,
@@ -10191,13 +10357,26 @@ impl VulkanBackend {
         // down projection at 512 tokens (48 tall tiles against 96 half
         // ones) the half tile was 1.4× faster on `Q6_K` and level on `Q4_K`.
         let floor = mmq_wide_min_workgroups();
+        let toks = Self::mmq_toks_for(n_tokens);
         for (kernel, min) in [(wide, 2 * floor), (mid, floor)] {
-            let (rows, toks) = kernel.tile();
+            let (rows, full) = kernel.tile();
             let workgroups = (w.out_dim / rows as usize) * n_tokens.div_ceil(toks as usize);
             if w.out_dim.is_multiple_of(rows as usize)
                 && workgroups >= min
                 && self.mmq_pipeline(kernel).is_some()
             {
+                // The same tile, shorter on the token axis, where the
+                // batch would mostly pad the full one.
+                if toks < full {
+                    let short = MmqKernel::Toks {
+                        ggml_type,
+                        rows,
+                        toks,
+                    };
+                    if self.mmq_pipeline(short).is_some() {
+                        return Some(short);
+                    }
+                }
                 return Some(kernel);
             }
         }
@@ -10230,7 +10409,67 @@ impl VulkanBackend {
                         .clone(),
                 )
             }
+            MmqKernel::Toks {
+                ggml_type,
+                rows,
+                toks,
+            } => {
+                use crate::engine::quant::{GGML_TYPE_Q4_K, GGML_TYPE_Q6_K};
+                let mut table = self
+                    .mmq_toks_pipelines
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                Some(
+                    table
+                        .entry((ggml_type, rows, toks))
+                        .or_insert_with(|| {
+                            let source = match ggml_type {
+                                GGML_TYPE_Q4_K => {
+                                    vulkan_shaders::shader_source_mmq_q4k_wide_toks(rows, toks)
+                                }
+                                GGML_TYPE_Q6_K => {
+                                    vulkan_shaders::shader_source_mmq_q6k_wide_toks(rows, toks)
+                                }
+                                t => {
+                                    vulkan_shaders::shader_source_mmq_wide_bytes_toks(t, rows, toks)
+                                }
+                            };
+                            self.build_mmq_pipeline_lazily(source)
+                        })
+                        .clone(),
+                )
+            }
         }
+    }
+
+    /// The token tile a dense integer-dot call at `n_tokens` takes: the
+    /// longest of 128, 64, 32 and 16 that pads the batch by at most a
+    /// quarter. A shorter tile stages each
+    /// weight tile for fewer tokens, so it is only worth what the padding
+    /// it removes costs. `ORANGU_MMQ_TOKS` fixes it (16–128) for a sweep;
+    /// `0`/unset is this rule.
+    fn mmq_toks_for(n_tokens: usize) -> u32 {
+        static FIXED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let fixed = *FIXED.get_or_init(|| {
+            std::env::var("ORANGU_MMQ_TOKS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .filter(|t: &u32| [16, 32, 64, 128].contains(t))
+                .unwrap_or(0)
+        });
+        if fixed != 0 {
+            return fixed;
+        }
+        let full = vulkan_shaders::MMQ_WIDE_TILE_TOKENS;
+        // Largest first: the tile that pads least is not the shortest one
+        // but the longest one that pads little enough.
+        for toks in [full, 64, 32] {
+            let padded = (n_tokens as u32).div_ceil(toks) * toks;
+            if padded * 4 <= n_tokens as u32 * 5 {
+                return toks;
+            }
+        }
+        16
     }
 
     /// [`Self::mmq_pipeline`]'s builder for a kernel first needed after
@@ -10692,38 +10931,43 @@ impl VulkanBackend {
         x: &[f32],
         n_tokens: usize,
         in_dim: usize,
-        gate: &ExpertOp<'_>,
+        gate: Option<&ExpertOp<'_>>,
         up: &ExpertOp<'_>,
         down: &ExpertOp<'_>,
         groups: &[(usize, Vec<usize>)],
-        silu: bool,
+        activation: MoeActivation,
         combine: Option<&MoeCombine>,
         prefetch: &[&QuantMatrix],
     ) -> Vec<Vec<f32>> {
         assert_eq!(x.len(), n_tokens * in_dim, "x is [n_tokens, in_dim]");
-        assert_eq!(gate.n_rows, up.n_rows, "gate and up are the same width");
-        let n_ff = gate.n_rows;
+        if let Some(gate) = gate {
+            assert_eq!(gate.n_rows, up.n_rows, "gate and up are the same width");
+        }
+        assert_eq!(
+            gate.is_some(),
+            activation.takes_gate(),
+            "a gated activation needs the gate projection, a gate-less one none"
+        );
+        let n_ff = up.n_rows;
         assert_eq!(down.stack.in_dim, n_ff, "down reads the activation's width");
         if groups.is_empty() {
             return Vec::new();
         }
         let _region_guard = self.prefill_region_guard();
-        let gu_ops = [
-            ExpertOp {
-                stack: gate.stack,
-                rows_per_expert: gate.rows_per_expert,
-                first_row: gate.first_row,
-                n_rows: gate.n_rows,
-                scale: gate.scale,
-            },
-            ExpertOp {
-                stack: up.stack,
-                rows_per_expert: up.rows_per_expert,
-                first_row: up.first_row,
-                n_rows: up.n_rows,
-                scale: up.scale,
-            },
-        ];
+        // The gate's op first when there is one, then the up's — the
+        // activation reads them as the first and second `[total, n_ff]` of
+        // `y_gu` below.
+        let gu_ops: Vec<ExpertOp<'_>> = gate
+            .into_iter()
+            .chain(std::iter::once(up))
+            .map(|op| ExpertOp {
+                stack: op.stack,
+                rows_per_expert: op.rows_per_expert,
+                first_row: op.first_row,
+                n_rows: op.n_rows,
+                scale: op.scale,
+            })
+            .collect();
         let (gu_kernels, gu_tables, gu_grids, total) = self.plan_expert_gemm(&gu_ops, groups);
         // The down projection reads the product's rows in group order, so
         // its lists are the identity ranges.
@@ -10763,10 +11007,10 @@ impl VulkanBackend {
         let align = (self.device.limits().min_storage_buffer_offset_alignment as u64).max(16);
         let packed = if self.packs_experts() {
             let budget = self.expert_stripe_bytes();
-            let gu_stacks: Vec<&ExpertOp<'_>> = if gate.stack.cache_key() == up.stack.cache_key() {
-                vec![gate]
-            } else {
-                vec![gate, up]
+            let gu_stacks: Vec<&ExpertOp<'_>> = match gate {
+                Some(gate) if gate.stack.cache_key() == up.stack.cache_key() => vec![gate],
+                Some(gate) => vec![gate, up],
+                None => vec![up],
             };
             let gu_per_expert: u64 = gu_stacks
                 .iter()
@@ -10785,30 +11029,32 @@ impl VulkanBackend {
         } else {
             None
         };
-        let (w_gate, w_up) = if packed.is_some() {
-            (None, None)
+        // Whole: the gate/up stack(s) placed in the region now, one
+        // binding per op.
+        let w_gu: Option<Vec<(wgpu::Buffer, u64, u64)>> = if packed.is_some() {
+            None
         } else {
-            self.ensure_stream_capacity(&[gate.stack, up.stack]);
+            let stacks: Vec<&QuantMatrix> = gu_ops.iter().map(|op| op.stack).collect();
+            self.ensure_stream_capacity(&stacks);
             self.ensure_stream_capacity(&[down.stack]);
-            self.reserve_stream_space(&[
-                MatmulOp {
+            let reserve: Vec<MatmulOp<'_>> = stacks
+                .iter()
+                .map(|&w| MatmulOp {
                     x: &[],
                     n_tokens: 0,
-                    w: gate.stack,
-                },
-                MatmulOp {
-                    x: &[],
-                    n_tokens: 0,
-                    w: up.stack,
-                },
-            ]);
-            let w_gate = self
-                .weight_buffer_streamed(gate.stack)
-                .expect("the streaming region holds a stack");
-            let w_up = self
-                .weight_buffer_streamed(up.stack)
-                .expect("the streaming region holds a stack");
-            (Some(w_gate), Some(w_up))
+                    w,
+                })
+                .collect();
+            self.reserve_stream_space(&reserve);
+            Some(
+                stacks
+                    .iter()
+                    .map(|&w| {
+                        self.weight_buffer_streamed(w)
+                            .expect("the streaming region holds a stack")
+                    })
+                    .collect(),
+            )
         };
         let upload_ms = t_upload.elapsed().as_secs_f64() * 1000.0;
         let mut uploaded = self.stream_upload_rate().map_or(0, |r| r.0) - before;
@@ -10822,15 +11068,25 @@ impl VulkanBackend {
             in_dim,
         );
         let gu_len = total * n_ff;
-        let y_gu = self.moe_buffer(2 * gu_len);
+        let y_gu = self.moe_buffer(gu_ops.len() * gu_len);
         let h = self.moe_buffer(gu_len);
         let act_meta = self.elem_meta_buffer(gu_len as u32, 0.0);
-        let act_bg = self.elem4_bind_group(
-            BindSrc::Slice(&y_gu, 0, (gu_len as u64) * 4),
-            BindSrc::Slice(&y_gu, (gu_len as u64) * 4, (gu_len as u64) * 4),
-            BindSrc::Slice(&h, 0, (gu_len as u64) * 4),
-            &act_meta,
-        );
+        // Gated: gate then up out of `y_gu` into the product; gate-less: the
+        // up projection alone.
+        let act_bg = if gate.is_some() {
+            self.elem4_bind_group(
+                BindSrc::Slice(&y_gu, 0, (gu_len as u64) * 4),
+                BindSrc::Slice(&y_gu, (gu_len as u64) * 4, (gu_len as u64) * 4),
+                BindSrc::Slice(&h, 0, (gu_len as u64) * 4),
+                &act_meta,
+            )
+        } else {
+            self.elem3_bind_group(
+                BindSrc::Slice(&y_gu, 0, (gu_len as u64) * 4),
+                BindSrc::Slice(&h, 0, (gu_len as u64) * 4),
+                &act_meta,
+            )
+        };
         let (q8_h, quantize_h_bg, quantize_h_wg, _meta_h) =
             self.mmq_stage(BindSrc::Slice(&h, 0, (gu_len as u64) * 4), total, n_ff);
         let out_len = total * down.n_rows;
@@ -10867,10 +11123,10 @@ impl VulkanBackend {
         let mut keep_dn: Vec<(wgpu::Buffer, wgpu::BindGroup)> = Vec::new();
         let stripes = packed.as_ref().map_or(0, |(_, gu, dn)| gu.len() + dn.len());
         let activation = |pass: &mut wgpu::ComputePass<'_>| {
-            pass.set_pipeline(if silu {
-                &self.silu_mul_pipeline
-            } else {
-                &self.gelu_mul_pipeline
+            pass.set_pipeline(match activation {
+                MoeActivation::Geglu => &self.gelu_mul_pipeline,
+                MoeActivation::Swiglu => &self.silu_mul_pipeline,
+                MoeActivation::ReluSquared => &self.relu_squared_pipeline,
             });
             pass.set_bind_group(0, &act_bg, &[]);
             pass.dispatch_workgroups(
@@ -11028,7 +11284,7 @@ impl VulkanBackend {
             combine_pass(&mut pass);
             drop(pass);
         } else {
-            let (w_gate, w_up) = (w_gate.expect("placed whole"), w_up.expect("placed whole"));
+            let w_gu = w_gu.expect("placed whole");
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("orangu-server routed FFN pass"),
@@ -11036,7 +11292,7 @@ impl VulkanBackend {
                 });
                 self.record_mmq_quantize(&mut pass, &quantize_bg, quantize_wg);
                 self.op_stamp(&mut pass, "moe.quantize");
-                for (i, (op, w)) in gu_ops.iter().zip([w_gate, w_up]).enumerate() {
+                for (i, (op, w)) in gu_ops.iter().zip(w_gu).enumerate() {
                     keep_gu.push(self.record_expert_gemm(
                         &mut pass,
                         op,
@@ -11167,8 +11423,37 @@ impl VulkanBackend {
         if n == 0 {
             return;
         }
-        let pipeline = self
-            .heater_pipeline
+        let pipeline = self.heater_pipeline_for();
+        let x = self.scratch_buffer(64);
+        let y = self.scratch_buffer(64);
+        let meta = self.elem_meta_buffer_aux(64, 1 << 16);
+        let bg = self.elem3_bind_group(&x, &y, &meta);
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(n, 1, 1);
+        self.op_stamp(pass, "moe.heater");
+        std::mem::forget((x, y, meta, bg));
+    }
+
+    /// Holds the card's clock up while `on` — see `vulkan_clock`. A
+    /// caller arms it around a decode step whose turns alternate between
+    /// the host and the card, and disarms it after; a device without the
+    /// holder ignores both.
+    pub fn hold_clock(&self, on: bool) {
+        let hold = self
+            .clock_hold
+            .get_or_init(|| super::vulkan_clock::ClockHold::new(&self.device));
+        if let Some(hold) = hold {
+            if on {
+                hold.arm();
+            } else {
+                hold.disarm();
+            }
+        }
+    }
+
+    fn heater_pipeline_for(&self) -> wgpu::ComputePipeline {
+        self.heater_pipeline
             .get_or_init(|| {
                 let source = format!(
                     "{}\n{}",
@@ -11193,19 +11478,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let module = self
                     .device
                     .create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: Some("orangu-server heater probe"),
+                        label: Some("orangu-server heater"),
                         source: wgpu::ShaderSource::Wgsl(source.into()),
                     });
                 let layout = self
                     .device
                     .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("orangu-server heater probe layout"),
+                        label: Some("orangu-server heater layout"),
                         bind_group_layouts: &[Some(&self.elem3_bind_group_layout)],
                         immediate_size: 0,
                     });
                 self.device
                     .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some("orangu-server heater probe"),
+                        label: Some("orangu-server heater"),
                         layout: Some(&layout),
                         module: &module,
                         entry_point: Some("main"),
@@ -11213,16 +11498,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         cache: None,
                     })
             })
-            .clone();
-        let x = self.scratch_buffer(64);
-        let y = self.scratch_buffer(64);
-        let meta = self.elem_meta_buffer_aux(64, 1 << 16);
-        let bg = self.elem3_bind_group(&x, &y, &meta);
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &bg, &[]);
-        pass.dispatch_workgroups(n, 1, 1);
-        self.op_stamp(pass, "moe.heater");
-        std::mem::forget((x, y, meta, bg));
+            .clone()
     }
 
     /// Grows the streaming region to hold these weights together (distinct
@@ -11396,6 +11672,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// had displaced KV pages into host memory and, the card full, the
     /// driver never brought them back.
     pub fn prompt_prefilled(&self) {
+        // What the prompt left on the card, before the region goes back —
+        // the peak a long prompt reaches (`ORANGU_VRAM_REPORT`).
+        self.report_device_memory("prefill");
         let mut region = self.stream_region.lock().expect("stream region poisoned");
         region.1 = false;
         if region.0 == 0 || !expert_region_release() {
@@ -13450,10 +13729,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// [`FusedResources`] this returns) every buffer/bind group
     /// `fused_post_attention` needs beyond what `op_cache` already
     /// provides for the matmul steps.
+    #[allow(clippy::too_many_arguments)]
     fn build_fused_resources(
         &self,
         input: &FusedPostAttentionInput<'_>,
         wo_g: &CachedOpResources,
+        gate_up_g: Option<&CachedOpResources>,
         gate_g: &CachedOpResources,
         up_g: &CachedOpResources,
         down_g: &CachedOpResources,
@@ -13461,6 +13742,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ) -> FusedResources {
         let n_embd = input.wo.out_dim;
         let ffn_len = input.ffn_gate.out_dim;
+        // Where the gate and up projections land: the pair's output, gate's
+        // rows then up's, when the pair serves; each half's own otherwise.
+        // Everything downstream reads through these two, so it does not
+        // know which.
+        let (gate_out, up_out) = match gate_up_g {
+            Some(g) => {
+                let half = (ffn_len as u64) * 4;
+                (
+                    BindSrc::Slice(&g.output_buffer, g.output_offset, half),
+                    BindSrc::Slice(&g.output_buffer, g.output_offset + half, half),
+                )
+            }
+            None => (gate_g.output_src(), up_g.output_src()),
+        };
 
         let align = (self.device.limits().min_storage_buffer_offset_alignment as u64).max(1);
         let n_embd_bytes = (n_embd as u64) * 4;
@@ -13567,10 +13862,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         );
         // The FFN input's 8-bit form from the norm pair's epilogue, for
         // gate/up on the integer dot — see `FusedResources::ffn_q8`.
-        let norm_pair_applies = attn_post_norm_w.is_some()
-            && self.norm_pair_for(n_embd)
+        // With or without a post-norm: without one the pair is the residual
+        // add and the FFN norm (`add_norm_wide_pipeline`).
+        let norm_pair_applies = self.norm_pair_for(n_embd)
             && meta_embd_post.is_none()
-            && !Self::capture_active();
+            && !Self::capture_active()
+            && (attn_post_norm_w.is_some() || add_norm_pair());
         let ffn_q8 = (self.decode_mmvq
             && norm_pair_applies
             && n_embd / 4 <= vulkan_shaders::NORM_WIDE_SLOTS * vulkan_shaders::NORM_WIDE_WG
@@ -13588,11 +13885,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let bg_gate =
                 self.matmul_bind_group_with_input(input.ffn_gate, &buffer, 0, q8_len, gate_g);
             let bg_up = self.matmul_bind_group_with_input(input.ffn_up, &buffer, 0, q8_len, up_g);
+            let bg_gate_up = match (gate_up_g, input.ffn_gate_up) {
+                (Some(g), Some(w)) if g.mmvq.is_some() => {
+                    Some(self.matmul_bind_group_with_input(w, &buffer, 0, q8_len, g))
+                }
+                _ => None,
+            };
             FfnQ8 {
                 buffer,
                 meta,
                 bg_gate,
                 bg_up,
+                bg_gate_up,
             }
         });
         let (norm_pair_meta, norm_pair_q8): (&wgpu::Buffer, &wgpu::Buffer) = match &ffn_q8 {
@@ -13601,21 +13905,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         };
         // The two dispatches above as one, over the copied residual; the
         // direct-residual form is built per call (`norm_pair_direct`).
-        let bg_norm_pair = attn_post_norm_w
-            .as_ref()
-            .filter(|_| self.norm_pair_for(n_embd) && meta_embd_post.is_none())
-            .map(|w| {
-                self.norm_pair_bind_group(
-                    wo_g.output_src(),
-                    w,
-                    BindSrc::Slice(&residual_buf, residual_buf_offset, n_embd_bytes),
-                    &ffn_norm_w,
-                    BindSrc::Slice(&x1, x1_offset, n_embd_bytes),
-                    BindSrc::Slice(&ffn_normed, ffn_normed_offset, n_embd_bytes),
-                    norm_pair_meta,
-                    norm_pair_q8,
-                )
-            });
+        // `w1` is the post-norm weight, or — bound and never read by the
+        // add-only kernel — the FFN norm's, so one layout serves both.
+        let bg_norm_pair = (self.norm_pair_for(n_embd)
+            && meta_embd_post.is_none()
+            && (attn_post_norm_w.is_some() || add_norm_pair()))
+        .then(|| {
+            self.norm_pair_bind_group(
+                wo_g.output_src(),
+                attn_post_norm_w.as_ref().unwrap_or(&ffn_norm_w),
+                BindSrc::Slice(&residual_buf, residual_buf_offset, n_embd_bytes),
+                &ffn_norm_w,
+                BindSrc::Slice(&x1, x1_offset, n_embd_bytes),
+                BindSrc::Slice(&ffn_normed, ffn_normed_offset, n_embd_bytes),
+                norm_pair_meta,
+                norm_pair_q8,
+            )
+        });
         // On the non-MMVQ path the FFN norm's output (`ffn_normed`) is
         // fed to the gate and up matmuls *directly* via these read-only-input
         // bind groups (both read the one `ffn_normed` slice — read-sharing a
@@ -13646,8 +13952,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 )),
             )
         };
+        // The pair as one dispatch over the same `ffn_normed`.
+        let bg_gate_up_matmul = match (shared_input, gate_up_g, input.ffn_gate_up) {
+            (true, Some(g), Some(w)) => Some(self.matmul_bind_group_with_input(
+                w,
+                &ffn_normed,
+                ffn_normed_offset,
+                n_embd_bytes,
+                g,
+            )),
+            _ => None,
+        };
         let bg_gelu = self.elem3_bind_group(
-            gate_g.output_src(),
+            gate_out,
             BindSrc::Slice(&gelu_out, gelu_out_offset, ffn_bytes),
             &meta_ffn_plain,
         );
@@ -13661,7 +13978,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // one reader (the down matmul), in separate dispatches.
         let bg_mul = self.elem4_bind_group(
             BindSrc::Slice(&gelu_out, gelu_out_offset, ffn_bytes),
-            up_g.output_src(),
+            up_out,
             BindSrc::Slice(&down_g.x_buffer, down_g.x_offset, ffn_bytes),
             &meta_ffn_plain,
         );
@@ -13672,8 +13989,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Read once per layer here (cached), never per token.
         let bg_gelu_mul = (!crate::engine::env::flag_on("ORANGU_NO_FUSED_GELU_MUL")).then(|| {
             self.elem4_bind_group(
-                gate_g.output_src(),
-                up_g.output_src(),
+                gate_out,
+                up_out,
                 BindSrc::Slice(&down_g.x_buffer, down_g.x_offset, ffn_bytes),
                 &meta_ffn_plain,
             )
@@ -13691,9 +14008,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 mapped_at_creation: false,
             });
             let bg_activation = self.norm_pair_bind_group(
-                gate_g.output_src(),
+                gate_out,
                 &self.placeholder_ro,
-                up_g.output_src(),
+                up_out,
                 &self.placeholder_ro,
                 BindSrc::Slice(&down_g.x_buffer, down_g.x_offset, ffn_bytes),
                 BindSrc::Slice(&buffer, 0, q8_len),
@@ -13790,6 +14107,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         FusedResources {
             bg_gate_matmul,
             bg_up_matmul,
+            bg_gate_up_matmul,
             wo_direct: Mutex::new(None),
             attn_residual_direct: Mutex::new(None),
             norm_pair_direct: Mutex::new(None),
@@ -13831,10 +14149,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// Returns this layer's cached [`FusedResources`], building (and
     /// caching) them first on a cache miss — the same reuse-after-first-
     /// call shape `op_entry`/`weight_buffer` already follow.
+    #[allow(clippy::too_many_arguments)]
     fn fused_entry_for(
         &self,
         input: &FusedPostAttentionInput<'_>,
         wo_g: &CachedOpResources,
+        gate_up_g: Option<&CachedOpResources>,
         gate_g: &CachedOpResources,
         up_g: &CachedOpResources,
         down_g: &CachedOpResources,
@@ -13864,8 +14184,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 return entry.clone();
             }
         }
-        let resources =
-            Arc::new(self.build_fused_resources(input, wo_g, gate_g, up_g, down_g, ple_g));
+        let resources = Arc::new(
+            self.build_fused_resources(input, wo_g, gate_up_g, gate_g, up_g, down_g, ple_g),
+        );
         let mut cache = self.fused_cache.lock().expect("fused cache poisoned");
         cache.entry(key).or_insert(resources).clone()
     }
@@ -13888,6 +14209,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         debug_assert_eq!(input.ffn_down.out_dim, n_embd);
 
         let wo_entry = self.op_entry_for(input.wo, input.batch_slot);
+        // The pair's entry ahead of its halves': placing the pair first is
+        // what lets the halves bind as sub-ranges of it (`weight_buffer`)
+        // rather than as uploads of their own.
+        let gate_up_entry = input
+            .ffn_gate_up
+            .filter(|pair| self.ffn_gate_up_serves(pair, input.ffn_gate, input.ffn_up))
+            .map(|w| self.op_entry_for(w, input.batch_slot));
         let gate_entry = self.op_entry_for(input.ffn_gate, input.batch_slot);
         let up_entry = self.op_entry_for(input.ffn_up, input.batch_slot);
         let down_entry = self.op_entry_for(input.ffn_down, input.batch_slot);
@@ -13899,6 +14227,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         });
 
         let wo_g = wo_entry.lock().expect("op cache entry poisoned");
+        let gate_up_g = gate_up_entry
+            .as_ref()
+            .map(|e| e.lock().expect("op cache entry poisoned"));
         let gate_g = gate_entry.lock().expect("op cache entry poisoned");
         let up_g = up_entry.lock().expect("op cache entry poisoned");
         let down_g = down_entry.lock().expect("op cache entry poisoned");
@@ -13910,7 +14241,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         });
         let ple_g_refs = ple_g.as_ref().map(|(g, p)| (&**g, &**p));
 
-        let res = self.fused_entry_for(&input, &wo_g, &gate_g, &up_g, &down_g, ple_g_refs);
+        let res = self.fused_entry_for(
+            &input,
+            &wo_g,
+            gate_up_g.as_deref(),
+            &gate_g,
+            &up_g,
+            &down_g,
+            ple_g_refs,
+        );
 
         // The three genuinely-per-call inputs — everything else in `res`
         // was uploaded once when this layer's entry was first built.
@@ -13954,8 +14293,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         };
         let meta_post = res.meta_embd_post.as_ref().unwrap_or(&res.meta_embd_eps);
-        let norm_pair_bg = match (input.residual, &res.bg_norm_pair, &res.attn_post_norm_w) {
-            (GpuInput::Gpu(buf, off), Some(_), Some(w)) if direct => {
+        let norm_pair_bg = match (input.residual, &res.bg_norm_pair) {
+            (GpuInput::Gpu(buf, off), Some(_)) if direct => {
                 let off = (off as u64) * 4;
                 Some(self.direct_bind_group(&res.norm_pair_direct, buf, off, || {
                     let (meta, q8) = match &res.ffn_q8 {
@@ -13964,7 +14303,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     };
                     self.norm_pair_bind_group(
                         wo_g.output_src(),
-                        w,
+                        res.attn_post_norm_w.as_ref().unwrap_or(&res.ffn_norm_w),
                         BindSrc::Slice(buf, off, n_embd_bytes),
                         &res.ffn_norm_w,
                         BindSrc::Slice(&res.x1, res.x1_offset, n_embd_bytes),
@@ -14063,7 +14402,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 &res.bg_attn_add,
             ) {
                 (Some(bg), _, _) if !Self::capture_active() => {
-                    pass.set_pipeline(&self.rmsnorm_add_norm_wide_pipeline);
+                    pass.set_pipeline(if res.attn_post_norm_w.is_some() {
+                        &self.rmsnorm_add_norm_wide_pipeline
+                    } else {
+                        &self.add_norm_wide_pipeline
+                    });
                     pass.set_bind_group(0, bg, &[]);
                     pass.dispatch_workgroups(1, 1, 1);
                     self.op_stamp(pass, "attn.post_norm_add+ffn.norm");
@@ -14216,17 +14559,44 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         {
             let pass = cursor.pass();
+            // The gate and up projections as one dispatch when the pair
+            // serves (`ffn_gate_up`): on the integer dot over the norm
+            // pair's q8 when that is what this call wrote, on the float
+            // kernel over `ffn_normed` otherwise.
+            let took_norm_pair = norm_pair_bg
+                .as_ref()
+                .or(res.bg_norm_pair.as_ref())
+                .is_some();
+            let pair = match (
+                input.ffn_gate_up,
+                &res.bg_gate_up_matmul,
+                gate_up_g.as_deref(),
+            ) {
+                (Some(w), Some(bg), Some(g)) if !Self::capture_active() => Some((w, bg, g)),
+                _ => None,
+            };
             match (&res.bg_gate_matmul, &res.bg_up_matmul) {
+                _ if pair.is_some() => {
+                    let (w, bg, g) = pair.expect("checked above");
+                    match res.ffn_q8.as_ref().and_then(|q| q.bg_gate_up.as_ref()) {
+                        Some(bg_q8) if took_norm_pair => {
+                            self.record_mmvq_matmul_shared(pass, w, g, bg_q8)
+                        }
+                        _ => self.record_matmul_shared_input(
+                            pass,
+                            w,
+                            g,
+                            bg,
+                            &res.ffn_normed,
+                            res.ffn_normed_offset,
+                        ),
+                    }
+                    self.op_stamp(pass, "ffn.gate_up");
+                }
                 // Both on the integer dot over the norm's own q8 output —
                 // only when this call took the pair kernel, which is what
                 // wrote it.
-                (Some(_), Some(_))
-                    if res.ffn_q8.is_some()
-                        && norm_pair_bg
-                            .as_ref()
-                            .or(res.bg_norm_pair.as_ref())
-                            .is_some() =>
-                {
+                (Some(_), Some(_)) if res.ffn_q8.is_some() && took_norm_pair => {
                     let q = res.ffn_q8.as_ref().expect("checked above");
                     self.record_mmvq_matmul_shared(pass, input.ffn_gate, &gate_g, &q.bg_gate);
                     self.op_stamp(pass, "ffn.gate");
@@ -17072,7 +17442,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             causal: u32::from(causal),
             kv_page_base: paged.as_ref().map_or(0, |p| p.3),
             kv_page_tokens: paged.as_ref().map_or(0, |p| p.4),
-            _pad0: 0,
+            kv_ring_rows: cache.ring_rows().unwrap_or(0),
             _pad1: 0,
             _pad2: 0,
         };
@@ -17146,11 +17516,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             n_head,
             n_head_kv,
             n_tokens,
-            if paged.is_some() {
-                vulkan_shaders::KvPaging::Paged
-            } else {
-                vulkan_shaders::KvPaging::Contiguous
-            },
+            Self::kv_paging_for(paged.is_some(), cache.ring_rows()),
         );
         let mut encoder = self.new_encoder("orangu-server prefill attention encoder");
         {
@@ -17666,11 +18032,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // large page.
         let write_runs: Vec<crate::engine::kv_cache::PageRun> = match &paged {
             Some(p) => p.runs.clone(),
-            None => vec![crate::engine::kv_cache::PageRun {
-                src_row: 0,
-                dst_row: write_pos as u32,
-                rows: n_tokens as u32,
-            }],
+            // The mirror's rows for these positions — one run, or two where
+            // a ring wraps.
+            None => cache.mirror_write_runs(write_pos, n_tokens),
         };
 
         // Attention writes into this stripe's slice of the caller's buffer.
@@ -17690,7 +18054,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             causal: u32::from(causal),
             kv_page_base: paged.as_ref().map_or(0, |p| p.table_base),
             kv_page_tokens: paged.as_ref().map_or(0, |p| p.page_tokens),
-            _pad0: 0,
+            kv_ring_rows: cache.ring_rows().unwrap_or(0),
             _pad1: 0,
             _pad2: 0,
         };
@@ -17932,10 +18296,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             n_head,
             n_head_kv.max(1),
             n_tokens,
-            match paged {
-                Some(_) => vulkan_shaders::KvPaging::Paged,
-                None => vulkan_shaders::KvPaging::Contiguous,
-            },
+            Self::kv_paging_for(paged.is_some(), cache.ring_rows()),
         );
 
         let (mut encoder, grouped) =
@@ -18249,6 +18610,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 paged
                     .as_ref()
                     .map(|p| (&p.table, p.table_base, p.page_tokens)),
+                cache.ring_rows(),
             );
         }
         {
@@ -19669,7 +20031,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             causal: 0,
             kv_page_base: paged.as_ref().map_or(0, |(_, _, _, base, _)| *base),
             kv_page_tokens: paged.as_ref().map_or(0, |(_, _, _, _, t)| *t),
-            _pad0: 0,
+            kv_ring_rows: cache.ring_rows().unwrap_or(0),
             _pad1: 0,
             _pad2: 0,
         };
@@ -19730,7 +20092,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 label: Some("orangu-server attention pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(self.attn_pipeline_for(paged.is_some()));
+            pass.set_pipeline(
+                self.attn_pipeline_for(Self::kv_paging_for(paged.is_some(), cache.ring_rows())),
+            );
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(n_head as u32, 1, 1);
         }
@@ -19940,6 +20304,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             head_dim,
             scale,
             None,
+            cache.ring_rows(),
         );
         out_buf
     }
@@ -19962,6 +20327,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         head_dim: usize,
         scale: f32,
         paged: Option<(&wgpu::Buffer, u32, u32)>,
+        ring_rows: Option<u32>,
     ) {
         let k_num = self.attn_split_k;
         let partial_ml = self.scratch_buffer(n_head * k_num as usize * 2);
@@ -19980,7 +20346,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // pool's halves, addressed through the table.
             kv_page_base: paged.map_or(0, |p| p.1),
             kv_page_tokens: paged.map_or(0, |p| p.2),
-            _pad0: 0,
+            kv_ring_rows: ring_rows.unwrap_or(0),
             _pad1: 0,
             _pad2: 0,
         };
@@ -20049,11 +20415,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             self.elem4_bind_group(&partial_ml, &partial_acc, out, &reduce_meta_buf);
 
         let group = (n_head / n_head_kv).max(1);
-        let paging = if paged.is_some() {
-            vulkan_shaders::KvPaging::Paged
-        } else {
-            vulkan_shaders::KvPaging::Contiguous
-        };
+        let paging = Self::kv_paging_for(paged.is_some(), ring_rows);
         let split_pipeline = self.attn_split_pipeline_for(head_dim, group, paging);
         let phase1_x = if self.attn_gqa && group > 1 {
             n_head_kv as u32
@@ -20462,8 +20824,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let paged = matches!(paging, vulkan_shaders::KvPaging::Paged);
         let key = (
             hd,
-            (1 << 17)
-                | u32::from(paged) << 16
+            (1 << 18)
+                | paging_code(paging) << 16
                 | tile.dlanes << 12
                 | tile.lanes << 8
                 | tile.rows << 4
@@ -20539,7 +20901,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let paged = matches!(paging, vulkan_shaders::KvPaging::Paged);
         let key = (
             hd,
-            if heads > 0 { group as u32 } else { 0 } | u32::from(paged) << 16,
+            if heads > 0 { group as u32 } else { 0 } | paging_code(paging) << 16,
         );
         let mut cache = self
             .attn_prefill_pipelines
@@ -20614,13 +20976,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         paging: vulkan_shaders::KvPaging,
     ) -> wgpu::ComputePipeline {
         let hd = head_dim as u32;
+        // One selector for every layout rather than one each that have to
+        // agree: which kernel a shape gets is a property of the shape, and
+        // paging only changes how that kernel addresses the cache. Two
+        // functions meant two places to remember a new variant in, and the
+        // paged one was already a shorter list than the contiguous one.
         let paged = matches!(paging, vulkan_shaders::KvPaging::Paged);
-        // One selector for both layouts rather than two that have to agree:
-        // which kernel a shape gets is a property of the shape, and paging only
-        // changes how that kernel addresses the cache. Two functions meant two
-        // places to remember a new variant in, and the paged one was already a
-        // shorter list than the contiguous one.
-        let key = hd | u32::from(paged) << 16;
+        let key = hd | paging_code(paging) << 16;
         let mut cache = self
             .attn_split_pipelines
             .lock()
@@ -20798,7 +21160,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             scale,
             kv_page_base: table_base,
             kv_page_tokens: page_tokens,
-            _pad0: 0,
+            kv_ring_rows: 0,
             _pad1: 0,
             _pad2: 0,
         };
@@ -21282,10 +21644,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     kv_refs.k_size,
                     kv_refs.v_off,
                     kv_refs.v_size,
-                    write_pos,
+                    // The mirror's row for this position — its own, or the
+                    // ring's.
+                    cache.mirror_row(write_pos),
                 )
             }
         };
+        let ring_rows = cache.ring_rows();
 
         // The calling layer's own `wq` identity — see `GpuAttnDispatch`'s
         // doc comment for why a cross-layer KV-donor layer must not reuse
@@ -21509,7 +21874,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 causal: 0,
                 kv_page_base: 0,
                 kv_page_tokens: 0,
-                _pad0: 0,
+                kv_ring_rows: ring_rows.unwrap_or(0),
                 _pad1: 0,
                 _pad2: 0,
             }),
@@ -21530,7 +21895,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     scale,
                     kv_page_base: paged.as_ref().map_or(0, |p| p.table_base),
                     kv_page_tokens: paged.as_ref().map_or(0, |p| p.page_tokens),
-                    _pad0: 0,
+                    kv_ring_rows: ring_rows.unwrap_or(0),
                     _pad1: 0,
                     _pad2: 0,
                 }),
@@ -22017,10 +22382,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let split_pipeline = self.attn_split_pipeline_for(
                 head_dim,
                 group,
-                match paged {
-                    Some(_) => vulkan_shaders::KvPaging::Paged,
-                    None => vulkan_shaders::KvPaging::Contiguous,
-                },
+                Self::kv_paging_for(paged.is_some(), ring_rows),
             );
             // GQA groups the query heads of each KV head into one workgroup, so
             // phase-1 covers `n_head_kv` (not `n_head`); phase-2 still merges per
@@ -22091,7 +22453,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         } else {
             let pass = cursor.pass();
-            pass.set_pipeline(&self.attn_pipeline);
+            pass.set_pipeline(self.attn_pipeline_for(Self::kv_paging_for(false, ring_rows)));
             pass.set_bind_group(0, &dispatch.bind_group, &[]);
             pass.dispatch_workgroups(n_head as u32, 1, 1);
             self.op_stamp(pass, "attn.attention");
@@ -22486,6 +22848,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             ffn_norm,
             ffn_gate,
             ffn_up,
+            ffn_gate_up,
             ffn_down,
             ffn_post_norm,
             ple,
@@ -22671,6 +23034,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 ffn_norm,
                 ffn_gate,
                 ffn_up,
+                ffn_gate_up,
                 ffn_down,
                 ffn_post_norm,
                 eps,
@@ -23282,9 +23646,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// The live device allocations grouped by label, largest first —
     /// what is competing for the card when a kernel that read fast an hour
     /// ago reads slowly now (`ORANGU_VRAM_REPORT=1`).
+    /// The device-local memory the driver says this process may still take
+    /// without eviction, and what it holds — see
+    /// `vulkan_replay::device_local_budget`.
+    pub fn device_local_budget(&self) -> Option<(u64, u64)> {
+        super::vulkan_replay::device_local_budget(&self.device)
+    }
+
     pub fn report_device_memory(&self, tag: &str) {
         if !crate::engine::env::flag_on("ORANGU_VRAM_REPORT") {
             return;
+        }
+        if let Some((budget, usage)) = self.device_local_budget() {
+            eprintln!(
+                "orangu-server: [{tag}] device-local budget {:.1} MiB, usage {:.1} MiB (driver)",
+                budget as f64 / (1024.0 * 1024.0),
+                usage as f64 / (1024.0 * 1024.0)
+            );
         }
         let Some(report) = self.device.generate_allocator_report() else {
             return;
@@ -24777,6 +25155,8 @@ struct FfnQ8 {
     meta: wgpu::Buffer,
     bg_gate: wgpu::BindGroup,
     bg_up: wgpu::BindGroup,
+    /// The pair's — see `FusedResources::bg_gate_up_matmul`.
+    bg_gate_up: Option<wgpu::BindGroup>,
 }
 
 /// The FFN activation product's 8-bit form and the down projection's bind
@@ -24846,6 +25226,10 @@ struct FusedResources {
     /// copy). When `Some`, `record_fused_post_attention` skips the
     /// `ffn_normed → gate.x`/`→ up.x` copies entirely.
     bg_gate_matmul: Option<wgpu::BindGroup>,
+    /// The gate and up projections as one dispatch over
+    /// `FusedPostAttentionInput::ffn_gate_up`, reading `ffn_normed` the way
+    /// `bg_gate_matmul` does — `Some` when the pair was given and serves.
+    bg_gate_up_matmul: Option<wgpu::BindGroup>,
     bg_up_matmul: Option<wgpu::BindGroup>,
     bg_gelu: wgpu::BindGroup,
     bg_mul: wgpu::BindGroup,

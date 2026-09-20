@@ -124,6 +124,21 @@ pub struct LayerCache {
     /// and left its wait to the next one, as opposed to a chunk that failed.
     /// [`Self::discard_pending_rows`] keeps these and forgets the rest.
     deferred_rows: usize,
+    /// Rows of the **device mirror** when it is a ring — `Some(n)`, a power
+    /// of two — rather than one row per position. Position `p` lives at
+    /// row `p & (n - 1)`, so the mirror holds the last `n` positions and
+    /// no more; a layer whose attention never looks further back than a
+    /// window (`n_swa`) needs nothing older, and a full-context mirror for
+    /// it was most of the device bytes on a model where five of six
+    /// layers are windowed. The host copy is not a ring: every position
+    /// stays there, so rollback, prefix reuse and slot save are unchanged.
+    /// `n` must cover the window plus the widest chunk written at once;
+    /// see [`Self::set_mirror_ring`].
+    mirror_ring: Option<usize>,
+    /// With a ring: the most positions one call may write, so the window
+    /// behind the first of them is still in the ring when the last one
+    /// attends — the ring's rows less the window it was asked to keep.
+    mirror_ring_slack: Option<usize>,
 }
 
 /// The pages of **one sequence**, shared by every layer of it.
@@ -492,6 +507,11 @@ struct PagedRows {
     /// mirror. Tracked per layer because each layer writes its own region of a
     /// page and they do not finish together.
     device_synced: usize,
+    /// Whether this layer has told the sequence it writes rows
+    /// (`SequencePages::joins`). A page is sealed once every layer that
+    /// writes has, so the first row this layer appends must register it —
+    /// whatever pages were reserved or adopted before that row.
+    joined: bool,
 }
 
 impl PagedRows {
@@ -961,6 +981,8 @@ impl LayerCache {
             pool_backed: false,
             pending_rows: 0,
             deferred_rows: 0,
+            mirror_ring: None,
+            mirror_ring_slack: None,
         }
     }
 
@@ -988,6 +1010,8 @@ impl LayerCache {
             pool_backed: false,
             pending_rows: 0,
             deferred_rows: 0,
+            mirror_ring: None,
+            mirror_ring_slack: None,
         }
     }
 
@@ -1013,6 +1037,8 @@ impl LayerCache {
             pool_backed: false,
             pending_rows: 0,
             deferred_rows: 0,
+            mirror_ring: None,
+            mirror_ring_slack: None,
         }
     }
 
@@ -1143,6 +1169,103 @@ impl LayerCache {
         self.pool_backed
     }
 
+    /// Makes this layer's device mirror a ring of `window + write` positions
+    /// (rounded up to a power of two, so a kernel finds a row with a mask)
+    /// — for a layer whose attention never
+    /// looks back further than `window`, so that older positions need not
+    /// stay on the device. `write` is the widest run of positions one call
+    /// writes before the oldest of them is read: a prefill chunk writes its
+    /// positions and then attends over the window behind each, so a chunk
+    /// of `c` tokens needs `window + c` rows present at once
+    /// ([`KvCache::max_positions_per_call`] is what a caller bounds its
+    /// chunks by). Set before the first mirror is built; a mirror that
+    /// already exists is dropped so the next sync rebuilds it at the ring's
+    /// size from the host rows.
+    pub fn set_mirror_ring(&mut self, window: usize, write: usize) {
+        let rows = (window + write).max(1).next_power_of_two();
+        if self.mirror_ring == Some(rows) {
+            return;
+        }
+        self.mirror_ring = Some(rows);
+        // No wrap can happen in a ring the whole context fits, so nothing
+        // bounds a call's width there.
+        self.mirror_ring_slack = (rows < self.capacity).then_some(rows - window);
+        self.gpu = None;
+    }
+
+    /// The ring's rows as asked for — the window plus a chunk, whatever the
+    /// context — for a pool sizing the device by them.
+    pub fn mirror_ring_rows(&self) -> Option<usize> {
+        self.mirror_ring
+    }
+
+    /// The ring's rows as this layer's mirror will actually allocate them:
+    /// a context shorter than the ring never wraps, so the mirror is sized
+    /// to the context (rounded up to keep the mask a mask) rather than to a
+    /// window it will never fill. `None` when the mirror is not a ring.
+    fn mirror_ring(&self) -> Option<usize> {
+        self.mirror_ring
+            .map(|rows| rows.min(self.capacity.max(1).next_power_of_two()))
+    }
+
+    /// The rows of the ring a kernel masks a position into to find its
+    /// mirror row — `None` when the mirror holds every position at its own
+    /// row.
+    pub fn ring_rows(&self) -> Option<u32> {
+        self.mirror_ring().map(|n| n as u32)
+    }
+
+    /// Rows the mirror allocates for a request of `context` tokens: the
+    /// ring's, or one per position.
+    #[cfg(test)]
+    pub(crate) fn mirror_rows_at(&self, context: usize) -> usize {
+        match self.mirror_ring {
+            Some(rows) => rows.min(context.max(1).next_power_of_two()),
+            None => context,
+        }
+    }
+
+    /// The mirror row position `pos` lives at.
+    pub fn mirror_row(&self, pos: usize) -> usize {
+        match self.mirror_ring() {
+            Some(n) => pos & (n - 1),
+            None => pos,
+        }
+    }
+
+    /// The device rows `n` positions from `pos` are written to, as runs
+    /// that are contiguous at both ends: one for a plain mirror, two when
+    /// a ring wraps inside the range. `src_row` counts from 0 — the
+    /// caller's rows are in position order.
+    pub fn mirror_write_runs(&self, pos: usize, n: usize) -> Vec<PageRun> {
+        let Some(ring) = self.mirror_ring() else {
+            return vec![PageRun {
+                src_row: 0,
+                dst_row: pos as u32,
+                rows: n as u32,
+            }];
+        };
+        assert!(
+            n <= ring,
+            "{n} positions written at once into a mirror ring of {ring} rows"
+        );
+        let first = pos & (ring - 1);
+        let head = n.min(ring - first);
+        let mut runs = vec![PageRun {
+            src_row: 0,
+            dst_row: first as u32,
+            rows: head as u32,
+        }];
+        if head < n {
+            runs.push(PageRun {
+                src_row: head as u32,
+                dst_row: 0,
+                rows: (n - head) as u32,
+            });
+        }
+        runs
+    }
+
     pub fn sync_gpu(
         &mut self,
         device: &wgpu::Device,
@@ -1189,15 +1312,25 @@ impl LayerCache {
         // sequence that could get no pages at all — every dispatch that can
         // read through the block table does, and the assertion above is what
         // holds the two apart.
-        let want = mirror_rows_for(needed, capacity);
+        let want = match self.mirror_ring() {
+            Some(ring) => {
+                assert!(
+                    rows_ahead <= ring,
+                    "{rows_ahead} positions ahead of a mirror ring of {ring} rows"
+                );
+                ring
+            }
+            None => mirror_rows_for(needed, capacity),
+        };
         // Grow before syncing, never shrink. A mirror that is already big
         // enough is left exactly as it is, so the steady state — every decode
-        // step after the first — does no work here at all.
+        // step after the first — does no work here at all. A ring never
+        // grows: every position has a row in it already.
         match &self.gpu {
             None => {
                 self.gpu = Some(GpuLayerCache::new(device, want, kv_dim, n_head, kv_storage));
             }
-            Some(gpu) if gpu.rows < needed => {
+            Some(gpu) if gpu.rows < needed && self.mirror_ring.is_none() => {
                 let old = self.gpu.take().expect("checked present");
                 let mut grown = GpuLayerCache::new(device, want, kv_dim, n_head, kv_storage);
                 // Carry the rows already on the device across on the device.
@@ -1247,26 +1380,47 @@ impl LayerCache {
         // borrow of `k`, and that is one `memcpy` of the range being uploaded
         // — a row per decode step.
         let storage = self.gpu.as_ref().map(|g| g.kv_storage);
-        let (row_from, row_to) = (self.gpu.as_ref().map_or(0, |g| g.synced_len), self.len);
-        let payload = (row_from < row_to).then(|| {
-            let k_rows = self.rows_between(row_from, row_to);
-            let v_rows = self.values_between(row_from, row_to);
-            match storage.expect("mirror present when rows are pending") {
-                crate::engine::backend::vulkan_shaders::KvStorage::F16 => {
-                    (f32_to_f16_bytes(&k_rows), f32_to_f16_bytes(&v_rows))
-                }
-                crate::engine::backend::vulkan_shaders::KvStorage::Q8_0 => {
-                    (f32_to_q8_0_bytes(&k_rows), f32_to_q8_0_bytes(&v_rows))
-                }
-                crate::engine::backend::vulkan_shaders::KvStorage::F32 => (
-                    bytemuck::cast_slice(&k_rows).to_vec(),
-                    bytemuck::cast_slice(&v_rows).to_vec(),
-                ),
-            }
-        });
+        let synced = self.gpu.as_ref().map_or(0, |g| g.synced_len);
+        // A ring holds only its last `ring` positions, so older unsynced
+        // rows are not uploaded: nothing will read them, and their slots
+        // belong to newer positions.
+        let row_from = match self.mirror_ring() {
+            Some(ring) => synced.max(self.len.saturating_sub(ring)),
+            None => synced,
+        };
+        let row_to = self.len;
+        // Each run is contiguous on both sides; a ring wrapping inside the
+        // range gives two.
+        let runs = if row_from < row_to {
+            self.mirror_write_runs(row_from, row_to - row_from)
+        } else {
+            Vec::new()
+        };
+        let payload: Vec<(u64, Vec<u8>, Vec<u8>)> = runs
+            .iter()
+            .map(|run| {
+                let from = row_from + run.src_row as usize;
+                let to = from + run.rows as usize;
+                let k_rows = self.rows_between(from, to);
+                let v_rows = self.values_between(from, to);
+                let (k, v) = match storage.expect("mirror present when rows are pending") {
+                    crate::engine::backend::vulkan_shaders::KvStorage::F16 => {
+                        (f32_to_f16_bytes(&k_rows), f32_to_f16_bytes(&v_rows))
+                    }
+                    crate::engine::backend::vulkan_shaders::KvStorage::Q8_0 => {
+                        (f32_to_q8_0_bytes(&k_rows), f32_to_q8_0_bytes(&v_rows))
+                    }
+                    crate::engine::backend::vulkan_shaders::KvStorage::F32 => (
+                        bytemuck::cast_slice(&k_rows).to_vec(),
+                        bytemuck::cast_slice(&v_rows).to_vec(),
+                    ),
+                };
+                (run.dst_row as u64, k, v)
+            })
+            .collect();
         let gpu = self.gpu.as_mut().expect("mirror present after growth");
-        if let Some((k_bytes, v_bytes)) = payload {
-            let start = row_from * kv_dim;
+        for (dst_row, k_bytes, v_bytes) in payload {
+            let start = dst_row as usize * kv_dim;
             // Local byte offset of `start` within each region, by storage
             // format; `k_off`/`v_off` shift it to the region's base in the
             // shared buffer.
@@ -1277,6 +1431,8 @@ impl LayerCache {
             };
             queue.write_buffer(&gpu.kv_buffer, gpu.k_off + local, &k_bytes);
             queue.write_buffer(&gpu.kv_buffer, gpu.v_off + local, &v_bytes);
+        }
+        if row_from < row_to {
             gpu.synced_len = self.len;
         }
         GpuKvRefs {
@@ -1388,12 +1544,17 @@ impl LayerCache {
             self.k.len() + self.kv_dim,
             (self.len - self.sealed_rows() - self.pending_rows) * self.kv_dim
         );
-        if let Some(paged) = self.paged.as_ref()
-            && self.k.is_empty()
-            && paged.pages.is_empty()
+        if let Some(paged) = self.paged.as_mut()
+            && !paged.joined
         {
             // First write from this layer: it is a participant, and a page is
-            // sealed once every participant has written it.
+            // sealed once every participant has written it. A flag rather
+            // than "no pages yet": the device-resident prefill reserves a
+            // chunk's pages (`paged_range_refs`) before any row comes back,
+            // and a reused prefix adopts pages before the first row — keyed
+            // on either, no layer ever joined, no page was ever sealed, and
+            // no prefix was ever reused.
+            paged.joined = true;
             paged.seq.joins(paged.layer);
         }
         self.k.extend_from_slice(k);
@@ -1604,6 +1765,7 @@ impl LayerCache {
             full_pages: 0,
             tail_uploaded: 0,
             device_synced: 0,
+            joined: false,
         });
         me
     }
@@ -1627,6 +1789,11 @@ impl LayerCache {
             return;
         };
         if paged.seq.pool.device_pages().is_none() {
+            return;
+        }
+        // A ring layer has no device pages to fill; its mirror syncs from
+        // the host rows like a contiguous layer's.
+        if paged.seq.pool.layers()[paged.layer].ring.is_some() {
             return;
         }
         let rows = paged.rows_per_page;
@@ -1806,13 +1973,7 @@ impl LayerCache {
             return None;
         }
         let last = (write_pos + n_tokens - 1) / rows_per_page;
-        {
-            let paged = self.paged.as_mut()?;
-            while paged.pages.len() <= last {
-                let (page, _) = paged.seq.page_for(paged.pages.len());
-                paged.pages.push(page);
-            }
-        }
+        self.reserve_pages_through(last);
         let paged = self.paged.as_ref()?;
         let pool = &paged.seq.pool;
         let pages = pool.device_pages()?;
@@ -1831,6 +1992,22 @@ impl LayerCache {
             page_tokens: page_tokens as u32,
             runs,
         })
+    }
+
+    /// Takes pages for this layer up to and including logical page `last`,
+    /// ahead of the rows that will fill them — a device-resident chunk writes
+    /// its rows into the pool's pages directly and needs them to exist
+    /// first. The host rows arrive later (`fill_gpu_written`) and are
+    /// appended as if pushed, so nothing about sealing may key on whether a
+    /// layer already has pages.
+    fn reserve_pages_through(&mut self, last: usize) {
+        let Some(paged) = self.paged.as_mut() else {
+            return;
+        };
+        while paged.pages.len() <= last {
+            let (page, _) = paged.seq.page_for(paged.pages.len());
+            paged.pages.push(page);
+        }
     }
 
     /// The per-request scratch a paged decode step still needs: the softmax
@@ -2169,6 +2346,14 @@ impl LayerCache {
         self.host_len() * self.stride
     }
 
+    /// Whether the device mirror holds rows the host buffers do not — the
+    /// gap [`host_len`](Self::host_len) describes. A reader on the host
+    /// would miss them, so attention over this layer has to run on the
+    /// device that wrote them while this is true.
+    pub fn has_device_only_rows(&self) -> bool {
+        self.len > self.host_len()
+    }
+
     /// The key vector at cached position `pos` for KV head `kv_head`
     /// (`[head_dim]`).
     pub fn key_at(&self, pos: usize, kv_head: usize, head_dim: usize) -> &[f32] {
@@ -2466,6 +2651,14 @@ impl KvCache {
             layer.v.clear();
             layer.len = 0;
             layer.gpu = None;
+            // The pool serves a ring layer's rows on the host only — its
+            // device copy stays this request's ring. Any other layer's
+            // device copy is the pool's pages, addressed through the block
+            // table, and a ring would describe a mirror it no longer has.
+            if geom.ring.is_none() {
+                layer.mirror_ring = None;
+                layer.mirror_ring_slack = None;
+            }
             layer.paged = Some(PagedRows {
                 seq: seq.clone(),
                 layer: i,
@@ -2474,6 +2667,7 @@ impl KvCache {
                 full_pages: 0,
                 tail_uploaded: 0,
                 device_synced: 0,
+                joined: false,
             });
         }
         Ok(self)
@@ -2584,7 +2778,9 @@ impl KvCache {
         self.layers
             .iter()
             .enumerate()
-            .filter(|(index, layer)| layer.kv_dim > 0 && keep(*index))
+            .filter(|(index, layer)| {
+                layer.kv_dim > 0 && layer.mirror_ring.is_none() && keep(*index)
+            })
             .map(|(_, layer)| {
                 gpu_layer_bytes(
                     token_capacity.div_ceil(layer.stride),
@@ -2595,6 +2791,49 @@ impl KvCache {
                 )
             })
             .sum()
+    }
+
+    /// The other half of [`Self::gpu_mirror_bytes_where`]: the layers whose
+    /// mirror is a ring, at the ring's rows — what they hold at any context
+    /// from the first window on.
+    pub fn gpu_mirror_fixed_bytes_where(
+        &self,
+        n_head: usize,
+        kv_storage: crate::engine::backend::vulkan_shaders::KvStorage,
+        keep: impl Fn(usize) -> bool,
+    ) -> u64 {
+        self.layers
+            .iter()
+            .enumerate()
+            .filter(|(index, layer)| layer.kv_dim > 0 && keep(*index))
+            .filter_map(|(_, layer)| {
+                layer.mirror_ring.map(|rows| {
+                    gpu_layer_bytes(
+                        rows,
+                        layer.kv_dim,
+                        n_head,
+                        kv_storage,
+                        ASSUMED_STORAGE_ALIGN,
+                    )
+                })
+            })
+            .sum()
+    }
+
+    /// [`LayerCache::set_mirror_ring`] on layer `index`.
+    pub fn set_mirror_ring(&mut self, index: usize, window: usize, write: usize) {
+        self.layers[index].set_mirror_ring(window, write);
+    }
+
+    /// The widest run of positions one forward call may write: a ring
+    /// mirror must still hold the window behind the run's first position
+    /// when the run's last one attends. `None` when no layer's mirror is a
+    /// ring — then nothing here bounds it.
+    pub fn max_positions_per_call(&self) -> Option<usize> {
+        self.layers
+            .iter()
+            .filter_map(|layer| layer.mirror_ring_slack)
+            .min()
     }
 
     /// Like [`KvCache::new_with_dims`], plus a recurrent state per entry in
@@ -3779,6 +4018,7 @@ mod tests {
         let geom = vec![LayerGeometry {
             kv_dim: 8,
             stride: 1,
+            ring: None,
         }];
         // Four pages of four tokens: sixteen tokens is the whole pool.
         let pool = Arc::new(KvPool::with_policy(4, 4, geom, Policy::Lru));
@@ -3809,7 +4049,11 @@ mod tests {
         use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
         use std::sync::Arc;
 
-        let geom = vec![LayerGeometry { kv_dim, stride }];
+        let geom = vec![LayerGeometry {
+            kv_dim,
+            stride,
+            ring: None,
+        }];
         // Room for far more pages than the sequence needs, so this measures
         // addressing rather than reclaim.
         let capacity = rows * stride + stride;
@@ -3896,6 +4140,7 @@ mod tests {
             let geom = vec![LayerGeometry {
                 kv_dim: KV,
                 stride: 1,
+                ring: None,
             }];
             let pool = Arc::new(KvPool::with_policy(64, PAGE, geom, Policy::Lru));
             let mut paged = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
@@ -3939,6 +4184,7 @@ mod tests {
         let geom = vec![LayerGeometry {
             kv_dim: 4,
             stride: 1,
+            ring: None,
         }];
         let pool = Arc::new(KvPool::with_policy(16, 4, geom, Policy::Lru));
         {
@@ -3968,6 +4214,7 @@ mod tests {
         let geom = vec![LayerGeometry {
             kv_dim: KV,
             stride: 1,
+            ring: None,
         }];
         let pool = Arc::new(KvPool::with_policy(32, 4, geom, Policy::Lru));
         let mut paged = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
@@ -4005,6 +4252,7 @@ mod tests {
         let geom = vec![LayerGeometry {
             kv_dim: KV,
             stride: 1,
+            ring: None,
         }];
         let pool = Arc::new(KvPool::with_policy(32, 4, geom, Policy::Lru));
         let mut paged = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
@@ -4022,6 +4270,119 @@ mod tests {
                 "row {r}"
             );
         }
+    }
+
+    /// A page is sealed once every layer that writes it has — and a layer
+    /// registers as a writer on its first row. The device-resident prefill
+    /// reserves a chunk's pages before any row comes back, and the first
+    /// version of that registration keyed on "no pages yet": every layer
+    /// already had pages, none registered, and no page was ever sealed —
+    /// which is to say prefix reuse was off for every GPU model, silently,
+    /// since the pool's pages started being written on the device.
+    #[test]
+    fn pages_reserved_ahead_of_their_rows_still_seal() {
+        use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+        use crate::engine::prefix_index::page_tags;
+        use std::sync::Arc;
+        const KV: usize = 8;
+        const PAGE: usize = 4;
+        let geom = vec![
+            LayerGeometry {
+                kv_dim: KV,
+                stride: 1,
+                ring: None,
+            };
+            2
+        ];
+        let pool = Arc::new(KvPool::with_policy(32, PAGE, geom, Policy::Lru));
+        let prompt: Vec<u32> = (0..8).collect();
+        let tags = page_tags(&prompt, PAGE);
+        let mut cache = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
+            .try_into_paged(pool.clone())
+            .unwrap_or_else(|_| panic!("test pool has room"));
+        cache.set_page_tags(&tags);
+        // The chunk's pages exist before its rows, as `paged_range_refs`
+        // leaves them; then the rows arrive the way the chain delivers
+        // them — counted first, filled after.
+        for layer in &mut cache.layers {
+            layer.reserve_pages_through(1);
+            layer.advance_gpu_written(8);
+        }
+        let k: Vec<f32> = (0..8 * KV).map(|i| i as f32).collect();
+        let v: Vec<f32> = k.iter().map(|x| -x).collect();
+        for layer in &mut cache.layers {
+            layer.fill_gpu_written(&k, &v);
+        }
+        cache.commit_pages();
+        for &t in &tags {
+            assert!(pool.holds(t), "a page every layer wrote was not published");
+        }
+    }
+
+    /// The same registration on the other path that gives a layer pages
+    /// before its first row: a reused prefix. The pages built past the
+    /// adopted ones must still seal, or the second request with a shared
+    /// prefix publishes nothing of its own and the third reuses only what
+    /// the first built.
+    #[test]
+    fn pages_built_past_an_adopted_prefix_still_seal() {
+        use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+        use crate::engine::prefix_index::{PrefixIndex, page_tags};
+        use std::sync::Arc;
+        const KV: usize = 8;
+        const PAGE: usize = 4;
+        let geom = vec![
+            LayerGeometry {
+                kv_dim: KV,
+                stride: 1,
+                ring: None,
+            };
+            2
+        ];
+        let pool = Arc::new(KvPool::with_policy(32, PAGE, geom, Policy::Lru));
+        let index = PrefixIndex::new(PAGE);
+        let row = |r: usize| -> (Vec<f32>, Vec<f32>) {
+            let k: Vec<f32> = (0..KV).map(|d| (r * KV + d) as f32).collect();
+            let v = k.iter().map(|x| -x).collect();
+            (k, v)
+        };
+        // First: one page, built and published.
+        let first_prompt: Vec<u32> = (0..4).collect();
+        let first_tags = page_tags(&first_prompt, PAGE);
+        let mut first = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
+            .try_into_paged(pool.clone())
+            .unwrap_or_else(|_| panic!("test pool has room"));
+        first.set_page_tags(&first_tags);
+        for r in 0..4 {
+            let (k, v) = row(r);
+            for layer in &mut first.layers {
+                layer.push(&k, &v);
+            }
+        }
+        first.commit_pages();
+        index.remember(first_tags[0], &first_prompt);
+
+        // Second: adopts that page, then builds one more.
+        let second_prompt: Vec<u32> = (0..8).collect();
+        let second_tags = page_tags(&second_prompt, PAGE);
+        let resolved = index.resolve(&second_prompt, false);
+        assert_eq!(resolved.shared.len(), 1);
+        let mut second = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
+            .try_into_paged(pool.clone())
+            .unwrap_or_else(|_| panic!("test pool has room"));
+        second.set_page_tags(&second_tags);
+        assert_eq!(second.adopt_shared_pages(&resolved.shared, PAGE), Some(4));
+        for r in 4..8 {
+            let (k, v) = row(r);
+            for layer in &mut second.layers {
+                layer.push(&k, &v);
+            }
+        }
+        second.commit_pages();
+        assert!(
+            pool.holds(second_tags[1]),
+            "the page built past the adopted prefix was not published"
+        );
     }
 
     /// **End to end: two sequences share a prefix, and the sharer reads exactly
@@ -4047,10 +4408,12 @@ mod tests {
             LayerGeometry {
                 kv_dim: KV,
                 stride: 1,
+                ring: None,
             },
             LayerGeometry {
                 kv_dim: KV,
                 stride: 1,
+                ring: None,
             },
         ];
         let pool = Arc::new(KvPool::with_policy(32, PAGE, geom, Policy::Lru));
@@ -4156,6 +4519,7 @@ mod tests {
         let geom = vec![LayerGeometry {
             kv_dim: 4,
             stride: 1,
+            ring: None,
         }];
         let pool = Arc::new(KvPool::with_policy(4, 4, geom, Policy::Lru));
         // Sixteen tokens, which is the whole pool: a sequence is admitted for
@@ -4186,6 +4550,7 @@ mod tests {
             vec![LayerGeometry {
                 kv_dim: KV,
                 stride: 1,
+                ring: None,
             }],
             Policy::Lru,
         ));
@@ -4227,6 +4592,7 @@ mod tests {
             vec![LayerGeometry {
                 kv_dim: KV,
                 stride: 1,
+                ring: None,
             }],
             Policy::Lru,
         );
@@ -4297,6 +4663,7 @@ mod tests {
             vec![LayerGeometry {
                 kv_dim: KV,
                 stride: 1,
+                ring: None,
             }],
             Policy::Lru,
         ));
@@ -4333,6 +4700,7 @@ mod tests {
             vec![LayerGeometry {
                 kv_dim: 8,
                 stride: 1,
+                ring: None,
             }],
             Policy::Lru,
         ));

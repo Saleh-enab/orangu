@@ -203,6 +203,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_warmup: bool,
 
+    /// Also print every repetition's rate, in order, after each row
+    #[arg(long, default_value_t = false)]
+    per_rep: bool,
+
     /// Per-request timeout in seconds.
     #[arg(long, default_value_t = 600, value_name = "SECONDS")]
     timeout: u64,
@@ -2986,6 +2990,13 @@ fn run_tg(
                 stats.mean,
                 stats.plus_minus(5, 2)
             );
+            // The repetitions in the order they ran: a first one well under
+            // the rest is a server still settling after its load, which the
+            // best and the mean each hide in their own way.
+            if args.per_rep {
+                let reps: Vec<String> = rates.iter().map(|r| format!("{r:.2}")).collect();
+                println!("{:>8}   reps {}", "", reps.join(" / "));
+            }
         }
 
         records.push(history::Record {

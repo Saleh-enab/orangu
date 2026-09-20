@@ -93,6 +93,50 @@ pub fn integer_dot_accelerated(_device: &wgpu::Device) -> Option<bool> {
     None
 }
 
+/// The device-local memory the driver says this process may still allocate
+/// without eviction, and what it holds now — `(budget, usage)` in bytes over
+/// the device-local heaps, from the memory-budget extension. `None` where
+/// the device is not Vulkan or the driver does not report a budget.
+///
+/// The figure is the driver's own estimate, and it is what a fraction of
+/// the heap's size can never be: it knows the other tenants, the part of
+/// the heap it keeps for itself, and the point past which it starts moving
+/// this process's buffers into host memory — where they are still usable
+/// and read across the bus at a fraction of the rate.
+#[cfg(not(target_vendor = "apple"))]
+pub fn device_local_budget(device: &wgpu::Device) -> Option<(u64, u64)> {
+    let hal = unsafe { device.as_hal::<Vulkan>()? };
+    let instance = hal.shared_instance().raw_instance().clone();
+    let phys = hal.raw_physical_device();
+    let extensions = unsafe { instance.enumerate_device_extension_properties(phys) }.ok()?;
+    let has_budget = extensions.iter().any(|e| {
+        e.extension_name_as_c_str()
+            .is_ok_and(|n| n == ash::ext::memory_budget::NAME)
+    });
+    if !has_budget {
+        return None;
+    }
+    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+    let mut props = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+    unsafe { instance.get_physical_device_memory_properties2(phys, &mut props) };
+    // The largest device-local heap: a card with a small host-visible
+    // window flags that one device-local too, and its budget is not room
+    // for weights.
+    let heaps =
+        &props.memory_properties.memory_heaps[..props.memory_properties.memory_heap_count as usize];
+    let (i, _) = heaps
+        .iter()
+        .enumerate()
+        .filter(|(_, h)| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+        .max_by_key(|(_, h)| h.size)?;
+    (budget.heap_budget[i] > 0).then_some((budget.heap_budget[i], budget.heap_usage[i]))
+}
+
+#[cfg(target_vendor = "apple")]
+pub fn device_local_budget(_device: &wgpu::Device) -> Option<(u64, u64)> {
+    None
+}
+
 pub struct ReplayContext {
     pub instance: ash::Instance,
     pub device: ash::Device,
@@ -3209,6 +3253,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             ffn_norm: &ffn_norm,
             ffn_gate: &ffn_gate,
             ffn_up: &ffn_up,
+            ffn_gate_up: None,
             ffn_down: &ffn_down,
             ffn_post_norm: Some(&ffn_post_norm),
             ple: None,
@@ -3499,6 +3544,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 ffn_norm: &ffn_norm,
                 ffn_gate: &ffn_gate,
                 ffn_up: &ffn_up,
+                ffn_gate_up: None,
                 ffn_down: &ffn_down,
                 ffn_post_norm: Some(&ffn_post_norm),
                 ple: None,

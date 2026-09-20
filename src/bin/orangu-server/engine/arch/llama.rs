@@ -710,6 +710,19 @@ impl LlamaModel {
         let mut ffn_device: Vec<f32> = Vec::new();
         // The same, for the width-16 comparison the check makes.
         let (mut tiled, mut wide): (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
+        // The layers after which what is recorded so far is submitted
+        // (`super::decode_chunk_ends`): the device starts on the first
+        // layer while the host records the rest, and the token's recording
+        // stops standing in front of its execution. One compute pass per
+        // chunk rather than per layer — nothing between two layers needs
+        // the encoder, and a pass boundary is device time. The NPU seam
+        // submits per layer on its own and keeps the single pass.
+        let chunk_ends = if npu.is_some() {
+            Vec::new()
+        } else {
+            super::decode_chunk_ends(layers.len())
+        };
+        let mut cursor = PassCursor::new(&mut encoder);
         for il in layers.clone() {
             let layer = &self.layers[il];
             let x_input = if npu.is_some() && !host_x.is_empty() {
@@ -720,8 +733,9 @@ impl LlamaModel {
                     None => GpuInput::Cpu(x_in),
                 }
             };
+            let ffn_gate_up = super::ffn_gate_up_pair(&layer.w_gate, &layer.w_up);
             let out = vulkan.record_fused_layer(
-                &mut PassCursor::new(&mut encoder),
+                &mut cursor,
                 FusedLayerInput {
                     stop_at_ffn_norm: npu.is_some(),
                     x: x_input,
@@ -774,6 +788,7 @@ impl LlamaModel {
                     ffn_norm: &layer.ffn_norm,
                     ffn_gate: &layer.w_gate,
                     ffn_up: &layer.w_up,
+                    ffn_gate_up: ffn_gate_up.as_ref(),
                     ffn_down: &layer.w_down,
                     ffn_post_norm: None,
                     ple: None,
@@ -784,12 +799,27 @@ impl LlamaModel {
                     attn_ts: ts.attn_slot(il, n_layer),
                 },
             );
-            ts.after_layer(&mut encoder, il);
+            ts.after_layer(cursor.encoder(), il);
+            let chunk_done = il + 1 < layers.end && chunk_ends.contains(&(il - layers.start + 1));
+            if chunk_done {
+                // Chunk boundary: what is recorded so far executes while
+                // the next chunk is recorded. The final chunk carries the
+                // tail and is returned unsubmitted for the caller's own
+                // submit-and-read.
+                drop(cursor);
+                let finished = std::mem::replace(
+                    &mut encoder,
+                    vulkan.new_encoder("orangu-server llama decode chunk"),
+                );
+                vulkan.submit_intermediate(finished);
+                cursor = PassCursor::new(&mut encoder);
+            }
 
             // With the FFN on the device, `out` is `x1` — the post-attention
             // residual — rather than the layer's output. Finish the layer
             // here: normalise, run the network, add the residual back.
             if let Some(npu) = npu {
+                drop(cursor);
                 let finished = std::mem::replace(
                     &mut encoder,
                     vulkan.new_encoder("orangu-server llama decode layer"),
@@ -797,6 +827,7 @@ impl LlamaModel {
                 let t_read = seam_clock();
                 host_x = vulkan.submit_and_read_at(finished, &out.0, out.1, n_embd);
                 let read_ns = seam_elapsed(t_read);
+                cursor = PassCursor::new(&mut encoder);
 
                 ffn_normed.clear();
                 ffn_normed.extend_from_slice(&host_x);
@@ -863,6 +894,7 @@ impl LlamaModel {
             }
             bufs.push(out);
         }
+        drop(cursor);
 
         // On the NPU path the layer loop ends with the hidden state on the
         // host, not in `bufs` — every layer was finished there. Hand it to

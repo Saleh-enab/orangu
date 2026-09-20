@@ -362,6 +362,8 @@ impl MistralModel {
         let head_dim = self.head_dim();
 
         let mut encoder = vulkan.new_encoder("orangu-server mistral decode");
+        // Per-dispatch stamps (`ORANGU_GPU_TIMESTAMPS=ops`) — inert otherwise.
+        vulkan.begin_op_step(&mut encoder);
         // Per-stage GPU timing for this step, when `ORANGU_GPU_TIMESTAMPS=1`
         // and the adapter has the query; inert otherwise. See
         // `VulkanBackend::begin_step_timestamps` for why the slot arithmetic
@@ -372,14 +374,19 @@ impl MistralModel {
         // reads them is recorded: a layer's `GpuInput` borrows the previous
         // layer's buffer, so they cannot be dropped inside the loop.
         let mut bufs: Vec<(wgpu::Buffer, u64)> = Vec::with_capacity(self.layers.len());
+        // Submitted in chunks and recorded as one pass per chunk — see
+        // `super::decode_chunk_ends` and `LlamaModel::record_decode_run`.
+        let chunk_ends = super::decode_chunk_ends(layers.len());
+        let mut cursor = PassCursor::new(&mut encoder);
         for il in layers.clone() {
             let layer = &self.layers[il];
             let x_input = match bufs.last() {
                 Some((buf, offset)) => GpuInput::Gpu(buf, (*offset / 4) as usize),
                 None => GpuInput::Cpu(x_in),
             };
+            let ffn_gate_up = super::ffn_gate_up_pair(&layer.w_gate, &layer.w_up);
             let out = vulkan.record_fused_layer(
-                &mut PassCursor::new(&mut encoder),
+                &mut cursor,
                 FusedLayerInput {
                     stop_at_ffn_norm: false,
                     x: x_input,
@@ -422,6 +429,7 @@ impl MistralModel {
                     ffn_norm: &layer.ffn_norm,
                     ffn_gate: &layer.w_gate,
                     ffn_up: &layer.w_up,
+                    ffn_gate_up: ffn_gate_up.as_ref(),
                     ffn_down: &layer.w_down,
                     ffn_post_norm: None,
                     ple: None,
@@ -432,9 +440,19 @@ impl MistralModel {
                     attn_ts: ts.attn_slot(il, n_layer),
                 },
             );
-            ts.after_layer(&mut encoder, il);
+            ts.after_layer(cursor.encoder(), il);
+            if il + 1 < layers.end && chunk_ends.contains(&(il - layers.start + 1)) {
+                drop(cursor);
+                let finished = std::mem::replace(
+                    &mut encoder,
+                    vulkan.new_encoder("orangu-server mistral decode chunk"),
+                );
+                vulkan.submit_intermediate(finished);
+                cursor = PassCursor::new(&mut encoder);
+            }
             bufs.push(out);
         }
+        drop(cursor);
 
         let (last_buf, last_offset) = bufs.last()?;
         if !with_tail {
@@ -480,12 +498,14 @@ impl MistralModel {
         // A decode step after a prompt whose last chunk parked its rows
         // fills them first.
         vulkan.fill_deferred_kv_rows(cache);
-        let (encoder, _, _) =
+        let (mut encoder, _, _) =
             self.record_decode_chain(vulkan, cache, tokens, start_pos, slot_id)?;
+        vulkan.finish_op_step(&mut encoder);
         let logits = vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1);
         if vulkan.gpu_timestamps() {
             vulkan.report_timestamps(start_pos, self.layers.len());
         }
+        vulkan.report_op_step(start_pos);
         Some(logits)
     }
 
@@ -901,10 +921,13 @@ impl ModelForward for MistralModel {
                 // `slot_id + 1` just above.
                 slot_id + 1,
             );
+            let mut encoder = encoder;
+            vulkan.finish_op_step(&mut encoder);
             let next = vulkan.submit_and_readback_u32(encoder, &sample_buf);
             if vulkan.gpu_timestamps() {
                 vulkan.report_timestamps(start_pos, self.layers.len());
             }
+            vulkan.report_op_step(start_pos);
             return Ok(super::ForwardOutcome::Token(next));
         }
         self.forward(cache, tokens, start_pos, slot_id)

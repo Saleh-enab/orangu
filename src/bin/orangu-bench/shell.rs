@@ -64,7 +64,7 @@ _orangu_bench() {
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
             "--url --depths --pp --pp-continue --pg --decode-cpu --streams --shared-prefix --shared-prefix-tokens \
-             --prefix-scan --pp-continue-base --embed --image --image-steps --image-cfg --image-prompt --gen --curve --bucket --reps --drop-model-cache --no-warmup \
+             --prefix-scan --pp-continue-base --embed --image --image-steps --image-cfg --image-prompt --gen --curve --bucket --reps --drop-model-cache --no-warmup --per-rep \
              --timeout --model --json --history --label --chart --chart-only --table --storage-probe --storage-file \
              --storage-span --storage-ramp --cap --chart-png --chart-scale --chart-y-label --chart-x-label --chart-panels \
              --flamegraph --flamegraph-pid --flamegraph-freq --flamegraph-call-graph --flamegraph-png \
@@ -112,6 +112,7 @@ _orangu_bench() {
         '--reps[Repetitions per depth; the reported rate is the best run with mean±sd]:n:' \
         '--drop-model-cache[Evict the model from the page cache before every repetition]' \
         '--no-warmup[Skip the initial warmup run]' \
+        '--per-rep[Also print every repetition'"'"'s rate, in order, after each row]' \
         '--timeout[Per-request timeout in seconds]:seconds:' \
         '--model[Model id to request]:id:' \
         '--json[Emit machine-readable JSON]' \
@@ -190,6 +191,7 @@ complete -c orangu-bench -l bucket                 -x -d 'Bucket width (in conte
 complete -c orangu-bench -l reps                   -x -d 'Repetitions per depth; the reported rate is the best run with mean±sd'
 complete -c orangu-bench -l drop-model-cache          -d 'Evict the model from the page cache before every repetition'
 complete -c orangu-bench -l no-warmup                 -d 'Skip the initial warmup run'
+complete -c orangu-bench -l per-rep                   -d 'Also print every repetition\'s rate, in order, after each row'
 complete -c orangu-bench -l timeout                -x -d 'Per-request timeout in seconds'
 complete -c orangu-bench -l model                  -x -d 'Model id to request'
 complete -c orangu-bench -l json                      -d 'Emit machine-readable JSON'
@@ -277,6 +279,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--reps', 'Repetitions per depth; the reported rate is the best run with mean+/-sd'),
         @('--drop-model-cache', 'Evict the model from the page cache before every repetition'),
         @('--no-warmup', 'Skip the initial warmup run'),
+        @('--per-rep', 'Also print every repetition''s rate, in order, after each row'),
         @('--timeout', 'Per-request timeout in seconds'),
         @('--model', 'Model id to request'),
         @('--json', 'Emit machine-readable JSON'),

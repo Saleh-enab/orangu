@@ -282,6 +282,9 @@ struct Args {
     /// Spread the model's layers across the selected devices: off, auto, all, cpu, or shares like 3,1.
     #[arg(long = "device-split", value_name = "MODE")]
     device_split: Option<String>,
+    /// Context (tokens) one request must fit on the device; layers move to the host to make room.
+    #[arg(long, value_name = "TOKENS")]
+    context: Option<usize>,
     /// Worker threads for every CPU path. Defaults to one per logical core.
     #[arg(long, value_name = "N")]
     threads: Option<String>,
@@ -1366,6 +1369,38 @@ fn prepare(args: Args) -> Result<Prepared> {
     // `device_split` — including `off` — is a decision, and this must not
     // quietly overrule it.
     let requested = requested_split(split_flag.as_deref(), &conf.device_split)?;
+    // A requested context (`--context`, `ORANGU_CONTEXT`, `[orangu-server]
+    // .context`): the KV cache it needs, in the device's own width, is
+    // taken out of the head card's budget before the layers are placed —
+    // so a model that fits the card with no room for that context has
+    // layers moved to the host until there is. The reserve beside it is
+    // the prefill's transient scratch, the same the pool keeps clear.
+    let context_kv_bytes = requested_context(args.context, conf.context).and_then(|context| {
+        let wgpu = backend.as_wgpu()?;
+        let per_token = engine::kv_pool::device_bytes_for(
+            engine::arch::kv_elements_per_token(&loaded),
+            wgpu.kv_storage(),
+        );
+        let fixed = engine::kv_pool::device_bytes_for(
+            engine::arch::kv_fixed_elements(&loaded, context),
+            wgpu.kv_storage(),
+        );
+        Some((context, per_token * context as u64 + fixed))
+    });
+    let fits_context = |kv: u64| -> bool {
+        let Some(wgpu) = backend.as_wgpu() else {
+            return true;
+        };
+        let (budget, _) = wgpu
+            .device_local_budget()
+            .or_else(|| {
+                wgpu.device_in_use()
+                    .vram_total_bytes
+                    .map(|t| (t * 9 / 10, 0))
+            })
+            .unwrap_or((u64::MAX, 0));
+        weights_device_bytes + kv + kv_pool_scratch_reserve_bytes() <= budget
+    };
     let split_mode = if requested.is_off()
         && split_flag.is_none()
         && conf.device_split.is_off()
@@ -1377,6 +1412,17 @@ fn prepare(args: Args) -> Result<Prepared> {
              (`device_split = cpu`). Set `device_split` explicitly to choose differently."
         );
         SplitMode::Cpu
+    } else if requested.is_off()
+        && let Some((context, kv)) = context_kv_bytes
+        && !fits_context(kv)
+    {
+        log::warn!(
+            "orangu-server: the weights leave no room on the selected device for a context of \
+             {context} tokens ({} of KV cache) — moving layers to the host until there is \
+             (`device_split = cpu`)",
+            orangu::format::format_bytes(kv)
+        );
+        SplitMode::Cpu
     } else {
         requested
     };
@@ -1386,6 +1432,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         &split_mode,
         &per_layer_bytes,
         weights_device_bytes,
+        context_kv_bytes.map(|(_, kv)| kv + kv_pool_scratch_reserve_bytes()),
     )?;
     // A model with layers on the host is never prefilled narrower than the
     // width at which those layers stream to the card — see `CHUNK_FLOOR`.
@@ -1805,15 +1852,6 @@ fn prepare(args: Args) -> Result<Prepared> {
     // Sized from the same headroom figure the startup report already prints,
     // but **not divided by the slot count** — that division is what a shared
     // pool exists to remove. See `KvPool::sized_for`.
-    /// Host memory the paged KV pool may take, unless `ORANGU_KV_POOL_BYTES`
-    /// says otherwise.
-    ///
-    /// A flat ceiling rather than a fraction of free RAM. What is free at
-    /// startup is not this process's to spend — the page cache holding the
-    /// model is counted as free and is doing real work — and a pool sized from
-    /// it would grow on an idle machine and shrink on a busy one, which makes
-    /// two runs of the same benchmark incomparable for reasons nothing reports.
-    const DEFAULT_HOST_KV_POOL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
     // On unless disabled — and not built at all where the selected attention
     // kernels have no paged form, because a paged cache under those would keep
     // the shared pages *and* the per-request mirror.
@@ -1835,7 +1873,7 @@ fn prepare(args: Args) -> Result<Prepared> {
             // on a machine whose card and RAM are differently proportioned.
             let budget = engine::backend::env_tuning_value(
                 "ORANGU_KV_POOL_BYTES",
-                DEFAULT_HOST_KV_POOL_BYTES,
+                default_host_kv_pool_bytes(orangu::hardware::detect_cpu().total_memory_bytes),
                 "a positive byte count",
                 |v: u64| v > 0,
             );
@@ -1861,11 +1899,70 @@ fn prepare(args: Args) -> Result<Prepared> {
             // is ~300 MiB on top of what is resident — after which decode
             // ran 20% slower at every depth. The quarter is what leaves
             // that room.
+            //
+            // The quarter is the floor. Where the driver reports what this
+            // process may still allocate without eviction (the memory
+            // budget), the pool takes what that leaves after the planned
+            // weights, the streaming region and a reserve for the prefill's
+            // transient scratch — on a card the weights half fill, that is
+            // two to three times the quarter, and the ceiling with it. The
+            // budget is the driver's own figure and knows the other tenants
+            // and the heap's real size, which no fraction of a nominal
+            // capacity does. A pool sized this way leaves the driver's usage
+            // under its budget through a long prompt with nothing moved to
+            // host memory and decode unchanged; a pool past the budget has
+            // part of the process moved into host memory, read across the
+            // bus, and every kernel slows with it.
             let device_budget = backend.as_wgpu().and_then(|wgpu| {
-                footprint
-                    .as_ref()?
+                let footprint = footprint.as_ref()?;
+                let quarter = footprint
                     .headroom_on(wgpu.device_in_use())
-                    .map(|h| h / 4)
+                    .map(|h| h * kv_device_share_percent() / 100)?;
+                // `ORANGU_KV_DEVICE_BUDGET=0` keeps the quarter alone, the
+                // control arm of a sweep.
+                let budget_rule = engine::env::flag_on_unless_disabled("ORANGU_KV_DEVICE_BUDGET");
+                let Some((budget, usage)) = wgpu.device_local_budget().filter(|_| budget_rule)
+                else {
+                    return Some(quarter);
+                };
+                // The weights are placed on first use, so what is held now
+                // is not yet them; the plan, with the arena's padding, is.
+                let planned = footprint.weights_device_bytes * 105 / 100;
+                let from_budget = budget
+                    .saturating_sub(usage.max(planned))
+                    .saturating_sub(footprint.reserved_device_bytes)
+                    .saturating_sub(kv_pool_scratch_reserve_bytes());
+                if from_budget > quarter {
+                    log::info!(
+                        "orangu-server: [kv] device pages sized from the driver's budget: {} of {} \
+                         after {} of weights and {} of reserve",
+                        orangu::format::format_bytes(from_budget),
+                        orangu::format::format_bytes(budget),
+                        orangu::format::format_bytes(planned),
+                        orangu::format::format_bytes(
+                            footprint.reserved_device_bytes + kv_pool_scratch_reserve_bytes()
+                        ),
+                    );
+                }
+                Some(from_budget.max(quarter))
+            });
+            // The ring layers' mirrors are per request, not per page: every
+            // slot holds its own whatever the pool's size, so they come out
+            // of the pages' budget first.
+            let device_budget = device_budget.map(|budget| {
+                let rings = footprint
+                    .as_ref()
+                    .map_or(0, |f| f.kv_fixed_bytes.saturating_mul(conf.slots as u64));
+                if rings > 0 {
+                    log::info!(
+                        "orangu-server: [kv] {} of the device pages' budget goes to the windowed \
+                         layers' rings ({} slot{}); the pages hold the rest",
+                        orangu::format::format_bytes(rings),
+                        conf.slots,
+                        if conf.slots == 1 { "" } else { "s" },
+                    );
+                }
+                budget.saturating_sub(rings)
             });
             // `F32` when there is no device: the width only matters for the
             // device bound, which is `None` in that case and never consulted.
@@ -4440,6 +4537,68 @@ fn expert_tier_projection(
 /// RAM and the page cache can between them) and `false` for a device that does
 /// not report its size, which is the "unknown is not zero" rule the rest of
 /// the capacity code follows.
+/// The share of the device headroom the KV pool's pages take, in percent
+/// (`ORANGU_KV_DEVICE_SHARE`; the rest is the prefill's transient scratch
+/// and the streaming region's growth). See the pool's sizing for how the
+/// default was measured.
+fn kv_device_share_percent() -> u64 {
+    engine::backend::env_tuning_value(
+        "ORANGU_KV_DEVICE_SHARE",
+        25u64,
+        "a percentage from 1 to 95",
+        |v: u64| (1..=95).contains(&v),
+    )
+}
+
+/// Device memory kept out of the KV pool, and out of a requested context's
+/// placement, for what a prefill allocates as it runs — the chunk's pooled
+/// regions, the K/V readback stage, the attention scratch — with room over
+/// what a 512-token chunk was measured to take, so the card is never at
+/// its last page (after which the driver moves pages out and never back).
+/// `ORANGU_KV_POOL_RESERVE_MIB` overrides it for a sweep.
+fn kv_pool_scratch_reserve_bytes() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        engine::backend::env_tuning_value(
+            "ORANGU_KV_POOL_RESERVE_MIB",
+            448u64,
+            "a size in MiB",
+            |v: u64| v > 0,
+        ) * 1024
+            * 1024
+    })
+}
+
+/// Host memory the paged KV pool may take by default: an eighth of the
+/// machine's RAM, never less than two gigabytes.
+///
+/// A fraction of *total* memory rather than of what is free. What is free
+/// at startup is not this process's to spend — the page cache holding the
+/// model is counted as free and is doing real work — and a pool sized from
+/// it would grow on an idle machine and shrink on a busy one, which makes
+/// two runs of the same benchmark incomparable for reasons nothing
+/// reports. Total memory is a property of the machine, so the pool is the
+/// same size every run on it, and larger on a larger machine — which the
+/// flat two gigabytes this replaced was not: on a 62 GiB box it held a
+/// 26B model to 4736 tokens of context while the card had room for far
+/// more.
+fn default_host_kv_pool_bytes(total_ram: u64) -> u64 {
+    (total_ram / 8).max(2 * 1024 * 1024 * 1024)
+}
+
+/// The context one request must fit on the device: `--context`, then
+/// `ORANGU_CONTEXT`, then `[orangu-server].context`; `None` leaves the
+/// placement to the weights alone.
+fn requested_context(flag: Option<usize>, configured: Option<usize>) -> Option<usize> {
+    flag.or_else(|| {
+        std::env::var("ORANGU_CONTEXT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+    })
+    .or(configured)
+}
+
 fn overflows_selected_device(backend: &dyn Backend, weights_bytes: u64) -> bool {
     backend
         .as_wgpu()
@@ -4453,6 +4612,7 @@ fn apply_device_split(
     mode: &SplitMode,
     per_layer_bytes: &[u64],
     weights_bytes: u64,
+    head_reserve_bytes: Option<u64>,
 ) -> Result<(Arc<dyn Backend>, String, Option<SplitReport>)> {
     /// The share of a device's memory a fill-in-order placement will put
     /// weights into, leaving the rest for the KV cache and the transient
@@ -4506,6 +4666,27 @@ fn apply_device_split(
             Some(((total - used) as f64 * WEIGHTS_SHARE_OF_DEVICE) as u64)
         })
         .collect();
+    // A requested context replaces the head card's share heuristic with
+    // the bytes that context needs: what is left after them is what the
+    // weights may take.
+    if let (Some(reserve), Some(Some(head))) = (head_reserve_bytes, capacities.first_mut()) {
+        let free = set
+            .first()
+            .and_then(|c| {
+                Some(
+                    c.vram_total_bytes? - c.vram_used_bytes().unwrap_or(0).min(c.vram_total_bytes?),
+                )
+            })
+            .unwrap_or(*head);
+        *head = free.saturating_sub(reserve);
+        log::info!(
+            "orangu-server: [{}] the head device plans against {} after {} for the requested \
+             context and its scratch",
+            wgpu.api_tag(),
+            orangu::format::format_bytes(*head),
+            orangu::format::format_bytes(reserve)
+        );
+    }
     // The first device pays for every tensor outside a numbered layer —
     // token embeddings, the output norm, `lm_head` — because that is where
     // `LoadedModel::device_for_tensor` puts them. Charging it only for the

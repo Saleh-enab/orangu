@@ -380,7 +380,11 @@ impl MuseModel {
         let n_layer = self.layers.len();
         let ts = vulkan.begin_step_timestamps(&mut encoder, n_layer);
         let mut bufs: Vec<(wgpu::Buffer, u64)> = Vec::with_capacity(layers.len());
-        for il in layers {
+        // Submitted in chunks and recorded as one pass per chunk — see
+        // `super::decode_chunk_ends` and `LlamaModel::record_decode_run`.
+        let chunk_ends = super::decode_chunk_ends(layers.len());
+        let mut cursor = PassCursor::new(&mut encoder);
+        for il in layers.clone() {
             let layer = &self.layers[il];
             let x_input = match bufs.last() {
                 Some((buf, offset)) => GpuInput::Gpu(buf, (*offset / 4) as usize),
@@ -394,8 +398,9 @@ impl MuseModel {
             } else {
                 (0, None)
             };
+            let ffn_gate_up = super::ffn_gate_up_pair(&layer.ffn_gate, &layer.ffn_up);
             let out = vulkan.record_fused_layer(
-                &mut PassCursor::new(&mut encoder),
+                &mut cursor,
                 FusedLayerInput {
                     stop_at_ffn_norm: false,
                     x: x_input,
@@ -435,6 +440,7 @@ impl MuseModel {
                     ffn_norm: &layer.ffn_norm,
                     ffn_gate: &layer.ffn_gate,
                     ffn_up: &layer.ffn_up,
+                    ffn_gate_up: ffn_gate_up.as_ref(),
                     ffn_down: &layer.ffn_down,
                     ffn_post_norm: Some(&layer.ffn_post_norm),
                     ple: None,
@@ -444,9 +450,19 @@ impl MuseModel {
                     attn_ts: ts.attn_slot(il, n_layer),
                 },
             );
-            ts.after_layer(&mut encoder, il);
+            ts.after_layer(cursor.encoder(), il);
+            if il + 1 < layers.end && chunk_ends.contains(&(il - layers.start + 1)) {
+                drop(cursor);
+                let finished = std::mem::replace(
+                    &mut encoder,
+                    vulkan.new_encoder("orangu-server muse decode chunk"),
+                );
+                vulkan.submit_intermediate(finished);
+                cursor = PassCursor::new(&mut encoder);
+            }
             bufs.push(out);
         }
+        drop(cursor);
         let (last_buf, last_offset) = bufs.last()?;
         if !with_tail {
             let (buf, offset) = (last_buf.clone(), *last_offset);

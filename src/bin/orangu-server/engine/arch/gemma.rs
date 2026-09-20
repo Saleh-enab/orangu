@@ -220,6 +220,100 @@ struct GemmaLayer {
     kv_donor: usize,
 }
 
+/// The KV cache one token costs across this file's layers, in `f32`
+/// elements, as the built model's [`KvCache`] will allocate it — the
+/// per-layer `head_count_kv` (an array on the mixtures), the sliding-window
+/// layers' own `key_length_swa`, and nothing for the layers that share a
+/// donor's cache. For sizing a requested context
+/// before the model is built (`main`'s `--context`): the file's scalar
+/// `head_count_kv` and `key_length` over-count a gemma-4 file by about
+/// two, since five of six of its layers are sliding-window and the global
+/// layers alone carry the wider heads.
+/// `ORANGU_SWA_FULL`: keep a full-context device mirror on the
+/// sliding-window layers too, instead of a ring of their window. Costs
+/// the memory the ring saves and buys nothing but a comparison; `0`/unset
+/// is the ring.
+pub(crate) fn swa_full() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_SWA_FULL"))
+}
+
+pub(crate) fn kv_elements_per_token(loaded: &LoadedModel) -> usize {
+    kv_estimate(loaded, None)
+}
+
+/// The device mirror one request holds at any context, in `f32` elements
+/// — the sliding-window layers' rings ([`GemmaModel::new_kv_cache`]),
+/// sized as they would be for `context` tokens. Zero under
+/// `ORANGU_SWA_FULL`, where [`kv_elements_per_token`] counts those layers
+/// at the full context instead.
+pub(crate) fn kv_fixed_elements(loaded: &LoadedModel, context: usize) -> usize {
+    kv_estimate(loaded, Some(context))
+}
+
+/// Both halves of the estimate from one walk over the file's layers:
+/// `ring_for == None` prices the per-token layers, `Some(context)` the
+/// ring layers at their rows for that context.
+fn kv_estimate(loaded: &LoadedModel, ring_for: Option<usize>) -> usize {
+    let n_layer = loaded.config.n_layer;
+    let n_swa = loaded.metadata_u64("attention.sliding_window").unwrap_or(0) as usize;
+    let ringed = n_swa > 0 && !swa_full();
+    let ring_rows = |context: usize| {
+        (n_swa + crate::engine::generate::prefill_chunk_ceiling())
+            .max(1)
+            .next_power_of_two()
+            .min(context.max(1).next_power_of_two())
+    };
+    let n_head = loaded.config.n_head;
+    let is_swa: Vec<bool> = loaded
+        .metadata_array_u64("attention.sliding_window_pattern")
+        .map(|arr| arr.iter().map(|&v| v != 0).collect())
+        .unwrap_or_else(|| {
+            if loaded.config.architecture == "gemma3"
+                || loaded.config.architecture == "gemma-embedding"
+            {
+                (0..n_layer).map(|il| il % 6 < 5).collect()
+            } else {
+                vec![false; n_layer]
+            }
+        });
+    let n_head_kv_default = loaded
+        .metadata_u64("attention.head_count_kv")
+        .unwrap_or(n_head as u64) as usize;
+    let n_head_kv_per_layer = loaded.metadata_array_u64("attention.head_count_kv");
+    let head_dim_full = loaded
+        .metadata_u64("attention.key_length")
+        .unwrap_or(loaded.config.head_dim as u64) as usize;
+    let head_dim_swa = loaded
+        .metadata_u64("attention.key_length_swa")
+        .unwrap_or(head_dim_full as u64) as usize;
+    // The last `shared_kv_layers` layers read another layer's cache and
+    // own no rows — the same rule `load` applies (`has_kv`).
+    let n_layer_kv = n_layer.saturating_sub(
+        loaded
+            .metadata_u64("attention.shared_kv_layers")
+            .unwrap_or(0) as usize,
+    );
+    (0..n_layer_kv)
+        .map(|i| {
+            let swa = is_swa.get(i).copied().unwrap_or(false);
+            let n_head_kv = n_head_kv_per_layer
+                .as_ref()
+                .and_then(|a| a.get(i).copied())
+                .map_or(n_head_kv_default, |v| v as usize);
+            let head_dim = if swa { head_dim_swa } else { head_dim_full };
+            let per_token = n_head_kv * head_dim * 2;
+            match (ring_for, ringed && swa) {
+                // A ring layer costs nothing per token and its rows once.
+                (None, true) => 0,
+                (None, false) => per_token,
+                (Some(context), true) => per_token * ring_rows(context),
+                (Some(_), false) => 0,
+            }
+        })
+        .sum()
+}
+
 pub struct GemmaModel {
     config: ModelConfig,
     backend: Arc<dyn Backend>,
@@ -616,43 +710,27 @@ gemma 4 checkpoint."
                 config.architecture
             );
         }
-        // The streaming region the grouped expert GEMM will need, sized for
-        // the largest stack of any layer and created **now**, ahead of the
-        // weights: what is allocated first is what lands in the card's own
-        // memory, and a region that arrives after the weights have filled
-        // the card lands in host memory, where every expert dispatch reads
-        // it across the bus (measured: a fixed 40 ms per dispatch against
-        // 6 with the region resident).
-        if is_moe
-            && super::expert_gemm_min_tokens() > 0
-            && let Some(vulkan) = backend.as_wgpu()
-        {
-            let largest = layers
-                .iter()
-                .filter_map(|l| l.moe.as_ref())
-                .flat_map(|m| {
+        // The streaming region the grouped expert GEMM will need, ahead of
+        // the weights — see `super::reserve_expert_region`.
+        if is_moe {
+            super::reserve_expert_region(
+                backend.as_ref(),
+                layers.iter().filter_map(|l| l.moe.as_ref()).flat_map(|m| {
                     let gate_up = match &m.gate_up {
                         GemmaExpertGateUp::Fused { gate_up, .. } => {
-                            vec![gate_up.stack_matrix().raw_bytes().len()]
+                            gate_up.stack_matrix().raw_bytes().len()
                         }
-                        GemmaExpertGateUp::Separate { gate, up, .. } => vec![
+                        GemmaExpertGateUp::Separate { gate, up, .. } => {
                             gate.stack_matrix().raw_bytes().len()
-                                + up.stack_matrix().raw_bytes().len(),
-                        ],
+                                + up.stack_matrix().raw_bytes().len()
+                        }
                     };
-                    gate_up.into_iter().chain(std::iter::once(
-                        m.down_exps.stack_matrix().raw_bytes().len(),
-                    ))
-                })
-                .max()
-                .unwrap_or(0);
-            let region = vulkan.expert_region_bytes_for(largest as u64);
-            log::info!(
-                "orangu-server: [vulkan] expert streaming region {} for stacks of up to {}",
-                orangu::format::format_bytes(region),
-                orangu::format::format_bytes(largest as u64)
+                    [
+                        gate_up as u64,
+                        m.down_exps.stack_matrix().raw_bytes().len() as u64,
+                    ]
+                }),
             );
-            vulkan.reserve_stream_region(region);
         }
 
         Ok(Self {
@@ -699,10 +777,21 @@ gemma 4 checkpoint."
 
     /// Per-layer KV cache dimensions (`n_head_kv * head_dim`, that layer's
     /// own SWA-or-full head size) — passed to [`KvCache::new_with_dims`].
+    /// One slot per layer, so a layer's cache index is its own index and a
+    /// sharing layer's is its donor's (`GemmaLayer::kv_donor`). A sharing
+    /// layer's slot is zero-width: it never writes a row, and a slot sized
+    /// like its donor's held nothing for over half the bytes of a cache on
+    /// a file where most layers share (E2B: 20 of 35).
     fn kv_dims(&self) -> Vec<usize> {
         self.layers
             .iter()
-            .map(|l| l.n_head_kv * l.head_dim)
+            .map(|l| {
+                if l.has_kv {
+                    l.n_head_kv * l.head_dim
+                } else {
+                    0
+                }
+            })
             .collect()
     }
 
@@ -732,74 +821,6 @@ gemma 4 checkpoint."
     /// `token` itself is still needed separately for the per-layer-
     /// embedding gather, which does its own independent lookup into a
     /// *different* embedding table.
-    /// How many `queue.submit()` calls one decode step's layer loop is
-    /// split across (`ORANGU_DECODE_CHUNKS`; see
-    /// `record_one_sequence_decode`). Read once and cached. Clamped to
-    /// `1..=n_layers` — `1` submits the whole token once, and no more than
-    /// one submit per layer is meaningful. A malformed value falls back to
-    /// the default rather than erroring a live decode. More chunks overlap
-    /// more of the CPU-side submission cost with GPU execution but add a
-    /// little per-submission barrier overhead, so the default sits below one
-    /// submit per layer.
-    /// The layer counts after which the decode step submits what it has
-    /// recorded so far — see `record_one_sequence_decode`.
-    ///
-    /// Recording is CPU work, and only the part recorded *before the first
-    /// submission* is exposed; everything after it is recorded while the
-    /// device runs what came before. Equal chunks (`ORANGU_DECODE_CHUNKS`)
-    /// expose a third of the token's recording, which at a few
-    /// microseconds a dispatch is measurable against a token of a few
-    /// milliseconds. So by default the first chunk is a single layer and
-    /// each next chunk is three times the last (`ORANGU_DECODE_FIRST_CHUNK`
-    /// sets the first; `0` keeps the equal split): the device starts after
-    /// one layer's recording, and the submissions stay few.
-    fn decode_chunk_ends(n_layers: usize) -> Vec<usize> {
-        static FIRST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let first = *FIRST.get_or_init(|| {
-            std::env::var("ORANGU_DECODE_FIRST_CHUNK")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(1)
-        });
-        if first == 0 || std::env::var_os("ORANGU_DECODE_CHUNKS").is_some() {
-            let chunks = Self::decode_submit_chunks(n_layers);
-            let per = n_layers.div_ceil(chunks.max(1));
-            return (1..chunks)
-                .map(|c| c * per)
-                .filter(|&e| e < n_layers)
-                .collect();
-        }
-        let mut ends = Vec::new();
-        let mut end = first.min(n_layers);
-        let mut width = first.max(1);
-        while end < n_layers {
-            ends.push(end);
-            width *= 3;
-            end += width;
-        }
-        ends
-    }
-
-    fn decode_submit_chunks(n_layers: usize) -> usize {
-        // The CPU↔GPU submission overlap this buys saturates early:
-        // throughput climbs as chunks go from 1 to 3 and is flat from 3
-        // upward. `3` sits at that knee, so it keeps the full overlap while
-        // paying only 3 `queue.submit()` calls (and allocating only 3 command
-        // encoders) per token — cutting the per-token `vkQueueSubmit` *and*
-        // `radv_BeginCommandBuffer`-`memset` cost, both of which scale with
-        // the submitted-command-buffer count.
-        const DEFAULT_CHUNKS: usize = 3;
-        static CHUNKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let requested = *CHUNKS.get_or_init(|| {
-            std::env::var("ORANGU_DECODE_CHUNKS")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&n| n >= 1)
-                .unwrap_or(DEFAULT_CHUNKS)
-        });
-        requested.clamp(1, n_layers.max(1))
-    }
-
     fn record_decode_forward(
         &self,
         vulkan: &VulkanBackend,
@@ -875,6 +896,25 @@ gemma 4 checkpoint."
     /// breakdown — a real per-sequence batched-decode timing breakdown
     /// would need its own, wider query set, not implemented here.
     #[allow(clippy::too_many_arguments)]
+    /// The device holding the KV cache layer `il` attends over: its own for
+    /// a KV-owning layer, the donor's for a layer that shares one
+    /// (`GemmaLayer::kv_donor`).
+    fn kv_device(&self, il: usize) -> usize {
+        self.layers[self.layers[il].kv_donor].wo.device()
+    }
+
+    /// Whether layer `il`'s attention can run on the device its weights are
+    /// on. False for a KV-sharing layer whose donor was placed elsewhere by
+    /// a split: the donor's cache mirror belongs to that other device (each
+    /// device is its own `wgpu` instance, so a buffer of one is unknown to
+    /// the other — binding it was a panic mid-prefill, not a wrong answer),
+    /// and its rows written by the fused decode chain exist nowhere else.
+    /// Such a layer takes the step-by-step path and runs its attention on
+    /// [`Self::kv_device`].
+    fn attention_on_own_device(&self, il: usize) -> bool {
+        self.kv_device(il) == self.layers[il].wo.device()
+    }
+
     /// The fused per-layer decode chain on a model whose layers live on
     /// more than one device: one encoder per run of consecutive layers
     /// sharing a device, with the hidden state crossing to host memory in
@@ -898,9 +938,15 @@ gemma 4 checkpoint."
         if self.n_embd_per_layer > 0 {
             return None;
         }
-        let runs = super::decode_runs_with_host(
+        // A layer whose cache lives on another device cannot join its own
+        // device's chain (`Self::attention_on_own_device`); it runs step by
+        // step like a host layer, with its attention on the cache's device.
+        let runs = super::decode_runs_with_host_of(
             self.backend.as_ref(),
-            self.layers.iter().map(|layer| layer.wo.device()),
+            self.layers.iter().enumerate().map(|(il, layer)| {
+                self.attention_on_own_device(il)
+                    .then_some(layer.wo.device())
+            }),
         )?;
         if runs.len() < 2 || runs.iter().all(|(device, _)| device.is_none()) {
             return None;
@@ -1042,7 +1088,7 @@ gemma 4 checkpoint."
         // execution instead of serialising it in front of one end-of-token
         // submit.
         let n_layers = self.layers.len();
-        let chunk_ends = Self::decode_chunk_ends(n_layers);
+        let chunk_ends = super::decode_chunk_ends(n_layers);
 
         let mut prev_buf: Option<(wgpu::Buffer, u64)> = None;
         // One compute pass per chunk, not per layer: nothing between two
@@ -1115,6 +1161,7 @@ gemma 4 checkpoint."
                 Some((buf, offset)) => GpuInput::Gpu(buf, (*offset / 4) as usize),
                 None => GpuInput::Cpu(x),
             };
+            let ffn_gate_up = super::ffn_gate_up_pair(&layer.ffn_gate, &layer.ffn_up);
             let out = vulkan.record_fused_layer(
                 &mut cursor,
                 FusedLayerInput {
@@ -1153,6 +1200,7 @@ gemma 4 checkpoint."
                     ffn_norm: &layer.ffn_norm,
                     ffn_gate: &layer.ffn_gate,
                     ffn_up: &layer.ffn_up,
+                    ffn_gate_up: ffn_gate_up.as_ref(),
                     ffn_down: &layer.ffn_down,
                     ffn_post_norm: Some(&layer.ffn_post_norm),
                     ple,
@@ -1554,8 +1602,10 @@ gemma 4 checkpoint."
             let fused_attn = self
                 .backend
                 // This layer's card: a fused attention chain is per-layer
-                // and needs no cross-layer state, so a split model keeps it.
+                // and needs no cross-layer state, so a split model keeps it
+                // — unless the cache it reads is on another card.
                 .as_wgpu_on(layer.wo.device())
+                .filter(|_| self.attention_on_own_device(il))
                 .filter(|vulkan| vulkan.prefill_fused_attention_enabled())
                 .and_then(|vulkan| {
                     let attn_input = crate::engine::backend::vulkan::FusedAttnPrefillInput {
@@ -1790,8 +1840,10 @@ gemma 4 checkpoint."
                     &mut cache.layers[cache_index],
                     &crate::engine::attention::Params {
                         backend: self.backend.as_ref(),
-                        // This layer's card — see `attention::Params::device`.
-                        device: layer.wo.device(),
+                        // The cache's card, which is this layer's own unless
+                        // it shares a donor placed elsewhere — see
+                        // `attention::Params::device` and `Self::kv_device`.
+                        device: self.kv_device(il),
                         n_head: self.n_head,
                         n_head_kv: layer.n_head_kv,
                         head_dim,
@@ -2652,7 +2704,20 @@ impl ModelForward for GemmaModel {
     }
 
     fn new_kv_cache(&self, capacity: usize) -> KvCache {
-        KvCache::new_with_dims(capacity, &self.kv_dims())
+        let mut cache = KvCache::new_with_dims(capacity, &self.kv_dims());
+        // A sliding-window layer's attention never reaches past its window,
+        // so its device mirror keeps the window and the chunk being written
+        // rather than the whole context — on this family that is five of
+        // six layers. `ORANGU_SWA_FULL` keeps every layer's mirror whole.
+        if self.n_swa > 0 && !swa_full() {
+            let write = crate::engine::generate::prefill_chunk_ceiling();
+            for (i, layer) in self.layers.iter().enumerate() {
+                if layer.has_kv && layer.is_swa {
+                    cache.set_mirror_ring(i, self.n_swa, write);
+                }
+            }
+        }
+        cache
     }
 
     fn forward_no_logits(
@@ -2949,6 +3014,13 @@ impl ModelForward for GemmaModel {
         greedy_sample: Option<GreedySampleParams<'_>>,
         slot_id: usize,
     ) -> Result<ForwardOutcome> {
+        // A mixture's decode step alternates between the card and the
+        // host's expert turns; the card's clock is held up through it. A
+        // dense model's step never leaves the card and arms nothing.
+        let _clock = self
+            .is_moe
+            .then(|| super::hold_clock_for_step(self.backend.as_ref(), tokens.len()))
+            .flatten();
         // Raw-Vulkan decode replay (`ORANGU_REPLAY`): capture the
         // forward once, then resubmit the persistent command buffer every token
         // with no `wgpu` submit on the forward — returns logits for the caller
@@ -4098,6 +4170,36 @@ mod real_model_tests {
     /// dropping BOS *does* reproduce the wrong answer, so a future BOS
     /// regression would look exactly like this bug.
     ///
+    /// The KV estimate a requested context is priced from, before the
+    /// model is built, is the cache the built model allocates — per-layer
+    /// heads and head widths included. Run with `ORANGU_TEST_MODEL=… cargo
+    /// test --release --bin orangu-server kv_estimate -- --ignored`.
+    #[test]
+    #[ignore]
+    fn kv_estimate_before_building_matches_the_built_cache() {
+        let path = std::env::var("ORANGU_TEST_MODEL").expect("set ORANGU_TEST_MODEL");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        let model =
+            GemmaModel::load_with_backend(&loaded, Arc::new(crate::engine::backend::CpuBackend))
+                .expect("build");
+        // At two contexts, so both halves of the estimate are checked: the
+        // rings are full at 8192 and capped by the context at 300.
+        for context in [300usize, 8192] {
+            let estimate =
+                kv_elements_per_token(&loaded) * context + kv_fixed_elements(&loaded, context);
+            let cache = model.new_kv_cache(context);
+            let built: usize = cache
+                .layers
+                .iter()
+                .map(|layer| layer.mirror_rows_at(context) * layer.kv_dim() * 2)
+                .sum();
+            assert_eq!(
+                estimate, built,
+                "estimate {estimate} vs the built cache's {built} at {context} tokens"
+            );
+        }
+    }
+
     /// Run with `ORANGU_TEST_MODEL=… cargo test --release --bin
     /// orangu-server gemma4_next_token -- --ignored --nocapture`.
     #[test]

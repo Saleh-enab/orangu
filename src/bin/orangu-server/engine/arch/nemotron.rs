@@ -376,6 +376,22 @@ impl NemotronModel {
             n_attn > 0,
             "no attention blocks: attention.head_count_kv is zero at every trunk index"
         );
+        // The expert streaming region ahead of the weights — see
+        // `super::reserve_expert_region`; only with the device form opted
+        // in (see `routed_branch` below), since the region is card memory
+        // the KV pool would otherwise have.
+        if super::gpu_experts() {
+            super::reserve_expert_region(
+                backend.as_ref(),
+                layers.iter().flat_map(|layer| match layer {
+                    Layer::Moe(moe) => vec![
+                        moe.up_exps.stack_matrix().raw_bytes().len() as u64,
+                        moe.down_exps.stack_matrix().raw_bytes().len() as u64,
+                    ],
+                    _ => Vec::new(),
+                }),
+            );
+        }
 
         Ok(Self {
             config,
@@ -468,6 +484,9 @@ impl ModelForward for NemotronModel {
     ) -> Result<Vec<f32>> {
         let n_tokens = tokens.len();
         let n_embd = self.config.n_embd;
+        // A decode step alternates between the card and the host's expert
+        // turns; the card's clock is held up through it.
+        let _clock = super::hold_clock_for_step(self.backend.as_ref(), n_tokens);
 
         let mut x = vec![0f32; n_tokens * n_embd];
         decode_stages::scope(Stage::Embed, || -> Result<()> {
@@ -811,6 +830,13 @@ impl NemotronModel {
         // experts have no gate projection to pair with `up`; everything else
         // about the two paths is the same, including the residency split and
         // the host remainder running beside the device batch.
+        // The grouped device GEMM (`ORANGU_GPU_EXPERTS`), the squared ReLU
+        // fused on the card so the routed feed-forward is one submission
+        // per layer. Not taken at width by default the way gemma's and
+        // qwen's are: these experts are picked six of 128 per token, so a
+        // 512-token chunk touches nearly every expert and 650–830 MiB of
+        // stack crosses the bus per layer — measured level with the host
+        // GEMM, which keeps the card's memory for the KV pool instead.
         let routed_branch = || {
             if super::gpu_experts() && self.backend.as_wgpu().is_some() {
                 super::evaluate_routed_experts_batched_gateless(
@@ -820,6 +846,7 @@ impl NemotronModel {
                     n_embd,
                     &layer.up_exps,
                     &layer.down_exps,
+                    Some(super::FusedActivation::ReluSquared),
                     |up| {
                         let mut up = up.to_vec();
                         relu_squared(&mut up);

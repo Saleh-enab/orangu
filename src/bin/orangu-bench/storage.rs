@@ -44,6 +44,11 @@
 //! the length must all be multiples of the device's logical block size.
 //! [`AlignedBuffer`] owns that discipline in one place.
 //!
+//! macOS has no `O_DIRECT`; `fcntl(F_NOCACHE)` is its way of saying the same
+//! thing (reads bypass the page cache and do not populate it), with no
+//! alignment rules — the same buffer and loop serve it. Elsewhere the probe
+//! declines rather than measure the cache.
+//!
 //! # Both directions, because this drive degrades under load
 //!
 //! **The single most expensive mistake available here is sweeping sizes in
@@ -64,6 +69,7 @@
 
 use std::io;
 use std::path::Path;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::time::Instant;
 
 /// One request size's result.
@@ -108,12 +114,14 @@ impl Point {
 /// examples do, but it silently gives back a buffer whose *length* is no
 /// longer a multiple of the block size, which is the other half of the same
 /// rule and fails as `EINVAL` at read time.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct AlignedBuffer {
     ptr: *mut u8,
     len: usize,
     layout: std::alloc::Layout,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl AlignedBuffer {
     /// `len` is rounded up to a whole number of `align`-sized blocks.
     fn new(len: usize, align: usize) -> io::Result<Self> {
@@ -132,6 +140,7 @@ impl AlignedBuffer {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
         // Safety: `ptr` came from `alloc` with exactly this layout and is
@@ -143,23 +152,45 @@ impl Drop for AlignedBuffer {
 /// The alignment `O_DIRECT` needs. 4096 covers every logical block size in
 /// practice (512 and 4096 are the only ones that exist), and over-aligning is
 /// always safe where under-aligning is `EINVAL`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const DIRECT_ALIGN: usize = 4096;
 
-/// Read `span` bytes of `path` sequentially in `request`-sized reads with
-/// `O_DIRECT`, returning MB/s.
+/// Opens `path` for reads that bypass the page cache: `O_DIRECT` on Linux,
+/// `F_NOCACHE` on macOS, which has no `O_DIRECT` and asks for the same thing
+/// through `fcntl` after the open.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_uncached(path: &Path) -> io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_DIRECT);
+    }
+    let file = options.open(path)?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // Safety: a plain `fcntl` on a descriptor this function just opened
+        // and still owns.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(file)
+}
+
+/// Read `span` bytes of `path` sequentially in `request`-sized reads that
+/// bypass the page cache, returning MB/s.
 ///
 /// `skip` bytes are read and discarded first — the ramp. Without it the first
 /// request of each point pays the drive's wake-up and the smallest sizes,
 /// which do the most requests, are charged for it most.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn read_at_size(path: &Path, request: usize, span: u64, skip: u64) -> io::Result<f64> {
-    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
 
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(path)?;
+    let file = open_uncached(path)?;
     let fd = file.as_raw_fd();
     let buf = AlignedBuffer::new(request, DIRECT_ALIGN)?;
 
@@ -203,11 +234,12 @@ fn read_at_size(path: &Path, request: usize, span: u64, skip: u64) -> io::Result
     Ok(read as f64 / seconds / 1e6)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn read_at_size(_path: &Path, _request: usize, _span: u64, _skip: u64) -> io::Result<f64> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "the storage probe needs O_DIRECT, which is a Linux interface",
+        "the storage probe needs reads that bypass the page cache (O_DIRECT on Linux, \
+         F_NOCACHE on macOS), which this platform does not offer",
     ))
 }
 
@@ -361,7 +393,7 @@ mod tests {
     /// Every size must appear once, and the descending pass must line up with
     /// the size it measured — an off-by-one in the reversed loop would pair
     /// each size with a neighbour's rate and produce a plausible, wrong curve.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn the_descending_pass_is_matched_to_the_right_size() {
         use std::io::Write;

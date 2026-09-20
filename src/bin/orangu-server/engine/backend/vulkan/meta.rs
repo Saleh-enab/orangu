@@ -81,7 +81,9 @@ pub(super) struct AttnMeta {
     /// contiguous path, where `kv_slot` is the identity and reads neither.
     pub(super) kv_page_base: u32,
     pub(super) kv_page_tokens: u32,
-    pub(super) _pad0: u32,
+    /// The rows of a ring mirror — `vulkan_shaders::KvPaging::Ring`; unread
+    /// by the other two forms.
+    pub(super) kv_ring_rows: u32,
     pub(super) _pad1: u32,
     pub(super) _pad2: u32,
 }
@@ -112,7 +114,9 @@ pub(super) struct AttnSplitMeta {
     /// `vulkan_shaders::KvPaging`.
     pub(super) kv_page_base: u32,
     pub(super) kv_page_tokens: u32,
-    pub(super) _pad0: u32,
+    /// The rows of a ring mirror — `vulkan_shaders::KvPaging::Ring`; unread
+    /// by the other two forms.
+    pub(super) kv_ring_rows: u32,
     pub(super) _pad1: u32,
     pub(super) _pad2: u32,
 }

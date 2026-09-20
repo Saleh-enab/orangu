@@ -10871,6 +10871,37 @@ pub fn shader_source_silu_mul() -> String {
     format!("{ELEM_META}\n{SILU_MUL_SHADER_BODY}")
 }
 
+/// Squared ReLU — `y[i] = max(x[i], 0)²`, the gate-less expert activation
+/// (`nemotron_h_moe`'s `down(relu(up(x))²)`). Grid-stride like the paired
+/// activations, so one dispatch covers a routed batch of any width.
+/// `elem3` bindings: the up projection, the product, the meta.
+const RELU_SQUARED_SHADER_BODY: &str = r#"
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read_write> y: array<f32>;
+@group(0) @binding(2) var<uniform> em: ElemMeta;
+
+@compute @workgroup_size(64)
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {
+    var i: u32 = gid.x;
+    let stride = nwg.x * 64u;
+    loop {
+        if (i >= em.len) {
+            break;
+        }
+        let v = max(x[i], 0.0);
+        y[i] = v * v;
+        i = i + stride;
+    }
+}
+"#;
+
+pub fn shader_source_relu_squared() -> String {
+    format!("{ELEM_META}\n{RELU_SQUARED_SHADER_BODY}")
+}
+
 /// Attention's output gated **in place** by the sigmoid of its own
 /// projection — `x[i] *= sigmoid(gate[i])`, the gate `muse-glimmer` (and
 /// the Qwen 3.5 family's full-attention layers) applies before `wo`.
@@ -11742,6 +11773,17 @@ pub fn shader_source_rmsnorm_add_scale_wide() -> String {
 /// second stage. Bindings: `x`, `w1`, `residual`, `w2` read-only, `y1`,
 /// `y2` read-write, `em` (`extra` is `eps`, the same for both norms).
 pub fn shader_source_rmsnorm_add_norm_wide() -> String {
+    shader_source_add_norm_wide(true)
+}
+
+/// [`shader_source_rmsnorm_add_norm_wide`] with or without the post-norm:
+/// without it, stage one is the residual add alone (`y1 = x + residual`,
+/// the llama family's shape) and `w1` is bound but never read, so the
+/// same bind group layout serves both. What this buys the family that
+/// has no post-norm is the pair's second half — the FFN norm and its
+/// 8-bit epilogue in the same dispatch as the add, one dispatch a layer
+/// fewer where the layer is sixteen.
+pub fn shader_source_add_norm_wide(post_norm: bool) -> String {
     let wg = NORM_WIDE_WG;
     let slots = NORM_WIDE_SLOTS;
     let stripes = 16;
@@ -11797,19 +11839,30 @@ pub fn shader_source_rmsnorm_add_norm_wide() -> String {
         "    var k: u32 = local + {}u;\n    loop {{\n        if (k >= n4) {{ break; }}\n        let v = x[k];\n        partial = partial + dot(v, v);\n        k = k + {wg}u;\n    }}\n",
         slots * wg
     ));
-    src.push_str(
-        "    let scale1 = 1.0 / sqrt(reduce_all(local, partial) / f32(em.len) + em.extra);\n",
-    );
+    // Without the post-norm the first reduce is skipped and the branch
+    // is added as it is: `scale1 * w1` becomes 1.
+    let (scale_w1_slot, scale_w1_loop): (Box<dyn Fn(usize) -> String>, &str) = if post_norm {
+        src.push_str(
+            "    let scale1 = 1.0 / sqrt(reduce_all(local, partial) / f32(em.len) + em.extra);\n",
+        );
+        (
+            Box::new(|i| format!("v{i} * scale1 * w1[k{i}]")),
+            "x[k] * scale1 * w1[k]",
+        )
+    } else {
+        (Box::new(|i| format!("v{i}")), "x[k]")
+    };
     // Stage two: `y1` in the same registers, stored, and squared for the
     // second reduce.
     src.push_str("    partial = 0.0;\n");
     for i in 0..slots {
         src.push_str(&format!(
-            "    if (k{i} < n4) {{ v{i} = v{i} * scale1 * w1[k{i}] + residual[k{i}]; y1[k{i}] = v{i}; partial = partial + dot(v{i}, v{i}); }}\n"
+            "    if (k{i} < n4) {{ v{i} = {} + residual[k{i}]; y1[k{i}] = v{i}; partial = partial + dot(v{i}, v{i}); }}\n",
+            scale_w1_slot(i)
         ));
     }
     src.push_str(&format!(
-        "    k = local + {}u;\n    loop {{\n        if (k >= n4) {{ break; }}\n        let v = x[k] * scale1 * w1[k] + residual[k];\n        y1[k] = v;\n        partial = partial + dot(v, v);\n        k = k + {wg}u;\n    }}\n",
+        "    k = local + {}u;\n    loop {{\n        if (k >= n4) {{ break; }}\n        let v = {scale_w1_loop} + residual[k];\n        y1[k] = v;\n        partial = partial + dot(v, v);\n        k = k + {wg}u;\n    }}\n",
         slots * wg
     ));
     src.push_str(
@@ -11994,7 +12047,7 @@ struct AttnMeta {
     // Read only by the paged form of this kernel; zero otherwise.
     kv_page_base: u32,
     kv_page_tokens: u32,
-    _pad0: u32,
+    kv_ring_rows: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -12365,6 +12418,12 @@ pub enum KvPaging {
     // to what the shader computes.
     #[allow(dead_code)]
     Paged,
+    /// The mirror is a ring of `am.kv_ring_rows` rows, a power of two:
+    /// position `p` is at row `p & (rows - 1)`.
+    /// For a layer whose attention window is bounded
+    /// (`LayerCache::set_mirror_ring`), so the mirror holds the window and
+    /// the run being written rather than the whole context.
+    Ring,
 }
 
 impl KvPaging {
@@ -12381,13 +12440,24 @@ impl KvPaging {
                 .replace("kv_slot(vp)", "vp")
                 .replace("kv_slot(pp)", "pp"),
             KvPaging::Paged => src,
+            // Inline, for the same reason the contiguous form is: an AND
+            // against a uniform is one instruction, a call is not. A mask,
+            // not a modulo — the ring is a power of two for it. The exact
+            // size (window plus chunk) with a `%` per position was tried:
+            // a third less memory on a 1024-token window, and the prefill
+            // kernels, which take the address per position in their inner
+            // loop, lost 12% on a 2238-token prompt.
+            KvPaging::Ring => src
+                .replace("kv_slot(p)", "(p & (am.kv_ring_rows - 1u))")
+                .replace("kv_slot(vp)", "(vp & (am.kv_ring_rows - 1u))")
+                .replace("kv_slot(pp)", "(pp & (am.kv_ring_rows - 1u))"),
         }
     }
 
     /// `%KV_PAGE_BINDING%` — the table, declared only when it is read.
     fn binding(self) -> &'static str {
         match self {
-            KvPaging::Contiguous => "",
+            KvPaging::Contiguous | KvPaging::Ring => "",
             KvPaging::Paged => {
                 "@group(0) @binding(6) var<storage, read> kv_page_table: array<u32>;"
             }
@@ -12408,7 +12478,7 @@ impl KvPaging {
     /// paging existed, which is the only form that cannot regress.
     fn slot_fn(self) -> &'static str {
         match self {
-            KvPaging::Contiguous => "",
+            KvPaging::Contiguous | KvPaging::Ring => "",
             KvPaging::Paged => {
                 "fn kv_slot(p: u32) -> u32 {\n    \
                  let page = kv_page_table[am.kv_page_base + p / am.kv_page_tokens];\n    \
@@ -12643,7 +12713,7 @@ struct AttnSplitMeta {
     // otherwise.
     kv_page_base: u32,
     kv_page_tokens: u32,
-    _pad0: u32,
+    kv_ring_rows: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -12944,7 +13014,7 @@ pub fn shader_source_attention_split_coop(
     // as the page size went 16 -> 64 -> 256, which is the same cost seen from
     // the other side: fewer lookups, less waiting.
     let pos_loop = match paging {
-        KvPaging::Contiguous => format!(
+        KvPaging::Contiguous | KvPaging::Ring => format!(
             "    var pos: u32 = split_start;\n\
              \x20   loop {{\n\
              \x20       if (pos >= split_end) {{\n\
@@ -13000,7 +13070,7 @@ struct AttnSplitMeta {{
     scale: f32,
     kv_page_base: u32,
     kv_page_tokens: u32,
-    _pad0: u32,
+    kv_ring_rows: u32,
     _pad1: u32,
     _pad2: u32,
 }}
@@ -13082,7 +13152,7 @@ struct AttnMeta {
     causal: u32,
     kv_page_base: u32,
     kv_page_tokens: u32,
-    _pad0: u32,
+    kv_ring_rows: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -13318,7 +13388,7 @@ struct AttnMeta {{
     causal: u32,
     kv_page_base: u32,
     kv_page_tokens: u32,
-    _pad0: u32,
+    kv_ring_rows: u32,
     _pad1: u32,
     _pad2: u32,
 }}
@@ -13696,7 +13766,7 @@ struct AttnMeta {{
     causal: u32,
     kv_page_base: u32,
     kv_page_tokens: u32,
-    _pad0: u32,
+    kv_ring_rows: u32,
     _pad1: u32,
     _pad2: u32,
 }}
@@ -13980,7 +14050,7 @@ struct AttnSplitMeta {
     scale: f32,
     kv_page_base: u32,
     kv_page_tokens: u32,
-    _pad0: u32,
+    kv_ring_rows: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -14311,7 +14381,7 @@ struct AttnSplitMeta {{
     scale: f32,
     kv_page_base: u32,
     kv_page_tokens: u32,
-    _pad0: u32,
+    kv_ring_rows: u32,
     _pad1: u32,
     _pad2: u32,
 }}
