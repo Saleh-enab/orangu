@@ -25,7 +25,8 @@
 //! (`Q2_K` through `Q6_K`), and the `IQ*` codebook quants a mixed
 //! "dynamic" release reaches for at the low end (`IQ1_S`, `IQ1_M`,
 //! `IQ1_XS`, `IQ1_XXS`, `IQ1_XXXS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`,
-//! `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`), plus `MXFP4`. Anything else fails with a
+//! `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS`), plus `MXFP4`, and Prism ML's two
+//! ternary formats (`PQ2_0`, `PTQ1_0`). Anything else fails with a
 //! clear "not yet supported" error naming the type, rather than silently
 //! misreading the bytes.
 //!
@@ -110,6 +111,21 @@ pub(crate) const GGML_TYPE_MXFP4: u32 = 39;
 pub(crate) const GGML_TYPE_IQ1_XS: u32 = 64;
 pub(crate) const GGML_TYPE_IQ1_XXS: u32 = 65;
 pub(crate) const GGML_TYPE_IQ1_XXXS: u32 = 66;
+// Prism ML's two ternary formats (`PrismML-Eng/llama.cpp`, `ggml.h` /
+// `ggml-common.h` / `ggml-quants.c`), the types a `Ternary-Bonsai-2` release
+// ships as. Both are ggml codecs already in this file's vocabulary, moved to a
+// **128-element** block with one `f16` scale: `PQ2_0` is `Q2_0`'s 2-bit
+// field (`00 = -1, 01 = 0, 10 = +1, 11 = +2`) at group 128 rather than 64,
+// and `PTQ1_0` is `TQ1_0`'s base-3 trit packing at group 128 rather than
+// 256 — 1.75 bits per weight, and lossless for a checkpoint that is already
+// ternary at group 128, which `TQ1_0`'s 256-wide scale cannot be. They carry
+// private ids because a stock ggml would read a `PQ2_0` tensor as `Q2_0` and
+// decode every block with the wrong scale stride, silently. Nothing about
+// the bytes is exotic; what *is* particular to these releases is that the
+// weights are stored Hadamard-rotated (see `engine::hadamard`), which is a
+// property of the file, not of the type.
+pub(crate) const GGML_TYPE_PQ2_0: u32 = 142;
+pub(crate) const GGML_TYPE_PTQ1_0: u32 = 143;
 
 const QK4_0: usize = 32;
 const QK4_1: usize = 32;
@@ -118,6 +134,17 @@ const QK5_1: usize = 32;
 const QK8_0: usize = 32;
 const QK4_NL: usize = 32;
 const QK_MXFP4: usize = 32;
+/// Elements per `PQ2_0`/`PTQ1_0` block — the one thing that separates them
+/// from ggml's own `Q2_0` (64) and `TQ1_0` (256).
+pub(crate) const QK_PRISM: usize = 128;
+/// `block_pq2_0`: `{ d: f16, qs: [u8; 32] }` — four 2-bit fields per byte.
+pub(crate) const PQ2_0_BLOCK_BYTES: usize = 2 + QK_PRISM / 4;
+/// `block_ptq1_0`: `{ qs: [u8; 24], qh: [u8; 2], d: f16 }` — the scale
+/// comes *last*, as in `TQ1_0`. 24 bytes of five trits each (120 values)
+/// plus 2 bytes of four trits each (8 values).
+pub(crate) const PTQ1_0_BLOCK_BYTES: usize = PTQ1_0_QS + PTQ1_0_QH + 2;
+const PTQ1_0_QS: usize = (QK_PRISM - 4 * QK_PRISM / 64) / 5;
+const PTQ1_0_QH: usize = QK_PRISM / 64;
 const QK_K: usize = 256;
 const K_SCALE_SIZE: usize = 12;
 const KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
@@ -164,6 +191,8 @@ pub(crate) fn block_layout(ggml_type: u32) -> Option<(usize, usize)> {
         | GGML_TYPE_IQ4_NL_4_8 | GGML_TYPE_IQ4_NL_8_8 => Some((2 + QK4_0 / 2, QK4_0)),
         GGML_TYPE_IQ4_NL => Some((2 + QK4_NL / 2, QK4_NL)),
         GGML_TYPE_IQ4_XS => Some((2 + 2 + QK_K / 64 + QK_K / 2, QK_K)),
+        GGML_TYPE_PQ2_0 => Some((PQ2_0_BLOCK_BYTES, QK_PRISM)),
+        GGML_TYPE_PTQ1_0 => Some((PTQ1_0_BLOCK_BYTES, QK_PRISM)),
         _ => None,
     }
 }
@@ -437,6 +466,8 @@ pub fn dequantize_into(
         GGML_TYPE_IQ2_S => dequantize_iq2_s(bytes, element_count, out),
         GGML_TYPE_IQ3_XXS => dequantize_iq3_xxs(bytes, element_count, out),
         GGML_TYPE_IQ3_S => dequantize_iq3_s(bytes, element_count, out),
+        GGML_TYPE_PQ2_0 => dequantize_pq2_0(bytes, element_count, out),
+        GGML_TYPE_PTQ1_0 => dequantize_ptq1_0(bytes, element_count, out),
         // Deliberately not dequantized here. A repacked row's blocks are
         // strided across its 4- or 8-row group, so `bytes` for "one row" is
         // not a thing that exists — the unit is the whole tensor, whose
@@ -646,6 +677,242 @@ fn dequantize_q8_0(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
         out.extend(qs.iter().map(|&q| (q as i8) as f32 * d));
     }
     out.truncate(element_count);
+}
+
+/// The 128 signed values of one `block_pq2_0` payload, as `int8` — the
+/// integer half of the fork's `dequantize_row_pq2_0`: field `j` is bits
+/// `2·(j % 4)` of byte `j / 4`, and `q - 1` maps `00/01/10/11` onto
+/// `-1/0/+1/+2`. Shared with `engine::vecdot`, whose fused kernels want the
+/// integers before the scale.
+#[inline(always)]
+pub(crate) fn unpack_block_pq2_0(qs: &[u8], w: &mut [i8; QK_PRISM]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Safety: NEON is architecturally mandatory on aarch64.
+        return unsafe { unpack_block_pq2_0_neon(qs, w) };
+    }
+    #[allow(unreachable_code)]
+    unpack_block_pq2_0_scalar(qs, w)
+}
+
+/// The reference form of [`unpack_block_pq2_0`], and the fallback off
+/// aarch64.
+#[inline(always)]
+pub(crate) fn unpack_block_pq2_0_scalar(qs: &[u8], w: &mut [i8; QK_PRISM]) {
+    for (j, &byte) in qs.iter().take(QK_PRISM / 4).enumerate() {
+        w[4 * j] = (byte & 0x03) as i8 - 1;
+        w[4 * j + 1] = ((byte >> 2) & 0x03) as i8 - 1;
+        w[4 * j + 2] = ((byte >> 4) & 0x03) as i8 - 1;
+        w[4 * j + 3] = (byte >> 6) as i8 - 1;
+    }
+}
+
+/// Sixteen bytes at a time: the four 2-bit fields of every byte as four
+/// vectors, then two rounds of `zip` to put a byte's fields back next to
+/// each other in element order. Twelve instructions per 64 weights.
+///
+/// This is not a micro-optimization: the 27B model is 27 billion of these
+/// per token, and the scalar form above decoded them at 0.2 tok/s with
+/// 87% of the profile in the unpack — the kernel was not multiplying, it
+/// was shifting bytes one at a time.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn unpack_block_pq2_0_neon(qs: &[u8], w: &mut [i8; QK_PRISM]) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mask = vdupq_n_u8(0x03);
+        let one = vdupq_n_s8(1);
+        for half in 0..2 {
+            let packed = vld1q_u8(qs.as_ptr().add(16 * half));
+            let f0 = vandq_u8(packed, mask);
+            let f1 = vandq_u8(vshrq_n_u8::<2>(packed), mask);
+            let f2 = vandq_u8(vshrq_n_u8::<4>(packed), mask);
+            let f3 = vshrq_n_u8::<6>(packed);
+            // (b0f0 b0f1 b1f0 b1f1 …) and (b0f2 b0f3 b1f2 b1f3 …) …
+            let lo01 = vzip1q_u8(f0, f1);
+            let hi01 = vzip2q_u8(f0, f1);
+            let lo23 = vzip1q_u8(f2, f3);
+            let hi23 = vzip2q_u8(f2, f3);
+            // … zipped as 16-bit pairs: (b0f0 b0f1 b0f2 b0f3 b1f0 …).
+            let out = [
+                vzip1q_u16(vreinterpretq_u16_u8(lo01), vreinterpretq_u16_u8(lo23)),
+                vzip2q_u16(vreinterpretq_u16_u8(lo01), vreinterpretq_u16_u8(lo23)),
+                vzip1q_u16(vreinterpretq_u16_u8(hi01), vreinterpretq_u16_u8(hi23)),
+                vzip2q_u16(vreinterpretq_u16_u8(hi01), vreinterpretq_u16_u8(hi23)),
+            ];
+            for (k, v) in out.iter().enumerate() {
+                let signed = vsubq_s8(vreinterpretq_s8_u16(*v), one);
+                vst1q_s8(w.as_mut_ptr().add(64 * half + 16 * k), signed);
+            }
+        }
+    }
+}
+
+/// `block_pq2_0`: `{ d: f16, qs: [u8; 32] }`, 128 elements — mirrors the
+/// fork's `dequantize_row_pq2_0` exactly.
+fn dequantize_pq2_0(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
+    out.clear();
+    out.reserve(element_count);
+    let mut w = [0i8; QK_PRISM];
+    for block in bytes.as_chunks::<PQ2_0_BLOCK_BYTES>().0 {
+        let d = read_f16(block, 0);
+        unpack_block_pq2_0(&block[2..], &mut w);
+        out.extend(w.iter().map(|&q| q as f32 * d));
+    }
+    out.truncate(element_count);
+}
+
+/// Trit `n` (most significant first) of a base-3 packed byte, as `0..=2` —
+/// `TQ1_0`'s trick, unchanged in `PTQ1_0`: a byte holds `ceil(v · 256 /
+/// 243)` for a five-trit value `v`, so multiplying by `3^n` (wrapping, in a
+/// byte) pushes trit `n` to the top, and `(q · 3) >> 8` reads it off.
+#[inline(always)]
+fn ptq1_0_trit(q: u8, n: usize) -> i8 {
+    const POW3: [u8; 5] = [1, 3, 9, 27, 81];
+    let shifted = q.wrapping_mul(POW3[n]);
+    ((shifted as u16 * 3) >> 8) as i8
+}
+
+/// The 128 ternary values of one `block_ptq1_0` payload, as `int8` in
+/// `-1..=1` — the integer half of the fork's `dequantize_row_ptq1_0`.
+///
+/// The element order is the one thing to get right, and it is not
+/// "byte-major". `TQ1_0`'s packing walks `qs` in *stages* — a run of `c`
+/// bytes yields `5·c` values, ordered trit-major: all `c` bytes' trit 0,
+/// then all their trit 1, and so on — and the fork generalises the stage
+/// widths to `32/16/8` so a 24-byte `qs` is covered (`32` never fits;
+/// bytes `0..16` come out as one 80-value run, bytes `16..24` as a 40-value
+/// one). `qh`'s two bytes then yield four trits each, again trit-major.
+/// A byte-major reading would produce values from the right bytes in the
+/// wrong positions — a permutation, invisible to any test that only checks
+/// the value histogram, and fatal to the model.
+#[inline(always)]
+pub(crate) fn unpack_block_ptq1_0(qs: &[u8], qh: &[u8], w: &mut [i8; QK_PRISM]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Safety: NEON is architecturally mandatory on aarch64.
+        return unsafe { unpack_block_ptq1_0_neon(qs, qh, w) };
+    }
+    #[allow(unreachable_code)]
+    unpack_block_ptq1_0_scalar(qs, qh, w)
+}
+
+/// The reference form of [`unpack_block_ptq1_0`] — the fork's traversal,
+/// stage by stage — and the fallback off aarch64.
+#[inline(always)]
+pub(crate) fn unpack_block_ptq1_0_scalar(qs: &[u8], qh: &[u8], w: &mut [i8; QK_PRISM]) {
+    const STAGES: [usize; 3] = [32, 16, 8];
+    let mut i = 0usize;
+    let mut j = 0usize;
+    for c in STAGES {
+        while j + c <= PTQ1_0_QS {
+            for n in 0..5 {
+                for m in 0..c {
+                    w[i] = ptq1_0_trit(qs[j + m], n) - 1;
+                    i += 1;
+                }
+            }
+            j += c;
+        }
+    }
+    for n in 0..4 {
+        for &byte in qh.iter().take(PTQ1_0_QH) {
+            w[i] = ptq1_0_trit(byte, n) - 1;
+            i += 1;
+        }
+    }
+    debug_assert_eq!(i, QK_PRISM);
+}
+
+/// The stage order written out for a 24-byte `qs`: one 16-byte run whose
+/// five trits are elements `0..80` (trit `n` of byte `m` at `16n + m`),
+/// one 8-byte run at `80..120`, and `qh` at `120..128` — so a trit plane
+/// of a run is one vector, and the whole block is nine vector multiplies.
+///
+/// `(3q) >> 8` is `(q + (q >> 1)) >> 7`, taken as `vhaddq` (a halving add
+/// that cannot overflow) followed by `>> 6` — ggml's own `TQ1_0` kernel's
+/// pair — and the identity is exact for every byte, not
+/// approximate: `q + floor(q/2)` differs from `3q/2` by at most one half,
+/// and `3q/2` is never a half-integer *and* a multiple of 128 at once. The
+/// test below enumerates all 256 inputs against the scalar form anyway.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn unpack_block_ptq1_0_neon(qs: &[u8], qh: &[u8], w: &mut [i8; QK_PRISM]) {
+    use std::arch::aarch64::*;
+    const POW3: [u8; 5] = [1, 3, 9, 27, 81];
+    unsafe {
+        let one = vdupq_n_s8(1);
+        let run16 = vld1q_u8(qs.as_ptr());
+        for (n, &p) in POW3.iter().enumerate() {
+            let v = vmulq_u8(run16, vdupq_n_u8(p));
+            let trit = vshrq_n_u8::<6>(vhaddq_u8(v, vshrq_n_u8::<1>(v)));
+            vst1q_s8(
+                w.as_mut_ptr().add(16 * n),
+                vsubq_s8(vreinterpretq_s8_u8(trit), one),
+            );
+        }
+        let one8 = vdup_n_s8(1);
+        let run8 = vld1_u8(qs.as_ptr().add(16));
+        for (n, &p) in POW3.iter().enumerate() {
+            let v = vmul_u8(run8, vdup_n_u8(p));
+            let trit = vshr_n_u8::<6>(vhadd_u8(v, vshr_n_u8::<1>(v)));
+            vst1_s8(
+                w.as_mut_ptr().add(80 + 8 * n),
+                vsub_s8(vreinterpret_s8_u8(trit), one8),
+            );
+        }
+    }
+    // Eight values from two bytes: not worth a vector.
+    for n in 0..4 {
+        for (h, &byte) in qh.iter().take(PTQ1_0_QH).enumerate() {
+            w[120 + 2 * n + h] = ptq1_0_trit(byte, n) - 1;
+        }
+    }
+}
+
+/// `block_ptq1_0`: `{ qs: [u8; 24], qh: [u8; 2], d: f16 }`, 128 elements —
+/// mirrors the fork's `dequantize_row_ptq1_0` exactly, scale last.
+fn dequantize_ptq1_0(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
+    out.clear();
+    out.reserve(element_count);
+    let mut w = [0i8; QK_PRISM];
+    for block in bytes.as_chunks::<PTQ1_0_BLOCK_BYTES>().0 {
+        let d = read_f16(block, PTQ1_0_QS + PTQ1_0_QH);
+        unpack_block_ptq1_0(
+            &block[..PTQ1_0_QS],
+            &block[PTQ1_0_QS..PTQ1_0_QS + PTQ1_0_QH],
+            &mut w,
+        );
+        out.extend(w.iter().map(|&q| q as f32 * d));
+    }
+    out.truncate(element_count);
+}
+
+/// `PTQ1_0` blocks rewritten as `PQ2_0` blocks: the same 128 trits and
+/// the same `f16` scale, two bits an element instead of base-3 packing —
+/// lossless, 34 bytes a block for 28. For a device whose `PTQ1_0` kernel
+/// is bound by the trit unpacking (the `q·3 mod 256` remainder chain)
+/// where its `PQ2_0` kernel is a shift and a mask — see
+/// `LoadedModel::matrix`. Whole blocks in, whole blocks out; rows of
+/// `QK_PRISM`-multiple width stay row-aligned.
+pub(crate) fn repack_ptq1_0_to_pq2_0(bytes: &[u8]) -> Vec<u8> {
+    let (blocks, rest) = bytes.as_chunks::<PTQ1_0_BLOCK_BYTES>();
+    debug_assert!(rest.is_empty(), "a whole number of PTQ1_0 blocks");
+    let mut out = Vec::with_capacity(blocks.len() * PQ2_0_BLOCK_BYTES);
+    let mut w = [0i8; QK_PRISM];
+    for block in blocks {
+        unpack_block_ptq1_0(
+            &block[..PTQ1_0_QS],
+            &block[PTQ1_0_QS..PTQ1_0_QS + PTQ1_0_QH],
+            &mut w,
+        );
+        out.extend_from_slice(&block[PTQ1_0_QS + PTQ1_0_QH..]);
+        out.extend(w.as_chunks::<4>().0.iter().map(|q| {
+            let f = |v: i8| (v + 1) as u8;
+            f(q[0]) | (f(q[1]) << 2) | (f(q[2]) << 4) | (f(q[3]) << 6)
+        }));
+    }
+    out
 }
 
 /// ggml's `get_scale_min_k4`: unpacks the 6-bit scale and 6-bit min for
@@ -1825,6 +2092,190 @@ mod tests {
         let out = dequantize(GGML_TYPE_Q8_0, &block, 32).unwrap();
         assert_eq!(out[0], 2.0);
         assert_eq!(out[1], -2.0);
+    }
+
+    /// The fork's `quantize_row_pq2_0_ref`, ported for the round trip below.
+    /// `x.len()` is one block.
+    pub(crate) fn quantize_pq2_0_ref(x: &[f32]) -> Vec<u8> {
+        assert_eq!(x.len(), QK_PRISM);
+        let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let id = if amax > 0.0 { 1.0 / amax } else { 0.0 };
+        let mut block = f16::from_f32(amax).to_le_bytes().to_vec();
+        let mut qs = [0u8; QK_PRISM / 4];
+        for (j, &w) in x.iter().enumerate() {
+            let q = ((w * id).round() as i32 + 1).clamp(0, 3) as u8;
+            qs[j / 4] |= q << ((j % 4) * 2);
+        }
+        block.extend_from_slice(&qs);
+        block
+    }
+
+    /// The fork's `quantize_row_ptq1_0_ref`, ported for the round trip
+    /// below — including its `32/16/8` staging and the ceiling division
+    /// that lets the decoder recover trits by multiplying.
+    pub(crate) fn quantize_ptq1_0_ref(x: &[f32]) -> Vec<u8> {
+        assert_eq!(x.len(), QK_PRISM);
+        let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let id = if amax > 0.0 { 1.0 / amax } else { 0.0 };
+        let mut qs = [0u8; PTQ1_0_QS];
+        let mut qh = [0u8; PTQ1_0_QH];
+        let mut x = x;
+        let mut j = 0usize;
+        for c in [32usize, 16, 8] {
+            while j + c <= PTQ1_0_QS {
+                for m in 0..c {
+                    let mut q = 0u8;
+                    for n in 0..5 {
+                        let xi = ((x[m + n * c] * id).round() as i32 + 1) as u8;
+                        q = q.wrapping_mul(3).wrapping_add(xi);
+                    }
+                    qs[j + m] = (q as u16 * 256).div_ceil(243) as u8;
+                }
+                x = &x[5 * c..];
+                j += c;
+            }
+        }
+        for (h, slot) in qh.iter_mut().enumerate() {
+            let mut q = 0u8;
+            for m in 0..4 {
+                let xi = ((x[h + m * PTQ1_0_QH] * id).round() as i32 + 1) as u8;
+                q = q.wrapping_mul(3).wrapping_add(xi);
+            }
+            q = q.wrapping_mul(3);
+            *slot = (q as u16 * 256).div_ceil(243) as u8;
+        }
+        let mut block = qs.to_vec();
+        block.extend_from_slice(&qh);
+        block.extend_from_slice(&f16::from_f32(amax).to_le_bytes());
+        block
+    }
+
+    /// A ternary pattern that is *not* symmetric under any byte or trit
+    /// permutation, so a decoder that read the right values in the wrong
+    /// order could not pass. `0.5` rather than `1.0` so the scale (`amax`)
+    /// is visibly applied rather than a no-op — and exact in `f16`, so the round
+    /// trip can be asserted as equality.
+    fn ternary_pattern() -> Vec<f32> {
+        (0..QK_PRISM)
+            .map(|i| match (i * 7 + i / 5) % 3 {
+                0 => -0.5,
+                1 => 0.0,
+                _ => 0.5,
+            })
+            .collect()
+    }
+
+    /// The repack keeps every trit and every scale: three `PTQ1_0` blocks
+    /// of a ternary pattern, dequantized, read the same as their `PQ2_0`
+    /// form.
+    #[test]
+    fn repacking_ptq1_0_to_pq2_0_is_lossless() {
+        let mut x = ternary_pattern();
+        let mut bytes = quantize_ptq1_0_ref(&x);
+        x.iter_mut().for_each(|v| *v = -*v);
+        bytes.extend(quantize_ptq1_0_ref(&x));
+        x.rotate_left(7);
+        bytes.extend(quantize_ptq1_0_ref(&x));
+        let repacked = repack_ptq1_0_to_pq2_0(&bytes);
+        assert_eq!(repacked.len(), 3 * PQ2_0_BLOCK_BYTES);
+        assert_eq!(
+            dequantize(GGML_TYPE_PQ2_0, &repacked, 3 * QK_PRISM).unwrap(),
+            dequantize(GGML_TYPE_PTQ1_0, &bytes, 3 * QK_PRISM).unwrap()
+        );
+    }
+
+    /// `PQ2_0` is the `Q2_0` field at group 128: the block is `d` plus 32
+    /// payload bytes, field `j` sits at bits `2·(j%4)` of byte `j/4`, and a
+    /// value of `3` decodes to `+2` — the one level a ternary checkpoint
+    /// never uses but the codec still has.
+    #[test]
+    fn dequantize_pq2_0_reads_two_bit_fields_at_group_128() {
+        assert_eq!(block_layout(GGML_TYPE_PQ2_0), Some((34, 128)));
+        let mut block = f16::from_f32(1.0).to_le_bytes().to_vec();
+        block.extend_from_slice(&[0u8; 32]);
+        block[2] = 0b11_10_01_00; // elements 0..4 = -1, 0, +1, +2
+        let out = dequantize(GGML_TYPE_PQ2_0, &block, 128).unwrap();
+        assert_eq!(out[..4], [-1.0, 0.0, 1.0, 2.0]);
+        assert!(out[4..].iter().all(|&v| v == -1.0), "{out:?}");
+
+        let x = ternary_pattern();
+        let block = quantize_pq2_0_ref(&x);
+        assert_eq!(block.len(), PQ2_0_BLOCK_BYTES);
+        let out = dequantize(GGML_TYPE_PQ2_0, &block, 128).unwrap();
+        assert_eq!(out, x);
+    }
+
+    /// `PTQ1_0` is `TQ1_0`'s trit packing at group 128, scale last. The
+    /// round trip through the ported reference encoder is the real check on
+    /// the stage order; the hand-built block pins the two things that order
+    /// depends on — that a byte's *first* trit is its most significant, and
+    /// that the first 80 values come from bytes `0..16` trit-major.
+    #[test]
+    fn dequantize_ptq1_0_reads_trits_stage_major_with_the_scale_last() {
+        assert_eq!(block_layout(GGML_TYPE_PTQ1_0), Some((28, 128)));
+        let mut block = vec![0u8; PTQ1_0_BLOCK_BYTES];
+        // All-zero payload is trit 0 everywhere, i.e. every value -1.
+        block[26..28].copy_from_slice(&f16::from_f32(2.0).to_le_bytes());
+        let out = dequantize(GGML_TYPE_PTQ1_0, &block, 128).unwrap();
+        assert!(out.iter().all(|&v| v == -2.0), "{out:?}");
+
+        // Byte 0 = trits (2, 1, 0, 0, 0): value 2·81 + 1·27 = 189, stored as
+        // ceil(189·256/243) = 200. Its five trits land at elements 0, 16,
+        // 32, 48, 64 — the trit-major stride of the 16-byte first stage.
+        block[0] = 200;
+        let out = dequantize(GGML_TYPE_PTQ1_0, &block, 128).unwrap();
+        assert_eq!(out[0], 2.0, "trit 0 (most significant) of byte 0");
+        assert_eq!(out[16], 0.0, "trit 1 of byte 0");
+        assert_eq!(out[32], -2.0);
+        assert_eq!(out[1], -2.0, "element 1 is byte 1's trit 0");
+        // Byte 16 opens the 8-byte stage at element 80; `qh[0]` opens the
+        // tail at element 120.
+        block[16] = 200;
+        block[24] = 200;
+        let out = dequantize(GGML_TYPE_PTQ1_0, &block, 128).unwrap();
+        assert_eq!(out[80], 2.0);
+        assert_eq!(out[88], 0.0);
+        assert_eq!(out[120], 2.0);
+        assert_eq!(out[122], 0.0);
+
+        let x = ternary_pattern();
+        let block = quantize_ptq1_0_ref(&x);
+        assert_eq!(block.len(), PTQ1_0_BLOCK_BYTES);
+        let out = dequantize(GGML_TYPE_PTQ1_0, &block, 128).unwrap();
+        assert_eq!(out, x);
+    }
+
+    /// The vector unpacks must agree with the scalar reference for **every**
+    /// byte value in every position — the trit extraction in particular is
+    /// a shift identity that has to hold for all 256 inputs, including the
+    /// 243..=255 an encoder never writes.
+    #[test]
+    fn prism_block_unpacks_are_exact_for_every_byte_value() {
+        for base in 0..=255u8 {
+            let bytes: Vec<u8> = (0..32u8)
+                .map(|j| base.wrapping_add(j.wrapping_mul(29)))
+                .collect();
+            let mut want = [0i8; QK_PRISM];
+            let mut got = [0i8; QK_PRISM];
+            unpack_block_pq2_0_scalar(&bytes, &mut want);
+            unpack_block_pq2_0(&bytes, &mut got);
+            assert_eq!(got, want, "pq2_0 base {base}");
+
+            let qs = &bytes[..PTQ1_0_QS];
+            let qh = &bytes[PTQ1_0_QS..PTQ1_0_QS + PTQ1_0_QH];
+            unpack_block_ptq1_0_scalar(qs, qh, &mut want);
+            unpack_block_ptq1_0(qs, qh, &mut got);
+            assert_eq!(got, want, "ptq1_0 base {base}");
+        }
+        // Every byte the same value, so each position sees each value.
+        for v in 0..=255u8 {
+            let bytes = [v; 32];
+            let mut want = [0i8; QK_PRISM];
+            let mut got = [0i8; QK_PRISM];
+            unpack_block_ptq1_0_scalar(&bytes[..24], &bytes[24..26], &mut want);
+            unpack_block_ptq1_0(&bytes[..24], &bytes[24..26], &mut got);
+            assert_eq!(got, want, "ptq1_0 uniform {v}");
+        }
     }
 
     #[test]

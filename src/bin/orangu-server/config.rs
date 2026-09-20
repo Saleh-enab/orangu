@@ -18,6 +18,7 @@
 
 use crate::engine::backend::DeviceRequest;
 use crate::engine::placement::SplitMode;
+use crate::engine::prefill_backend::PrefillBackend;
 use anyhow::{Context, Result, anyhow, bail};
 use orangu::config::parse_ini_sections;
 use orangu::logging::LogTarget;
@@ -179,6 +180,7 @@ pub fn bundled_configuration(
         // nothing for the NPU precompile step to find; leaving it on costs a
         // probe that fails immediately.
         npu_precompile: default_npu_precompile(),
+        prefill_backend: PrefillBackend::Device,
         npu_cache_gb: default_npu_cache_gb(),
         mlp_unroll: None,
         // The console follows the API's address, baked-in or default —
@@ -659,6 +661,17 @@ pub struct ServerConfiguration {
     /// To keep the device but stop it growing the cache, set
     /// [`Config::npu_cache_gb`] to 0 instead.
     pub npu_precompile: bool,
+    /// `[orangu-server].prefill_backend` — `device` (the default: prompts
+    /// run where decode runs), `cpu` (a multi-token pass runs on the CPU
+    /// backend while single-token decode stays on the selected device) or
+    /// `auto` (one prompt-shaped GEMM timed on each backend at load, the
+    /// faster takes the prompts). For a board whose device does a prompt's
+    /// GEMMs slower than its cores do (the CIX P1's Mali: 1.6 against 9.8
+    /// tok/s on the 27B ternary model) and whose memory the two share.
+    /// Honoured by the Qwen 3.5-family trunk (`qwen35`, `qwen35moe`,
+    /// `qwen3next`, `qwen4exp`); `ORANGU_HYBRID_PREFILL_CPU=1` is `cpu`
+    /// from the environment.
+    pub prefill_backend: PrefillBackend,
     /// `[orangu-server].npu_cache_gb` — how much compiled-block cache the
     /// NPU precompile may spend on one model.
     ///
@@ -1184,6 +1197,19 @@ pub fn load_server_configuration(
         Some(value) => parse_bool(SERVER_SECTION, "npu_precompile", value)?,
         None => default_npu_precompile(),
     };
+    let prefill_backend = match section.get("prefill_backend") {
+        Some(value) => match value.trim().to_lowercase().as_str() {
+            "device" => PrefillBackend::Device,
+            "cpu" => PrefillBackend::Cpu,
+            "auto" => PrefillBackend::Auto,
+            other => {
+                return Err(anyhow!(
+                    "invalid value for [{SERVER_SECTION}].prefill_backend: {other:?} (expected device, cpu or auto)"
+                ));
+            }
+        },
+        None => PrefillBackend::Device,
+    };
 
     let backend = match section.get("backend") {
         Some(value) => match value.trim().to_lowercase().as_str() {
@@ -1273,6 +1299,7 @@ pub fn load_server_configuration(
         mlp_unroll,
         npu_cache_gb,
         npu_precompile,
+        prefill_backend,
         kv_cache,
         read_size,
         queue_limit,
@@ -1904,6 +1931,39 @@ mod tests {
     /// against a real prompt rather than a sixteen-token one, and back on
     /// once the calibration and the per-channel smoothing made a real
     /// prompt come back with a real answer — see [`default_npu_precompile`].
+    /// `prefill_backend` is `device` unless the file says `cpu` or `auto`;
+    /// anything else stops the server at the file.
+    #[test]
+    fn prefill_backend_is_device_unless_cpu_is_asked_for() {
+        use crate::engine::prefill_backend::PrefillBackend;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "[orangu-server]\nmodels = /srv/models\n").unwrap();
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.prefill_backend, PrefillBackend::Device);
+        for (value, expected) in [
+            ("cpu", PrefillBackend::Cpu),
+            ("device", PrefillBackend::Device),
+            ("CPU", PrefillBackend::Cpu),
+            ("auto", PrefillBackend::Auto),
+        ] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(
+                file,
+                "[orangu-server]\nmodels = /srv/models\nprefill_backend = {value}\n"
+            )
+            .unwrap();
+            let conf = load_server_configuration(file.path(), None, false).unwrap();
+            assert_eq!(conf.prefill_backend, expected, "prefill_backend = {value}");
+        }
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\nprefill_backend = gpu\n"
+        )
+        .unwrap();
+        assert!(load_server_configuration(file.path(), None, false).is_err());
+    }
+
     #[test]
     fn npu_precompile_defaults_on_and_can_be_turned_off() {
         let mut file = tempfile::NamedTempFile::new().unwrap();

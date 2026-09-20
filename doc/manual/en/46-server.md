@@ -1624,6 +1624,18 @@ reexec = yes
   proportions like `3,1`. A split buys capacity at a real cost in speed —
   see **Splitting a model across devices** below. `--device-split` and
   `ORANGU_DEVICE_SPLIT` override it for one run.
+- `prefill_backend` — `device` (the default: a prompt runs where decode
+  runs), `cpu` (multi-token passes run on the CPU backend while
+  single-token decode stays on the selected device) or `auto` (one
+  64-token GEMM at the model's FFN gate shape is timed on each backend
+  when the model loads, the faster one takes the prompts, and the log
+  says which and by how much). For a board whose device does a prompt's
+  GEMMs slower than its cores do and whose memory the two share — on the
+  CIX P1's Mali the 27B ternary model prefills at 1.6 tok/s on the
+  device and 10 on its eight big cores (the probe: 79 ms against 18),
+  with decode unchanged at 3 tok/s on the device. Honoured by the Qwen
+  3.5-family trunk (`qwen35`, `qwen35moe`, `qwen3next`, `qwen4exp`);
+  `ORANGU_HYBRID_PREFILL_CPU=1` is `cpu` from the environment.
 - `threads` — how many worker threads every CPU path shares: the CPU
   matmul, the MoE expert loop, and the per-expert fan-out. Unset (the
   default) means one per logical core. `--threads` and `ORANGU_THREADS`
@@ -3415,7 +3427,8 @@ top-k experts per MoE layer — plus the bidirectional-attention,
 embeddings-only `gemma-embedding`), Qwen3.5/3.6-MoE (`qwen35moe`, e.g.
 `unsloth/Qwen3.6-35B-A3B-GGUF`), Qwen3.5-family dense (`qwen35`, e.g.
 `unsloth/Qwen3.8-27B-GGUF` — the same hybrid full-attention/gated-DeltaNet
-layer shape as `qwen35moe`, plain SwiGLU FFN instead of MoE routing),
+layer shape as `qwen35moe`, plain SwiGLU FFN instead of MoE routing — and
+Prism's Hadamard-folded ternary `Ternary-Bonsai-2-27B`, see below),
 Qwen3-Next (`qwen3next`), the Qwen4 preview (`qwen4exp`, e.g.
 `unsloth/Qwen3.8-Flash-Next-GGUF` — the same hybrid
 full-attention/gated-DeltaNet sub-layers and routed-plus-shared-expert MoE
@@ -3474,7 +3487,7 @@ the experts form `expert_group_count` groups and only the best
 a dual-stream diffusion transformer that denoises a latent picture under a
 prompt's hidden states, served with a `qwen2vl` text encoder and the
 Qwen-Image VAE beside it; see **Image generation**) — using
-`F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`MXFP4`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
+`F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`MXFP4`/`PQ2_0`/`PTQ1_0`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
 `IQ1_S`/`IQ1_M`/`IQ1_XS`/`IQ1_XXS`/`IQ1_XXXS`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_NL`/`IQ4_XS` tensors. Weight matrices and embedding tables are read lazily from the
 memory-mapped file (dequantized one row at a time, on demand) rather than
 eagerly resident, so even large models fit in modest RAM. A model split
@@ -3561,6 +3574,76 @@ multi-section RoPE these files declare (`rope.dimension_sections`) is run
 as plain rope, which is exact for text-only input; image and video input is
 out of scope, and with it `ple.image_token_id`, which only names the
 placeholder id a vision batch would hash.
+
+Ternary Bonsai 2 (`prism-ml/Ternary-Bonsai-2-27B-gguf`) is a `qwen35` file
+with two things no other release here has, both declared in its header.
+**Prism's ternary types**: `PQ2_0` (ggml type 142) is `Q2_0`'s 2-bit field
+and `PTQ1_0` (143) is `TQ1_0`'s base-3 trit packing, each with one `f16`
+scale per **128** weights rather than ggml's 64 and 256 — 2.13 and 1.75
+bits per weight, 7.2 and 5.9 GB for 27B parameters. They carry private ids
+because a stock ggml would read a `PQ2_0` tensor as `Q2_0` with the wrong
+scale stride; here they are read on the CPU (NEON-unpacked into the same
+int8 dot kernels every other type uses) and on Vulkan/Metal, where each has
+an element-wise kernel for prefill and a word-reading block-hoisted one for
+decode. **Hadamard-folded weights** (`prism.hadamard.*`): every projection
+— 401 tensors, in the `F16` release as much as the ternary ones — is stored
+in a rotated input basis (a normalized Sylvester–Walsh–Hadamard transform
+over 1024-wide blocks, with a fixed ±1 sign per input channel folded in),
+which is what lets a ternary quantization of it hold up. The engine applies
+the matching rotation to each such projection's input just before the
+matmul, once per shared input (Q/K/V, gate/up, the joint QKV and gate), the
+inverse to every looked-up embedding row, and the head-order regrouping the
+file's `gdn_v_grouped` flag asks of the delta-net output — on the host, in
+`f32`, for every backend, at under 3% of a decode step. Every folded
+weight is checked off against a transform site at load, so a file that
+folds something this build does not transform is refused naming the tensor
+rather than served in the wrong basis; the Qwen 3.5-family dense trunk is
+the one that applies it, and `list` says `No (qwen35, prism.hadamard: …)`
+for a fold variant this build does not know. Without any of this the `F16`
+file loads as an ordinary `qwen35` and generates fluent nonsense — which is
+also what upstream `llama.cpp` does with it. A compiled NPU feed-forward
+block is never used on a folded file, for the same reason.
+
+Where the 27B stands on the development board (CIX P1, 8 big + 4 little
+cores, Mali-G720), `PTQ1_0`, `orangu-bench`: **2.0 tok/s decode and 9.8
+tok/s prefill on the CPU backend with `threads = 8`** (the fused `sdot`
+trit kernel and the `i8mm` K GEMM; 0.2 tok/s the day the format first
+decoded), and **3.9 tok/s decode on Vulkan with `ORANGU_BUSY_POLL=1`**
+for either file (the `PTQ1_0` one repacked at load, see below; the
+token submitted eight layers at a time so the device never waits for
+the host's encoding), the fastest decode on the board (0.7 the day the format
+first ran there) — with `prefill_backend = auto` the same server puts
+the prompts on the cores and prefills at **9–10 tok/s** (1.6 on the
+device) while decoding on the device.
+Prism's own `llama.cpp` fork — the
+only other engine that reads these files — measured through the same
+`orangu-bench` two-engine sweep on the same board: 0.22 tok/s decode and
+0.41 prefill on Vulkan for `PTQ1_0` (0.79 / 1.47 for `PQ2_0`), and a CPU
+path that does not answer a prompt in twenty minutes. On that Mali the ternary decode kernels are bound by
+instructions per weight, not bytes: the float kernels streamed at 7.5
+GB/s where `Q8_0` streams at 37, and the integer-dot kernels that
+replaced them (`dot4I8Packed` over trits packed four to a word, the
+activations quantized to `int8` by a dispatch per token in the layout
+`main`'s own i8 kernels read; built wherever the device executes the
+packed dot natively, `ORANGU_TERNARY_IDOT=0` keeps the float ones,
+`ORANGU_TERNARY_I8=0` the in-kernel quantize) doubled that; a `PTQ1_0`
+file is repacked as `PQ2_0` when it loads for a Vulkan device (lossless,
+21% more bytes, `ORANGU_TERNARY_REPACK=0` keeps the file's format),
+because the device's `PTQ1_0` kernel is bound by the base-3 unpacking
+and its `PQ2_0` one is not — either file then decodes at 3.9 tok/s. What the Vulkan token still pays for
+is now the device: a token is one submission — the residual stream,
+the norms, the recurrent sub-layer (projections, conv step, delta rule,
+gated norm, fold, `ssm_out`; the state and conv history resident between
+tokens), the attention sub-layer and the dense FFN all recorded on the
+device, one readback for the head — and the kernels are ~80% of it.
+`ORANGU_BUSY_POLL=1` matters more than before, not less: one long wait a
+token lets the core clock down for the head and the sampling that
+follow. Prefill on the device is
+bounded at ~150 GFLOP/s by its GEMMs, so for prompts the CPU backend is
+the faster one on this board. `doc/PERF-BONSAI.md` has the profiles, the
+numbers behind each step and the task list. On a big.LITTLE board set
+`threads` to the number of big cores for this model: the little cores are
+4.5× slower on the kernel and finish their rows last.
 
 Kimi-K3 (`kimi-k3`) runs on the CPU path only. Three layers in every four
 are Kimi Delta Attention — a gated delta-net whose per-token state is a

@@ -104,13 +104,25 @@ pub enum Stage {
     FfnShared,
     /// Summing the shared and routed contributions into the block's output.
     FfnCombine,
+    /// A dense (non-MoE) feed-forward block — gate, up, the activation and
+    /// down — timed where an architecture routes it as one unit
+    /// (`qwen_hybrid::DenseFfn`), so a device backend's one-submission FFN
+    /// has a line of its own.
+    FfnDense,
     /// The final norm and the output projection over the vocabulary.
     Head,
+    /// Recording one token's layer loop into a device submission
+    /// (`qwen_hybrid::Trunk::forward_token_on_device`) — host time only,
+    /// before anything runs.
+    DeviceRecord,
+    /// That submission's submit, the wait for the device and the residual
+    /// stream's readback.
+    DeviceSubmit,
 }
 
 impl Stage {
     /// Every stage, in report order.
-    pub const ALL: [Stage; 12] = [
+    pub const ALL: [Stage; 15] = [
         Stage::Forward,
         Stage::Embed,
         Stage::RecurrentProject,
@@ -122,7 +134,10 @@ impl Stage {
         Stage::FfnRouted,
         Stage::FfnShared,
         Stage::FfnCombine,
+        Stage::FfnDense,
         Stage::Head,
+        Stage::DeviceRecord,
+        Stage::DeviceSubmit,
     ];
 
     /// The name this stage is reported under. Dotted, so a reader can see the
@@ -140,7 +155,10 @@ impl Stage {
             Stage::FfnRouted => "ffn.routed",
             Stage::FfnShared => "ffn.shared",
             Stage::FfnCombine => "ffn.combine",
+            Stage::FfnDense => "ffn.dense",
             Stage::Head => "head",
+            Stage::DeviceRecord => "device.record",
+            Stage::DeviceSubmit => "device.submit",
         }
     }
 
@@ -165,7 +183,10 @@ impl Stage {
             Stage::FfnRouted => 8,
             Stage::FfnShared => 9,
             Stage::FfnCombine => 10,
-            Stage::Head => 11,
+            Stage::FfnDense => 11,
+            Stage::Head => 12,
+            Stage::DeviceRecord => 13,
+            Stage::DeviceSubmit => 14,
         }
     }
 }

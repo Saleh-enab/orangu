@@ -20,9 +20,9 @@ use crate::engine::loader::test_quant_matrix;
 use crate::engine::quant::{
     GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_S,
     GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS,
-    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
-    GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K,
-    GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0,
+    GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0,
+    GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
 };
 
 /// The RMSNorm width rule must reproduce every width it was measured at,
@@ -1481,6 +1481,7 @@ fn block_elems(ggml_type: u32) -> usize {
         {
             32
         }
+        t if t == GGML_TYPE_PQ2_0 || t == GGML_TYPE_PTQ1_0 => 128,
         _ => 256,
     }
 }
@@ -1542,20 +1543,43 @@ fn _scratch_measure_prefill_gemm() {
     // compute-bound and the kernel is what matters; if it barely moves,
     // the per-call data movement dominates and the kernel is not the
     // thing to tune.
-    for k in [1536usize, 768, 384] {
+    for k in if std::env::var("ORANGU_SCRATCH_BONSAI").is_ok() {
+        vec![]
+    } else {
+        vec![1536usize, 768, 384]
+    } {
         let (ms, gflops) = measure_matmul_gflops(vulkan, GGML_TYPE_Q4_K, k, 12288, 128, 10);
         eprintln!(
             "orangu-server: [scratch] k-sweep in_dim={k} out_dim=12288 n_tokens=128: \
                  min={ms:.2}ms ({gflops:.1} GFLOP/s)"
         );
     }
-    for (label, in_dim, out_dim) in [
-        ("gate_up", 1536usize, 12288usize),
-        ("ffn_down", 6144, 1536),
-        ("qkv", 1536, 1024),
-    ] {
+    // `ORANGU_SCRATCH_BONSAI=1`: the 27B ternary model's FFN shapes and
+    // types instead, through `matmul` — whichever GEMM the batch path
+    // picks (the integer-dot one where the type has it).
+    let bonsai = std::env::var("ORANGU_SCRATCH_BONSAI").is_ok();
+    let shapes: Vec<(&str, usize, usize)> = if bonsai {
+        vec![("gate", 5120, 17408), ("down", 17408, 5120)]
+    } else {
+        vec![
+            ("gate_up", 1536, 12288),
+            ("ffn_down", 6144, 1536),
+            ("qkv", 1536, 1024),
+        ]
+    };
+    let types: Vec<(&str, u32)> = if bonsai {
+        vec![
+            ("ptq1_0", GGML_TYPE_PTQ1_0),
+            ("pq2_0", GGML_TYPE_PQ2_0),
+            ("q4_k", GGML_TYPE_Q4_K),
+            ("q8_0", GGML_TYPE_Q8_0),
+        ]
+    } else {
+        vec![("q4_k", GGML_TYPE_Q4_K), ("f16", GGML_TYPE_F16)]
+    };
+    for (label, in_dim, out_dim) in shapes {
         for n_tokens in [64usize, 128] {
-            for (type_label, ggml_type) in [("q4_k", GGML_TYPE_Q4_K), ("f16", GGML_TYPE_F16)] {
+            for &(type_label, ggml_type) in &types {
                 let (ms, gflops) =
                     measure_matmul_gflops(vulkan, ggml_type, in_dim, out_dim, n_tokens, 10);
                 eprintln!(
@@ -1759,6 +1783,10 @@ fn tuning_report_names_the_kernel_the_dispatch_would_use() {
         return;
     };
     let report = vulkan.tuning_report();
+    eprintln!(
+        "features: {}\nflags: {}",
+        report["features"], report["flags"]
+    );
     for (shape, n_tokens) in [("decode", 1), ("prefill", vulkan.coop_min_n_tokens)] {
         let named = report["kernels"][shape]
             .as_object()
@@ -1948,6 +1976,16 @@ fn cross_check_n_tokens(ggml_type: u32, in_dim: usize, out_dim: usize, n_tokens:
         *v = (b as f32 - 128.0) / 64.0 + jitter;
     }
 
+    if vulkan.ternary_idot_for(&w, n_tokens) {
+        // Off the `1/64` grid: on it, an element at exactly half the block
+        // maximum quantizes to the tie `±63.5`, and whether the device's
+        // reciprocal lands a hair above or below decides the rounding — a
+        // difference of one activation LSB that says nothing about the
+        // kernel. Real activations are never on a grid.
+        for (i, v) in x.iter_mut().enumerate() {
+            *v += ((i * 7919) % 101) as f32 * 1e-4;
+        }
+    }
     let cpu_out = CpuBackend.matmul_dequant(&x, n_tokens, &w);
     // The float kernels: this is a tight check of the tiled GEMM against
     // the dequantized product, and the integer-dot kernel the generic
@@ -1996,16 +2034,105 @@ fn cross_check_n_tokens(ggml_type: u32, in_dim: usize, out_dim: usize, n_tokens:
             }
         }
         (reference, 1e-2)
+    } else if vulkan.ternary_idot_for(&w, n_tokens) {
+        // The integer-dot ternary kernel quantizes the activations to `int8`
+        // per 128-block inside the kernel (`pack4x8snorm(x / amax)`); the
+        // reference is the dequantized weights against exactly that
+        // rounding, so the check is of the kernel, not of the quantization.
+        let wdq = crate::engine::quant::dequantize(ggml_type, &bytes, out_dim * in_dim).unwrap();
+        let mut qx = vec![0f32; x.len()];
+        for (blk, chunk) in x.chunks(128).enumerate() {
+            let amax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let inv = if amax > 0.0 { 1.0 / amax } else { 0.0 };
+            for (i, &v) in chunk.iter().enumerate() {
+                // `PackSnorm4x8` rounds to nearest; this test's `x` grid
+                // lands on exact halves often enough that `floor(0.5 + v)`
+                // (WGSL's wording) is measurably a different rounding.
+                let q = (127.0 * (v * inv).clamp(-1.0, 1.0)).round_ties_even();
+                qx[blk * 128 + i] = q * (amax / 127.0);
+            }
+        }
+        let mut reference = vec![0f32; n_tokens * out_dim];
+        for t in 0..n_tokens {
+            for o in 0..out_dim {
+                let mut s = 0f32;
+                for e in 0..in_dim {
+                    s += wdq[o * in_dim + e] * qx[t * in_dim + e];
+                }
+                reference[t * out_dim + o] = s;
+            }
+        }
+        (reference, 1e-2)
     } else {
         // `packed_dot_f16` (`ORANGU_PACKED_DOT`) also widens the dot to an
         // `f16` accumulate, needing the loose tolerance vs `cpu_out`.
         let packed = vulkan.packed_dot_f16
             && ggml_type == GGML_TYPE_Q4_K
             && n_tokens < vulkan.coop_min_n_tokens;
-        (cpu_out, if packed { 6e-2 } else { 1e-2 })
+        (cpu_out.clone(), if packed { 6e-2 } else { 1e-2 })
     };
 
     assert_eq!(reference.len(), gpu_out.len());
+    if std::env::var("ORANGU_CROSS_CHECK_STATS").is_ok() {
+        let stats = |name: &str, r: &[f32]| {
+            let (mut worst, mut sum) = (0f32, 0f32);
+            for (a, b) in r.iter().zip(gpu_out.iter()) {
+                let e = (a - b).abs() / a.abs().max(1.0);
+                worst = worst.max(e);
+                sum += e;
+            }
+            eprintln!(
+                "{ggml_type} [{in_dim} x {out_dim}] x {n_tokens}: gpu vs {name}: worst {worst:.4} mean {:.5}",
+                sum / r.len() as f32
+            );
+        };
+        stats("reference", &reference);
+        stats("cpu float", &cpu_out);
+        let bad: Vec<String> = reference
+            .iter()
+            .zip(gpu_out.iter())
+            .enumerate()
+            .filter(|(_, (a, b))| (*a - *b).abs() > 1e-3 * a.abs().max(1.0))
+            .take(24)
+            .map(|(i, (a, b))| format!("{i}(t{} o{}): {a:.4} vs {b:.4}", i / out_dim, i % out_dim))
+            .collect();
+        eprintln!("  off: {}", bad.join(", "));
+        if n_tokens == 1 {
+            // Project the row errors onto each element's weight column — a
+            // mis-quantized element shows as its LSB count.
+            let wdq =
+                crate::engine::quant::dequantize(ggml_type, &bytes, out_dim * in_dim).unwrap();
+            for (blk, chunk) in x.chunks(128).enumerate() {
+                let amax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let step = amax / 127.0;
+                let mut found = Vec::new();
+                for e in 0..128 {
+                    let (mut num, mut den) = (0f64, 0f64);
+                    for o in 0..out_dim {
+                        let w = wdq[o * in_dim + blk * 128 + e] as f64;
+                        num += (reference[o] - gpu_out[o]) as f64 * w;
+                        den += w * w;
+                    }
+                    let c = if den > 0.0 {
+                        num / den / step as f64
+                    } else {
+                        0.0
+                    };
+                    if c.abs() > 0.3 {
+                        let sc = 127.0 * chunk[e] / amax;
+                        found.push(format!("e{e}: {c:+.2} LSB (x={} sc={sc:.4})", chunk[e]));
+                    }
+                }
+                if !found.is_empty() {
+                    eprintln!(
+                        "  block {blk} amax {amax} (element {}): {}",
+                        chunk.iter().position(|v| v.abs() == amax).unwrap(),
+                        found.join(", ")
+                    );
+                }
+            }
+        }
+    }
     for (i, (a, b)) in reference.iter().zip(gpu_out.iter()).enumerate() {
         let tol = tol_factor * a.abs().max(1.0);
         assert!(
@@ -2132,6 +2259,14 @@ fn cross_check_decode(ggml_type: u32, in_dim: usize) {
         }
     }
     cross_check_n_tokens(ggml_type, in_dim, out_dim, 1);
+}
+
+/// Prism's ternary pair at the 27B's width, on the integer dot where the
+/// device has it (`decode_mmvq`, `shader_source_ternary_i8`).
+#[test]
+fn decode_matvec_matches_cpu_backend_for_the_ternary_types_model_shaped() {
+    cross_check_decode(GGML_TYPE_PTQ1_0, 5120);
+    cross_check_decode(GGML_TYPE_PQ2_0, 5120);
 }
 
 #[test]
@@ -3569,6 +3704,62 @@ fn matmul_matches_cpu_backend_for_mxfp4() {
     cross_check(GGML_TYPE_MXFP4, 896, 5);
 }
 
+/// Prism's two ternary types on the decode path — `in_dim = 5120`, the
+/// served 27B's own width, is a multiple of 128 but **not** of 256, and
+/// `PQ2_0`'s 34-byte block puts every other block at a half-word offset
+/// while `PTQ1_0`'s 28-byte one is always aligned; both readers are
+/// exercised. `out_dim = 5` keeps a trailing row for the multi-row
+/// block-hoisted kernel's tail.
+#[test]
+fn matmul_matches_cpu_backend_for_pq2_0() {
+    cross_check(GGML_TYPE_PQ2_0, 5120, 5);
+    cross_check(GGML_TYPE_PQ2_0, 128, 3);
+    // Three blocks: a row of 102 bytes, so odd rows start at a half word.
+    cross_check(GGML_TYPE_PQ2_0, 384, 2048);
+    cross_check(GGML_TYPE_PQ2_0, 2048, 2055);
+    // Wide enough for the four-row block-hoisted variant.
+    cross_check(GGML_TYPE_PQ2_0, 1024, 2048);
+}
+
+#[test]
+fn matmul_matches_cpu_backend_for_ptq1_0() {
+    cross_check(GGML_TYPE_PTQ1_0, 5120, 5);
+    cross_check(GGML_TYPE_PTQ1_0, 128, 3);
+    // Wide enough for the four-row kernel — on this device the integer-dot
+    // one. `896` is seven blocks: the last block iteration has a masked
+    // slot, and the `qh` lane's spare activation loads once reached into
+    // the next block's elements and skewed the block maximum here.
+    cross_check(GGML_TYPE_PTQ1_0, 1024, 2048);
+    cross_check_n_tokens(GGML_TYPE_PTQ1_0, 896, 2048, 1);
+    // A row count that is not a multiple of the workgroup's rows (the
+    // start-up self-check's own wide case): the tail workgroup's rows.
+    cross_check(GGML_TYPE_PTQ1_0, 2048, 2055);
+}
+
+/// A word-reading type through the generic batched matmul at a width that
+/// takes the four-row block-hoisted kernel. `matmul_batch_dispatch_streamed`
+/// used to bind the one-row pipeline to a grid sized for four rows, and
+/// every row from `out_dim / 4` up came back zero — for every words type,
+/// on every architecture that does not go through a fused chain. `Q2_K` is
+/// the one that has been in the tree longest; the `PQ2_0`/`PTQ1_0` checks
+/// above cover the same shape.
+#[test]
+fn a_wide_words_type_projection_is_computed_in_full_by_the_batched_matmul() {
+    cross_check_n_tokens(GGML_TYPE_Q2_K, 1024, 2048, 1);
+    cross_check(GGML_TYPE_Q2_K, 1024, 2048);
+}
+
+/// The cooperative-tiled (prefill) path over the same two types.
+#[test]
+fn matmul_matches_cpu_backend_cooperative_path_pq2_0() {
+    cross_check_n_tokens(GGML_TYPE_PQ2_0, 1024, 64, 130);
+}
+
+#[test]
+fn matmul_matches_cpu_backend_cooperative_path_ptq1_0() {
+    cross_check_n_tokens(GGML_TYPE_PTQ1_0, 1024, 64, 130);
+}
+
 /// The `e8m0` exponent decode across its whole range.
 ///
 /// `cross_check`'s generated blocks deliberately bound the exponent near
@@ -4451,7 +4642,15 @@ fn concurrent_fused_ffn_prefills_do_not_corrupt_each_other() {
         &cases,
         |c| {
             vulkan
-                .fused_ffn_prefill(&c.x, n_tokens, &c.gate, &c.up, &c.down)
+                .fused_ffn_prefill(
+                    &c.x,
+                    n_tokens,
+                    &c.gate,
+                    &c.up,
+                    &c.down,
+                    crate::engine::backend::vulkan::FfnActivation::Geglu,
+                    None,
+                )
                 .expect("fused FFN available without MMVQ")
         },
         "fused FFN prefill",
@@ -8290,7 +8489,15 @@ fn cross_check_fused_ffn_prefill(n_tokens: usize) {
     let expected = vulkan.matmul(&expected, n_tokens, &down);
 
     let got = vulkan
-        .fused_ffn_prefill(&x, n_tokens, &gate, &up, &down)
+        .fused_ffn_prefill(
+            &x,
+            n_tokens,
+            &gate,
+            &up,
+            &down,
+            crate::engine::backend::vulkan::FfnActivation::Geglu,
+            None,
+        )
         .expect("fused path available without MMVQ");
 
     assert_eq!(got.len(), expected.len());
@@ -9977,6 +10184,2354 @@ fn gqa_prefill_heads_divide_the_group() {
 #[test]
 fn fused_ffn_prefill_matches_the_unfused_sequence_small() {
     cross_check_fused_ffn_prefill(3);
+}
+
+/// How this device lays a 64-lane workgroup over subgroups, and what
+/// `subgroupShuffleXor` by 1, 2 and 4 returns per lane — the assumption the
+/// ternary kernel's per-block maximum rests on (eight adjacent lanes in one
+/// subgroup, xor-shuffles staying among them).
+/// `cargo test --profile release-with-debug --bin orangu-server
+/// subgroup_layout_on_this_device -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn subgroup_layout_on_this_device() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    const SRC: &str = r#"
+@group(0) @binding(0) var<storage, read_write> out: array<f32>;
+@compute @workgroup_size(64)
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(subgroup_invocation_id) sg_lane: u32,
+    @builtin(subgroup_id) sg_id: u32,
+    @builtin(subgroup_size) sg_size: u32,
+) {
+    let t = lid.x;
+    var it: u32 = 0u;
+    var a: f32 = 0.0;
+    var b: f32 = 0.0;
+    var c: f32 = 0.0;
+    loop {
+        if (it >= 2u) { break; }
+        let v = f32(t) + f32(it) * 100.0;
+        a = subgroupShuffleXor(v, 1u);
+        b = subgroupShuffleXor(v, 2u);
+        c = subgroupShuffleXor(v, 4u);
+        it = it + 1u;
+    }
+    // The ternary kernel's own chain: a max over eight adjacent lanes.
+    var mx: f32 = 0.0;
+    it = 0u;
+    loop {
+        if (it >= 3u) { break; }
+        let a0 = f32((t * 37u + it * 11u) % 64u);
+        let a1 = max(a0, subgroupShuffleXor(a0, 1u));
+        let a2 = max(a1, subgroupShuffleXor(a1, 2u));
+        let a3 = max(a2, subgroupShuffleXor(a2, 4u));
+        mx = mx + a3 * 1.0;
+        it = it + 1u;
+    }
+    out[t * 4u] = f32(sg_id) * 100.0 + f32(sg_lane) + f32(sg_size) * 10000.0;
+    out[t * 4u + 1u] = a;
+    out[t * 4u + 2u] = b;
+    out[t * 4u + 3u] = mx;
+}
+"#;
+    let got = run_probe_kernel(vulkan, SRC, 64, 256);
+    for t in 0..64 {
+        let meta = got[t * 4] as u32;
+        let want: usize = (0..3)
+            .map(|it| {
+                (0..8)
+                    .map(|l| ((t / 8 * 8 + l) * 37 + it * 11) % 64)
+                    .max()
+                    .unwrap()
+            })
+            .sum();
+        eprintln!(
+            "lane {t:2}: subgroup {} lane {:2} (size {}) | xor1 {} xor2 {} | 8-lane max chain {} (want {want}){}",
+            (meta / 100) % 100,
+            meta % 100,
+            meta / 10000,
+            got[t * 4 + 1] - 100.0,
+            got[t * 4 + 2] - 100.0,
+            got[t * 4 + 3],
+            if got[t * 4 + 3] as usize == want {
+                ""
+            } else {
+                "  <-- WRONG"
+            }
+        );
+    }
+}
+
+/// What `pack4x8snorm` rounds to on this device around a tie: 64 values
+/// `v = (63.5 + k · 0.004) / 127`, `k = -32..32`, packed and read back.
+/// `cargo test --profile release-with-debug --bin orangu-server
+/// pack4x8snorm_rounding_on_this_device -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn pack4x8snorm_rounding_on_this_device() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    const SRC: &str = r#"
+@group(0) @binding(0) var<storage, read_write> out: array<f32>;
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let t = lid.x;
+    let v = (63.5 + (f32(t) - 32.0) * 0.004) / 127.0;
+    let p = pack4x8snorm(vec4<f32>(v, -v, v * 0.5, 1.0));
+    out[t] = f32(i32(p << 24u) >> 24u);
+}
+"#;
+    let got = run_probe_kernel(vulkan, SRC, 64, 64);
+    for (t, g) in got.iter().enumerate() {
+        let v = (63.5 + (t as f32 - 32.0) * 0.004) / 127.0;
+        eprintln!("v*127 = {:9.4} -> {g}", v * 127.0);
+    }
+}
+
+/// The matmul kernel's device time read two ways: the pass timestamps
+/// (`matmul_kernel_us_tokens`) against the wall clock of the whole
+/// submission for 1, 4, 16 and 64 back-to-back dispatches — the slope of
+/// the wall clock over the dispatch count is the kernel's real time per
+/// dispatch, whatever the timestamps say, and the intercept is the
+/// submission's fixed cost. Random weights, not a constant byte, so the
+/// reading is what a model's layer sees.
+/// `cargo test --profile release-with-debug --bin orangu-server
+/// matmul_kernel_time_by_wall_clock -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn matmul_kernel_time_by_wall_clock() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let (in_dim, out_dim) = (5120usize, 17408usize);
+    // `ORANGU_KERNEL_PROBE_TOKENS` reads the prefill kernel at that batch.
+    let n_tokens: usize = std::env::var("ORANGU_KERNEL_PROBE_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    for &ggml_type in &[
+        GGML_TYPE_PTQ1_0,
+        GGML_TYPE_PQ2_0,
+        GGML_TYPE_Q8_0,
+        GGML_TYPE_Q4_K,
+    ] {
+        let mut seed = 0xC0FFEE_u64;
+        let mut bytes = Vec::new();
+        for _ in 0..out_dim {
+            for _ in 0..(in_dim
+                / crate::engine::quant::block_layout(ggml_type)
+                    .expect("layout")
+                    .1)
+            {
+                bytes.extend(build_block(ggml_type, &mut seed));
+            }
+        }
+        // `ORANGU_KERNEL_PROBE_FILL=const` reads the kernel on a constant
+        // byte instead (what the format sweep does).
+        if std::env::var("ORANGU_KERNEL_PROBE_FILL").as_deref() == Ok("const") {
+            bytes.fill(0x42);
+        }
+        let mib = bytes.len() as f64 / (1024.0 * 1024.0);
+        let w = test_quant_matrix(&bytes, ggml_type, in_dim, out_dim);
+        let x: Vec<f32> = (0..in_dim * n_tokens)
+            .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.031)
+            .collect();
+        let mut name = "";
+        for &reps in &[1u32, 4, 16, 64] {
+            let mut best_wall = f64::MAX;
+            let mut ts = 0.0;
+            for _ in 0..3 {
+                let t = std::time::Instant::now();
+                let (us, n) = vulkan
+                    .matmul_kernel_us_tokens(&x, n_tokens, &w, reps)
+                    .expect("timestamps");
+                name = n;
+                let wall = t.elapsed().as_secs_f64() * 1e6;
+                if wall < best_wall {
+                    best_wall = wall;
+                    ts = us;
+                }
+            }
+            eprintln!(
+                "  {} [{in_dim} x {out_dim}] x {n_tokens} {mib:.1} MiB ({name}) reps {reps:3}: wall {:9.0} us ({:7.0} us/dispatch, {:5.1} GB/s)   timestamps {ts:7.0} us/dispatch ({:5.1} GB/s, {:5.1} G weights/s)",
+                orangu::gguf::ggml_type_name(ggml_type),
+                best_wall,
+                best_wall / f64::from(reps),
+                mib * 1.048576 * f64::from(reps) / best_wall * 1e3,
+                mib * 1.048576 / ts * 1e3,
+                (in_dim * out_dim * n_tokens) as f64 / ts * 1e-3,
+            );
+        }
+    }
+}
+
+/// The cost of a *dependent* dispatch on this device: `k` back-to-back
+/// `add` dispatches over one small buffer (each reads what the last
+/// wrote) in one submission, against the same `k` over `n` independent
+/// buffers. If the dependent chain costs milliseconds a dispatch where the
+/// independent set does not, the device (or its driver) serialises on a
+/// per-dispatch latency that no amount of submission fusion removes.
+/// `cargo test --profile release-with-debug --bin orangu-server
+/// dependent_dispatch_latency -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn dependent_dispatch_latency() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    for &elems in &[64usize, 17408, 1 << 20] {
+        let buf = |label: &str| {
+            vulkan.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: (elems as u64) * 4,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        };
+        let a = buf("probe a");
+        let b = buf("probe b");
+        let c = buf("probe c");
+        let meta = vulkan.elem_meta_buffer(elems as u32, 0.0);
+        // dependent: c = a + b, then b = a + c, alternating — each dispatch
+        // reads what the previous one wrote.
+        let bg_ab_c = vulkan.elem4_bind_group(&a, &b, &c, &meta);
+        let bg_ac_b = vulkan.elem4_bind_group(&a, &c, &b, &meta);
+        for &k in &[1usize, 16, 64, 256] {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let mut encoder = vulkan.new_encoder("probe");
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: None,
+                        timestamp_writes: None,
+                    });
+                    for i in 0..k {
+                        pass.set_pipeline(&vulkan.add_pipeline);
+                        pass.set_bind_group(0, if i % 2 == 0 { &bg_ab_c } else { &bg_ac_b }, &[]);
+                        pass.dispatch_workgroups(vulkan.strided_workgroups(elems), 1, 1);
+                    }
+                }
+                let t = std::time::Instant::now();
+                let _ = vulkan.submit_and_readback(encoder, &b, 0, 4);
+                best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            eprintln!(
+                "elems {elems:8}: {k:4} dependent add dispatches: {best:8.2} ms  ({:.3} ms each)",
+                best / k as f64
+            );
+        }
+    }
+}
+
+/// Wall time of one decode-shaped fused FFN call at the 27B's shape, beside
+/// the three matmuls issued separately — where a fused submission's time
+/// goes. `cargo test --profile release-with-debug --bin orangu-server
+/// fused_ffn_decode_call_cost -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn fused_ffn_decode_call_cost() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let (n_embd, ffn_len) = (5120usize, 17408usize);
+    let mut seed = 0xFFF1_u64;
+    let build = |in_dim: usize, out_dim: usize, seed: &mut u64| {
+        let mut bytes = Vec::new();
+        for _ in 0..out_dim {
+            for _ in 0..(in_dim / 128) {
+                bytes.extend(build_block(GGML_TYPE_PTQ1_0, seed));
+            }
+        }
+        test_quant_matrix(&bytes, GGML_TYPE_PTQ1_0, in_dim, out_dim)
+    };
+    let gate = build(n_embd, ffn_len, &mut seed);
+    let up = build(n_embd, ffn_len, &mut seed);
+    let down = build(ffn_len, n_embd, &mut seed);
+    let x: Vec<f32> = (0..n_embd)
+        .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.031)
+        .collect();
+    let act = crate::engine::backend::vulkan::FfnActivation::Swiglu;
+    // The Mali's devfreq clock (`simple_ondemand`, 72 MHz – 1 GHz on the
+    // CIX P1): a decode loop that round-trips per projection looks idle to
+    // the governor, so the clock it settles at is part of the measurement.
+    // A sampler thread reads it every millisecond while a section runs and
+    // the section reports the time-weighted histogram beside its min /
+    // median / max call time.
+    let cur_freq_path = std::fs::read_dir("/sys/class/devfreq")
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            std::fs::read_to_string(p.join("device/uevent"))
+                .is_ok_and(|s| s.contains("DRIVER=mali"))
+        })
+        .map(|p| p.join("cur_freq"));
+    let read_mhz = |path: &std::path::Path| -> Option<u64> {
+        std::fs::read_to_string(path)
+            .ok()?
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .map(|hz| hz / 1_000_000)
+    };
+    let reps_env: usize = std::env::var("ORANGU_FFN_COST_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let time = |label: &str, reps: usize, f: &mut dyn FnMut()| {
+        f();
+        let reps = reps.max(reps_env);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sampler = cur_freq_path.clone().map(|path| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut hist = std::collections::BTreeMap::<u64, u32>::new();
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(mhz) = read_mhz(&path) {
+                        *hist.entry(mhz).or_default() += 1;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                hist
+            })
+        });
+        let mut calls = Vec::with_capacity(reps);
+        for _ in 0..reps {
+            let t = std::time::Instant::now();
+            f();
+            calls.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let hist = sampler.and_then(|h| h.join().ok()).unwrap_or_default();
+        let total: u32 = hist.values().sum::<u32>().max(1);
+        let clocks: Vec<String> = hist
+            .iter()
+            .map(|(mhz, n)| format!("{mhz} MHz {:.0}%", 100.0 * f64::from(*n) / f64::from(total)))
+            .collect();
+        let mean = calls.iter().sum::<f64>() / reps as f64;
+        calls.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "{label:36} mean {mean:6.2} ms  min {:6.2}  median {:6.2}  max {:6.2}   clock: {}",
+            calls[0],
+            calls[reps / 2],
+            calls[reps - 1],
+            clocks.join(", ")
+        );
+    };
+    time("fused_ffn_prefill (decode, 1 token)", 10, &mut || {
+        vulkan
+            .fused_ffn_prefill(&x, 1, &gate, &up, &down, act, None)
+            .unwrap();
+    });
+    {
+        let mut call = 0f64;
+        let mut drop_ms = 0f64;
+        for _ in 0..10 {
+            let t = std::time::Instant::now();
+            let r = vulkan.fused_ffn_prefill(&x, 1, &gate, &up, &down, act, None);
+            call += t.elapsed().as_secs_f64() * 1e3;
+            let t = std::time::Instant::now();
+            drop(r);
+            drop_ms += t.elapsed().as_secs_f64() * 1e3;
+        }
+        eprintln!(
+            "fused call {:.2} ms, result drop {:.2} ms",
+            call / 10.0,
+            drop_ms / 10.0
+        );
+    }
+    time("three separate matmul calls", 10, &mut || {
+        let g = vulkan.matmul(&x, 1, &gate);
+        let _ = vulkan.matmul(&x, 1, &up);
+        let _ = vulkan.matmul(&g[..ffn_len], 1, &down);
+    });
+    time("one matmul, gate shape", 10, &mut || {
+        vulkan.matmul(&x, 1, &gate);
+    });
+    time("one matmul, down shape", 10, &mut || {
+        vulkan.matmul(&x[..1].repeat(ffn_len), 1, &down);
+    });
+    time("matmul_batch gate+up", 10, &mut || {
+        use crate::engine::backend::MatmulOp;
+        vulkan.matmul_batch(&[
+            MatmulOp {
+                x: &x,
+                n_tokens: 1,
+                w: &gate,
+            },
+            MatmulOp {
+                x: &x,
+                n_tokens: 1,
+                w: &up,
+            },
+        ]);
+    });
+}
+
+/// The device side of a recurrent layer's decode step — the delta rule,
+/// the gated norm, the `gdn_v_grouped` regrouping, the fold and `ssm_out`
+/// as one submission — against the host sequence step for step
+/// (`delta_head_step`, `rmsnorm_inplace`, the gate, `Rotation::apply`, the
+/// matmul), on both the returned output and the state it leaves behind,
+/// over two consecutive tokens so a state error would compound. Three
+/// shapes: no fold, a fold with the head permutation and identity signs,
+/// and one with explicit signs; and both output gates.
+#[test]
+fn fused_recurrent_tail_matches_the_host_delta_rule_and_projection() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    if vulkan.q4_k_mmvq {
+        eprintln!("skipping: ORANGU_Q4K_MMVQ selects the unfused fallback path");
+        return;
+    }
+    use crate::engine::arch::qwen_hybrid::delta_head_step;
+    use crate::engine::backend::vulkan::GatedDeltaInput;
+    use crate::engine::hadamard::HadamardFold;
+    use crate::engine::tensor;
+    use orangu::gguf::GgufValue;
+
+    let (n_k, n_v, hd) = (2usize, 8usize, 128usize);
+    let value_dim = n_v * hd;
+    let n_embd = 256usize;
+    let eps = 1e-6f32;
+    let mut seed = 0xDE17A_u64;
+    let mut bytes = Vec::new();
+    for _ in 0..n_embd {
+        for _ in 0..(value_dim / 256) {
+            bytes.extend(build_block(GGML_TYPE_Q4_K, &mut seed));
+        }
+    }
+    let ssm_out = test_quant_matrix(&bytes, GGML_TYPE_Q4_K, value_dim, n_embd);
+    let mut rnd = |scale: f32| (next_byte(&mut seed) as f32 - 128.0) / 128.0 * scale;
+    let ssm_norm: Vec<f32> = (0..hd).map(|_| 1.0 + rnd(0.3)).collect();
+
+    let fold_metadata = |sign_mode: &str| -> Vec<(String, GgufValue)> {
+        let mut m = vec![
+            ("prism.hadamard.version", GgufValue::U32(1)),
+            ("prism.hadamard.block_size", GgufValue::U32(1024)),
+            (
+                "prism.hadamard.transform",
+                GgufValue::String("normalized-sylvester-walsh-hadamard".into()),
+            ),
+            (
+                "prism.hadamard.axis",
+                GgufValue::String("input-last-dimension".into()),
+            ),
+            (
+                "prism.hadamard.sign_mode",
+                GgufValue::String(sign_mode.into()),
+            ),
+            (
+                "prism.hadamard.weight_names",
+                GgufValue::Array(vec![GgufValue::String("blk.0.ssm_out.weight".into())]),
+            ),
+            ("prism.hadamard.gdn_v_grouped", GgufValue::Bool(true)),
+        ];
+        if sign_mode == "explicit" {
+            m.push((
+                "prism.hadamard.sign_widths",
+                GgufValue::Array(vec![GgufValue::I32(value_dim as i32)]),
+            ));
+            m.push((
+                "prism.hadamard.sign_values",
+                GgufValue::Array(
+                    (0..value_dim)
+                        .map(|i| GgufValue::I32(if (i * 11 + i / 7) % 3 == 1 { -1 } else { 1 }))
+                        .collect(),
+                ),
+            ));
+        }
+        m.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    };
+    let rotations: Vec<Option<crate::engine::hadamard::Rotation>> = vec![
+        None,
+        Some(
+            HadamardFold::from_metadata(&fold_metadata("identity"))
+                .unwrap()
+                .unwrap()
+                .input_rotation("blk.0.ssm_out.weight", value_dim, Some((n_v, n_k)))
+                .unwrap()
+                .unwrap(),
+        ),
+        Some(
+            HadamardFold::from_metadata(&fold_metadata("explicit"))
+                .unwrap()
+                .unwrap()
+                .input_rotation("blk.0.ssm_out.weight", value_dim, Some((n_v, n_k)))
+                .unwrap()
+                .unwrap(),
+        ),
+    ];
+
+    for (case, rot) in rotations.iter().enumerate() {
+        for sigmoid_gate in [false, true] {
+            let mut host_state: Vec<f32> = (0..n_v * hd * hd).map(|_| rnd(0.05)).collect();
+            // The device side as the cache hands it over: the host copy
+            // current before the first token (uploaded), the device's
+            // after it (kept), and downloaded here only to compare.
+            let mut dev_state = host_state.clone();
+            let mut dev_conv: Vec<f32> = Vec::new();
+            let mut mirror: Option<Box<dyn crate::engine::kv_cache::DeviceStateMirror>> = None;
+            let mut fresh = crate::engine::kv_cache::Fresh::Host;
+            for token in 0..2 {
+                let q: Vec<f32> = (0..n_k * hd).map(|_| rnd(0.2)).collect();
+                let k: Vec<f32> = (0..n_k * hd).map(|_| rnd(0.2)).collect();
+                let v: Vec<f32> = (0..n_v * hd).map(|_| rnd(1.0)).collect();
+                let beta: Vec<f32> = (0..n_v).map(|_| 0.5 + rnd(0.4)).collect();
+                let decay: Vec<f32> = (0..n_v).map(|_| 0.9 + rnd(0.09)).collect();
+                let z: Vec<f32> = (0..n_v * hd).map(|_| rnd(2.0)).collect();
+
+                // Host: the delta rule per head, gated norm, gate.
+                let mut attn = vec![0f32; value_dim];
+                let mut scratch = vec![0f32; 2 * hd];
+                for vh in 0..n_v {
+                    let kh = vh % n_k;
+                    let (sk, d) = scratch.split_at_mut(hd);
+                    let out = &mut attn[vh * hd..(vh + 1) * hd];
+                    delta_head_step(
+                        &mut host_state[vh * hd * hd..(vh + 1) * hd * hd],
+                        &q[kh * hd..(kh + 1) * hd],
+                        &k[kh * hd..(kh + 1) * hd],
+                        &v[vh * hd..(vh + 1) * hd],
+                        beta[vh],
+                        decay[vh],
+                        out,
+                        sk,
+                        d,
+                    );
+                    tensor::rmsnorm_inplace(out, &ssm_norm, 1, hd, eps);
+                    for (o, &zv) in out.iter_mut().zip(&z[vh * hd..(vh + 1) * hd]) {
+                        *o *= if sigmoid_gate {
+                            tensor::sigmoid(zv)
+                        } else {
+                            tensor::silu(zv)
+                        };
+                    }
+                }
+                if let Some(rot) = rot {
+                    rot.apply(&mut attn, value_dim);
+                }
+                let expected = vulkan.matmul(&attn, 1, &ssm_out);
+
+                let got = vulkan
+                    .fused_recurrent_tail(GatedDeltaInput {
+                        q: &q,
+                        k: &k,
+                        v: &v,
+                        beta: &beta,
+                        decay: &decay,
+                        z: &z,
+                        state: crate::engine::kv_cache::DeviceStateAccess {
+                            host: &mut dev_state,
+                            conv: &mut dev_conv,
+                            mirror: &mut mirror,
+                            fresh: &mut fresh,
+                        },
+                        ssm_norm: &ssm_norm,
+                        eps,
+                        sigmoid_gate,
+                        n_k,
+                        n_v,
+                        head_dim: hd,
+                        out_rotation: rot.as_ref(),
+                        ssm_out: &ssm_out,
+                        batch_slot: 0,
+                    })
+                    .expect("the device takes this shape");
+                assert_eq!(got.len(), n_embd);
+                for (i, (a, b)) in expected.iter().zip(&got).enumerate() {
+                    let tol = 6e-2 * a.abs().max(1.0);
+                    assert!(
+                        (a - b).abs() <= tol,
+                        "case {case} sigmoid={sigmoid_gate} token {token}: output {i}: host={a} device={b}"
+                    );
+                }
+                assert_eq!(fresh, crate::engine::kv_cache::Fresh::Device);
+                let mut downloaded = vec![0f32; dev_state.len()];
+                mirror
+                    .as_ref()
+                    .expect("a mirror after a step")
+                    .download(&mut downloaded, &mut []);
+                for (i, (a, b)) in host_state.iter().zip(&downloaded).enumerate() {
+                    assert!(
+                        (a - b).abs() <= 1e-4 * a.abs().max(1e-2),
+                        "case {case} sigmoid={sigmoid_gate} token {token}: state {i}: host={a} device={b}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The q8-input ternary kernel (`shader_source_ternary_i8`) against the
+/// dequantized product on main's per-32 q8 activation, and its device time
+/// beside the f32-input kernel's, at the FFN gate shape.
+/// `cargo test --profile release-with-debug --bin orangu-server
+/// ternary_i8_kernel -- --nocapture` (the timing part needs `--ignored`).
+fn ternary_i8_check(ggml_type: u32, in_dim: usize, out_dim: usize, n_tokens: usize, time: bool) {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let mut seed = 0x1D07_u64;
+    let mut bytes = Vec::new();
+    for _ in 0..out_dim {
+        for _ in 0..(in_dim / 128) {
+            bytes.extend(build_block(ggml_type, &mut seed));
+        }
+    }
+    let w = test_quant_matrix(&bytes, ggml_type, in_dim, out_dim);
+    let x: Vec<f32> = (0..in_dim * n_tokens)
+        .map(|i| (next_byte(&mut seed) as f32 - 128.0) / 64.0 + ((i * 7919) % 101) as f32 * 1e-4)
+        .collect();
+    let q8 = super::quantize_activation_q8(&x);
+    // The dequantized product against exactly the q8 rounding.
+    let wdq = crate::engine::quant::dequantize(ggml_type, &bytes, out_dim * in_dim).unwrap();
+    let mut qx = vec![0f32; x.len()];
+    for (blk, chunk) in q8.as_chunks::<10>().0.iter().enumerate() {
+        let d = f32::from_bits(chunk[0]);
+        for i in 0..32 {
+            let byte = ((chunk[2 + i / 4] >> (8 * (i % 4))) & 0xFF) as u8 as i8;
+            qx[blk * 32 + i] = d * byte as f32;
+        }
+    }
+    let mut expected = vec![0f32; n_tokens * out_dim];
+    for t in 0..n_tokens {
+        for o in 0..out_dim {
+            let mut s = 0f32;
+            for e in 0..in_dim {
+                s += wdq[o * in_dim + e] * qx[t * in_dim + e];
+            }
+            expected[t * out_dim + o] = s;
+        }
+    }
+    let env_usize = |name: &str, default: usize| -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    let (rows, groups) = (
+        env_usize("ORANGU_TERNARY_IDOT_ROWS", 8),
+        env_usize("ORANGU_TERNARY_IDOT_GROUPS", 4),
+    );
+    let mut src = crate::engine::backend::vulkan_shaders::shader_source_ternary_i8(
+        ggml_type, rows, groups, true,
+    )
+    .unwrap();
+    // Scratch, timing only: the weight word as one aligned load (wrong
+    // for every other block), the bound of removing the unaligned read.
+    match std::env::var("ORANGU_O_EXPERIMENT").as_deref() {
+        Ok("aligned") => {
+            src = src.replace(
+                "let word = read_u32_at(byte_off);",
+                "let word = weights[byte_off >> 2u];",
+            );
+        }
+        Ok("noweights") => {
+            src = src
+                .replace(
+                    "let word = read_u32_at(byte_off);",
+                    "let word = byte_off * 0x01010101u;",
+                )
+                .replace(
+                    "let dw = f16_to_f32(read_u16_even(byte_off - 2u - 4u * sub));",
+                    "let dw = f32(byte_off & 15u);",
+                );
+        }
+        Ok("noact") => {
+            for j in 0..4 {
+                src = src.replace(
+                    &format!("let a{j} = q8_word(eb + e{j}) & zero;"),
+                    &format!("let a{j} = (eb * {}u + e{j}) & zero;", j + 3),
+                );
+            }
+            src = src.replace("let dx = q8_scale(eb + e0);", "let dx = f32(eb & 7u);");
+        }
+        Ok("skeleton") => {
+            src = src
+                .replace(
+                    "let word = read_u32_at(byte_off);",
+                    "let word = byte_off * 0x01010101u;",
+                )
+                .replace(
+                    "let dw = f16_to_f32(read_u16_even(byte_off - 2u - 4u * sub));",
+                    "let dw = f32(byte_off & 15u);",
+                );
+            for j in 0..4 {
+                src = src.replace(
+                    &format!("let a{j} = q8_word(eb + e{j}) & zero;"),
+                    &format!("let a{j} = (eb * {}u + e{j}) & zero;", j + 3),
+                );
+            }
+            src = src.replace("let dx = q8_scale(eb + e0);", "let dx = f32(eb & 7u);");
+        }
+        Ok("pretransposed") => {
+            // The activation words used as the transposed words (timing
+            // only): what a pre-transposed layout would save.
+            for k in 0..4 {
+                let sh = 8 * k;
+                src = src.replace(
+                    &format!("        let xq{k} = ((a0 >> {sh}u) & 0xFFu) | (((a1 >> {sh}u) & 0xFFu) << 8u) | (((a2 >> {sh}u) & 0xFFu) << 16u) | (((a3 >> {sh}u) & 0xFFu) << 24u);\n"),
+                    &format!("        let xq{k} = a{k};\n"),
+                );
+            }
+        }
+        Ok("noscale") => {
+            // The per-row scale as a constant (timing only): what the
+            // `f16` read and convert per row per block cost.
+            src = src.replace(
+                "let dw = f16_to_f32(read_u16_even(byte_off - 2u - 4u * sub));",
+                "let dw = 1.0;",
+            );
+        }
+        Ok("nodots") => {
+            for k in 1..4 {
+                src = src.replace(
+                    &format!(
+                        "            isum = isum + dot4I8Packed((word >> {}u) & fm, xq{k});\n",
+                        2 * k
+                    ),
+                    "",
+                );
+            }
+        }
+        _ => {}
+    }
+    let experiment = std::env::var_os("ORANGU_O_EXPERIMENT").is_some();
+    let module = vulkan
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("probe ternary i8"),
+            source: wgpu::ShaderSource::Wgsl(src.into()),
+        });
+    let layout = vulkan
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&vulkan.bind_group_layout)],
+            immediate_size: 0,
+        });
+    let pipeline = vulkan
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("probe ternary i8"),
+            layout: Some(&layout),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+    let q8_buf = vulkan.upload_new_u32(&q8);
+    let out = vulkan.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("probe out"),
+        size: (n_tokens * out_dim * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let meta = vulkan.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("probe meta"),
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    vulkan.queue.write_buffer(
+        &meta,
+        0,
+        bytemuck::cast_slice(&[
+            in_dim as u32,
+            out_dim as u32,
+            n_tokens as u32,
+            w.row_bytes() as u32,
+        ]),
+    );
+    let (wchunk, woff, wsize) = vulkan.weight_buffer(&w);
+    let bg = vulkan.matmul_bind_group(
+        "probe ternary i8",
+        (&wchunk, woff, wsize),
+        BindSrc::Whole(&q8_buf),
+        BindSrc::Whole(&out),
+        BindSrc::Whole(&meta),
+    );
+    let workgroups = (out_dim.div_ceil(rows * groups) * n_tokens) as u32;
+    let mut encoder = vulkan.new_encoder("probe");
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(workgroups, 1, 1);
+    }
+    let got = vulkan.submit_and_readback(encoder, &out, 0, n_tokens * out_dim);
+    let mut worst = 0f32;
+    for (i, (a, b)) in expected.iter().zip(&got).enumerate() {
+        let tol = 1e-2 * a.abs().max(1.0);
+        worst = worst.max((a - b).abs() / a.abs().max(1.0));
+        assert!(
+            experiment || (a - b).abs() <= tol,
+            "type {ggml_type} [{in_dim} x {out_dim}] x {n_tokens}: output {i}: ref={a} gpu={b}"
+        );
+    }
+    eprintln!("type {ggml_type} [{in_dim} x {out_dim}] x {n_tokens}: worst rel {worst:.5}");
+    if time {
+        // The best of a dozen bursts: the first are read at whatever clock
+        // the device idles at, and it takes a while to hold the top one.
+        let us = (0..12)
+            .map(|_| {
+                vulkan
+                    .dispatch_kernel_us(&pipeline, &bg, (workgroups, 1, 1), 32)
+                    .expect("timestamps")
+            })
+            .fold(f64::MAX, f64::min);
+        let mib = bytes.len() as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "  i8 kernel {us:.0} us ({:.1} GB/s)",
+            mib * 1.048576 / us * 1e3
+        );
+    }
+}
+
+/// The two-phase `PQ2_0` kernel (`shader_source_ternary_t`) over the
+/// transposed activation layout its quantize kernel writes
+/// (`shader_source_quantize_ternary_t`), against the dequantized product
+/// at exactly the per-128 q8 rounding; timed with `time`.
+fn ternary_t_check(in_dim: usize, out_dim: usize, n_tokens: usize, time: bool) {
+    ternary_t_check_kind(in_dim, out_dim, n_tokens, time, false);
+}
+
+/// `octet`: the octet kernel (`shader_source_ternary_o`) over its own
+/// layout instead of the two-phase one.
+fn ternary_t_check_kind(in_dim: usize, out_dim: usize, n_tokens: usize, time: bool, octet: bool) {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let ggml_type = GGML_TYPE_PQ2_0;
+    let mut seed = 0x1D07_u64;
+    let mut bytes = Vec::new();
+    for _ in 0..out_dim {
+        for _ in 0..(in_dim / 128) {
+            bytes.extend(build_block(ggml_type, &mut seed));
+        }
+    }
+    let w = test_quant_matrix(&bytes, ggml_type, in_dim, out_dim);
+    let x: Vec<f32> = (0..in_dim * n_tokens)
+        .map(|i| (next_byte(&mut seed) as f32 - 128.0) / 64.0 + ((i * 7919) % 101) as f32 * 1e-4)
+        .collect();
+    // The host's per-128 rounding, for the reference.
+    let mut qx = vec![0f32; x.len()];
+    for (blk, chunk) in x.as_chunks::<128>().0.iter().enumerate() {
+        let amax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let d = amax / 127.0;
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        for (i, &v) in chunk.iter().enumerate() {
+            qx[blk * 128 + i] = d * (v * id).round().clamp(-127.0, 127.0);
+        }
+    }
+    let wdq = crate::engine::quant::dequantize(ggml_type, &bytes, out_dim * in_dim).unwrap();
+    let mut expected = vec![0f32; n_tokens * out_dim];
+    for t in 0..n_tokens {
+        for o in 0..out_dim {
+            let mut s = 0f32;
+            for e in 0..in_dim {
+                s += wdq[o * in_dim + e] * qx[t * in_dim + e];
+            }
+            expected[t * out_dim + o] = s;
+        }
+    }
+    let build = |label: &str, source: String, layout: &wgpu::BindGroupLayout| {
+        let module = vulkan
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+        let pl = vulkan
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(layout)],
+                immediate_size: 0,
+            });
+        vulkan
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pl),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+    };
+    use crate::engine::backend::vulkan_shaders as sh;
+    let words = if octet {
+        sh::TERNARY_O_WORDS
+    } else {
+        sh::TERNARY_T_WORDS
+    } as usize;
+    let quantize = build(
+        "probe quantize ternary t",
+        if octet {
+            sh::shader_source_quantize_ternary_o()
+        } else {
+            sh::shader_source_quantize_ternary_t()
+        },
+        &vulkan.elem3_bind_group_layout,
+    );
+    let mut kernel_src = if octet {
+        sh::shader_source_ternary_o()
+    } else {
+        sh::shader_source_ternary_t()
+    };
+    // Scratch experiments on the octet kernel's source, timing only.
+    match std::env::var("ORANGU_O_EXPERIMENT").as_deref() {
+        Ok("noshuffle") => {
+            kernel_src = kernel_src
+                .replace("subgroupShuffle(mine, sa / 4u)", "mine")
+                .replace("subgroupShuffle(mine, sb / 4u)", "mine")
+                .replace("subgroupShuffle(mine, 14u)", "mine");
+        }
+        Ok("nodyn+noshuffle") => {
+            kernel_src = kernel_src
+                .replace("subgroupShuffle(mine, sa / 4u)", "mine")
+                .replace("subgroupShuffle(mine, sb / 4u)", "mine")
+                .replace("subgroupShuffle(mine, 14u)", "mine")
+                .replace("let mine = v[l / 4u];", "let mine = v[0];");
+            for r in 0..8 {
+                kernel_src = kernel_src.replace(
+                    &format!("weights[row{r} + wbase + 16u][l & 3u]"),
+                    &format!("weights[row{r} + wbase + 16u][0]"),
+                );
+            }
+        }
+        Ok("fewdots") => {
+            // Only field 0's dot per word: the ALU share.
+            kernel_src = kernel_src
+                .replace("subgroupShuffle(mine, sa / 4u)", "mine")
+                .replace("subgroupShuffle(mine, sb / 4u)", "mine")
+                .replace("subgroupShuffle(mine, 14u)", "mine");
+            for m in 0..4 {
+                for k in 1..4 {
+                    kernel_src = kernel_src.replace(
+                        &format!("            s{m} = s{m} + dot4I8Packed((v[{m}] >> {}u) & fm, x{m}_{k});\n", 2 * k),
+                        "",
+                    );
+                }
+            }
+        }
+        Ok("noextra") => {
+            kernel_src = kernel_src
+                .replace("subgroupShuffle(mine, sa / 4u)", "mine")
+                .replace("subgroupShuffle(mine, sb / 4u)", "mine")
+                .replace("subgroupShuffle(mine, 14u)", "mine");
+            for k in 0..4 {
+                let src = if k == 0 {
+                    "ve & fm".to_string()
+                } else {
+                    format!("(ve >> {}u) & fm", 2 * k)
+                };
+                kernel_src = kernel_src.replace(
+                    &format!("            se = se + dot4I8Packed({src}, xe_{k});\n"),
+                    "",
+                );
+            }
+        }
+        Ok("scalar4") => {
+            // The weights as `array<u32>`, four loads a lane.
+            kernel_src = kernel_src
+                .replace("subgroupShuffle(mine, sa / 4u)", "mine")
+                .replace("subgroupShuffle(mine, sb / 4u)", "mine")
+                .replace("subgroupShuffle(mine, 14u)", "mine")
+                .replace(
+                    "var<storage, read> weights: array<vec4<u32>>;",
+                    "var<storage, read> weights: array<u32>;",
+                );
+            for r in 0..8 {
+                kernel_src = kernel_src
+                    .replace(
+                        &format!("let v = weights[row{r} + wbase + l];"),
+                        &format!("let wb = (row{r} + wbase + l) * 4u; let v = vec4<u32>(weights[wb], weights[wb + 1u], weights[wb + 2u], weights[wb + 3u]);"),
+                    )
+                    .replace(
+                        &format!("weights[row{r} + wbase + 16u][l & 3u]"),
+                        &format!("weights[(row{r} + wbase + 16u) * 4u + (l & 3u)]"),
+                    );
+            }
+        }
+        Ok("noweights") => {
+            kernel_src = kernel_src
+                .replace("subgroupShuffle(mine, sa / 4u)", "mine")
+                .replace("subgroupShuffle(mine, sb / 4u)", "mine")
+                .replace("subgroupShuffle(mine, 14u)", "mine");
+            for r in 0..8 {
+                kernel_src = kernel_src
+                    .replace(
+                        &format!("let v = weights[row{r} + wbase + l];"),
+                        &format!("let v = vec4<u32>(row{r} * 0x01010101u + oct, l * 0x01010101u, oct * 0x01010101u, row{r} ^ l);"),
+                    )
+                    .replace(
+                        &format!("let ve = weights[row{r} + wbase + 16u][l & 3u];"),
+                        &format!("let ve = row{r} ^ oct;"),
+                    );
+            }
+        }
+        Ok("noact") => {
+            kernel_src = kernel_src
+                .replace("subgroupShuffle(mine, sa / 4u)", "mine")
+                .replace("subgroupShuffle(mine, sb / 4u)", "mine")
+                .replace("subgroupShuffle(mine, 14u)", "mine");
+            for m in 0..4 {
+                for k in 0..4 {
+                    kernel_src = kernel_src.replace(
+                        &format!("let x{m}_{k} = q8x[xb{m}_ + {k}u];"),
+                        &format!("let x{m}_{k} = xb{m}_ * {}u + {k}u;", m + 1),
+                    );
+                }
+                kernel_src = kernel_src.replace(
+                    &format!("let xs{m} = bitcast<i32>(q8x[xb{m}_ + 4u]);"),
+                    &format!("let xs{m} = i32(xb{m}_ & 7u);"),
+                );
+            }
+            for k in 0..4 {
+                kernel_src = kernel_src.replace(
+                    &format!("let xe_{k} = select(0u, q8x[xbe + {k}u], extra);"),
+                    &format!("let xe_{k} = select(0u, xbe + {k}u, extra);"),
+                );
+            }
+            kernel_src = kernel_src.replace(
+                "let xse = select(0, bitcast<i32>(q8x[xbe + 4u]), extra);",
+                "let xse = select(0, i32(xbe & 3u), extra);",
+            );
+        }
+        Ok("nodyn") => {
+            kernel_src = kernel_src
+                .replace("let mine = v[l / 4u];", "let mine = v[0];")
+                .replace(
+                    "weights[row{r} + wbase + 16u][l & 3u]",
+                    "weights[row{r} + wbase + 16u][0]",
+                );
+            for r in 0..8 {
+                kernel_src = kernel_src.replace(
+                    &format!("weights[row{r} + wbase + 16u][l & 3u]"),
+                    &format!("weights[row{r} + wbase + 16u][0]"),
+                );
+            }
+        }
+        _ => {}
+    }
+    let kernel = build("probe ternary t", kernel_src, &vulkan.bind_group_layout);
+    let n_blocks = n_tokens * in_dim / 128;
+    let x_buf = vulkan.upload_new(&x);
+    let tq8 = vulkan.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("probe tq8"),
+        size: (n_blocks as u64) * (words as u64) * 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let qmeta = vulkan.cast_meta_buffer((n_tokens * in_dim) as u32, 0);
+    let qbg = vulkan.elem3_bind_group(&x_buf, &tq8, &qmeta);
+    let out = vulkan.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("probe out"),
+        size: (n_tokens * out_dim * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let meta = vulkan.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("probe meta"),
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    vulkan.queue.write_buffer(
+        &meta,
+        0,
+        bytemuck::cast_slice(&[
+            in_dim as u32,
+            out_dim as u32,
+            n_tokens as u32,
+            w.row_bytes() as u32,
+        ]),
+    );
+    let (wchunk, woff, wsize) = vulkan.weight_buffer(&w);
+    let bg = vulkan.matmul_bind_group(
+        "probe ternary t",
+        (&wchunk, woff, wsize),
+        BindSrc::Whole(&tq8),
+        BindSrc::Whole(&out),
+        BindSrc::Whole(&meta),
+    );
+    let workgroups = (out_dim.div_ceil(32) * n_tokens) as u32;
+    let mut encoder = vulkan.new_encoder("probe");
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&quantize);
+        pass.set_bind_group(0, &qbg, &[]);
+        pass.dispatch_workgroups(n_blocks as u32, 1, 1);
+        pass.set_pipeline(&kernel);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(workgroups, 1, 1);
+    }
+    let got = vulkan.submit_and_readback(encoder, &out, 0, n_tokens * out_dim);
+    // The layout itself, against the host's construction of it.
+    let encoder = vulkan.new_encoder("probe tq8 readback");
+    let got_t: Vec<u32> = vulkan
+        .submit_and_readback(encoder, &tq8, 0, n_blocks * words)
+        .iter()
+        .map(|v| v.to_bits())
+        .collect();
+    for (blk, chunk) in x.as_chunks::<128>().0.iter().enumerate() {
+        let amax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let at = blk * words;
+        // The device's own scale (its division may differ by an ulp), so
+        // the words compare exactly.
+        let d = f32::from_bits(got_t[at]);
+        assert!(
+            (d - amax / 127.0).abs() <= 1e-6 * amax.max(1e-6),
+            "block {blk} scale {d} vs {}",
+            amax / 127.0
+        );
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        let q: Vec<i32> = chunk
+            .iter()
+            .map(|&v| (v * id).round().clamp(-127.0, 127.0) as i32)
+            .collect();
+        assert_eq!(
+            got_t[at + 1] as i32,
+            q.iter().sum::<i32>(),
+            "block {blk} sum"
+        );
+        for phase in 0..2usize {
+            for i in 0..9usize {
+                for k in 0..4usize {
+                    let mut word = 0u32;
+                    for tt in 0..4usize {
+                        let j = (4 * i + tt) as i32 - if phase == 1 { 4 } else { 2 };
+                        let qv = if (0..32).contains(&j) {
+                            q[4 * j as usize + k]
+                        } else {
+                            0
+                        };
+                        word |= ((qv as u8) as u32) << (8 * tt);
+                    }
+                    let slot = if octet {
+                        at + 4 + 45 * phase + 5 * i + k
+                    } else {
+                        at + 4 + 36 * phase + 4 * i + k
+                    };
+                    assert_eq!(
+                        got_t[slot], word,
+                        "block {blk} phase {phase} word {i} field {k}"
+                    );
+                }
+                if octet {
+                    let mut gsum = 0i32;
+                    for k in 0..4usize {
+                        for tt in 0..4usize {
+                            let j = (4 * i + tt) as i32 - if phase == 1 { 4 } else { 2 };
+                            if (0..32).contains(&j) {
+                                gsum += q[4 * j as usize + k];
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        got_t[at + 4 + 45 * phase + 5 * i + 4] as i32,
+                        gsum,
+                        "block {blk} phase {phase} group {i} sum"
+                    );
+                }
+            }
+        }
+    }
+    let mut worst = 0f32;
+    let experiment = std::env::var_os("ORANGU_O_EXPERIMENT").is_some();
+    for (i, (a, b)) in expected.iter().zip(&got).enumerate() {
+        let tol = 1e-2 * a.abs().max(1.0);
+        worst = worst.max((a - b).abs() / a.abs().max(1.0));
+        assert!(
+            experiment || (a - b).abs() <= tol,
+            "ternary {} [{in_dim} x {out_dim}] x {n_tokens}: output {i}: ref={a} gpu={b}",
+            if octet { "o" } else { "t" }
+        );
+    }
+    eprintln!(
+        "ternary {} [{in_dim} x {out_dim}] x {n_tokens}: worst rel {worst:.5}",
+        if octet { "o" } else { "t" }
+    );
+    if time {
+        let us = (0..12)
+            .map(|_| {
+                vulkan
+                    .dispatch_kernel_us(&kernel, &bg, (workgroups, 1, 1), 32)
+                    .expect("timestamps")
+            })
+            .fold(f64::MAX, f64::min);
+        let mib = bytes.len() as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "  ternary t kernel {us:.0} us ({:.1} GB/s)",
+            mib * 1.048576 / us * 1e3
+        );
+        let qus = (0..6)
+            .map(|_| {
+                vulkan
+                    .dispatch_kernel_us(&quantize, &qbg, (n_blocks as u32, 1, 1), 32)
+                    .expect("timestamps")
+            })
+            .fold(f64::MAX, f64::min);
+        eprintln!("  quantize t {qus:.0} us");
+    }
+}
+
+/// Widths with an even block count only: an odd count puts odd rows two
+/// bytes off the phase pattern (`shader_source_ternary_t`'s doc), and the
+/// kernel is not offered for them.
+#[test]
+fn ternary_t_kernel_matches_the_dequantized_product() {
+    ternary_t_check(1024, 2048, 3, false);
+    ternary_t_check(768, 2055, 2, false);
+    ternary_t_check(5120, 40, 1, false);
+    ternary_t_check(5120, 33, 2, false);
+    ternary_t_check(2304, 65, 1, false);
+}
+
+/// `cargo test --profile release-with-debug --bin orangu-server ternary_t_kernel_time -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn ternary_t_kernel_time() {
+    for (in_dim, out_dim) in [(5120, 17408), (17408, 5120), (5120, 10240), (6144, 5120)] {
+        ternary_t_check(in_dim, out_dim, 1, true);
+    }
+}
+
+/// Block counts that are multiples of eight only.
+#[test]
+fn ternary_o_kernel_matches_the_dequantized_product() {
+    ternary_t_check_kind(1024, 2048, 3, false, true);
+    ternary_t_check_kind(2048, 2055, 2, false, true);
+    ternary_t_check_kind(5120, 40, 1, false, true);
+    ternary_t_check_kind(5120, 33, 2, false, true);
+}
+
+/// `cargo test --profile release-with-debug --bin orangu-server ternary_o_kernel_time -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn ternary_o_kernel_time() {
+    for (in_dim, out_dim) in [(5120, 17408), (17408, 5120), (5120, 10240), (6144, 5120)] {
+        ternary_t_check_kind(in_dim, out_dim, 1, true, true);
+    }
+}
+
+#[test]
+fn ternary_i8_kernel_matches_the_dequantized_product() {
+    for ggml_type in [GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0] {
+        ternary_i8_check(ggml_type, 1024, 2048, 3, false);
+        ternary_i8_check(ggml_type, 896, 2055, 2, false);
+        ternary_i8_check(ggml_type, 5120, 40, 1, false);
+    }
+}
+
+#[test]
+#[ignore]
+fn ternary_i8_kernel_time() {
+    // `ORANGU_TERNARY_PROBE_SHAPES=in:out,in:out` replaces the FFN shapes.
+    let shapes: Vec<(usize, usize)> = std::env::var("ORANGU_TERNARY_PROBE_SHAPES")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .filter_map(|s| {
+                    let (i, o) = s.split_once(':')?;
+                    Some((i.parse().ok()?, o.parse().ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_else(|| vec![(5120, 17408), (17408, 5120)]);
+    for ggml_type in [GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0] {
+        for &(in_dim, out_dim) in &shapes {
+            ternary_i8_check(ggml_type, in_dim, out_dim, 1, true);
+        }
+    }
+}
+
+/// The device's read bandwidth as a decode kernel sees it: every thread
+/// of a large grid streams `vec4<u32>` loads from a 256 MiB buffer and
+/// folds them into one word, best of several 8-repetition readings.
+/// The ceiling a weight kernel's GB/s is judged against on this board.
+///
+/// `cargo test --release --bin orangu-server device_read_bandwidth_probe -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn device_read_bandwidth_probe() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let words = 64usize << 20; // 256 MiB
+    let buffer = vulkan.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("probe read bandwidth"),
+        size: (words * 4) as u64,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let out = vulkan.scratch_buffer(1 << 16);
+    let meta = vulkan.elem_meta_buffer_aux((words / 4) as u32, 0);
+    for (label, per_thread) in [("16 vec4 a thread", 16u32), ("64 vec4 a thread", 64)] {
+        let src = format!(
+            r#"
+struct ElemMeta {{ len: u32, aux: u32, extra: f32, out_scale: f32 }}
+@group(0) @binding(0) var<storage, read> x: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read_write> y: array<u32>;
+@group(0) @binding(2) var<uniform> em: ElemMeta;
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {{
+    let threads = nwg.x * 256u;
+    var acc = vec4<u32>(0u);
+    var i = gid.x;
+    for (var k: u32 = 0u; k < {per_thread}u; k = k + 1u) {{
+        acc = acc ^ x[i];
+        i = i + threads;
+    }}
+    if ((acc.x ^ acc.y ^ acc.z ^ acc.w) == 0x9E3779B9u) {{ y[gid.x % 1024u] = 1u; }}
+}}
+"#
+        );
+        let module = vulkan
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("probe read bandwidth"),
+                source: wgpu::ShaderSource::Wgsl(src.into()),
+            });
+        let pipeline = vulkan
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("probe read bandwidth"),
+                layout: Some(&vulkan.elem3_pipeline_layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let bg = vulkan.elem3_bind_group(&buffer, &out, &meta);
+        let workgroups = (words / 4 / per_thread as usize / 256) as u32;
+        let us = (0..5)
+            .map(|_| {
+                vulkan
+                    .dispatch_kernel_us(&pipeline, &bg, (workgroups, 1, 1), 8)
+                    .expect("timestamps")
+            })
+            .fold(f64::INFINITY, f64::min);
+        eprintln!(
+            "read bandwidth, {label} ({workgroups} workgroups): {us:.0} us for 256 MiB = {:.1} GB/s",
+            (words * 4) as f64 / us / 1e3
+        );
+    }
+}
+
+/// Prints the generated ternary kernel, for reading.
+#[test]
+#[ignore]
+fn dump_ternary_kernel_source() {
+    let src = crate::engine::backend::vulkan_shaders::shader_source_ternary_idot(
+        GGML_TYPE_PTQ1_0,
+        2,
+        2,
+        true,
+    )
+    .unwrap();
+    eprintln!("{src}");
+}
+
+/// The start-up self-check's own probe cases through the ternary kernel
+/// against the dequantized product, per case — what
+/// `decode_kernel_agrees` sees, reproduced where it can be looked at.
+/// `cargo test --profile release-with-debug --bin orangu-server
+/// ternary_kernel_on_the_probe_cases -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn ternary_kernel_on_the_probe_cases() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    for ggml_type in [GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0] {
+        let cases = vulkan.kernel_probe_cases(ggml_type).expect("cases");
+        for (case, (x, n, w)) in cases.iter().enumerate() {
+            let got = vulkan.matmul(x, *n, w);
+            let exact = CpuBackend.matmul_dequant(x, *n, w);
+            let scale = exact.iter().fold(1f32, |m, v| m.max(v.abs()));
+            let (mut worst, mut at) = (0f32, 0usize);
+            for (i, (a, b)) in got.iter().zip(&exact).enumerate() {
+                if (a - b).abs() > worst {
+                    worst = (a - b).abs();
+                    at = i;
+                }
+            }
+            eprintln!(
+                "type {ggml_type} case {case} [{} x {}] x {n} ({}): worst {worst:.4} of {scale:.4} at {at} (t{} o{}): got {} exact {}",
+                w.in_dim,
+                w.out_dim,
+                vulkan.ternary_idot_for(w, *n),
+                at / w.out_dim,
+                at % w.out_dim,
+                got[at],
+                exact[at]
+            );
+        }
+    }
+}
+
+/// The gated-delta kernel's device time at the 27B's recurrent shape
+/// (48 value heads of 128, 16 key heads): what one recurrent layer's
+/// state step costs on its own, before any projection.
+/// `cargo test --profile release-with-debug --bin orangu-server
+/// gated_delta_kernel_time -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn gated_delta_kernel_time() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let n_v: usize = std::env::var("ORANGU_DELTA_PROBE_NV")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(48);
+    let (n_k, hd) = (16usize, 128usize);
+    let state_len = n_v * hd * hd;
+    let inputs_len = 2 * n_k * hd + n_v * hd + 2 * n_v + n_v * hd;
+    let tail_len = n_v * hd;
+    let inputs_off = state_len + tail_len;
+    let total = inputs_off + inputs_len;
+    let mut seed = 0xD3174_u64;
+    let mut rnd = |scale: f32| (next_byte(&mut seed) as f32 - 128.0) / 128.0 * scale;
+    let mut scratch: Vec<f32> = (0..total).map(|_| rnd(0.1)).collect();
+    for h in 0..n_v {
+        scratch[inputs_off + 2 * n_k * hd + n_v * hd + h] = 0.5; // beta
+        scratch[inputs_off + 2 * n_k * hd + n_v * hd + n_v + h] = 0.95; // decay
+    }
+    let scratch_buf = vulkan.upload_new(&scratch);
+    let norm = vulkan.upload_new(&vec![1.0f32; hd]);
+    let meta = vulkan.elem_meta_buffer_aux_extra(inputs_off as u32, 2, 1e-6);
+    let bg = vulkan.elem4_bind_group(&norm, &norm, &scratch_buf, &meta);
+    let module = vulkan
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("probe gated delta"),
+            source: wgpu::ShaderSource::Wgsl(
+                crate::engine::backend::vulkan_shaders::shader_source_gated_delta(
+                    hd as u32, n_k as u32, n_v as u32, false,
+                )
+                .into(),
+            ),
+        });
+    let pipeline = vulkan
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("probe gated delta"),
+            layout: Some(&vulkan.elem4_pipeline_layout),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+    let build = |label: &str, source: String| {
+        let module = vulkan
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+        vulkan
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&vulkan.elem4_pipeline_layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+    };
+    // Best of a few readings at 32 repetitions: the clock ramps during
+    // the first.
+    let best = |steps: &[super::ProbeDispatch<'_>]| {
+        (0..4)
+            .map(|_| vulkan.dispatch_sequence_us(steps, 32).expect("timestamps"))
+            .fold(f64::INFINITY, f64::min)
+    };
+    let one = best(&[(&pipeline, &[&bg], (n_v as u32, 1, 1))]);
+    eprintln!("gated delta [{n_v} x {hd} x {hd}] one workgroup per head: {one:.0} us");
+    let norm = build(
+        "probe gated delta norm",
+        crate::engine::backend::vulkan_shaders::shader_source_gated_delta_norm(
+            hd as u32, n_k as u32, n_v as u32, false,
+        ),
+    );
+    for cols in [128u32, 64, 32, 16] {
+        let split = build(
+            "probe gated delta split",
+            crate::engine::backend::vulkan_shaders::shader_source_gated_delta_split(
+                hd as u32, n_k as u32, n_v as u32, cols,
+            ),
+        );
+        let workgroups = n_v as u32 * hd as u32 / cols;
+        let us = best(&[
+            (&split, &[&bg], (workgroups, 1, 1)),
+            (&norm, &[&bg], (n_v as u32, 1, 1)),
+        ]);
+        let alone = best(&[(&split, &[&bg], (workgroups, 1, 1))]);
+        eprintln!(
+            "gated delta [{n_v} x {hd} x {hd}] {cols} columns a workgroup ({workgroups} workgroups) + norm: {us:.0} us (the split alone {alone:.0})"
+        );
+    }
+    let one = best(&[(&pipeline, &[&bg], (n_v as u32, 1, 1))]);
+    eprintln!("gated delta [{n_v} x {hd} x {hd}] one workgroup per head, again: {one:.0} us");
+}
+
+/// The whole full-attention sub-layer on the device
+/// (`fused_attention_layer`) against the host sequence: the four
+/// projections, the per-head norms, RoPE, the cache write, attention over
+/// a pre-seeded history, the sigmoid gate, the output fold and `wo` — over
+/// three consecutive tokens, with and without the fold. Over the weight
+/// types the model family ships: `Q4_K` reads the float input (or the
+/// norm's q8, on main's i8 kernels), the ternary types the per-token q8
+/// the recorder quantizes for them.
+#[test]
+fn fused_attention_layer_matches_the_host_sequence() {
+    fused_attention_layer_check(GGML_TYPE_Q4_K);
+}
+
+#[test]
+fn fused_attention_layer_matches_the_host_sequence_for_ptq1_0() {
+    fused_attention_layer_check(GGML_TYPE_PTQ1_0);
+}
+
+#[test]
+fn fused_attention_layer_matches_the_host_sequence_for_pq2_0() {
+    fused_attention_layer_check(GGML_TYPE_PQ2_0);
+}
+
+fn fused_attention_layer_check(ggml_type: u32) {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    if vulkan.q4_k_mmvq {
+        eprintln!("skipping: ORANGU_Q4K_MMVQ selects the unfused fallback path");
+        return;
+    }
+    use crate::engine::backend::vulkan::FusedAttentionLayerInput;
+    use crate::engine::hadamard::HadamardFold;
+    use crate::engine::tensor;
+    use orangu::gguf::GgufValue;
+
+    let (n_head, n_head_kv, head_dim, rope_dim) = (8usize, 2usize, 128usize, 64usize);
+    let attn_width = n_head * head_dim;
+    let kv_dim = n_head_kv * head_dim;
+    let n_embd = 1024usize;
+    let eps = 1e-6f32;
+    let rope_freq_base = 10000.0f32;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut seed = 0xA77E_u64;
+    let matrix = |in_dim: usize, out_dim: usize, seed: &mut u64| {
+        let mut bytes = Vec::new();
+        for _ in 0..out_dim {
+            for _ in 0..(in_dim / block_elems(ggml_type)) {
+                bytes.extend(build_block(ggml_type, seed));
+            }
+        }
+        test_quant_matrix(&bytes, ggml_type, in_dim, out_dim)
+    };
+    let wq = matrix(n_embd, attn_width, &mut seed);
+    let wgate = matrix(n_embd, attn_width, &mut seed);
+    let wk = matrix(n_embd, kv_dim, &mut seed);
+    let wv = matrix(n_embd, kv_dim, &mut seed);
+    let wo = matrix(attn_width, n_embd, &mut seed);
+    let mut rnd = |scale: f32| (next_byte(&mut seed) as f32 - 128.0) / 128.0 * scale;
+    let q_norm: Vec<f32> = (0..head_dim).map(|_| 1.0 + rnd(0.3)).collect();
+    let k_norm: Vec<f32> = (0..head_dim).map(|_| 1.0 + rnd(0.3)).collect();
+    let fold = HadamardFold::from_metadata(
+        &[
+            ("prism.hadamard.version", GgufValue::U32(1)),
+            ("prism.hadamard.block_size", GgufValue::U32(1024)),
+            (
+                "prism.hadamard.transform",
+                GgufValue::String("normalized-sylvester-walsh-hadamard".into()),
+            ),
+            (
+                "prism.hadamard.axis",
+                GgufValue::String("input-last-dimension".into()),
+            ),
+            (
+                "prism.hadamard.sign_mode",
+                GgufValue::String("identity".into()),
+            ),
+            (
+                "prism.hadamard.weight_names",
+                GgufValue::Array(vec![GgufValue::String("blk.0.attn_output.weight".into())]),
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect::<Vec<_>>(),
+    )
+    .unwrap()
+    .unwrap();
+    let o_rot = fold
+        .input_rotation("blk.0.attn_output.weight", attn_width, None)
+        .unwrap()
+        .unwrap();
+
+    for (case, o_rot) in [None, Some(&o_rot)].into_iter().enumerate() {
+        let capacity = 16;
+        let mut kv_cache = crate::engine::kv_cache::KvCache::new_with_dims(capacity, &[kv_dim]);
+        let mut reference_cache =
+            crate::engine::kv_cache::KvCache::new_with_dims(capacity, &[kv_dim]);
+        for _ in 0..3 {
+            let k: Vec<f32> = (0..kv_dim).map(|_| rnd(1.0)).collect();
+            let v: Vec<f32> = (0..kv_dim).map(|_| rnd(1.0)).collect();
+            kv_cache.layers[0].push(&k, &v);
+            reference_cache.layers[0].push(&k, &v);
+        }
+        for token in 0..3 {
+            let pos = kv_cache.layers[0].len;
+            let normed: Vec<f32> = (0..n_embd).map(|_| rnd(1.0)).collect();
+
+            // Host, through the same device matmul so the weights read
+            // identically.
+            let mut q = vulkan.matmul(&normed, 1, &wq);
+            let gate = vulkan.matmul(&normed, 1, &wgate);
+            let mut k = vulkan.matmul(&normed, 1, &wk);
+            let v = vulkan.matmul(&normed, 1, &wv);
+            tensor::rmsnorm_inplace(&mut q, &q_norm, n_head, head_dim, eps);
+            tensor::rope_apply_inplace(&mut q, n_head, head_dim, rope_dim, pos, rope_freq_base);
+            tensor::rmsnorm_inplace(&mut k, &k_norm, n_head_kv, head_dim, eps);
+            tensor::rope_apply_inplace(&mut k, n_head_kv, head_dim, rope_dim, pos, rope_freq_base);
+            reference_cache.layers[0].push(&k, &v);
+            let group = n_head / n_head_kv;
+            let mut attn = vec![0f32; attn_width];
+            for h in 0..n_head {
+                let kv_head = h / group;
+                let qh = &q[h * head_dim..(h + 1) * head_dim];
+                let mut scores: Vec<f32> = (0..=pos)
+                    .map(|p| {
+                        tensor::dot(qh, reference_cache.layers[0].key_at(p, kv_head, head_dim))
+                            * scale
+                    })
+                    .collect();
+                tensor::softmax_inplace(&mut scores);
+                let out = &mut attn[h * head_dim..(h + 1) * head_dim];
+                for (p, &w) in scores.iter().enumerate() {
+                    let vh = reference_cache.layers[0].value_at(p, kv_head, head_dim);
+                    for (o, vi) in out.iter_mut().zip(vh) {
+                        *o += w * vi;
+                    }
+                }
+            }
+            for (o, &g) in attn.iter_mut().zip(&gate) {
+                *o *= tensor::sigmoid(g);
+            }
+            if let Some(rot) = o_rot {
+                rot.apply(&mut attn, attn_width);
+            }
+            // `wo` from the dequantized weights: the batched `matmul` may
+            // quantize its activations to 8 bits per op on this device
+            // (`decode_mmvq`), which at the magnitudes a random `Q4_K`
+            // layer produces is a several-percent difference of its own,
+            // while the chain's `wo` reads the `f32` output in place.
+            let expected = CpuBackend.matmul_dequant(&attn, 1, &wo);
+
+            let got = vulkan
+                .fused_attention_layer(FusedAttentionLayerInput {
+                    normed: &normed,
+                    wq: &wq,
+                    wgate: &wgate,
+                    wk: &wk,
+                    wv: &wv,
+                    q_norm: &q_norm,
+                    k_norm: &k_norm,
+                    n_head,
+                    n_head_kv,
+                    head_dim,
+                    rope_dim,
+                    rope_freq_base,
+                    eps,
+                    pos,
+                    o_rotation: o_rot,
+                    wo: &wo,
+                    cache: &mut kv_cache.layers[0],
+                    batch_slot: 0,
+                })
+                .expect("the device takes this shape");
+            assert_eq!(got.len(), n_embd);
+            assert_eq!(kv_cache.layers[0].len, pos + 1, "the cache advanced");
+            // Against the row's scale, not each element's: a random `Q4_K`
+            // layer's outputs are large and a near-cancelling element
+            // among them differs between two summation orders by far more
+            // than its own size.
+            let scale_out = expected.iter().fold(0f32, |m, v| m.max(v.abs()));
+            for (i, (a, b)) in expected.iter().zip(&got).enumerate() {
+                assert!(
+                    (a - b).abs() <= 2e-2 * scale_out,
+                    "case {case} token {token}: output {i}: host={a} device={b} (row scale {scale_out})"
+                );
+            }
+        }
+    }
+}
+
+/// The fused fold + quantize kernel (`shader_source_hadamard_q8`) against
+/// the host: the rotated row in place and its per-32 q8, from the row
+/// itself and from `silu(a) · b` (the FFN's form), with explicit signs
+/// and without.
+#[test]
+fn hadamard_q8_kernel_matches_the_host() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    use crate::engine::hadamard::HadamardFold;
+    use orangu::gguf::GgufValue;
+    let width = 5120usize;
+    let fold_metadata = |sign_mode: &str| -> Vec<(String, GgufValue)> {
+        let mut m = vec![
+            ("prism.hadamard.version", GgufValue::U32(1)),
+            ("prism.hadamard.block_size", GgufValue::U32(1024)),
+            (
+                "prism.hadamard.transform",
+                GgufValue::String("normalized-sylvester-walsh-hadamard".into()),
+            ),
+            (
+                "prism.hadamard.axis",
+                GgufValue::String("input-last-dimension".into()),
+            ),
+            (
+                "prism.hadamard.sign_mode",
+                GgufValue::String(sign_mode.into()),
+            ),
+            (
+                "prism.hadamard.weight_names",
+                GgufValue::Array(vec![GgufValue::String("blk.0.ffn_down.weight".into())]),
+            ),
+        ];
+        if sign_mode == "explicit" {
+            m.push((
+                "prism.hadamard.sign_widths",
+                GgufValue::Array(vec![GgufValue::I32(width as i32)]),
+            ));
+            m.push((
+                "prism.hadamard.sign_values",
+                GgufValue::Array(
+                    (0..width)
+                        .map(|i| GgufValue::I32(if (i * 13 + i / 5) % 3 == 1 { -1 } else { 1 }))
+                        .collect(),
+                ),
+            ));
+        }
+        m.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    };
+    let mut seed = 0x4AD4_u64;
+    for sign_mode in ["identity", "explicit"] {
+        let rot = HadamardFold::from_metadata(&fold_metadata(sign_mode))
+            .unwrap()
+            .unwrap()
+            .input_rotation("blk.0.ffn_down.weight", width, None)
+            .unwrap()
+            .unwrap();
+        for silu_mul in [false, true] {
+            let mut rnd = |scale: f32| (next_byte(&mut seed) as f32 - 128.0) / 128.0 * scale;
+            let a: Vec<f32> = (0..width).map(|_| rnd(2.0)).collect();
+            let b: Vec<f32> = (0..width).map(|_| rnd(1.0)).collect();
+            let x: Vec<f32> = (0..width).map(|_| rnd(1.0)).collect();
+            let mut expected: Vec<f32> = if silu_mul {
+                a.iter()
+                    .zip(&b)
+                    .map(|(&g, &u)| g / (1.0 + (-g).exp()) * u)
+                    .collect()
+            } else {
+                x.clone()
+            };
+            rot.apply(&mut expected, width);
+            let expected_q8 = super::quantize_activation_q8(&expected);
+
+            let a_buf = vulkan.upload_new(&a);
+            let b_buf = vulkan.upload_new(&b);
+            let x_buf = vulkan.upload_new(&x);
+            let q8_buf = vulkan.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("test q8"),
+                size: (width / 32 * 10 * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let (pipeline, bg, workgroups) = vulkan.hadamard_q8_dispatch(
+                &rot,
+                silu_mul.then_some((BindSrc::from(&a_buf), BindSrc::from(&b_buf))),
+                BindSrc::from(&x_buf),
+                BindSrc::from(&q8_buf),
+                width,
+            );
+            let mut encoder = vulkan.new_encoder("test hadamard q8");
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("test hadamard q8"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+            }
+            let got = vulkan.submit_and_readback(encoder, &x_buf, 0, width);
+            let encoder = vulkan.new_encoder("test hadamard q8 readback");
+            let got_q8: Vec<u32> = vulkan
+                .submit_and_readback(encoder, &q8_buf, 0, width / 32 * 10)
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
+                assert!(
+                    (g - e).abs() <= 1e-4 * e.abs().max(1.0),
+                    "{sign_mode} silu_mul={silu_mul}: element {i}: {g} vs {e}"
+                );
+            }
+            for blk in 0..width / 32 {
+                let (g, e) = (
+                    &got_q8[blk * 10..blk * 10 + 10],
+                    &expected_q8[blk * 10..blk * 10 + 10],
+                );
+                let (gd, ed) = (f32::from_bits(g[0]), f32::from_bits(e[0]));
+                assert!(
+                    (gd - ed).abs() <= 1e-5 * ed.abs().max(1e-6),
+                    "{sign_mode} silu_mul={silu_mul}: block {blk} scale {gd} vs {ed}"
+                );
+                for w in 2..10 {
+                    for k in 0..4 {
+                        let gq = ((g[w] >> (8 * k)) & 0xFF) as u8 as i8;
+                        let eq = ((e[w] >> (8 * k)) & 0xFF) as u8 as i8;
+                        assert!(
+                            (i32::from(gq) - i32::from(eq)).abs() <= 1,
+                            "{sign_mode} silu_mul={silu_mul}: block {blk} word {w} byte {k}: {gq} vs {eq}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The decode chain's fused residual add + norm
+/// (`hybrid_record_add_norm`) against the host: the stream after the add,
+/// and the norm of it, at the 27B's width and at a width past the wide
+/// norm's straight-line slots.
+#[test]
+fn hybrid_add_norm_matches_the_host() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    use crate::engine::tensor;
+    let eps = 1e-6f32;
+    let mut seed = 0xADD0_u64;
+    for n_embd in [5120usize, 9216] {
+        let mut rnd = |scale: f32| (next_byte(&mut seed) as f32 - 128.0) / 128.0 * scale;
+        let x: Vec<f32> = (0..n_embd).map(|_| rnd(1.0)).collect();
+        let out: Vec<f32> = (0..n_embd).map(|_| rnd(0.5)).collect();
+        let weight: Vec<f32> = (0..n_embd).map(|_| 1.0 + rnd(0.3)).collect();
+        let out_buf = vulkan.upload_new(&out);
+        let mut tok = vulkan.hybrid_decode_begin(&x, eps);
+        let res = tok.res.clone();
+        vulkan.hybrid_record_add_norm(&mut tok, (&out_buf, 0), &weight);
+        let side = tok.side;
+        let stream = vulkan.hybrid_decode_finish(tok, 0);
+        assert_eq!(side, 1, "the add lands on the other residual buffer");
+        let encoder = vulkan.new_encoder("test add+norm readback");
+        let normed = vulkan.submit_and_readback(encoder, &res.n, 0, n_embd);
+
+        let mut expected_stream: Vec<f32> = x.iter().zip(&out).map(|(a, b)| a + b).collect();
+        for (i, (a, b)) in stream.iter().zip(&expected_stream).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-6,
+                "width {n_embd} stream {i}: {a} vs {b}"
+            );
+        }
+        tensor::rmsnorm_inplace(&mut expected_stream, &weight, 1, n_embd, eps);
+        for (i, (a, b)) in normed.iter().zip(&expected_stream).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-4 * b.abs().max(1.0),
+                "width {n_embd} normed {i}: {a} vs {b}"
+            );
+        }
+    }
+}
+
+/// The whole recurrent sub-layer on the device (`fused_recurrent_layer`)
+/// against the host sequence step for step — the input fold, the four
+/// projections, the conv step over a rolling history, SiLU, the L2 norms
+/// and the query scale, `beta`, `decay`, then the delta rule, gated norm,
+/// output fold and `ssm_out` — over three consecutive tokens, on both the
+/// output and the state and history the device keeps. With and without
+/// the input fold (`blk.0.attn_qkv.weight`, identity signs), the output
+/// fold with the head permutation, and both output gates. Over the
+/// weight types as the attention layer's test.
+#[test]
+fn fused_recurrent_layer_matches_the_host_sequence() {
+    fused_recurrent_layer_check(GGML_TYPE_Q4_K);
+}
+
+#[test]
+fn fused_recurrent_layer_matches_the_host_sequence_for_ptq1_0() {
+    fused_recurrent_layer_check(GGML_TYPE_PTQ1_0);
+}
+
+#[test]
+fn fused_recurrent_layer_matches_the_host_sequence_for_pq2_0() {
+    fused_recurrent_layer_check(GGML_TYPE_PQ2_0);
+}
+
+fn fused_recurrent_layer_check(ggml_type: u32) {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    if vulkan.q4_k_mmvq {
+        eprintln!("skipping: ORANGU_Q4K_MMVQ selects the unfused fallback path");
+        return;
+    }
+    use crate::engine::arch::qwen_hybrid::delta_head_step;
+    use crate::engine::backend::vulkan::RecurrentLayerInput;
+    use crate::engine::hadamard::HadamardFold;
+    use crate::engine::kv_cache::{DeviceStateAccess, DeviceStateMirror, Fresh};
+    use crate::engine::tensor;
+    use orangu::gguf::GgufValue;
+
+    let (n_k, n_v, hd) = (2usize, 8usize, 128usize);
+    let key_dim = n_k * hd;
+    let value_dim = n_v * hd;
+    let conv_channels = 2 * key_dim + value_dim;
+    let d_conv = 4usize;
+    let n_embd = 1024usize;
+    let eps = 1e-6f32;
+    let mut seed = 0x5EC0D_u64;
+    let matrix = |in_dim: usize, out_dim: usize, seed: &mut u64| {
+        let mut bytes = Vec::new();
+        for _ in 0..out_dim {
+            for _ in 0..(in_dim / block_elems(ggml_type)) {
+                bytes.extend(build_block(ggml_type, seed));
+            }
+        }
+        test_quant_matrix(&bytes, ggml_type, in_dim, out_dim)
+    };
+    let wqkv = matrix(n_embd, conv_channels, &mut seed);
+    let wgate = matrix(n_embd, value_dim, &mut seed);
+    let wbeta = matrix(n_embd, n_v, &mut seed);
+    let walpha = matrix(n_embd, n_v, &mut seed);
+    let ssm_out = matrix(value_dim, n_embd, &mut seed);
+    let mut rnd = |scale: f32| (next_byte(&mut seed) as f32 - 128.0) / 128.0 * scale;
+    let ssm_norm: Vec<f32> = (0..hd).map(|_| 1.0 + rnd(0.3)).collect();
+    let conv_kernel: Vec<f32> = (0..conv_channels * d_conv).map(|_| rnd(0.5)).collect();
+    let dt_bias: Vec<f32> = (0..n_v).map(|_| rnd(1.0)).collect();
+    let ssm_a: Vec<f32> = (0..n_v).map(|_| -0.5 - rnd(0.4).abs()).collect();
+
+    let fold_metadata = |names: &[&str], grouped: bool| -> Vec<(String, GgufValue)> {
+        vec![
+            ("prism.hadamard.version", GgufValue::U32(1)),
+            ("prism.hadamard.block_size", GgufValue::U32(1024)),
+            (
+                "prism.hadamard.transform",
+                GgufValue::String("normalized-sylvester-walsh-hadamard".into()),
+            ),
+            (
+                "prism.hadamard.axis",
+                GgufValue::String("input-last-dimension".into()),
+            ),
+            (
+                "prism.hadamard.sign_mode",
+                GgufValue::String("identity".into()),
+            ),
+            (
+                "prism.hadamard.weight_names",
+                GgufValue::Array(
+                    names
+                        .iter()
+                        .map(|n| GgufValue::String((*n).into()))
+                        .collect(),
+                ),
+            ),
+            ("prism.hadamard.gdn_v_grouped", GgufValue::Bool(grouped)),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    };
+    let fold = HadamardFold::from_metadata(&fold_metadata(
+        &[
+            "blk.0.attn_qkv.weight",
+            "blk.0.attn_gate.weight",
+            "blk.0.ssm_beta.weight",
+            "blk.0.ssm_alpha.weight",
+            "blk.0.ssm_out.weight",
+        ],
+        true,
+    ))
+    .unwrap()
+    .unwrap();
+    let in_rot = fold
+        .input_rotation("blk.0.attn_qkv.weight", n_embd, None)
+        .unwrap()
+        .unwrap();
+    let out_rot = fold
+        .input_rotation("blk.0.ssm_out.weight", value_dim, Some((n_v, n_k)))
+        .unwrap()
+        .unwrap();
+
+    for (case, (in_rot, ba_rot, out_rot)) in [
+        (None, None, None),
+        (Some(&in_rot), Some(&in_rot), Some(&out_rot)),
+        // The served file: QKV and the gate folded, beta/alpha not.
+        (Some(&in_rot), None, Some(&out_rot)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for sigmoid_gate in [false, true] {
+            let mut host_state: Vec<f32> = (0..n_v * hd * hd).map(|_| rnd(0.05)).collect();
+            let mut host_conv: Vec<f32> = (0..conv_channels * (d_conv - 1))
+                .map(|_| rnd(0.5))
+                .collect();
+            let mut dev_state = host_state.clone();
+            let mut dev_conv = host_conv.clone();
+            let mut mirror: Option<Box<dyn DeviceStateMirror>> = None;
+            let mut fresh = Fresh::Host;
+            for token in 0..3 {
+                let normed: Vec<f32> = (0..n_embd).map(|_| rnd(1.0)).collect();
+
+                // Host: the fold, the projections (through the same device
+                // matmul, so the weights read identically), the conv step,
+                // the norms, the delta rule.
+                let mut x = normed.clone();
+                if let Some(rot) = in_rot {
+                    rot.apply(&mut x, n_embd);
+                }
+                let mixed = vulkan.matmul(&x, 1, &wqkv);
+                let z = vulkan.matmul(&x, 1, &wgate);
+                let x_ba = if ba_rot.is_some() { &x } else { &normed };
+                let b = vulkan.matmul(x_ba, 1, &wbeta);
+                let a = vulkan.matmul(x_ba, 1, &walpha);
+                let hw = d_conv - 1;
+                let mut conv = vec![0f32; conv_channels];
+                for c in 0..conv_channels {
+                    let mut sum = 0f32;
+                    for t in 0..hw {
+                        sum += host_conv[c * hw + t] * conv_kernel[c * d_conv + t];
+                    }
+                    sum += mixed[c] * conv_kernel[c * d_conv + hw];
+                    conv[c] = tensor::silu(sum);
+                    host_conv.copy_within(c * hw + 1..c * hw + hw, c * hw);
+                    host_conv[c * hw + hw - 1] = mixed[c];
+                }
+                let (q, rest) = conv.split_at_mut(key_dim);
+                let (k, v) = rest.split_at_mut(key_dim);
+                for h in 0..n_k {
+                    tensor::l2_norm_inplace(&mut q[h * hd..(h + 1) * hd], eps);
+                    tensor::l2_norm_inplace(&mut k[h * hd..(h + 1) * hd], eps);
+                }
+                let q_scale = 1.0 / (hd as f32).sqrt();
+                for qv in q.iter_mut() {
+                    *qv *= q_scale;
+                }
+                let beta: Vec<f32> = b.iter().map(|&x| tensor::sigmoid(x)).collect();
+                let decay: Vec<f32> = (0..n_v)
+                    .map(|h| (tensor::softplus(a[h] + dt_bias[h]) * ssm_a[h]).exp())
+                    .collect();
+                let mut attn = vec![0f32; value_dim];
+                let mut scratch = vec![0f32; 2 * hd];
+                for vh in 0..n_v {
+                    let kh = vh % n_k;
+                    let (sk, d) = scratch.split_at_mut(hd);
+                    let out = &mut attn[vh * hd..(vh + 1) * hd];
+                    delta_head_step(
+                        &mut host_state[vh * hd * hd..(vh + 1) * hd * hd],
+                        &q[kh * hd..(kh + 1) * hd],
+                        &k[kh * hd..(kh + 1) * hd],
+                        &v[vh * hd..(vh + 1) * hd],
+                        beta[vh],
+                        decay[vh],
+                        out,
+                        sk,
+                        d,
+                    );
+                    tensor::rmsnorm_inplace(out, &ssm_norm, 1, hd, eps);
+                    for (o, &zv) in out.iter_mut().zip(&z[vh * hd..(vh + 1) * hd]) {
+                        *o *= if sigmoid_gate {
+                            tensor::sigmoid(zv)
+                        } else {
+                            tensor::silu(zv)
+                        };
+                    }
+                }
+                if let Some(rot) = out_rot {
+                    rot.apply(&mut attn, value_dim);
+                }
+                let expected = vulkan.matmul(&attn, 1, &ssm_out);
+
+                let got = vulkan
+                    .fused_recurrent_layer(RecurrentLayerInput {
+                        normed: &normed,
+                        qkv_rotation: in_rot,
+                        ba_rotation: ba_rot,
+                        wqkv: &wqkv,
+                        wgate: &wgate,
+                        wbeta: &wbeta,
+                        walpha: &walpha,
+                        conv_kernel: &conv_kernel,
+                        d_conv,
+                        dt_bias: &dt_bias,
+                        ssm_a: &ssm_a,
+                        state: DeviceStateAccess {
+                            host: &mut dev_state,
+                            conv: &mut dev_conv,
+                            mirror: &mut mirror,
+                            fresh: &mut fresh,
+                        },
+                        ssm_norm: &ssm_norm,
+                        eps,
+                        sigmoid_gate,
+                        n_k,
+                        n_v,
+                        head_dim: hd,
+                        out_rotation: out_rot,
+                        ssm_out: &ssm_out,
+                        batch_slot: 0,
+                    })
+                    .expect("the device takes this shape");
+                assert_eq!(got.len(), n_embd);
+                assert_eq!(fresh, Fresh::Device);
+                for (i, (a, b)) in expected.iter().zip(&got).enumerate() {
+                    let tol = 6e-2 * a.abs().max(1.0);
+                    assert!(
+                        (a - b).abs() <= tol,
+                        "case {case} sigmoid={sigmoid_gate} token {token}: output {i}: host={a} device={b}"
+                    );
+                }
+                let mut down_state = vec![0f32; dev_state.len()];
+                let mut down_conv = vec![0f32; dev_conv.len()];
+                mirror
+                    .as_ref()
+                    .expect("a mirror after a step")
+                    .download(&mut down_state, &mut down_conv);
+                // The device's inputs to the delta rule differ from the
+                // host's by the rounding of a Hadamard butterfly and a
+                // projection each, and the state carries that forward.
+                for (i, (a, b)) in host_conv.iter().zip(&down_conv).enumerate() {
+                    assert!(
+                        (a - b).abs() <= 1e-2 * a.abs().max(1e-2),
+                        "case {case} sigmoid={sigmoid_gate} token {token}: history {i}: host={a} device={b}"
+                    );
+                }
+                for (i, (a, b)) in host_state.iter().zip(&down_state).enumerate() {
+                    assert!(
+                        (a - b).abs() <= 1e-2 * a.abs().max(1e-2),
+                        "case {case} sigmoid={sigmoid_gate} token {token}: state {i}: host={a} device={b}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The SwiGLU form with a Hadamard-folded `down`: the intermediate is
+/// rotated on the device before the down projection, and must match the
+/// CPU sequence that rotates it with `hadamard::Rotation::apply` — at one
+/// token (decode) and at several (prefill), in identity and explicit sign
+/// mode, and with a fold this build refuses (a permuting rotation) giving
+/// `None` rather than a wrong answer.
+#[test]
+fn fused_ffn_with_a_folded_down_projection_matches_the_host_rotation() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    if vulkan.q4_k_mmvq {
+        eprintln!("skipping: ORANGU_Q4K_MMVQ selects the unfused fallback path");
+        return;
+    }
+    use crate::engine::hadamard::HadamardFold;
+    use orangu::gguf::GgufValue;
+
+    let (n_embd, ffn_len) = (256usize, 2048usize);
+    let mut seed = 0xFADE_u64;
+    let mut build = |in_dim: usize, out_dim: usize| {
+        let mut bytes = Vec::new();
+        for _ in 0..out_dim {
+            for _ in 0..(in_dim / 256) {
+                bytes.extend(build_block(GGML_TYPE_Q4_K, &mut seed));
+            }
+        }
+        test_quant_matrix(&bytes, GGML_TYPE_Q4_K, in_dim, out_dim)
+    };
+    let gate = build(n_embd, ffn_len);
+    let up = build(n_embd, ffn_len);
+    let down = build(ffn_len, n_embd);
+
+    for sign_mode in ["identity", "explicit"] {
+        let mut metadata = vec![
+            ("prism.hadamard.version", GgufValue::U32(1)),
+            ("prism.hadamard.block_size", GgufValue::U32(1024)),
+            (
+                "prism.hadamard.transform",
+                GgufValue::String("normalized-sylvester-walsh-hadamard".into()),
+            ),
+            (
+                "prism.hadamard.axis",
+                GgufValue::String("input-last-dimension".into()),
+            ),
+            (
+                "prism.hadamard.sign_mode",
+                GgufValue::String(sign_mode.into()),
+            ),
+            (
+                "prism.hadamard.weight_names",
+                GgufValue::Array(vec![GgufValue::String("blk.0.ffn_down.weight".into())]),
+            ),
+        ];
+        if sign_mode == "explicit" {
+            metadata.push((
+                "prism.hadamard.sign_widths",
+                GgufValue::Array(vec![GgufValue::I32(ffn_len as i32)]),
+            ));
+            metadata.push((
+                "prism.hadamard.sign_values",
+                GgufValue::Array(
+                    (0..ffn_len)
+                        .map(|i| GgufValue::I32(if (i * 7 + i / 13) % 3 == 0 { -1 } else { 1 }))
+                        .collect(),
+                ),
+            ));
+        }
+        let metadata: Vec<(String, GgufValue)> = metadata
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let fold = HadamardFold::from_metadata(&metadata).unwrap().unwrap();
+        let rot = fold
+            .input_rotation("blk.0.ffn_down.weight", ffn_len, None)
+            .unwrap()
+            .unwrap();
+
+        for n_tokens in [1usize, 5] {
+            let x: Vec<f32> = (0..n_tokens * n_embd)
+                .map(|_| (next_byte(&mut seed) as f32 - 128.0) / 64.0)
+                .collect();
+            // The host sequence: gate/up, SiLU·up, the rotation, down.
+            let mut expected = vulkan.matmul(&x, n_tokens, &gate);
+            let up_out = vulkan.matmul(&x, n_tokens, &up);
+            for (g, u) in expected.iter_mut().zip(&up_out) {
+                *g = crate::engine::tensor::silu(*g) * u;
+            }
+            rot.apply(&mut expected, ffn_len);
+            let expected = vulkan.matmul(&expected, n_tokens, &down);
+
+            let got = vulkan
+                .fused_ffn_prefill(
+                    &x,
+                    n_tokens,
+                    &gate,
+                    &up,
+                    &down,
+                    crate::engine::backend::vulkan::FfnActivation::Swiglu,
+                    Some(&rot),
+                )
+                .expect("fused path available without MMVQ");
+            assert_eq!(got.len(), n_tokens * n_embd);
+            for (i, (a, b)) in expected.iter().zip(got.iter()).enumerate() {
+                let tol = 6e-2 * a.abs().max(1.0);
+                assert!(
+                    (a - b).abs() <= tol,
+                    "{sign_mode} n_tokens={n_tokens}: mismatch at {i}: host={a} device={b}"
+                );
+            }
+        }
+    }
+
+    // A rotation with a head permutation is not something the kernel does.
+    let metadata: Vec<(String, GgufValue)> = vec![
+        ("prism.hadamard.version", GgufValue::U32(1)),
+        ("prism.hadamard.block_size", GgufValue::U32(1024)),
+        (
+            "prism.hadamard.transform",
+            GgufValue::String("normalized-sylvester-walsh-hadamard".into()),
+        ),
+        (
+            "prism.hadamard.axis",
+            GgufValue::String("input-last-dimension".into()),
+        ),
+        (
+            "prism.hadamard.sign_mode",
+            GgufValue::String("identity".into()),
+        ),
+        (
+            "prism.hadamard.weight_names",
+            GgufValue::Array(vec![GgufValue::String("blk.0.ssm_out.weight".into())]),
+        ),
+        ("prism.hadamard.gdn_v_grouped", GgufValue::Bool(true)),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    let fold = HadamardFold::from_metadata(&metadata).unwrap().unwrap();
+    let permuting = fold
+        .input_rotation("blk.0.ssm_out.weight", ffn_len, Some((16, 4)))
+        .unwrap()
+        .unwrap();
+    let x = vec![0.5f32; n_embd];
+    assert!(
+        vulkan
+            .fused_ffn_prefill(
+                &x,
+                1,
+                &gate,
+                &up,
+                &down,
+                crate::engine::backend::vulkan::FfnActivation::Swiglu,
+                Some(&permuting),
+            )
+            .is_none()
+    );
 }
 
 #[test]

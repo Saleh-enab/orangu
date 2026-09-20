@@ -804,7 +804,25 @@ pub fn is_removed_ggml_type(ggml_type: u32) -> bool {
     REMOVED_GGML_TYPES.contains(&ggml_type)
 }
 
+/// Vendor-private `ggml_type` ids that sit *above* the contiguous table —
+/// too far up for a run of `None`s to be readable, so they are named by id.
+///
+/// `PQ2_0`/`PTQ1_0` are Prism ML's ternary formats (`PrismML-Eng/llama.cpp`,
+/// `ggml/include/ggml.h`): the same 2-bit and base-3 codecs as ggml's own
+/// `Q2_0` (42) and `TQ1_0` (34), with one `f16` scale per **128** weights
+/// instead of per 64 and per 256. They carry their own ids because stock
+/// ggml would otherwise read a `PQ2_0` file as `Q2_0` and decode it wrong
+/// without a word — a file carrying one names itself here for the same
+/// reason. `engine::quant` reads both.
+const PRIVATE_GGML_TYPE_NAMES: &[(u32, &str)] = &[(142, "PQ2_0"), (143, "PTQ1_0")];
+
 pub fn ggml_type_name(ggml_type: u32) -> String {
+    if let Some((_, name)) = PRIVATE_GGML_TYPE_NAMES
+        .iter()
+        .find(|(id, _)| *id == ggml_type)
+    {
+        return name.to_string();
+    }
     match GGML_TYPE_NAMES.get(ggml_type as usize) {
         Some(Some(name)) => name.to_string(),
         Some(None) => format!("reserved({ggml_type})"),
@@ -1149,6 +1167,20 @@ mod tests {
         for reserved in 43..64 {
             assert!(!is_removed_ggml_type(reserved), "type {reserved}");
         }
+    }
+
+    /// Prism's two ternary ids live far above the table. Both must name
+    /// themselves — `list`'s `QUANT` column prints this for a
+    /// `Ternary-Bonsai-2-27B-PTQ1_0.gguf` — and the ids around them must
+    /// stay `unknown`, not silently inherit a neighbour's name.
+    #[test]
+    fn prism_ternary_types_are_named_by_id() {
+        assert_eq!(ggml_type_name(142), "PQ2_0");
+        assert_eq!(ggml_type_name(143), "PTQ1_0");
+        assert_eq!(ggml_type_name(141), "unknown(141)");
+        assert_eq!(ggml_type_name(144), "unknown(144)");
+        assert!(!is_removed_ggml_type(142));
+        assert!(!is_removed_ggml_type(143));
     }
 
     #[test]

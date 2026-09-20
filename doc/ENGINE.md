@@ -114,6 +114,8 @@ carry hard-won behaviour that a local reimplementation will not:
   routing, expert batching and the expert budget.
 - `engine::kv_cache::KvCache` — per-layer dims, strides, recurrent state, the
   device mirror.
+- `engine::hadamard` — Prism's `prism.hadamard.*` fold: the metadata, the
+  activation-side rotation, and the ledger that proves coverage.
 
 Three modules are worth reading before writing a fourth of anything:
 `llama.rs` is the plain case, `gemma.rs` the elaborate one, and `qwen_hybrid.rs`
@@ -150,6 +152,17 @@ workload there is, a growing conversation on a GPU.
 **A layer's `len` is rows, not tokens.** A block-compressed slot has a
 `stride`, and one row stands for `stride` tokens. Convert through it; several
 helpers exist that already do.
+
+**A folded file's weights are not in the basis you think.** A file
+carrying `prism.hadamard.*` (Prism's `Ternary-Bonsai-2`) stores every
+projection Hadamard-rotated, and a matmul against it is wrong unless its
+input went through `engine::hadamard` first. The trunk that applies it
+(`qwen_hybrid`) keeps a `Rotation` beside each folded weight and proves at
+load, through `FoldLedger::finish`, that every folded name in the file was
+claimed by a transform site; `build_model` refuses such a file for every
+other architecture. If you add a matmul to a folded architecture, route its
+weight through the ledger — an unclaimed one fails the load, which is the
+point.
 
 **Some tensors never go to a device.** `is_cpu_only_tensor` names them —
 routed and shared expert weights. Shared-expert matmuls must go through

@@ -64,6 +64,28 @@ fn split_label(label: &str) -> (String, Option<String>) {
     (label.to_string(), None)
 }
 
+/// Sorted, distinct `n` values clustered so that every value in a group is
+/// within [`near`] of the group's first: `[78, 79, 512]` is `[[78, 79],
+/// [512]]`. Two tokenizations of one prompt differ by a token or two; two
+/// prompt lengths a sweep asks for differ by far more.
+fn group_near(ns: &[u32]) -> Vec<Vec<u32>> {
+    let mut groups: Vec<Vec<u32>> = Vec::new();
+    for &n in ns {
+        match groups.last_mut() {
+            Some(g) if n <= g[0] + near(g[0]) => g.push(n),
+            _ => groups.push(vec![n]),
+        }
+    }
+    groups
+}
+
+/// How far apart two reported prompt counts may be and still be the same
+/// prompt: two tokens, or 3% for a long prompt whose template differences
+/// scale with it.
+fn near(n: u32) -> u32 {
+    (n / 33).max(2)
+}
+
 /// Render `records` as markdown: one table per mode, in the order the modes
 /// first appear, each with one row per model and context and one column per
 /// swept value. With exactly two columns the last one is their ratio,
@@ -164,17 +186,28 @@ pub fn render(records: &[Record]) -> String {
                 .collect();
             ns.sort_unstable();
             ns.dedup();
-            for n in ns {
+            // Two engines tokenize one prompt to counts a token or two apart
+            // (their chat templates differ), and a prefill row is keyed on
+            // the count the server reported — so the same `--pp 64` landed
+            // on two rows, 78 and 79, with no ratio between them. Counts
+            // within `near` of each other are one row, named by its range.
+            let groups = group_near(&ns);
+            for group in groups {
                 let at = |column: &Option<String>| -> Option<&Cell> {
                     latest
                         .iter()
                         .find(|(l, m, k, _)| {
-                            m == mode && *k == n && {
+                            m == mode && group.contains(k) && {
                                 let (r, c) = split_label(l);
                                 r == *row && c == *column
                             }
                         })
                         .map(|(_, _, _, cell)| cell)
+                };
+                let n = match (group.first(), group.last()) {
+                    (Some(a), Some(b)) if a != b => format!("{a}–{b}"),
+                    (Some(a), _) => a.to_string(),
+                    _ => String::new(),
                 };
                 let _ = write!(out, "| {row} | {n} |");
                 for c in &columns {
@@ -231,6 +264,25 @@ mod tests {
             sd_sample: Some(0.6),
             device: None,
         }
+    }
+
+    /// Two engines tokenizing one prompt to 78 and 79 tokens are one row
+    /// with a ratio, not two rows with none; 78 and 512 stay apart.
+    #[test]
+    fn near_prompt_counts_share_a_row() {
+        let records = vec![
+            rec("2026-09-20", "m · ENGINE=orangu", "pp", 79, 1.62),
+            rec("2026-09-20", "m · ENGINE=fork", "pp", 78, 0.42),
+            rec("2026-09-20", "m · ENGINE=orangu", "pp", 512, 3.0),
+        ];
+        let md = render(&records);
+        assert!(md.contains("| m | 78–79 | 1.6"), "{md}");
+        assert!(md.contains("| 3.86× |"), "{md}");
+        assert!(md.contains("| m | 512 | 3.0"), "{md}");
+        assert_eq!(
+            group_near(&[78, 79, 512, 520, 1024]),
+            vec![vec![78, 79], vec![512, 520], vec![1024]]
+        );
     }
 
     #[test]

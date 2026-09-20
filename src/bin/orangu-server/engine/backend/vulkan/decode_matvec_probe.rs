@@ -378,6 +378,8 @@ const SWEEP_FORMATS: &[(&str, u32)] = &[
     ("IQ4_XS", crate::engine::quant::GGML_TYPE_IQ4_XS),
     ("IQ3_S", crate::engine::quant::GGML_TYPE_IQ3_S),
     ("IQ2_S", crate::engine::quant::GGML_TYPE_IQ2_S),
+    ("PQ2_0", crate::engine::quant::GGML_TYPE_PQ2_0),
+    ("PTQ1_0", crate::engine::quant::GGML_TYPE_PTQ1_0),
     ("Q6_K", crate::engine::quant::GGML_TYPE_Q6_K),
     ("Q4_K", GGML_TYPE_Q4_K),
 ];
@@ -633,7 +635,13 @@ fn norm_kernel_probe() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1536);
-    let reps = 2000;
+    // `ORANGU_NORM_PROBE_REPS` for a device that loses itself under two
+    // thousand passes in one submission (`ORANGU_PROBE_PASS_PER_DISPATCH=1`
+    // on the Mali-G720: 200 is fine).
+    let reps: u32 = std::env::var("ORANGU_NORM_PROBE_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2000);
     println!("\n== whole-row norm dispatches at width {n_embd}, {reps} back to back ==");
     for which in ["norm", "norm_add"] {
         let mut runs: Vec<f64> = (0..21)

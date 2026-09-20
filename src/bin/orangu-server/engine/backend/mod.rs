@@ -872,7 +872,8 @@ pub trait Backend: Send + Sync {
     /// test: `VulkanBackend` lacks only the three lowest-bit `IQ1_*` ids that
     /// are not ggml's own (`quant`'s 64..=66); the vendor backends
     /// (`CudaBackend`/`RocmBackend`/`OpenClBackend`, which share one shader
-    /// source) lack those and `MXFP4`. The vendor list is a strict subset of
+    /// source) lack those, `MXFP4`, and Prism's ternary `PQ2_0`/`PTQ1_0`
+    /// (`quant`'s 142/143). The vendor list is a strict subset of
     /// Vulkan's, and the test holds it that way on purpose — Vulkan is the
     /// backend with hardware to verify a kernel on, so a new one lands there
     /// first.
@@ -1149,9 +1150,9 @@ mod tests {
         const NOT_A_WEIGHT: &[u32] = &[quant::GGML_TYPE_I32];
 
         // Every id `quant` can read, swept rather than listed — the highest
-        // id in the tree is 66 and the sweep is deliberately well past it, so
+        // id in the tree is 143 and the sweep is deliberately well past it, so
         // a new type lands in this set on its own.
-        let cpu: Vec<u32> = (0..=127u32)
+        let cpu: Vec<u32> = (0..=255u32)
             .filter(|&t| quant::supports_type(t))
             .filter(|t| !REPACKS.contains(t) && !NOT_A_WEIGHT.contains(t))
             .collect();
@@ -1184,7 +1185,7 @@ mod tests {
             .collect();
         assert_eq!(
             vulkan_only,
-            ["MXFP4"],
+            ["MXFP4", "PQ2_0", "PTQ1_0"],
             "the set of types Vulkan has a kernel for and the vendor backends do \
              not has changed; update `Backend::supports_type`'s doc to match"
         );
@@ -1205,7 +1206,7 @@ mod tests {
         );
         assert_eq!(
             gap(vendor),
-            ["MXFP4", "IQ1_XS", "IQ1_XXS", "IQ1_XXXS"],
+            ["MXFP4", "IQ1_XS", "IQ1_XXS", "IQ1_XXXS", "PQ2_0", "PTQ1_0"],
             "the set of types the CPU path reads and the vendor backends have no \
              kernel for has changed; update `Backend::supports_type`'s doc to match"
         );

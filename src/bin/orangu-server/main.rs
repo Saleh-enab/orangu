@@ -1167,6 +1167,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     // Before anything parallel runs — the loader itself reaches for rayon,
     // and `build_global` can only be called once.
     let threads = configure_cpu_threads(threads_flag.as_deref(), conf.threads)?;
+    engine::prefill_backend::set(conf.prefill_backend);
     // Before the model is opened, because the loader is the first thing that
     // can read a weight through an explicit route.
     engine::expert_read::set_read_size(conf.read_size);
@@ -1237,6 +1238,20 @@ fn prepare(args: Args) -> Result<Prepared> {
     // timeout, and on a backend that has none it reads the clock as a
     // per-token rate that a streamed model does not have.
     engine::generate::set_chunk_policy(backend.has_submission_timeout());
+    // A `PTQ1_0` file is served to a Vulkan device as `PQ2_0`: the same
+    // trits in the layout its kernel reads 1.3× faster, for 21% more
+    // bytes. Decided here, with the backend final and before anything
+    // reads the tensor table, so the footprint, the placement and the
+    // banner all describe what the device will hold.
+    let repack = backend.as_wgpu().is_some()
+        && engine::env::flag_on_unless_disabled("ORANGU_TERNARY_REPACK")
+        && loaded.has_ternary_ptq1_0();
+    engine::loader::ternary_repack::set(repack);
+    if repack {
+        eprintln!(
+            "orangu-server: [vulkan] PTQ1_0 weights repacked as PQ2_0 for the device (lossless, 21% more bytes; ORANGU_TERNARY_REPACK=0 keeps the file's format)"
+        );
+    }
     // The split decision needs only the *weight* side of the footprint,
     // which is readable straight from the loaded tensor table — the KV side
     // needs a built model, and the model cannot be built until placement is
@@ -2562,7 +2577,21 @@ fn build_model(
     backend: &Arc<dyn Backend>,
 ) -> Result<Arc<dyn ModelForward>> {
     let architecture = loaded.config.architecture.clone();
-    let model: Arc<dyn ModelForward> = match engine::loader::resolve_arch_family(&architecture)? {
+    let family = engine::loader::resolve_arch_family(&architecture)?;
+    // A Hadamard-folded file (`engine::hadamard`) is only served by the
+    // architectures whose loaders route every folded weight through the
+    // fold ledger. The rest would load it as if the weights were plain and
+    // generate confidently wrong text, so they refuse it up front.
+    if !matches!(
+        family,
+        ArchFamily::Qwen35 | ArchFamily::Qwen35Moe | ArchFamily::Qwen3Next | ArchFamily::Qwen4Exp
+    ) && engine::hadamard::from_loaded(loaded)?.is_some()
+    {
+        bail!(
+            "this file's weights are Hadamard-folded (prism.hadamard.*), and the `{architecture}`              architecture does not apply the activation transform that requires; only the Qwen              3.5-family architectures do"
+        );
+    }
+    let model: Arc<dyn ModelForward> = match family {
         ArchFamily::LlamaStyle => Arc::new(
             LlamaModel::load_with_backend(loaded, backend.clone()).context("building model")?,
         ),

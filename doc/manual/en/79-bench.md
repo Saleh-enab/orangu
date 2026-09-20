@@ -832,6 +832,14 @@ orangu first and the percentages say how far behind or ahead it is. The
 history rows carry the label `<label> · ENGINE=<value>`, which is the shape
 `--table` turns into one row per model with one column per engine.
 
+A prefill row is keyed on the prompt length the *server* reported, and two
+engines' chat templates tokenize one `--pp 64` prompt to counts a token or
+two apart (78 against 79, on the Prism fork against orangu). The table
+therefore clusters counts within two tokens of each other — three percent,
+for a long prompt whose template differences scale with it — into one row
+named by the range (`78–79`), so the ratio column has both engines to read.
+Two lengths a sweep actually asked for are never that close.
+
 A decode sweep warms each fresh server on its own workload — one generation
 of `--gen` tokens at the deepest requested context — before anything is
 recorded. An eight-token warmup was measured leaving the first timed

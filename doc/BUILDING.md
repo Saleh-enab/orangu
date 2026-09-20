@@ -147,6 +147,65 @@ or ROCm hardware was available when they were built). Metal is not in that
 group: it shares the Vulkan backend's kernels outright, so it is at full
 parity and is covered by the same tests.
 
+### Newer Vulkan headers on Debian 12 (for a reference `llama.cpp`)
+
+`orangu-server` itself never needs Vulkan headers — `wgpu` carries its own
+bindings — but building a *reference* engine beside it does: `llama.cpp`'s
+Vulkan backend (and Prism ML's fork of it, the one that runs the
+`Ternary-Bonsai-2` files) uses `vk::LayerSettingEXT` and other symbols
+that arrived after the `1.3.239` headers Debian 12 ships (`libvulkan-dev
+1.3.239.0-1`; `bookworm-backports` has nothing newer), so a plain
+`cmake -DGGML_VULKAN=ON` build fails in `ggml-vulkan.cpp`. The driver is
+not the problem: the Mali ICD (`/etc/vulkan/icd.d/mali.json`) reports
+`1.3.296`, and the `1.3.239` **loader** (`libvulkan1`) talks to it fine.
+Only the headers are old, and they are header-only. Two ways to get them:
+
+**Per build**, no root — what `doc/PERF-BONSAI.md`'s reference build does:
+
+```sh
+git clone --depth 1 --branch v1.3.296 https://github.com/KhronosGroup/Vulkan-Headers.git
+cmake -B build -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release \
+      -DVulkan_INCLUDE_DIR=$PWD/../Vulkan-Headers/include \
+      -DCMAKE_CXX_FLAGS="-I$PWD/../Vulkan-Headers/include"
+```
+
+Match the tag to the driver's `apiVersion` (`vulkaninfo --summary`);
+newer headers than the driver are fine too, older than the code being
+built is what fails.
+
+**System-wide**, into `/usr/local` — searched before `/usr/include`, so it
+takes precedence over the distro's copy without replacing any package:
+
+```sh
+git clone --depth 1 --branch v1.3.296 https://github.com/KhronosGroup/Vulkan-Headers.git
+cd Vulkan-Headers
+cmake -B build -DCMAKE_INSTALL_PREFIX=/usr/local
+sudo cmake --install build          # /usr/local/include/vulkan/*.h, vulkan.hpp, vk_video/
+```
+
+Then `cmake -DGGML_VULKAN=ON` finds them on its own (`find_package(Vulkan)`
+looks in `/usr/local/include` first). To go back, `sudo rm -r
+/usr/local/include/vulkan /usr/local/include/vk_video
+/usr/local/share/cmake/VulkanHeaders`. Do **not** pull `libvulkan-dev`
+from Debian 13 instead: that package depends on a `libvulkan1` built
+against a newer glibc than bookworm's.
+
+The other pieces, and whether they need updating:
+
+| piece | on this board | needed? |
+| :-- | :-- | :-- |
+| loader `libvulkan1` | 1.3.239 | no — a loader is forward-compatible with newer drivers and headers; a source build of `KhronosGroup/Vulkan-Loader` is only for a loader *bug* |
+| `vulkan-tools` (`vulkaninfo`) | 1.3.239 | no — it reports the driver's version either way |
+| `glslc` (`shaderc` 2023.2) | 2023.2 | no for `llama.cpp` today; a newer `KhronosGroup/glslang` + `google/shaderc` source build only if a shader uses a newer GLSL extension than it accepts (the build log names it) |
+| Mali ICD + `libmali` | vendor, `1.3.296` | leave alone — it is the device |
+
+The stock `/usr/local/bin/llama-*` on this board is a CPU-only build
+(`ldd llama-bench` shows no `libggml-vulkan`); a Vulkan build of the
+same tree installs beside it with `cmake --install build` after the
+headers above are in place, or runs from its `build/bin` — the fork under
+`/mnt/ai/pgmoneta/prism-llama.cpp` does the latter and is what
+`doc/PERF-BONSAI.md` compares against.
+
 ## Test
 
 ```sh

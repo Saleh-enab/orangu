@@ -2474,10 +2474,27 @@ pub fn prepare_in_background(model: &Path, enabled: bool, budget_bytes: u64) {
     // The blocks that will be compiled, which is also what has to be
     // captured — counted here rather than passed in, because this runs
     // before the weights are mapped and the caller has only the file.
-    let n_layer = open_model(model)
-        .ok_or(())
-        .map(|gguf| discover_blocks(&gguf, model, Some("blk.")).len())
-        .unwrap_or(0);
+    let Some(gguf) = open_model(model) else {
+        return;
+    };
+    // A Hadamard-folded file (`engine::hadamard`) stores its feed-forward
+    // weights in a rotated input basis and the architecture rotates the
+    // activation to match; a block compiled from the weights as stored and
+    // calibrated on unrotated activations would compute something else, so
+    // the FFN never consults the device for one and there is nothing to
+    // prepare. Said once here rather than discovered after a compile that
+    // reads the whole file on the way to being ignored.
+    if gguf
+        .metadata
+        .iter()
+        .any(|(key, _)| key.starts_with("prism.hadamard."))
+    {
+        log::info!(
+            "orangu-server: [npu] not used — this model's feed-forward weights are              Hadamard-folded, which the compiled blocks do not apply"
+        );
+        return;
+    }
+    let n_layer = discover_blocks(&gguf, model, Some("blk.")).len();
     if n_layer == 0 {
         return;
     }

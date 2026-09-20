@@ -48,9 +48,9 @@
 use crate::engine::quant::{
     GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_S,
     GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS,
-    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
-    GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K,
-    GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0,
+    GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0,
+    GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
 };
 
 /// Storage/uniform bindings every shader shares, plus byte- and half-float-
@@ -1958,6 +1958,55 @@ fn dequant_element(byte_offset: u32, k: u32) -> f32 {
 }
 "#;
 
+/// `block_pq2_0`: mirrors `quant::unpack_block_pq2_0` — Prism's 128-element
+/// `Q2_0`, one `f16` scale then 32 bytes of four 2-bit fields each, field
+/// `k % 4` of byte `k / 4`, `0..=3` standing for `-1..=2`.
+const PQ2_0_COOP_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 34u;
+const BLOCK_ELEMS: u32 = 128u;
+var<workgroup> shared_vals: array<f32, BLOCK_ELEMS>;
+fn dequant_element(byte_offset: u32, k: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let byte = read_u8(byte_offset + 2u + (k >> 2u));
+    let q = (byte >> ((k & 3u) * 2u)) & 3u;
+    return (f32(q) - 1.0) * d;
+}
+"#;
+
+/// `block_ptq1_0`: mirrors `quant::unpack_block_ptq1_0` — `TQ1_0`'s base-3
+/// trits at group 128 with the `f16` scale **last** (byte 26). Element `k`
+/// is trit `n` (most significant first) of one byte: `k < 80` is byte
+/// `k % 16`, trit `k / 16`; `80..120` is byte `16 + (k - 80) % 8`, trit
+/// `(k - 80) / 8`; `120..128` is `qh` byte `(k - 120) % 2`, trit
+/// `(k - 120) / 2`. A trit is read by pushing it to the top with `3^n`
+/// (wrapping in a byte) and taking `(q · 3) >> 8`.
+const PTQ1_0_COOP_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 28u;
+const BLOCK_ELEMS: u32 = 128u;
+var<workgroup> shared_vals: array<f32, BLOCK_ELEMS>;
+fn ptq1_trit(byte: u32, n: u32) -> f32 {
+    var pow3 = array<u32, 5>(1u, 3u, 9u, 27u, 81u);
+    let q = (byte * pow3[n]) & 0xFFu;
+    return f32((q * 3u) >> 8u) - 1.0;
+}
+fn dequant_element(byte_offset: u32, k: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset + 26u) | (read_u8(byte_offset + 27u) << 8u));
+    var byte_index: u32;
+    var n: u32;
+    if (k < 80u) {
+        byte_index = k % 16u;
+        n = k / 16u;
+    } else if (k < 120u) {
+        byte_index = 16u + (k - 80u) % 8u;
+        n = (k - 80u) / 8u;
+    } else {
+        byte_index = 24u + (k - 120u) % 2u;
+        n = (k - 120u) / 2u;
+    }
+    return ptq1_trit(read_u8(byte_offset + byte_index), n) * d;
+}
+"#;
+
 /// `block_q4_K`: mirrors `quant::dequantize_q4_k`, whose sequential form
 /// visits `q_offset` in `{0, 64, 128, 192}`, each covering a 64-wide
 /// output range split into a low-nibble half (scale/min pair `is`) and a
@@ -3495,6 +3544,939 @@ fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
 /// scalar activation loads, and the loop keeps every one of them in
 /// order. Measured on the E2B UD-Q2_K_XL file, the FFN gate ran at 13 GB/s
 /// that way against the Q4_K kernel's ~80.
+/// `block_pq2_0` for [`block_hoisted_suffix`], read as words: a lane's 16
+/// elements are the four 2-bit fields of each of four consecutive bytes —
+/// one word of the payload — against four `vec4` activations. The block is
+/// 34 bytes, so the word and the scale go through the unaligned readers.
+const PQ2_0_WORDS_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 34u;
+const BLOCK_ELEMS: u32 = 128u;
+const LANES_PER_BLOCK: u32 = 8u;
+// One byte's four fields as `-1..=2`, in element order.
+fn fields4(b: u32) -> vec4<f32> {
+    return vec4<f32>(f32(b & 3u), f32((b >> 2u) & 3u), f32((b >> 4u) & 3u), f32(b >> 6u)) - vec4<f32>(1.0);
+}
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u16_at(byte_offset));
+    let w = read_u32_at(byte_offset + 2u + 4u * sub);
+    let xi = (x_off + 16u * sub) / 4u;
+    var acc: f32 = dot(fields4(w & 0xFFu), xv(xi));
+    acc = acc + dot(fields4((w >> 8u) & 0xFFu), xv(xi + 1u));
+    acc = acc + dot(fields4((w >> 16u) & 0xFFu), xv(xi + 2u));
+    acc = acc + dot(fields4(w >> 24u), xv(xi + 3u));
+    return acc * d;
+}
+"#;
+
+/// `block_ptq1_0` for [`block_hoisted_suffix`], read as words. The block is
+/// 28 bytes — seven words, always word-aligned — with the scale in the top
+/// half of the last. Sixteen lanes per block and **no branch**: every lane
+/// dots two words through the same `trit4v`, and only *which* words, which
+/// trit multiplier and which eight activations differ, as lane-uniform
+/// selects. Lanes `0..10` take half a trit plane of the 16-byte run (plane
+/// `sub / 2`, words `2·(sub % 2)`, `+1`); lanes `10..15` a whole plane of
+/// the 8-byte run (words 4 and 5); lane 15 the eight `qh` values, which
+/// are the two `qh` bytes duplicated into a word and multiplied by
+/// `[1 1 3 3]` then `[9 9 27 27]` — the same `(q · 3^n · 3) >> 8` as
+/// everywhere else, with the multiplier per lane instead of per word.
+///
+/// The first version of this kernel had eight lanes and a three-way branch
+/// on `sub`; on the Mali-G720 it streamed at 20 GB/s against `PQ2_0`'s
+/// 32 at the same shape (`decode_matvec_format_sweep_gpu_versus_cpu`).
+const PTQ1_0_WORDS_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 28u;
+const BLOCK_ELEMS: u32 = 128u;
+const LANES_PER_BLOCK: u32 = 16u;
+// Trit `p[i]` (a power of three) of byte `i` of `w`, as `-1..=1`.
+fn trit4v(w: u32, p: vec4<u32>) -> vec4<f32> {
+    let b = vec4<u32>(w & 0xFFu, (w >> 8u) & 0xFFu, (w >> 16u) & 0xFFu, w >> 24u);
+    let m = (b * p) & vec4<u32>(0xFFu);
+    return vec4<f32>((m * vec4<u32>(3u)) >> vec4<u32>(8u)) - vec4<f32>(1.0);
+}
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let w0 = byte_offset / 4u;
+    let d = f16_to_f32(weights[w0 + 6u] >> 16u);
+    var pow3 = array<u32, 5>(1u, 3u, 9u, 27u, 81u);
+    let in16 = sub < 10u;
+    let in8 = sub >= 10u && sub < 15u;
+    let is_qh = sub == 15u;
+    let n = select(select(0u, sub - 10u, in8), sub / 2u, in16);
+    let h = sub & 1u;
+    let p = pow3[n];
+    let ia = select(select(6u, 4u, in8), 2u * h, in16);
+    let ib = select(select(6u, 5u, in8), 2u * h + 1u, in16);
+    var wa = weights[w0 + ia];
+    var wb = weights[w0 + ib];
+    let dup = (wa & 0xFFFFu) | (wa << 16u);
+    wa = select(wa, dup, is_qh);
+    wb = select(wb, dup, is_qh);
+    let pa = select(vec4<u32>(p), vec4<u32>(1u, 1u, 3u, 3u), is_qh);
+    let pb = select(vec4<u32>(p), vec4<u32>(9u, 9u, 27u, 27u), is_qh);
+    let e = select(select(120u, 80u + 8u * n, in8), 16u * n + 8u * h, in16);
+    let xi = (x_off + e) / 4u;
+    return (dot(trit4v(wa, pa), xv(xi)) + dot(trit4v(wb, pb), xv(xi + 1u))) * d;
+}
+"#;
+
+/// The **integer-dot** decode kernel for Prism's ternary pair, `PQ2_0`
+/// and `PTQ1_0` — the same workgroup shape as [`block_hoisted_suffix`]
+/// (64 lanes, `n_rows` rows, eight adjacent lanes to a block, eight blocks
+/// in flight) with the arithmetic of the `mmvq` kernels: the activations
+/// are quantized to `int8` and the weights' trits are packed four to a
+/// word, so `dot4I8Packed` does four multiply-adds per instruction and the
+/// `-1` offset of a `0/1/2` trit comes out as one subtraction per block
+/// (`Σ t·q − Σ q`).
+///
+/// **Why.** The float words kernels above decode every trit to `f32`
+/// before the multiply — for `PTQ1_0` that is a byte extract, a multiply,
+/// a mask, a multiply, a shift, a convert and a subtract per weight, then
+/// the FMA — and the Mali-G720 issues them at 7.5 GB/s against 37 for
+/// `Q8_0` and 30 for `Q4_K` at the same shape
+/// (`matmul_kernel_time_by_wall_clock`): the kernel is bound by
+/// instructions per weight, not bytes. Here a lane owns one *word* of the
+/// block and its whole trit chain: the two even bytes sit in the low
+/// halves of two 16-bit lanes and the two odd bytes in another word, and
+/// one multiply by three, one shift, one mask per pair of trits
+/// (`((q · 3ⁿ) mod 256) · 3 >> 8`, the reference formula, as a remainder
+/// chain) yields the four trits of a position already in byte lanes — two
+/// shifts fewer than the float form and no conversion at all. Three
+/// instructions per weight for `PTQ1_0`, under two for `PQ2_0`, whose
+/// fields are already two bits in element order (`(w >> 2k) & 0x03030303`
+/// is a whole position).
+///
+/// **The activations are quantized in the kernel**, per 128-block, by the
+/// eight lanes that own the block: each loads exactly the elements its own
+/// word multiplies (the block's element map partitions its 128 elements
+/// over the lanes' words), takes their absolute maximum, and three
+/// `subgroupShuffleXor` steps make that the block's; `pack4x8snorm` of
+/// `x / amax` is then the `int8` row with `amax / 127` its scale. Nothing
+/// is staged, no barrier is crossed, and the same lanes reuse the packed
+/// row for every one of the workgroup's `n_rows` rows — the reason the
+/// quantization is worth its ~20% of the block: its cost is paid once per
+/// block per workgroup, the trit chain once per block per row. The `Q4_K`
+/// `mmvq` path quantizes in a separate dispatch into a second buffer; this
+/// binds the same `f32` activations as every other decode kernel, so every
+/// caller (the batched path, the fused FFN, the recurrent tail) takes it
+/// without knowing.
+///
+/// **Lanes never branch.** For `PTQ1_0` the seven words of a block have
+/// three roles — the 16-byte run (four words, five trit positions of
+/// sixteen elements), the 8-byte run (two words, five positions of eight)
+/// and the `qh` word (two bytes of four trits each, beside the scale) —
+/// and every lane runs the same five-position chain; the role only decides
+/// which activations it pairs with, through five per-lane `vec4` indices
+/// and validity masks computed once. The `qh` lane's two bytes go in as
+/// `[qh0, qh0·3]` and `[qh1, qh1·3]`, so a position `n` of its chain packs
+/// `[t(qh0,n), t(qh1,n), t(qh0,n+1), t(qh1,n+1)]` — exactly elements
+/// `120 + 2n ..= 123 + 2n`, contiguous — and only positions 0 and 2 are
+/// live. The eighth lane decodes the `qh` word again with every position
+/// masked; its activation loads duplicate live elements so the block
+/// maximum is unchanged.
+///
+/// Every workgroup runs the same number of block iterations (a block past
+/// the row is masked, not skipped), so the shuffles are in uniform control
+/// flow. `-1..=1` per trit and `int8` activations sum exactly in `i32`
+/// across a block; the rounding is the activation quantization's alone,
+/// `round(x · 127 / amax)` per 128 elements — the same step the CPU
+/// backend's fused `sdot` kernels take at 256.
+///
+/// `ORANGU_TERNARY_IDOT=0` keeps the float words kernels — the control arm.
+pub fn shader_source_ternary_idot(
+    ggml_type: u32,
+    n_rows: usize,
+    groups: usize,
+    subgroup: bool,
+) -> Option<String> {
+    let ptq = match ggml_type {
+        t if t == GGML_TYPE_PTQ1_0 => true,
+        t if t == GGML_TYPE_PQ2_0 => false,
+        _ => return None,
+    };
+    let mut s = String::new();
+    s.push_str(PRELUDE_XV);
+    s.push_str(&format!(
+        "\nvar<workgroup> partial_sums: array<f32, {}>;\n\n",
+        n_rows * 64
+    ));
+    s.push_str("@compute @workgroup_size(64)\nfn main(\n    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>,\n    @builtin(num_workgroups) nwg: vec3<u32>,");
+    s.push_str(subgroup_entry_params(subgroup));
+    s.push_str("\n) {\n");
+    // A workgroup takes `groups` runs of `n_rows` rows one after another:
+    // the lane's role constants, the launch and the drain are paid once
+    // per workgroup, and at a 40-block row (the FFN gate) they were about
+    // two fifths of it.
+    let wg_rows = n_rows * groups;
+    s.push_str(&format!(
+        "    let n_row_groups = (params.out_dim + {}u) / {wg_rows}u;\n",
+        wg_rows - 1
+    ));
+    s.push_str("    let flat = wid.x + wid.y * nwg.x + wid.z * nwg.x * nwg.y;\n    if (flat >= n_row_groups * params.n_tokens) {\n        return;\n    }\n");
+    s.push_str("    let rg = flat / params.n_tokens;\n    let t = flat % params.n_tokens;\n");
+    s.push_str("    let local = lid.x;\n    let x_base = t * params.in_dim;\n\n");
+    s.push_str("    let sub = local % 8u;\n    let slot = local / 8u;\n    let n_blocks = params.in_dim / 128u;\n    let n_iter = (n_blocks + 7u) / 8u;\n");
+    let slots = if ptq { 5 } else { 4 };
+    if ptq {
+        // Per-lane role constants: the word this lane decodes and, for
+        // each of its five positions, the `vec4` (within the block) of the
+        // activations that position pairs with. The `qh` lane's positions
+        // pair with *two* elements each (`120 + 2n`, `121 + 2n`), which is
+        // arranged on the activation side below; its fifth position and
+        // every position of the eighth lane pair with zeros.
+        s.push_str("    let w = min(sub, 6u);\n    let is16 = sub < 4u;\n    let is8 = sub >= 4u && sub < 6u;\n    let is_qh = sub == 6u;\n    let live = is16 || is8;\n");
+        for n in 0..5 {
+            s.push_str(&format!(
+                "    let idx{n} = select(select(select({n}u, {}u + w, is16), {}u + (w & 1u), is8), {}u, is_qh);\n",
+                4 * n,
+                20 + 2 * n,
+                // `vec4` 30 holds elements 120..124, 31 the last four; the
+                // fifth position is masked and duplicates 30 so the block
+                // maximum sees nothing outside the block.
+                if (2..4).contains(&n) { 31 } else { 30 }
+            ));
+        }
+    } else {
+        for n in 0..4 {
+            s.push_str(&format!("    let idx{n} = 4u * sub + {n}u;\n"));
+        }
+    }
+    s.push_str(&format!(
+        "\n    var g: u32 = 0u;\n    loop {{\n    if (g >= {groups}u) {{\n        break;\n    }}\n    let o_base = (rg * {groups}u + g) * {n_rows}u;\n"
+    ));
+    for i in 0..n_rows {
+        s.push_str(&format!("    let o{i} = o_base + {i}u;\n"));
+    }
+    for i in 0..n_rows {
+        s.push_str(&format!("    var partial{i}: f32 = 0.0;\n"));
+    }
+    if ptq {
+        for r in 0..n_rows {
+            s.push_str(&format!(
+                "    let row{r} = o{r} * params.row_bytes / 4u + w;\n"
+            ));
+        }
+    } else {
+        for r in 0..n_rows {
+            s.push_str(&format!("    let row{r} = o{r} * params.row_bytes;\n"));
+        }
+    }
+    s.push_str("\n    var it: u32 = 0u;\n    loop {\n        if (it >= n_iter) {\n            break;\n        }\n");
+    s.push_str("        let b = it * 8u + slot;\n        let bvalid = b < n_blocks;\n        let bb = min(b, n_blocks - 1u);\n        let xq_base = (x_base + bb * 128u) / 4u;\n");
+    for n in 0..slots {
+        s.push_str(&format!("        let v{n} = xv(xq_base + idx{n});\n"));
+    }
+    // The block's absolute maximum over the eight lanes.
+    s.push_str("        var m = abs(v0);\n");
+    for n in 1..slots {
+        s.push_str(&format!("        m = max(m, abs(v{n}));\n"));
+    }
+    s.push_str("        let a0 = max(max(m.x, m.y), max(m.z, m.w));\n        let a1 = max(a0, subgroupShuffleXor(a0, 1u));\n        let a2 = max(a1, subgroupShuffleXor(a1, 2u));\n        let amax = max(a2, subgroupShuffleXor(a2, 4u));\n");
+    s.push_str("        let inv = select(0.0, 1.0 / amax, amax > 0.0);\n        let dx = amax * (1.0 / 127.0);\n");
+    if ptq {
+        // A position's four trits come out of the chain in bytes 1 and 3 of
+        // `l·3` (even bytes of the word) and of `h·3` (odd bytes), so the
+        // activations are spread the same way once per block: `xe` holds
+        // the even elements in bytes 1 and 3, `xo` the odd ones. The `qh`
+        // lane's position `n` is elements `120 + 2n` and `121 + 2n` in
+        // byte 1 of each; everything masked is a zero activation word.
+        s.push_str("        let zero = select(0u, 0xFFFFFFFFu, bvalid);\n");
+        for n in 0..5 {
+            s.push_str(&format!(
+                "        let p{n} = pack4x8snorm(v{n} * inv) & zero;\n"
+            ));
+        }
+        // Live lanes take their packs whole; the `qh` lane's position `n`
+        // is the low or high half of `vec4` 30 or 31 (two elements, the
+        // rest zero); the eighth lane and the `qh` lane's fifth position
+        // are zeros.
+        for n in 0..5 {
+            let qh = match n {
+                0 | 2 => format!("p{n} & 0xFFFFu"),
+                1 | 3 => format!("p{n} >> 16u"),
+                _ => "0u".to_string(),
+            };
+            s.push_str(&format!(
+                "        let xq{n} = select(select(0u, p{n}, live), {qh}, is_qh);\n"
+            ));
+        }
+        for n in 0..5 {
+            s.push_str(&format!(
+                "        let xe{n} = (xq{n} & 0x00FF00FFu) << 8u;\n        let xo{n} = xq{n} & 0xFF00FF00u;\n"
+            ));
+        }
+        s.push_str("        var qsum: i32 = 0;\n");
+        for n in 0..5 {
+            s.push_str(&format!(
+                "        qsum = qsum + dot4I8Packed(0x01010101u, xq{n});\n"
+            ));
+        }
+        s.push_str("        let blk = bb * 7u;\n");
+        for r in 0..n_rows {
+            // Every row guarded, row 0 included: with several runs per
+            // workgroup a run past the last row starts past `out_dim`, and
+            // an unguarded row 0 there wrote the next token's rows — the
+            // start-up self-check's 2055-row case caught it.
+            s.push_str(&format!("        if (o{r} < params.out_dim) {{\n"));
+            s.push_str(&format!(
+                "            let w0 = row{r} + blk;\n            let word = weights[w0];\n            let dw = f16_to_f32(weights[w0 + 6u - w] >> 16u);\n"
+            ));
+            s.push_str("            var l = word & 0x00FF00FFu;\n            var h = (word >> 8u) & 0x00FF00FFu;\n            var isum: i32 = 0;\n");
+            for n in 0..5 {
+                s.push_str(&format!(
+                    "            let ml{n} = l * 3u;\n            let mh{n} = h * 3u;\n            isum = isum + dot4I8Packed(ml{n} & 0x03000300u, xe{n}) + dot4I8Packed(mh{n} & 0x03000300u, xo{n});\n"
+                ));
+                if n < 4 {
+                    s.push_str(&format!(
+                        "            l = ml{n} & 0x00FF00FFu;\n            h = mh{n} & 0x00FF00FFu;\n"
+                    ));
+                }
+            }
+            s.push_str(&format!(
+                "            partial{r} = partial{r} + f32(isum - qsum) * (dw * dx);\n        }}\n"
+            ));
+        }
+    } else {
+        // `PQ2_0`: position `k` of the lane's word is field `k` of its four
+        // bytes — elements `16·sub + 4j + k` — against the `k`-th component
+        // of the four activation vectors.
+        s.push_str("        let zero = select(0u, 0xFFFFFFFFu, bvalid);\n");
+        for k in 0..4 {
+            let c = ["x", "y", "z", "w"][k];
+            s.push_str(&format!(
+                "        let xq{k} = pack4x8snorm(vec4<f32>(v0.{c}, v1.{c}, v2.{c}, v3.{c}) * inv) & zero;\n"
+            ));
+        }
+        s.push_str("        var qsum: i32 = 0;\n");
+        for k in 0..4 {
+            s.push_str(&format!(
+                "        qsum = qsum + dot4I8Packed(0x01010101u, xq{k});\n"
+            ));
+        }
+        s.push_str("        let blk = bb * 34u + 2u + 4u * sub;\n");
+        for r in 0..n_rows {
+            // Every row guarded, row 0 included: with several runs per
+            // workgroup a run past the last row starts past `out_dim`, and
+            // an unguarded row 0 there wrote the next token's rows — the
+            // start-up self-check's 2055-row case caught it.
+            s.push_str(&format!("        if (o{r} < params.out_dim) {{\n"));
+            s.push_str(&format!(
+                "            let byte_off = row{r} + blk;\n            let word = read_u32_at(byte_off);\n            let dw = f16_to_f32(read_u16_at(byte_off - 2u - 4u * sub));\n"
+            ));
+            s.push_str("            var isum: i32 = 0;\n");
+            for k in 0..4 {
+                s.push_str(&format!(
+                    "            isum = isum + dot4I8Packed((word >> {}u) & 0x03030303u, xq{k});\n",
+                    2 * k
+                ));
+            }
+            s.push_str(&format!(
+                "            partial{r} = partial{r} + f32(isum - qsum) * (dw * dx);\n        }}\n"
+            ));
+        }
+    }
+    s.push_str("        it = it + 1u;\n    }\n\n");
+    // The shared combine writes row 0 unguarded (its other kernels never
+    // start a workgroup past the last row); here a run can.
+    s.push_str(
+        &reduce_combine_block(n_rows, subgroup)
+            .replace(
+                "        y[t * params.out_dim + o0] = t0;\n",
+                "        if (o0 < params.out_dim) {\n            y[t * params.out_dim + o0] = t0;\n        }\n",
+            )
+            .replace(
+                "        y[t * params.out_dim + o0] = partial_sums[0];\n",
+                "        if (o0 < params.out_dim) {\n            y[t * params.out_dim + o0] = partial_sums[0];\n        }\n",
+            ),
+    );
+    // The next run's partial sums must not land before this run's combine
+    // has read them.
+    s.push_str("    workgroupBarrier();\n    g = g + 1u;\n    }\n");
+    s.push_str("}\n");
+    Some(s)
+}
+
+/// [`shader_source_ternary_idot`] against an activation already quantized
+/// to `int8` per 32 (`shader_source_quantize_q8`'s layout, binding 1 —
+/// the layout main's integer-dot kernels read, so the same quantize
+/// dispatch or norm epilogue feeds this). The activation side of the
+/// kernel above — five `vec4` loads, `abs`/`max`, three shuffles, five
+/// packs per block iteration, redone by every workgroup — becomes five
+/// word loads; and the scale is per 32 rather than per 128. The trit
+/// chain is the same.
+///
+/// A lane's five positions fall into three scale groups whatever its
+/// role (positions 0–1, 2–3 and 4 each lie in one 32-block: elements
+/// `16n + 4w` for the 16-byte run, `80 + 8n + 4(w − 4)` for the 8-byte
+/// run, `120 + 2n` for `qh`), so the integer sums are kept per group and
+/// scaled once each per row.
+pub fn shader_source_ternary_i8(
+    ggml_type: u32,
+    n_rows: usize,
+    groups: usize,
+    subgroup: bool,
+) -> Option<String> {
+    let ptq = match ggml_type {
+        t if t == GGML_TYPE_PTQ1_0 => true,
+        t if t == GGML_TYPE_PQ2_0 => false,
+        _ => return None,
+    };
+    let mut s = String::new();
+    s.push_str(PRELUDE_Q8);
+    s.push_str(&format!(
+        "\nvar<workgroup> partial_sums: array<f32, {}>;\n\n",
+        n_rows * 64
+    ));
+    s.push_str("@compute @workgroup_size(64)\nfn main(\n    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>,\n    @builtin(num_workgroups) nwg: vec3<u32>,");
+    s.push_str(subgroup_entry_params(subgroup));
+    s.push_str("\n) {\n");
+    let wg_rows = n_rows * groups;
+    s.push_str(&format!(
+        "    let n_row_groups = (params.out_dim + {}u) / {wg_rows}u;\n",
+        wg_rows - 1
+    ));
+    s.push_str("    let flat = wid.x + wid.y * nwg.x + wid.z * nwg.x * nwg.y;\n    if (flat >= n_row_groups * params.n_tokens) {\n        return;\n    }\n");
+    s.push_str("    let rg = flat / params.n_tokens;\n    let t = flat % params.n_tokens;\n");
+    s.push_str("    let local = lid.x;\n    let x_base = t * params.in_dim;\n\n");
+    s.push_str("    let sub = local % 8u;\n    let slot = local / 8u;\n    let n_blocks = params.in_dim / 128u;\n    let n_iter = (n_blocks + 7u) / 8u;\n");
+    if ptq {
+        s.push_str("    let w = min(sub, 6u);\n    let is16 = sub < 4u;\n    let is8 = sub >= 4u && sub < 6u;\n    let is_qh = sub == 6u;\n    let live = is16 || is8;\n");
+        for n in 0..5 {
+            // Element offsets within the block, per role; the `qh` lane's
+            // live positions 0 and 2 start at 120 and 124.
+            s.push_str(&format!(
+                "    let e{n} = select(select(select({}u, {}u + 4u * w, is16), {}u + 4u * (w & 1u), is8), {}u, is_qh);\n",
+                4 * n,
+                16 * n,
+                80 + 8 * n,
+                if (2..4).contains(&n) { 124 } else { 120 }
+            ));
+        }
+    } else {
+        for n in 0..4 {
+            s.push_str(&format!("    let e{n} = 16u * sub + 4u * {n}u;\n"));
+        }
+    }
+    s.push_str(&format!(
+        "\n    var g: u32 = 0u;\n    loop {{\n    if (g >= {groups}u) {{\n        break;\n    }}\n    let o_base = (rg * {groups}u + g) * {n_rows}u;\n"
+    ));
+    for i in 0..n_rows {
+        s.push_str(&format!("    let o{i} = o_base + {i}u;\n"));
+    }
+    for i in 0..n_rows {
+        s.push_str(&format!("    var partial{i}: f32 = 0.0;\n"));
+    }
+    if ptq {
+        for r in 0..n_rows {
+            s.push_str(&format!(
+                "    let row{r} = o{r} * params.row_bytes / 4u + w;\n"
+            ));
+        }
+    } else {
+        for r in 0..n_rows {
+            s.push_str(&format!("    let row{r} = o{r} * params.row_bytes;\n"));
+        }
+    }
+    s.push_str("\n    var it: u32 = 0u;\n    loop {\n        if (it >= n_iter) {\n            break;\n        }\n");
+    s.push_str("        let b = it * 8u + slot;\n        let bvalid = b < n_blocks;\n        let bb = min(b, n_blocks - 1u);\n        let eb = x_base + bb * 128u;\n        let zero = select(0u, 0xFFFFFFFFu, bvalid);\n");
+    if ptq {
+        // The five activation words and their three scales; the `qh` lane's
+        // words hold two live elements each, the eighth lane's none.
+        for n in 0..5 {
+            let qh = match n {
+                0 | 2 => format!("q8_word(eb + e{n}) & 0xFFFFu"),
+                1 | 3 => format!("q8_word(eb + e{n}) >> 16u"),
+                _ => "0u".to_string(),
+            };
+            s.push_str(&format!(
+                "        let xq{n} = select(select(0u, q8_word(eb + e{n}), live), {qh}, is_qh) & zero;\n"
+            ));
+        }
+        s.push_str("        let d01 = q8_scale(eb + e0);\n        let d23 = q8_scale(eb + e2);\n        let d4 = q8_scale(eb + e4);\n");
+        for n in 0..5 {
+            s.push_str(&format!(
+                "        let xe{n} = (xq{n} & 0x00FF00FFu) << 8u;\n        let xo{n} = xq{n} & 0xFF00FF00u;\n"
+            ));
+        }
+        s.push_str("        let q01 = dot4I8Packed(0x01010101u, xq0) + dot4I8Packed(0x01010101u, xq1);\n        let q23 = dot4I8Packed(0x01010101u, xq2) + dot4I8Packed(0x01010101u, xq3);\n        let q4 = dot4I8Packed(0x01010101u, xq4);\n");
+        s.push_str("        let blk = bb * 7u;\n");
+        for r in 0..n_rows {
+            s.push_str(&format!("        if (o{r} < params.out_dim) {{\n"));
+            s.push_str(&format!(
+                "            let w0 = row{r} + blk;\n            let word = weights[w0];\n            let dw = f16_to_f32(weights[w0 + 6u - w] >> 16u);\n"
+            ));
+            s.push_str("            var l = word & 0x00FF00FFu;\n            var h = (word >> 8u) & 0x00FF00FFu;\n            var s01: i32 = 0;\n            var s23: i32 = 0;\n            var s4: i32 = 0;\n");
+            for n in 0..5 {
+                let acc = match n {
+                    0 | 1 => "s01",
+                    2 | 3 => "s23",
+                    _ => "s4",
+                };
+                s.push_str(&format!(
+                    "            let ml{n} = l * 3u;\n            let mh{n} = h * 3u;\n            {acc} = {acc} + dot4I8Packed(ml{n} & 0x03000300u, xe{n}) + dot4I8Packed(mh{n} & 0x03000300u, xo{n});\n"
+                ));
+                if n < 4 {
+                    s.push_str(&format!(
+                        "            l = ml{n} & 0x00FF00FFu;\n            h = mh{n} & 0x00FF00FFu;\n"
+                    ));
+                }
+            }
+            s.push_str(&format!(
+                "            partial{r} = partial{r} + dw * (f32(s01 - q01) * d01 + f32(s23 - q23) * d23 + f32(s4 - q4) * d4);\n        }}\n"
+            ));
+        }
+    } else {
+        // `PQ2_0`: position `k` of the lane's word is field `k` of its four
+        // bytes — elements `16·sub + 4j + k` — so the activation words are
+        // gathered transposed: word `k` holds elements `16·sub + k + 4j`.
+        for j in 0..4 {
+            s.push_str(&format!("        let a{j} = q8_word(eb + e{j}) & zero;\n"));
+        }
+        for k in 0..4 {
+            let sh = 8 * k;
+            s.push_str(&format!(
+                "        let xq{k} = ((a0 >> {sh}u) & 0xFFu) | (((a1 >> {sh}u) & 0xFFu) << 8u) | (((a2 >> {sh}u) & 0xFFu) << 16u) | (((a3 >> {sh}u) & 0xFFu) << 24u);\n"
+            ));
+        }
+        // The lane's sixteen elements lie in one 32-block: one scale.
+        s.push_str("        let dx = q8_scale(eb + e0);\n        var qsum: i32 = 0;\n");
+        for k in 0..4 {
+            s.push_str(&format!(
+                "        qsum = qsum + dot4I8Packed(0x01010101u, xq{k});\n"
+            ));
+        }
+        s.push_str(
+            "        let blk = bb * 34u + 2u + 4u * sub;\n        let fm = zero & 0x03030303u;\n",
+        );
+        for r in 0..n_rows {
+            s.push_str(&format!("        if (o{r} < params.out_dim) {{\n"));
+            s.push_str(&format!(
+                "            let byte_off = row{r} + blk;\n            let word = read_u32_at(byte_off);\n            let dw = f16_to_f32(read_u16_even(byte_off - 2u - 4u * sub));\n"
+            ));
+            s.push_str("            var isum: i32 = 0;\n");
+            for k in 0..4 {
+                s.push_str(&format!(
+                    "            isum = isum + dot4I8Packed((word >> {}u) & fm, xq{k});\n",
+                    2 * k
+                ));
+            }
+            s.push_str(&format!(
+                "            partial{r} = partial{r} + f32(isum - qsum) * (dw * dx);\n        }}\n"
+            ));
+        }
+    }
+    s.push_str("        it = it + 1u;\n    }\n\n");
+    s.push_str(
+        &reduce_combine_block(n_rows, subgroup)
+            .replace(
+                "        y[t * params.out_dim + o0] = t0;\n",
+                "        if (o0 < params.out_dim) {\n            y[t * params.out_dim + o0] = t0;\n        }\n",
+            )
+            .replace(
+                "        y[t * params.out_dim + o0] = partial_sums[0];\n",
+                "        if (o0 < params.out_dim) {\n            y[t * params.out_dim + o0] = partial_sums[0];\n        }\n",
+            ),
+    );
+    s.push_str("    workgroupBarrier();\n    g = g + 1u;\n    }\n");
+    s.push_str("}\n");
+    Some(s)
+}
+
+/// Words per 128-element block of the transposed `int8` activation layout
+/// the two-phase `PQ2_0` kernel reads (`shader_source_ternary_t`): `[d,
+/// Σq, 0, 0]`, then for each of two phases nine groups of four words —
+/// word `4 + 36·phase + 4·i + k` holds, in bytes `t = 0..3`, the quant of
+/// element `4·j + k` with `j = 4·i − 4 + t` (phase 1) or `4·i − 2 + t`
+/// (phase 0), zero where `j` is outside `0..32`. That is the activation
+/// transposed to meet `PQ2_0`'s 2-bit fields *as the weight words land in
+/// memory*: a block's 32 payload bytes start at byte `34·b + 2`, so an
+/// even block's payload sits two bytes into its aligned words (phase 0)
+/// and an odd block's is aligned (phase 1, with a dead word ahead of it).
+/// The kernel reads nine aligned words either way and dots them against
+/// the phase's groups, and no weight word is ever shifted into alignment.
+/// One scale per 128 (`amax / 127`, the same rounding as the per-32
+/// layout), 304 bytes a block.
+///
+/// Probe-only, with the kernel: measured slower than
+/// [`shader_source_ternary_i8`] on the Mali-G720 (see there).
+#[cfg(test)]
+pub const TERNARY_T_WORDS: u32 = 76;
+
+/// `shader_source_quantize_q8`'s counterpart for [`TERNARY_T_WORDS`]'
+/// layout: one workgroup of 64 threads per 128-block, each thread one of
+/// the 72 transposed words (eight idle), the scale and sum from a shared
+/// reduction. `qmeta.len` elements, a multiple of 128.
+#[cfg(test)]
+pub fn shader_source_quantize_ternary_t() -> String {
+    r#"
+struct ElemMeta {
+    len: u32,
+    _p0: u32,
+    _p1: u32,
+    _p2: u32,
+}
+
+@group(0) @binding(0) var<storage, read> xin: array<f32>;
+@group(0) @binding(1) var<storage, read_write> qout: array<u32>;
+@group(0) @binding(2) var<uniform> qmeta: ElemMeta;
+
+var<workgroup> q: array<i32, 128>;
+var<workgroup> red: array<f32, 64>;
+var<workgroup> redi: array<i32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let blk = wid.x;
+    let t = lid.x;
+    let base = blk * 128u;
+    let v0 = xin[base + t];
+    let v1 = xin[base + 64u + t];
+    red[t] = max(abs(v0), abs(v1));
+    workgroupBarrier();
+    var stride: u32 = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (t < stride) { red[t] = max(red[t], red[t + stride]); }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let amax = red[0];
+    let d = amax / 127.0;
+    let id = select(0.0, 1.0 / d, d > 0.0);
+    let q0 = clamp(i32(round(v0 * id)), -127, 127);
+    let q1 = clamp(i32(round(v1 * id)), -127, 127);
+    q[t] = q0;
+    q[64u + t] = q1;
+    redi[t] = q0 + q1;
+    workgroupBarrier();
+    stride = 32u;
+    loop {
+        if (stride == 0u) { break; }
+        if (t < stride) { redi[t] = redi[t] + redi[t + stride]; }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    let out = blk * 76u;
+    if (t == 0u) {
+        qout[out] = bitcast<u32>(d);
+        qout[out + 1u] = bitcast<u32>(redi[0]);
+        qout[out + 2u] = 0u;
+        qout[out + 3u] = 0u;
+    }
+    // Thread `t` builds transposed word `t` (0..36) of both phases.
+    if (t < 36u) {
+        let i = t / 4u;
+        let k = t % 4u;
+        for (var phase: u32 = 0u; phase < 2u; phase = phase + 1u) {
+            var word: u32 = 0u;
+            for (var tt: u32 = 0u; tt < 4u; tt = tt + 1u) {
+                let j = i32(4u * i + tt) - select(2, 4, phase == 1u);
+                var qv: i32 = 0;
+                if (j >= 0 && j < 32) {
+                    qv = q[4u * u32(j) + k];
+                }
+                word = word | ((u32(qv) & 0xFFu) << (8u * tt));
+            }
+            qout[out + 4u + 36u * phase + t] = word;
+        }
+    }
+}
+"#
+    .to_string()
+}
+
+/// The `PQ2_0` decode kernel over [`TERNARY_T_WORDS`]' activation layout:
+/// a workgroup of four 16-lane subgroups, each subgroup its own eight
+/// rows, each lane one block per iteration — nine aligned weight words
+/// (the block's payload as it lies, with the scale in the first word's
+/// low or high half by the block's phase) dotted field by field against
+/// the phase's transposed activation words, one integer sum per row per
+/// block, one scale multiply. Against [`shader_source_ternary_i8`] this
+/// removes the unaligned word reads (two loads and three shifts each),
+/// the per-lane activation transposes and the per-32 scale bookkeeping:
+/// ~1.1 instructions a weight where that kernel spent ~1.9. Subgroups
+/// reduce their own rows, so there is no shared memory and no barrier.
+/// 32 rows a workgroup. **An even number of blocks per row only**: with
+/// an odd count a row's start is two bytes off every other row and the
+/// phase would depend on the row as well as the block (every width this
+/// model family has is a multiple of 256).
+///
+/// **Probe-only.** Measured on the Mali-G720 (`ternary_t_kernel_time`,
+/// warm, best of 12): the FFN gate shape 951 µs against the 8-lane
+/// kernel's 698, the down shape 876 against 535 — slower, with fewer
+/// instructions a weight, because a lane's nine loads walk the row at a
+/// 34-byte stride across the subgroup (nine cache lines a load
+/// instruction where the 8-lane kernel touches two). Kept with its test
+/// as the record of the attempt, for a device with a different memory
+/// pipeline.
+#[cfg(test)]
+pub fn shader_source_ternary_t() -> String {
+    let mut s = String::new();
+    s.push_str(PRELUDE_Q8);
+    s.push_str(
+        "\n@compute @workgroup_size(64)\nfn main(\n    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>,\n    @builtin(num_workgroups) nwg: vec3<u32>,\n    @builtin(subgroup_invocation_id) sg_lane: u32,\n    @builtin(subgroup_id) sg_id: u32,\n) {\n",
+    );
+    s.push_str("    let n_row_groups = (params.out_dim + 31u) / 32u;\n");
+    s.push_str("    let flat = wid.x + wid.y * nwg.x + wid.z * nwg.x * nwg.y;\n    if (flat >= n_row_groups * params.n_tokens) {\n        return;\n    }\n");
+    s.push_str("    let rg = flat / params.n_tokens;\n    let t = flat % params.n_tokens;\n");
+    s.push_str(
+        "    let n_blocks = params.in_dim / 128u;\n    let n_iter = (n_blocks + 15u) / 16u;\n",
+    );
+    s.push_str("    let x_base = t * n_blocks * 76u;\n    let o_base = rg * 32u + sg_id * 8u;\n");
+    // A row past the last reads the last one (in bounds) and writes
+    // nothing.
+    for r in 0..8 {
+        s.push_str(&format!(
+            "    let o{r} = o_base + {r}u;\n    let row{r} = min(o{r}, params.out_dim - 1u) * params.row_bytes;\n    var partial{r}: f32 = 0.0;\n"
+        ));
+    }
+    s.push_str("    var it: u32 = 0u;\n    loop {\n        if (it >= n_iter) {\n            break;\n        }\n");
+    s.push_str("        let b = it * 16u + sg_lane;\n        let bvalid = b < n_blocks;\n        let bb = min(b, n_blocks - 1u);\n        let phase = bb & 1u;\n        let zero = select(0u, 0xFFFFFFFFu, bvalid);\n");
+    // A lane past the last block reads the last one, masked: its
+    // activation words and its scale are zero, so its `Σq` does not leak
+    // through the `-1` offset.
+    s.push_str("        let xb = x_base + bb * 76u;\n        let d = select(0.0, bitcast<f32>(q8x[xb]), bvalid);\n        let sumq = bitcast<i32>(q8x[xb + 1u]);\n        let tb = xb + 4u + 36u * phase;\n");
+    // The block's nine aligned words start at byte 34·b, or two bytes
+    // earlier for an odd block. Word by word: the word's four activation
+    // words, then every row's weight word against them — nothing but the
+    // eight integer sums stays live across words.
+    s.push_str(
+        "        let wstart = (34u * bb - 2u * phase) / 4u;\n        let fm = 0x03030303u;\n",
+    );
+    for r in 0..8 {
+        s.push_str(&format!(
+            "        let wi{r} = row{r} / 4u + wstart;\n        var isum{r}: i32 = 0;\n        var dw{r}: f32 = 0.0;\n"
+        ));
+    }
+    for i in 0..9 {
+        for k in 0..4 {
+            s.push_str(&format!(
+                "        let x{i}_{k} = q8x[tb + {}u] & zero;\n",
+                4 * i + k
+            ));
+        }
+        for r in 0..8 {
+            s.push_str(&format!(
+                "        {{\n            let w = weights[wi{r} + {i}u];\n"
+            ));
+            if i == 0 {
+                s.push_str(&format!(
+                    "            dw{r} = f16_to_f32(select(w & 0xFFFFu, w >> 16u, phase == 1u));\n"
+                ));
+            }
+            for k in 0..4 {
+                let src = if k == 0 {
+                    "w & fm".to_string()
+                } else {
+                    format!("(w >> {}u) & fm", 2 * k)
+                };
+                s.push_str(&format!(
+                    "            isum{r} = isum{r} + dot4I8Packed({src}, x{i}_{k});\n"
+                ));
+            }
+            s.push_str("        }\n");
+        }
+    }
+    for r in 0..8 {
+        s.push_str(&format!(
+            "        if (o{r} < params.out_dim) {{\n            partial{r} = partial{r} + f32(isum{r} - sumq) * (dw{r} * d);\n        }}\n"
+        ));
+    }
+    s.push_str("        it = it + 1u;\n    }\n");
+    for r in 0..8 {
+        s.push_str(&format!("    let sg{r} = subgroupAdd(partial{r});\n"));
+    }
+    s.push_str("    if (sg_lane == 0u) {\n");
+    for r in 0..8 {
+        s.push_str(&format!(
+            "        if (o{r} < params.out_dim) {{\n            y[t * params.out_dim + o{r}] = sg{r};\n        }}\n"
+        ));
+    }
+    s.push_str("    }\n}\n");
+    s
+}
+
+/// Words per 128-element block of the activation layout the octet `PQ2_0`
+/// kernel reads (`shader_source_ternary_o`): `[d, 0, 0, 0]`, then for
+/// each of the two phases nine groups of five words — the four transposed
+/// activation words of [`TERNARY_T_WORDS`]' group `(phase, i)` and the
+/// group's `Σq` as an `i32` — 94 words padded to 96 (384 bytes). With the
+/// sum beside each group, a lane subtracts the `-1` offset of the fields
+/// it holds by itself; no lane has to know where a block's words end.
+///
+/// Probe-only, with the kernel (see [`shader_source_ternary_o`]).
+#[cfg(test)]
+pub const TERNARY_O_WORDS: u32 = 96;
+
+/// [`shader_source_quantize_ternary_t`] for [`TERNARY_O_WORDS`]' layout.
+#[cfg(test)]
+pub fn shader_source_quantize_ternary_o() -> String {
+    shader_source_quantize_ternary_t()
+        .replace("let out = blk * 76u;", "let out = blk * 96u;")
+        .replace(
+            "            qout[out + 4u + 36u * phase + t] = word;\n",
+            "            qout[out + 4u + 45u * phase + 5u * i + k] = word;\n            if (k == 0u) {\n                var all: i32 = 0;\n                for (var kk: u32 = 0u; kk < 4u; kk = kk + 1u) {\n                    for (var tt: u32 = 0u; tt < 4u; tt = tt + 1u) {\n                        let j = i32(4u * i + tt) - select(2, 4, phase == 1u);\n                        if (j >= 0 && j < 32) {\n                            all = all + q[4u * u32(j) + kk];\n                        }\n                    }\n                }\n                qout[out + 4u + 45u * phase + 5u * i + 4u] = bitcast<u32>(all);\n            }\n",
+        )
+}
+
+/// The `PQ2_0` decode kernel over [`TERNARY_O_WORDS`]' layout, reading the
+/// weights the way the memory system likes them: a subgroup takes eight
+/// consecutive blocks of a row — 272 bytes, sixteen-byte aligned when the
+/// row is (a block count that is a multiple of eight) — as one `vec4<u32>`
+/// a lane, lanes 0–3 the four words left over. Every word of the 68 is
+/// the payload (and, for the first of a block, the scale) of exactly one
+/// block: word `w` belongs to block `j = 2w / 17` at position `i = w −
+/// (17j − (j & 1)) / 2` of its phase's transposed groups (an even block's
+/// nine words start at its scale, an odd block's eight after it), and a
+/// lane's four words fall in at most two blocks. The block scale reaches
+/// every lane of the block by `subgroupShuffle` from the lane that loaded
+/// it. Four subgroups a workgroup, eight rows each, reduced within the
+/// subgroup. **Block count a multiple of eight only.**
+///
+/// **Probe-only.** Measured on the Mali-G720 (`ternary_o_kernel_time`):
+/// 7978 µs at the gate shape with the shuffles — `subgroupShuffle` is
+/// ruinous on this driver, three a row costing eight times the kernel —
+/// and 1017 µs with them stubbed out (`ORANGU_O_EXPERIMENT=noshuffle`),
+/// still behind the 8-lane kernel's 698 with the same coalescing, fewer
+/// load instructions and fewer dots. The 8-lane kernel's own
+/// decomposition (`ternary_i8_kernel_time` under `ORANGU_O_EXPERIMENT`)
+/// says why neither redesign could win: with every load removed it still
+/// takes 375 of its 693 µs — the per-block-per-row structure, not any of
+/// the loads or the arithmetic, is the floor, and each of those removed
+/// alone moves the time by less than the run-to-run noise. Kept with its
+/// test as the record of the attempt.
+#[cfg(test)]
+pub fn shader_source_ternary_o() -> String {
+    let mut s = String::new();
+    // The weights as `vec4<u32>`: one load a lane an octet-row.
+    s.push_str(
+        r#"
+struct Meta {
+    in_dim: u32,
+    out_dim: u32,
+    n_tokens: u32,
+    row_bytes: u32,
+}
+
+@group(0) @binding(0) var<storage, read> weights: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read> q8x: array<u32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> params: Meta;
+
+fn f16_to_f32(bits: u32) -> f32 {
+    return unpack2x16float(bits & 0xFFFFu).x;
+}
+"#,
+    );
+    s.push_str(
+        "\n@compute @workgroup_size(64)\nfn main(\n    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>,\n    @builtin(num_workgroups) nwg: vec3<u32>,\n    @builtin(subgroup_invocation_id) sg_lane: u32,\n    @builtin(subgroup_id) sg_id: u32,\n) {\n",
+    );
+    s.push_str("    let n_row_groups = (params.out_dim + 31u) / 32u;\n");
+    s.push_str("    let flat = wid.x + wid.y * nwg.x + wid.z * nwg.x * nwg.y;\n    if (flat >= n_row_groups * params.n_tokens) {\n        return;\n    }\n");
+    s.push_str("    let rg = flat / params.n_tokens;\n    let t = flat % params.n_tokens;\n");
+    s.push_str("    let n_blocks = params.in_dim / 128u;\n    let n_oct = n_blocks / 8u;\n");
+    s.push_str("    let x_base = t * n_blocks * 96u;\n    let o_base = rg * 32u + sg_id * 8u;\n    let l = sg_lane;\n    let extra = l < 4u;\n");
+    // The lane's words and their blocks/positions, fixed per lane.
+    for m in 0..4 {
+        s.push_str(&format!(
+            "    let w{m} = 4u * l + {m}u;\n    let j{m} = (2u * w{m}) / 17u;\n    let i{m} = w{m} - (17u * j{m} - (j{m} & 1u)) / 2u;\n    let g{m} = 4u + 45u * (j{m} & 1u) + 5u * i{m};\n"
+        ));
+    }
+    // The extra word (lanes 0–3): word 64 + l, block 7, position 5 + l.
+    s.push_str("    let we = 64u + (l & 3u);\n    let ge = 4u + 45u + 5u * (we - 59u);\n");
+    // The scale word of the lane's first and last block: word S_j, held
+    // by lane S_j / 4 at component S_j % 4, low or high half by phase.
+    s.push_str(
+        "    let sa = (17u * j0 - (j0 & 1u)) / 2u;\n    let sb = (17u * j3 - (j3 & 1u)) / 2u;\n",
+    );
+    for r in 0..8 {
+        s.push_str(&format!(
+            "    let o{r} = o_base + {r}u;\n    let row{r} = min(o{r}, params.out_dim - 1u) * params.row_bytes / 16u;\n    var partial{r}: f32 = 0.0;\n"
+        ));
+    }
+    s.push_str("    var oct: u32 = 0u;\n    loop {\n        if (oct >= n_oct) {\n            break;\n        }\n");
+    s.push_str("        let xb0 = x_base + (oct * 8u + j0) * 96u;\n        let xb3 = x_base + (oct * 8u + j3) * 96u;\n        let d0 = bitcast<f32>(q8x[xb0]);\n        let d3 = bitcast<f32>(q8x[xb3]);\n");
+    // The activation groups of the lane's words (the same for every row).
+    for m in 0..4 {
+        s.push_str(&format!(
+            "        let xb{m}_ = x_base + (oct * 8u + j{m}) * 96u + g{m};\n"
+        ));
+        for k in 0..4 {
+            s.push_str(&format!("        let x{m}_{k} = q8x[xb{m}_ + {k}u];\n"));
+        }
+        s.push_str(&format!(
+            "        let xs{m} = bitcast<i32>(q8x[xb{m}_ + 4u]);\n"
+        ));
+    }
+    s.push_str("        let xbe = x_base + (oct * 8u + 7u) * 96u + ge;\n        let de = bitcast<f32>(q8x[x_base + (oct * 8u + 7u) * 96u]);\n");
+    for k in 0..4 {
+        s.push_str(&format!(
+            "        let xe_{k} = select(0u, q8x[xbe + {k}u], extra);\n"
+        ));
+    }
+    s.push_str("        let xse = select(0, bitcast<i32>(q8x[xbe + 4u]), extra);\n");
+    s.push_str("        let fm = 0x03030303u;\n        let wbase = oct * 17u;\n");
+    for r in 0..8 {
+        s.push_str(&format!(
+            "        {{\n            let v = weights[row{r} + wbase + l];\n            let ve = weights[row{r} + wbase + 16u][l & 3u];\n"
+        ));
+        // Block scales by shuffle: a scale word `S_j` lies in lane `S_j / 4`
+        // at component `S_j % 4`, which for every one of the eight is that
+        // lane's `l / 4` — so each lane offers component `l / 4` of its own
+        // load, and a shuffle names the lane alone (the shuffled expression
+        // is evaluated by the source lane, so it cannot depend on the
+        // caller's index).
+        s.push_str("            let mine = v[l / 4u];\n            let sw0 = subgroupShuffle(mine, sa / 4u);\n            let sw3 = subgroupShuffle(mine, sb / 4u);\n            let dw0 = f16_to_f32(select(sw0 & 0xFFFFu, sw0 >> 16u, (j0 & 1u) == 1u));\n            let dw3 = f16_to_f32(select(sw3 & 0xFFFFu, sw3 >> 16u, (j3 & 1u) == 1u));\n");
+        s.push_str("            let swe = subgroupShuffle(mine, 14u);\n            let dwe = f16_to_f32(swe >> 16u);\n");
+        s.push_str("            var acc0: i32 = 0;\n            var acc3: i32 = 0;\n");
+        for m in 0..4 {
+            s.push_str(&format!("            var s{m}: i32 = -xs{m};\n"));
+            for k in 0..4 {
+                let src = if k == 0 {
+                    format!("v[{m}] & fm")
+                } else {
+                    format!("(v[{m}] >> {}u) & fm", 2 * k)
+                };
+                s.push_str(&format!(
+                    "            s{m} = s{m} + dot4I8Packed({src}, x{m}_{k});\n"
+                ));
+            }
+            s.push_str(&format!(
+                "            acc0 = acc0 + select(0, s{m}, j{m} == j0);\n            acc3 = acc3 + select(0, s{m}, j{m} != j0);\n"
+            ));
+        }
+        s.push_str("            var se: i32 = -xse;\n");
+        for k in 0..4 {
+            let src = if k == 0 {
+                "ve & fm".to_string()
+            } else {
+                format!("(ve >> {}u) & fm", 2 * k)
+            };
+            s.push_str(&format!(
+                "            se = se + dot4I8Packed({src}, xe_{k});\n"
+            ));
+        }
+        s.push_str(&format!(
+            "            partial{r} = partial{r} + f32(acc0) * (dw0 * d0) + f32(acc3) * (dw3 * d3) + f32(se) * (dwe * de);\n        }}\n"
+        ));
+    }
+    s.push_str("        oct = oct + 1u;\n    }\n");
+    for r in 0..8 {
+        s.push_str(&format!("    let sg{r} = subgroupAdd(partial{r});\n"));
+    }
+    s.push_str("    if (sg_lane == 0u) {\n");
+    for r in 0..8 {
+        s.push_str(&format!(
+            "        if (o{r} < params.out_dim) {{\n            y[t * params.out_dim + o{r}] = sg{r};\n        }}\n"
+        ));
+    }
+    s.push_str("    }\n}\n");
+    s
+}
+
+/// Prism's ternary pair, which the integer-dot kernels above serve.
+pub fn is_ternary(ggml_type: u32) -> bool {
+    ggml_type == GGML_TYPE_PTQ1_0 || ggml_type == GGML_TYPE_PQ2_0
+}
+
 /// Whether `ggml_type` decodes through a word-reading `block_dot`.
 pub fn has_words_block_dot(ggml_type: u32) -> bool {
     block_hoisted_words_middle(ggml_type).is_some()
@@ -3522,6 +4504,8 @@ fn block_hoisted_words_middle(ggml_type: u32) -> Option<&'static str> {
         t if t == GGML_TYPE_IQ4_XS => IQ4_XS_WORDS_MIDDLE,
         t if t == GGML_TYPE_IQ3_S => IQ3_S_WORDS_MIDDLE,
         t if t == GGML_TYPE_IQ2_S => IQ2_S_WORDS_MIDDLE,
+        t if t == GGML_TYPE_PQ2_0 => PQ2_0_WORDS_MIDDLE,
+        t if t == GGML_TYPE_PTQ1_0 => PTQ1_0_WORDS_MIDDLE,
         _ => return None,
     })
 }
@@ -4040,6 +5024,8 @@ fn coop_middle(ggml_type: u32) -> Option<&'static str> {
         t if t == GGML_TYPE_IQ4_NL => IQ4_NL_COOP_MIDDLE,
         t if t == GGML_TYPE_IQ4_XS => IQ4_XS_COOP_MIDDLE,
         t if t == GGML_TYPE_MXFP4 => MXFP4_COOP_MIDDLE,
+        t if t == GGML_TYPE_PQ2_0 => PQ2_0_COOP_MIDDLE,
+        t if t == GGML_TYPE_PTQ1_0 => PTQ1_0_COOP_MIDDLE,
         _ => return None,
     })
 }
@@ -8933,6 +9919,632 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// The blockwise Hadamard rotation of `engine::hadamard` on the device:
+/// `x` is `n_rows` rows of `em.len` elements, each row `em.len / BLOCK`
+/// independent blocks, and one workgroup transforms one block in place —
+/// the sign multiply (when `em.aux & 1`, before the butterflies; `em.aux
+/// & 2` puts it after, which is the inverse for a folded lookup table),
+/// then the `log2(BLOCK)` butterfly stages in shared memory, then the
+/// `1 / sqrt(BLOCK)` normalization. The same arithmetic as
+/// `hadamard::fwht_normalized`, to reassociation.
+///
+/// `elem3` bindings: the sign vector (`em.len` long; unread when `em.aux`
+/// has neither bit, but a buffer must still be bound), the rows, the meta.
+/// Workgroup `wid.x` is a flat block index across the rows.
+pub fn shader_source_hadamard(block: u32) -> String {
+    assert!(block.is_power_of_two() && block >= 2 * HADAMARD_WG);
+    format!(
+        r#"{ELEM_META}
+@group(0) @binding(0) var<storage, read> signs: array<f32>;
+@group(0) @binding(1) var<storage, read_write> x: array<f32>;
+@group(0) @binding(2) var<uniform> em: ElemMeta;
+
+const BLOCK: u32 = {block}u;
+const WG: u32 = {wg}u;
+const PER_THREAD: u32 = BLOCK / WG;
+var<workgroup> v: array<f32, BLOCK>;
+
+@compute @workgroup_size({wg})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let blocks_per_row = em.len / BLOCK;
+    let row = wid.x / blocks_per_row;
+    let base = row * em.len + (wid.x % blocks_per_row) * BLOCK;
+    let sign_base = (wid.x % blocks_per_row) * BLOCK;
+    let t = lid.x;
+    let pre = (em.aux & 1u) != 0u;
+    let post = (em.aux & 2u) != 0u;
+    for (var k: u32 = 0u; k < PER_THREAD; k = k + 1u) {{
+        let i = t + k * WG;
+        var val = x[base + i];
+        if (pre) {{
+            val = val * signs[sign_base + i];
+        }}
+        v[i] = val;
+    }}
+    workgroupBarrier();
+    // `BLOCK / 2` butterfly pairs per stage, `PER_THREAD / 2` per thread:
+    // pair `p` is elements `(p / h) * 2h + (p % h)` and `+ h`.
+    var h: u32 = 1u;
+    loop {{
+        if (h >= BLOCK) {{
+            break;
+        }}
+        for (var k: u32 = 0u; k < PER_THREAD / 2u; k = k + 1u) {{
+            let p = t + k * WG;
+            let j = (p / h) * 2u * h + (p % h);
+            let a = v[j];
+            let b = v[j + h];
+            v[j] = a + b;
+            v[j + h] = a - b;
+        }}
+        workgroupBarrier();
+        h = h * 2u;
+    }}
+    let scale = 1.0 / sqrt(f32(BLOCK));
+    for (var k: u32 = 0u; k < PER_THREAD; k = k + 1u) {{
+        let i = t + k * WG;
+        var val = v[i] * scale;
+        if (post) {{
+            val = val * signs[sign_base + i];
+        }}
+        x[base + i] = val;
+    }}
+}}
+"#,
+        wg = HADAMARD_WG
+    )
+}
+
+/// [`shader_source_hadamard`] with the consumers' epilogue folded in, for
+/// the decode chain: after the butterfly the block is written back as
+/// `f32` (in place, for the float readers) **and** as the per-32 q8 the
+/// integer-dot kernels read (`shader_source_quantize_q8`'s layout —
+/// `[d, Σq, 8 words]` a block, the same rounding), thread `t < BLOCK/32`
+/// quantizing block `t` out of shared memory. With `silu_mul`, the input
+/// is `silu(a) · b` over two buffers (the FFN's gate and up outputs)
+/// rather than `x` — the activation, the fold and the quantize as one
+/// dispatch where the chain ran three. Six bindings
+/// (`elem6_bind_group_layout`): `a`, `b`, `signs` read-only, `x` and `q8`
+/// read-write, `meta`; without `silu_mul` the first two are unread.
+/// One row only.
+pub fn shader_source_hadamard_q8(block: u32, silu_mul: bool) -> String {
+    assert!(block.is_power_of_two() && block >= 2 * HADAMARD_WG && block.is_multiple_of(32));
+    let load = if silu_mul {
+        "let g = a[base + i]; var val = g / (1.0 + exp(-g)) * b[base + i];"
+    } else {
+        "var val = x[base + i];"
+    };
+    format!(
+        r#"{ELEM_META}
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read> signs: array<f32>;
+@group(0) @binding(3) var<storage, read_write> x: array<f32>;
+@group(0) @binding(4) var<storage, read_write> q8: array<u32>;
+@group(0) @binding(5) var<uniform> em: ElemMeta;
+
+const BLOCK: u32 = {block}u;
+const WG: u32 = {wg}u;
+const PER_THREAD: u32 = BLOCK / WG;
+const Q8_BLOCKS: u32 = BLOCK / 32u;
+var<workgroup> v: array<f32, BLOCK>;
+
+@compute @workgroup_size({wg})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let base = wid.x * BLOCK;
+    let sign_base = base;
+    let t = lid.x;
+    let pre = (em.aux & 1u) != 0u;
+    let post = (em.aux & 2u) != 0u;
+    for (var k: u32 = 0u; k < PER_THREAD; k = k + 1u) {{
+        let i = t + k * WG;
+        {load}
+        if (pre) {{
+            val = val * signs[sign_base + i];
+        }}
+        v[i] = val;
+    }}
+    workgroupBarrier();
+    var h: u32 = 1u;
+    loop {{
+        if (h >= BLOCK) {{
+            break;
+        }}
+        for (var k: u32 = 0u; k < PER_THREAD / 2u; k = k + 1u) {{
+            let p = t + k * WG;
+            let j = (p / h) * 2u * h + (p % h);
+            let a0 = v[j];
+            let b0 = v[j + h];
+            v[j] = a0 + b0;
+            v[j + h] = a0 - b0;
+        }}
+        workgroupBarrier();
+        h = h * 2u;
+    }}
+    let scale = 1.0 / sqrt(f32(BLOCK));
+    for (var k: u32 = 0u; k < PER_THREAD; k = k + 1u) {{
+        let i = t + k * WG;
+        var val = v[i] * scale;
+        if (post) {{
+            val = val * signs[sign_base + i];
+        }}
+        v[i] = val;
+        x[base + i] = val;
+    }}
+    workgroupBarrier();
+    if (t < Q8_BLOCKS) {{
+        let qb = t * 32u;
+        var amax: f32 = 0.0;
+        for (var i: u32 = 0u; i < 32u; i = i + 1u) {{
+            amax = max(amax, abs(v[qb + i]));
+        }}
+        let d = amax / 127.0;
+        let id = select(0.0, 1.0 / d, d > 0.0);
+        var sumq: i32 = 0;
+        let out_base = (base / 32u + t) * 10u;
+        for (var w: u32 = 0u; w < 8u; w = w + 1u) {{
+            var word: u32 = 0u;
+            for (var kk: u32 = 0u; kk < 4u; kk = kk + 1u) {{
+                var q: i32 = i32(round(v[qb + w * 4u + kk] * id));
+                q = clamp(q, -127, 127);
+                sumq = sumq + q;
+                word = word | ((u32(q) & 0xFFu) << (8u * kk));
+            }}
+            q8[out_base + 2u + w] = word;
+        }}
+        q8[out_base] = bitcast<u32>(d);
+        q8[out_base + 1u] = bitcast<u32>(sumq);
+    }}
+}}
+"#,
+        wg = HADAMARD_WG
+    )
+}
+
+/// The gated-DeltaNet step of `engine::arch::qwen_hybrid` — one token, every
+/// head — as one dispatch: workgroup `h` is value head `h`, thread `j` owns
+/// column `j` of that head's `HD × HD` state, so every step of
+/// `delta_head_step` is a loop over the thread's own column with the reads
+/// coalesced across the workgroup (`state[i * HD + j]`, `j` adjacent):
+///
+/// ```text
+///   sk[j]      = Σ_i k[i] · decay · S[i][j]
+///   d[j]       = β · (v[j] − sk[j])
+///   S[i][j]    = decay · S[i][j] + k[i] · d[j]
+///   o[j]       = Σ_i q[i] · S[i][j]
+/// ```
+///
+/// then the gated RMSNorm over the head — the one reduction, through
+/// shared memory — times the output gate of `z`, and the store, into the
+/// tiled position (`h`) or, for a `gdn_v_grouped` fold, the grouped one
+/// (`h % NK · REP + h / NK`), so the Hadamard kernel that follows needs no
+/// permutation of its own. `q`/`k` are per key head and shared by the
+/// `REP` value heads tiled from it (`h % NK`), exactly as the host's
+/// `kh = vh % n_k_heads`.
+///
+/// `elem4` bindings: `a` = the token's inputs packed as `q | k | v | beta |
+/// decay | z`, `b` = the norm weight, `y` = the layer's scratch — the state
+/// at `0`, the output at `NV·HD` — and the meta, whose `extra` is `eps`
+/// and whose `aux & 1` selects the grouped store.
+pub fn shader_source_gated_delta(hd: u32, n_k: u32, n_v: u32, sigmoid_gate: bool) -> String {
+    assert!(hd <= 256 && hd.is_power_of_two() && n_v.is_multiple_of(n_k));
+    let gate = if sigmoid_gate {
+        "1.0 / (1.0 + exp(-zv))"
+    } else {
+        "zv / (1.0 + exp(-zv))"
+    };
+    // A head's `hd × hd` state, one thread per column `j`, walking the
+    // rows four at a time. `split` threads per column (each a share of the
+    // rows, meeting at two shared-memory reductions) is written in and was
+    // measured at the 27B's shape (48 heads of 128): 0.68 ms a layer at
+    // one thread per column, 0.6–0.8 at two, 1.3 at four — the workgroup
+    // is not short of loads in flight, it is a fixed cost per head that
+    // only more *heads* amortize (16 heads 0.29 ms, 192 heads 1.7 ms, the
+    // last at 21 GB/s). One thread per column, then. Columns across
+    // several workgroups with the head's norm as a dispatch of its own
+    // (`shader_source_gated_delta_split` + `_norm`, probe-only) was the
+    // next attempt, and measured *warm* (`gated_delta_kernel_time`, best
+    // of four at 32 repetitions) the single workgroup is 245 µs a layer at
+    // the 27B's shape, not 0.66 ms — the earlier figure was the clock
+    // ramping — and the split forms are 250 (128 columns), 253 (64), 264
+    // (32), 305 (16): no gain to have. 48 × 245 µs is 12 ms of a ~320 ms
+    // token; the kernel is done.
+    let split = 1u32;
+    assert!((hd / split).is_multiple_of(4));
+    let rows = hd / split;
+    // The inputs `[q | k | v | beta | decay | z]` sit in the scratch at
+    // `em.len`: written there by the host tail already L2-normed and
+    // scaled, or by the prep kernel raw (`em.aux & 2`), in which case the
+    // head norms its own `q` and `k` on load — `x / max(||x||, eps)`, then
+    // `q / sqrt(HD)`, `tensor::l2_norm_inplace` and the trunk's `q_scale`.
+    format!(
+        r#"{ELEM_META}
+@group(0) @binding(0) var<storage, read> unused: array<f32>;
+@group(0) @binding(1) var<storage, read> norm_w: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> em: ElemMeta;
+
+const HD: u32 = {hd}u;
+const NK: u32 = {n_k}u;
+const NV: u32 = {n_v}u;
+const SPLIT: u32 = {split}u;
+const ROWS: u32 = {rows}u;
+const REP: u32 = NV / NK;
+const Q_OFF: u32 = 0u;
+const K_OFF: u32 = NK * HD;
+const V_OFF: u32 = 2u * NK * HD;
+const BETA_OFF: u32 = V_OFF + NV * HD;
+const DECAY_OFF: u32 = BETA_OFF + NV;
+const Z_OFF: u32 = DECAY_OFF + NV;
+const OUT_OFF: u32 = NV * HD * HD;
+var<workgroup> red: array<f32, HD>;
+var<workgroup> qs: array<f32, HD>;
+var<workgroup> ks: array<f32, HD>;
+var<workgroup> parts: array<f32, {parts_len}>;
+
+// The sum of `v` over the columns, from the `part == 0` threads only; every
+// thread of the workgroup calls this (the barriers are uniform).
+fn column_sum(j: u32, part: u32, v: f32) -> f32 {{
+    if (part == 0u) {{
+        red[j] = v;
+    }}
+    workgroupBarrier();
+    var stride: u32 = HD / 2u;
+    loop {{
+        if (stride == 0u) {{
+            break;
+        }}
+        if (part == 0u && j < stride) {{
+            red[j] = red[j] + red[j + stride];
+        }}
+        workgroupBarrier();
+        stride = stride / 2u;
+    }}
+    let total = red[0];
+    workgroupBarrier();
+    return total;
+}}
+
+// The sum of `v` over the `SPLIT` threads of column `j`.
+fn part_sum(j: u32, part: u32, v: f32) -> f32 {{
+    parts[part * HD + j] = v;
+    workgroupBarrier();
+    var total: f32 = 0.0;
+    for (var p: u32 = 0u; p < SPLIT; p = p + 1u) {{
+        total = total + parts[p * HD + j];
+    }}
+    workgroupBarrier();
+    return total;
+}}
+
+@compute @workgroup_size({wg})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let h = wid.x;
+    let kh = h % NK;
+    let j = lid.x % HD;
+    let part = lid.x / HD;
+    let base = h * HD * HD;
+    let inp = em.len;
+    var qj = y[inp + Q_OFF + kh * HD + j];
+    var kj = y[inp + K_OFF + kh * HD + j];
+    if ((em.aux & 2u) != 0u) {{
+        let qn = max(sqrt(column_sum(j, part, qj * qj)), em.extra);
+        let kn = max(sqrt(column_sum(j, part, kj * kj)), em.extra);
+        qj = qj / qn * inverseSqrt(f32(HD));
+        kj = kj / kn;
+    }}
+    if (part == 0u) {{
+        qs[j] = qj;
+        ks[j] = kj;
+    }}
+    workgroupBarrier();
+    let beta = y[inp + BETA_OFF + h];
+    let decay = y[inp + DECAY_OFF + h];
+    let v = y[inp + V_OFF + h * HD + j];
+    let i0 = part * ROWS;
+    // Four rows a step, loads first: the rows are independent, and issued
+    // together they overlap, where one dependent load per row is one
+    // round trip per row.
+    var sk: f32 = 0.0;
+    for (var i: u32 = i0; i < i0 + ROWS; i = i + 4u) {{
+        let s0 = y[base + i * HD + j];
+        let s1 = y[base + (i + 1u) * HD + j];
+        let s2 = y[base + (i + 2u) * HD + j];
+        let s3 = y[base + (i + 3u) * HD + j];
+        sk = sk + ks[i] * s0 + ks[i + 1u] * s1 + ks[i + 2u] * s2 + ks[i + 3u] * s3;
+    }}
+    sk = part_sum(j, part, sk * decay);
+    let d = beta * (v - sk);
+    var o: f32 = 0.0;
+    for (var i: u32 = i0; i < i0 + ROWS; i = i + 4u) {{
+        let s0 = decay * y[base + i * HD + j] + ks[i] * d;
+        let s1 = decay * y[base + (i + 1u) * HD + j] + ks[i + 1u] * d;
+        let s2 = decay * y[base + (i + 2u) * HD + j] + ks[i + 2u] * d;
+        let s3 = decay * y[base + (i + 3u) * HD + j] + ks[i + 3u] * d;
+        y[base + i * HD + j] = s0;
+        y[base + (i + 1u) * HD + j] = s1;
+        y[base + (i + 2u) * HD + j] = s2;
+        y[base + (i + 3u) * HD + j] = s3;
+        o = o + qs[i] * s0 + qs[i + 1u] * s1 + qs[i + 2u] * s2 + qs[i + 3u] * s3;
+    }}
+    o = part_sum(j, part, o);
+    // Gated RMSNorm over the head: rms of `o` across the columns.
+    let inv = inverseSqrt(column_sum(j, part, o * o) / f32(HD) + em.extra);
+    if (part == 0u) {{
+        let zv = y[inp + Z_OFF + h * HD + j];
+        let gate = {gate};
+        let out_head = select(h, (h % NK) * REP + h / NK, (em.aux & 1u) != 0u);
+        y[OUT_OFF + out_head * HD + j] = o * inv * norm_w[j] * gate;
+    }}
+}}
+"#,
+        wg = hd * split,
+        parts_len = hd * split,
+    )
+}
+
+/// [`shader_source_gated_delta`] with a head's columns spread over
+/// `hd / cols` workgroups of `cols` threads: `n_v * hd / cols` workgroups,
+/// so the device has more of them in flight than it has heads. Every
+/// workgroup loads the head's whole `q` and `k` (and norms them itself
+/// when the inputs are raw — a redundancy of `2 · hd` elements per
+/// workgroup), walks its columns' rows once for `k·S` and once for the
+/// update, and leaves the head's *un-normed* output `o` in the `v` slot
+/// of the inputs (each thread's own, read before it is written); the
+/// gated RMSNorm, which needs every column of the head, is
+/// [`shader_source_gated_delta_norm`]'s dispatch after it. `cols == hd`
+/// is the single-workgroup kernel's shape with the norm split off, for
+/// the A/B. Probe-only: measured no faster than the single workgroup
+/// (see there).
+#[cfg(test)]
+pub fn shader_source_gated_delta_split(hd: u32, n_k: u32, n_v: u32, cols: u32) -> String {
+    assert!(hd <= 256 && hd.is_power_of_two() && n_v.is_multiple_of(n_k));
+    assert!(cols.is_power_of_two() && cols <= hd && hd.is_multiple_of(4));
+    format!(
+        r#"{ELEM_META}
+@group(0) @binding(0) var<storage, read> unused: array<f32>;
+@group(0) @binding(1) var<storage, read> norm_w: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> em: ElemMeta;
+
+const HD: u32 = {hd}u;
+const NK: u32 = {n_k}u;
+const NV: u32 = {n_v}u;
+const COLS: u32 = {cols}u;
+const CS: u32 = HD / COLS;
+const Q_OFF: u32 = 0u;
+const K_OFF: u32 = NK * HD;
+const V_OFF: u32 = 2u * NK * HD;
+const BETA_OFF: u32 = V_OFF + NV * HD;
+const DECAY_OFF: u32 = BETA_OFF + NV;
+var<workgroup> red: array<f32, COLS>;
+var<workgroup> qs: array<f32, HD>;
+var<workgroup> ks: array<f32, HD>;
+
+// The sum of `v` over the workgroup; every thread calls it.
+fn wg_sum(t: u32, v: f32) -> f32 {{
+    red[t] = v;
+    workgroupBarrier();
+    var stride: u32 = COLS / 2u;
+    loop {{
+        if (stride == 0u) {{
+            break;
+        }}
+        if (t < stride) {{
+            red[t] = red[t] + red[t + stride];
+        }}
+        workgroupBarrier();
+        stride = stride / 2u;
+    }}
+    let total = red[0];
+    workgroupBarrier();
+    return total;
+}}
+
+@compute @workgroup_size({cols})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let h = wid.x / CS;
+    let c = wid.x % CS;
+    let kh = h % NK;
+    let t = lid.x;
+    let j = c * COLS + t;
+    let base = h * HD * HD;
+    let inp = em.len;
+    for (var i: u32 = t; i < HD; i = i + COLS) {{
+        qs[i] = y[inp + Q_OFF + kh * HD + i];
+        ks[i] = y[inp + K_OFF + kh * HD + i];
+    }}
+    workgroupBarrier();
+    if ((em.aux & 2u) != 0u) {{
+        var sq: f32 = 0.0;
+        var sk2: f32 = 0.0;
+        for (var i: u32 = t; i < HD; i = i + COLS) {{
+            sq = sq + qs[i] * qs[i];
+            sk2 = sk2 + ks[i] * ks[i];
+        }}
+        let qsc = inverseSqrt(f32(HD)) / max(sqrt(wg_sum(t, sq)), em.extra);
+        let ksc = 1.0 / max(sqrt(wg_sum(t, sk2)), em.extra);
+        for (var i: u32 = t; i < HD; i = i + COLS) {{
+            qs[i] = qs[i] * qsc;
+            ks[i] = ks[i] * ksc;
+        }}
+        workgroupBarrier();
+    }}
+    let beta = y[inp + BETA_OFF + h];
+    let decay = y[inp + DECAY_OFF + h];
+    let v = y[inp + V_OFF + h * HD + j];
+    var sk: f32 = 0.0;
+    for (var i: u32 = 0u; i < HD; i = i + 4u) {{
+        let s0 = y[base + i * HD + j];
+        let s1 = y[base + (i + 1u) * HD + j];
+        let s2 = y[base + (i + 2u) * HD + j];
+        let s3 = y[base + (i + 3u) * HD + j];
+        sk = sk + ks[i] * s0 + ks[i + 1u] * s1 + ks[i + 2u] * s2 + ks[i + 3u] * s3;
+    }}
+    let d = beta * (v - sk * decay);
+    var o: f32 = 0.0;
+    for (var i: u32 = 0u; i < HD; i = i + 4u) {{
+        let s0 = decay * y[base + i * HD + j] + ks[i] * d;
+        let s1 = decay * y[base + (i + 1u) * HD + j] + ks[i + 1u] * d;
+        let s2 = decay * y[base + (i + 2u) * HD + j] + ks[i + 2u] * d;
+        let s3 = decay * y[base + (i + 3u) * HD + j] + ks[i + 3u] * d;
+        y[base + i * HD + j] = s0;
+        y[base + (i + 1u) * HD + j] = s1;
+        y[base + (i + 2u) * HD + j] = s2;
+        y[base + (i + 3u) * HD + j] = s3;
+        o = o + qs[i] * s0 + qs[i + 1u] * s1 + qs[i + 2u] * s2 + qs[i + 3u] * s3;
+    }}
+    // The head's un-normed output, in this thread's own `v` slot.
+    y[inp + V_OFF + h * HD + j] = o;
+}}
+"#
+    )
+}
+
+/// The gated RMSNorm over each head's output that
+/// [`shader_source_gated_delta_split`] leaves in the `v` slots: one
+/// workgroup of `hd` threads per head, the same bindings, the result in
+/// the delta kernel's output layout (with the head permutation of
+/// `em.aux & 1`). Probe-only, with the split.
+#[cfg(test)]
+pub fn shader_source_gated_delta_norm(hd: u32, n_k: u32, n_v: u32, sigmoid_gate: bool) -> String {
+    let gate = if sigmoid_gate {
+        "1.0 / (1.0 + exp(-zv))"
+    } else {
+        "zv / (1.0 + exp(-zv))"
+    };
+    format!(
+        r#"{ELEM_META}
+@group(0) @binding(0) var<storage, read> unused: array<f32>;
+@group(0) @binding(1) var<storage, read> norm_w: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> em: ElemMeta;
+
+const HD: u32 = {hd}u;
+const NK: u32 = {n_k}u;
+const NV: u32 = {n_v}u;
+const REP: u32 = NV / NK;
+const V_OFF: u32 = 2u * NK * HD;
+const Z_OFF: u32 = V_OFF + NV * HD + 2u * NV;
+const OUT_OFF: u32 = NV * HD * HD;
+var<workgroup> red: array<f32, HD>;
+
+@compute @workgroup_size({hd})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let h = wid.x;
+    let j = lid.x;
+    let inp = em.len;
+    let o = y[inp + V_OFF + h * HD + j];
+    red[j] = o * o;
+    workgroupBarrier();
+    var stride: u32 = HD / 2u;
+    loop {{
+        if (stride == 0u) {{
+            break;
+        }}
+        if (j < stride) {{
+            red[j] = red[j] + red[j + stride];
+        }}
+        workgroupBarrier();
+        stride = stride / 2u;
+    }}
+    let inv = inverseSqrt(red[0] / f32(HD) + em.extra);
+    let zv = y[inp + Z_OFF + h * HD + j];
+    let gate = {gate};
+    let out_head = select(h, (h % NK) * REP + h / NK, (em.aux & 1u) != 0u);
+    y[OUT_OFF + out_head * HD + j] = o * inv * norm_w[j] * gate;
+}}
+"#
+    )
+}
+
+/// The device half of a recurrent layer's step between its projections
+/// and the delta rule (`shader_source_gated_delta`), one thread per
+/// element: the causal conv1d over the QKV mix against the rolling history
+/// kept in the scratch (`Recurrent LayerState::conv_step` — the history's
+/// `d_conv - 1` taps then the current input, and the window slid by one),
+/// SiLU, `beta = sigmoid(b)`, `decay = exp(softplus(a + dt_bias) · A)`, and
+/// the gate `z` copied — each landing in the delta kernel's input layout
+/// `[q | k | v | beta | decay | z]` at `em.len` of the scratch, the history
+/// at `em.aux`.
+///
+/// Bindings: 0 the projections `[qkv mix | z | beta | alpha]` as the four
+/// matmuls left them, copied together; 1 the layer's constants `[conv
+/// kernel (channel-major, `d_conv` fastest) | dt_bias | A]`; 2 the scratch;
+/// 3 the meta. `em.extra` is unused.
+pub fn shader_source_recurrent_prep(
+    conv_channels: u32,
+    d_conv: u32,
+    value_dim: u32,
+    n_v: u32,
+) -> String {
+    format!(
+        r#"{ELEM_META}
+@group(0) @binding(0) var<storage, read> proj: array<f32>;
+@group(0) @binding(1) var<storage, read> consts: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<uniform> em: ElemMeta;
+
+const CC: u32 = {conv_channels}u;
+const DC: u32 = {d_conv}u;
+const HW: u32 = DC - 1u;
+const VD: u32 = {value_dim}u;
+const NV: u32 = {n_v}u;
+// The projections, back to back.
+const P_Z: u32 = CC;
+const P_BETA: u32 = CC + VD;
+const P_ALPHA: u32 = CC + VD + NV;
+// The constants.
+const C_DT: u32 = CC * DC;
+const C_A: u32 = CC * DC + NV;
+// The delta inputs, relative to `em.len`.
+const I_BETA: u32 = CC;
+const I_DECAY: u32 = CC + NV;
+const I_Z: u32 = CC + 2u * NV;
+
+fn softplus(x: f32) -> f32 {{
+    return select(log(1.0 + exp(x)), x, x > 20.0);
+}}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let i = gid.x;
+    let inp = em.len;
+    let hist = em.aux;
+    if (i < CC) {{
+        let x = proj[i];
+        var sum: f32 = 0.0;
+        for (var t: u32 = 0u; t < HW; t = t + 1u) {{
+            sum = sum + y[hist + i * HW + t] * consts[i * DC + t];
+        }}
+        sum = sum + x * consts[i * DC + HW];
+        for (var t: u32 = 1u; t < HW; t = t + 1u) {{
+            y[hist + i * HW + t - 1u] = y[hist + i * HW + t];
+        }}
+        if (HW > 0u) {{
+            y[hist + i * HW + HW - 1u] = x;
+        }}
+        y[inp + i] = sum / (1.0 + exp(-sum));
+    }} else if (i < CC + NV) {{
+        let h = i - CC;
+        y[inp + I_BETA + h] = 1.0 / (1.0 + exp(-proj[P_BETA + h]));
+    }} else if (i < CC + 2u * NV) {{
+        let h = i - CC - NV;
+        y[inp + I_DECAY + h] = exp(softplus(proj[P_ALPHA + h] + consts[C_DT + h]) * consts[C_A + h]);
+    }} else if (i < CC + 2u * NV + VD) {{
+        let e = i - CC - 2u * NV;
+        y[inp + I_Z + e] = proj[P_Z + e];
+    }}
+}}
+"#
+    )
+}
+
+/// Threads per Hadamard workgroup — half the smallest block this will be
+/// asked for (`prism.hadamard.block_size` is 1024), and inside every
+/// device's 256-invocation floor.
+pub const HADAMARD_WG: u32 = 256;
+
 pub fn shader_source_bias_add() -> String {
     format!("{ELEM_META}\n{BIAS_ADD_SHADER_BODY}")
 }
@@ -9960,6 +11572,14 @@ fn shader_source_rmsnorm_wide_shaped(kind: NormKind, rows: bool) -> String {
             src.push_str("@group(0) @binding(3) var<storage, read_write> y: array<vec4<f32>>;\n");
             src.push_str("@group(0) @binding(4) var<uniform> em: ElemMeta;\n");
         }
+        NormKind::AddThenNorm => {
+            src.push_str("@group(0) @binding(2) var<storage, read> residual: array<vec4<f32>>;\n");
+            src.push_str(
+                "@group(0) @binding(3) var<storage, read_write> x_out: array<vec4<f32>>;\n",
+            );
+            src.push_str("@group(0) @binding(4) var<storage, read_write> y: array<vec4<f32>>;\n");
+            src.push_str("@group(0) @binding(5) var<uniform> em: ElemMeta;\n");
+        }
     }
     // Round one: every thread's partial. Round two: sixteen threads each
     // sum a sixteen-slot stripe, then every thread sums those sixteen.
@@ -9975,10 +11595,24 @@ fn shader_source_rmsnorm_wide_shaped(kind: NormKind, rows: bool) -> String {
          \x20   let base = {};\n",
         if rows { "wid.x * n4" } else { "0u" }
     ));
+    // The pre-norm form sums the stream and the sub-layer's output first,
+    // keeps the sum in the slot and writes it out as the new stream.
+    let load = |idx: &str| -> String {
+        match kind {
+            NormKind::AddThenNorm => format!(
+                "x[base + {idx}] + residual[base + {idx}]; x_out[base + {idx}] = v{}",
+                idx.strip_prefix('k')
+                    .filter(|r| r.chars().all(|c| c.is_ascii_digit()))
+                    .unwrap_or("")
+            ),
+            _ => format!("x[base + {idx}]"),
+        }
+    };
     for i in 0..slots {
         src.push_str(&format!(
-            "    let k{i} = local + {}u;\n    var v{i} = vec4<f32>(0.0);\n    if (k{i} < n4) {{ v{i} = x[base + k{i}]; }}\n",
-            i * wg
+            "    let k{i} = local + {}u;\n    var v{i} = vec4<f32>(0.0);\n    if (k{i} < n4) {{ v{i} = {}; }}\n",
+            i * wg,
+            load(&format!("k{i}"))
         ));
     }
     src.push_str("    var partial: f32 = 0.0;\n");
@@ -9986,8 +11620,12 @@ fn shader_source_rmsnorm_wide_shaped(kind: NormKind, rows: bool) -> String {
         src.push_str(&format!("    partial = partial + dot(v{i}, v{i});\n"));
     }
     // The tail for a row wider than the slots cover.
+    let tail_load = match kind {
+        NormKind::AddThenNorm => "x[base + k] + residual[base + k]; x_out[base + k] = v",
+        _ => "x[base + k]",
+    };
     src.push_str(&format!(
-        "    var k: u32 = local + {}u;\n    loop {{\n        if (k >= n4) {{ break; }}\n        let v = x[base + k];\n        partial = partial + dot(v, v);\n        k = k + {wg}u;\n    }}\n",
+        "    var k: u32 = local + {}u;\n    loop {{\n        if (k >= n4) {{ break; }}\n        let v = {tail_load};\n        partial = partial + dot(v, v);\n        k = k + {wg}u;\n    }}\n",
         slots * wg
     ));
     src.push_str(&format!(
@@ -10005,7 +11643,9 @@ fn shader_source_rmsnorm_wide_shaped(kind: NormKind, rows: bool) -> String {
     );
     let store = |idx: &str, val: &str| -> String {
         match kind {
-            NormKind::Plain => format!("y[base + {idx}] = {val} * scale * weight[{idx}];"),
+            NormKind::Plain | NormKind::AddThenNorm => {
+                format!("y[base + {idx}] = {val} * scale * weight[{idx}];")
+            }
             NormKind::Add => {
                 format!("y[base + {idx}] = {val} * scale * weight[{idx}] + residual[base + {idx}];")
             }
@@ -10025,9 +11665,24 @@ fn shader_source_rmsnorm_wide_shaped(kind: NormKind, rows: bool) -> String {
     src.push_str(&format!(
         "    k = local + {}u;\n    loop {{\n        if (k >= n4) {{ break; }}\n        {}\n        k = k + {wg}u;\n    }}\n}}\n",
         slots * wg,
-        store("k", "x[base + k]")
+        store(
+            "k",
+            match kind {
+                NormKind::AddThenNorm => "x_out[base + k]",
+                _ => "x[base + k]",
+            }
+        )
     ));
     src
+}
+
+/// The pre-norm pair as one dispatch: `x_out = x + residual` (the stream
+/// after a sub-layer's residual add) and `y = rmsnorm(x_out) · weight` (the
+/// next sub-layer's input), six bindings (`elem6_bind_group_layout`). The
+/// Qwen hybrid trunk's decode chain ran these as two dependent dispatches
+/// per sub-layer, 128 a token; the second booked the first's drain.
+pub fn shader_source_add_rmsnorm_wide() -> String {
+    shader_source_rmsnorm_wide_kind(NormKind::AddThenNorm)
 }
 
 /// The wide norms, one workgroup per row — see
@@ -10050,6 +11705,9 @@ enum NormKind {
     Plain,
     Add,
     AddScale,
+    /// The add first, then the norm of the sum — see
+    /// `shader_source_add_rmsnorm_wide`.
+    AddThenNorm,
 }
 
 /// The wide whole-row RMSNorm — see `shader_source_rmsnorm_wide_kind`.

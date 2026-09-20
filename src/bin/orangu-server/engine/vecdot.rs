@@ -44,10 +44,14 @@
 //! changes behavior.
 
 use super::iq_grids::KVALUES_IQ4NL;
+#[cfg(target_arch = "aarch64")]
+use super::quant::unpack_block_pq2_0_neon;
 use super::quant::{
     GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
-    GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
-    GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, get_scale_min_k4, read_f16, unpack_q3_k_scales,
+    GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+    PQ2_0_BLOCK_BYTES, PTQ1_0_BLOCK_BYTES, QK_PRISM, get_scale_min_k4, read_f16,
+    unpack_block_pq2_0, unpack_block_ptq1_0, unpack_q3_k_scales,
 };
 use rayon::prelude::*;
 
@@ -279,6 +283,7 @@ pub fn supports(ggml_type: u32, in_dim: usize) -> bool {
         }
         GGML_TYPE_Q2_K | GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
         | GGML_TYPE_IQ4_XS => in_dim.is_multiple_of(256),
+        GGML_TYPE_PQ2_0 | GGML_TYPE_PTQ1_0 => in_dim.is_multiple_of(QK_PRISM),
         _ => false,
     }
 }
@@ -377,6 +382,8 @@ pub fn unpack_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut UnpackedR
         GGML_TYPE_Q4_K => unpack_q4_k(row, out),
         GGML_TYPE_Q5_K => unpack_q5_k(row, out),
         GGML_TYPE_Q6_K => unpack_q6_k(row, out),
+        GGML_TYPE_PQ2_0 => unpack_pq2_0(row, out),
+        GGML_TYPE_PTQ1_0 => unpack_ptq1_0(row, out),
         // Unreachable via `supports`, but a wrong answer here would be a
         // silently corrupt forward pass, so make it loud instead.
         other => panic!("vecdot::unpack_row called for unsupported ggml_type {other}"),
@@ -1391,6 +1398,48 @@ fn unpack_q4_0(row: &[u8], out: &mut UnpackedRow) {
     }
 }
 
+// ---------------------------------------------------------------- PQ2_0 / PTQ1_0
+
+/// `PQ2_0` into the generic [`UnpackedRow`] form: the block's one scale
+/// repeated across its four 32-groups, no `min`. Ternary values are already
+/// `int8`-sized, so this is the bit unpack and nothing else.
+fn unpack_pq2_0(row: &[u8], out: &mut UnpackedRow) {
+    out.has_min = false;
+    for (b, block) in row.as_chunks::<PQ2_0_BLOCK_BYTES>().0.iter().enumerate() {
+        let dw = read_f16(block, 0);
+        let w: &mut [i8; QK_PRISM] = (&mut out.q[b * QK_PRISM..(b + 1) * QK_PRISM])
+            .try_into()
+            .unwrap();
+        unpack_block_pq2_0(&block[2..], w);
+        prism_scales(out, b, dw);
+    }
+}
+
+/// `PTQ1_0` into the generic [`UnpackedRow`] form — as [`unpack_pq2_0`],
+/// with `TQ1_0`'s trit unpack and the scale read from the block's tail.
+fn unpack_ptq1_0(row: &[u8], out: &mut UnpackedRow) {
+    const QS: usize = PTQ1_0_BLOCK_BYTES - 4;
+    out.has_min = false;
+    for (b, block) in row.as_chunks::<PTQ1_0_BLOCK_BYTES>().0.iter().enumerate() {
+        let dw = read_f16(block, QS + 2);
+        let w: &mut [i8; QK_PRISM] = (&mut out.q[b * QK_PRISM..(b + 1) * QK_PRISM])
+            .try_into()
+            .unwrap();
+        unpack_block_ptq1_0(&block[..QS], &block[QS..QS + 2], w);
+        prism_scales(out, b, dw);
+    }
+}
+
+/// One Prism block's scale, written to each of the four per-32 slots it
+/// covers — what lets a per-128 type ride the per-32 kernels unchanged.
+#[inline(always)]
+fn prism_scales(out: &mut UnpackedRow, b: usize, dw: f32) {
+    for s in 0..QK_PRISM / 32 {
+        out.scale[b * (QK_PRISM / 32) + s] = dw;
+        out.min[b * (QK_PRISM / 32) + s] = 0.0;
+    }
+}
+
 // ---------------------------------------------------------------- Q5_1
 
 /// `Q5_1` into the generic [`UnpackedRow`] form.
@@ -2032,9 +2081,19 @@ const Q6K_GROUPS: usize = SUPER_BLOCK / GROUP;
 /// 11.5% of a `Q2_K` file against `Q3_K`'s 77.2%, so that trade is measured
 /// before it is paid for — see `doc/PERF-TINY.md`.
 pub fn supports_k(ggml_type: u32, in_dim: usize) -> bool {
+    // The Prism ternary types have no super-block of their own, but two of
+    // their 128-blocks make one: `unpack_k_prism` turns the pair of `f16`
+    // scales into one `f32` base and two 15-bit integer scales, which is
+    // exactly the `IQ4_XS` shape (per-32 signed integer scale, no min).
     matches!(
         ggml_type,
-        GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K | GGML_TYPE_IQ4_XS
+        GGML_TYPE_Q3_K
+            | GGML_TYPE_Q4_K
+            | GGML_TYPE_Q5_K
+            | GGML_TYPE_Q6_K
+            | GGML_TYPE_IQ4_XS
+            | GGML_TYPE_PQ2_0
+            | GGML_TYPE_PTQ1_0
     ) && in_dim.is_multiple_of(SUPER_BLOCK)
 }
 
@@ -2240,7 +2299,69 @@ pub fn unpack_k_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut KRow) {
             out.resize_for(in_dim, KKind::Iq4Xs);
             unpack_k_iq4_xs(row, out);
         }
+        GGML_TYPE_PQ2_0 => {
+            out.resize_for(in_dim, KKind::Iq4Xs);
+            unpack_k_prism::<false>(row, out);
+        }
+        GGML_TYPE_PTQ1_0 => {
+            out.resize_for(in_dim, KKind::Iq4Xs);
+            unpack_k_prism::<true>(row, out);
+        }
         other => panic!("vecdot::unpack_k_row called for unsupported ggml_type {other}"),
+    }
+}
+
+/// The largest integer scale [`unpack_k_prism`] hands out. 15 bits rather
+/// than `i16`'s 16 so the super-block accumulation stays inside `i32` at
+/// the format's extreme: `16383 · |q| ≤ 2 · |x| ≤ 127 · 256` is 1.07e9,
+/// under half of `i32::MAX`; a full 16 bits would be over it.
+const PRISM_K_SCALE_MAX: i32 = 16383;
+
+/// Unpacks a `PQ2_0` (`TRITS = false`) or `PTQ1_0` (`TRITS = true`) row into
+/// [`KKind::Iq4Xs`] form: per super-block the larger of its two blocks'
+/// `f16` scales, divided by [`PRISM_K_SCALE_MAX`], is the `f32` base, and
+/// each block's scale is rounded to an integer multiple of it, written to
+/// its four per-32 slots.
+///
+/// The rounding is the one place this path is not exact: a block's scale
+/// lands within `1 / (2 · 16383)` of itself, a relative error of 3e-5 —
+/// against the 1e-3 the int8 activation quantization already introduces,
+/// and far tighter than the 2% the k-row test allows. What the coarser
+/// activation scale buys is the reason the K GEMM exists: the whole
+/// super-block accumulates in `i32` and converts once.
+fn unpack_k_prism<const TRITS: bool>(row: &[u8], out: &mut KRow) {
+    let block_bytes = if TRITS {
+        PTQ1_0_BLOCK_BYTES
+    } else {
+        PQ2_0_BLOCK_BYTES
+    };
+    let per_super = SUPER_BLOCK / QK_PRISM;
+    for (s, pair) in row.chunks_exact(per_super * block_bytes).enumerate() {
+        let mut scales = [0f32; SUPER_BLOCK / QK_PRISM];
+        for (h, block) in pair.chunks_exact(block_bytes).enumerate() {
+            let w: &mut [i8; QK_PRISM] = (&mut out.q[(s * per_super + h) * QK_PRISM..][..QK_PRISM])
+                .try_into()
+                .unwrap();
+            scales[h] = if TRITS {
+                const QS: usize = PTQ1_0_BLOCK_BYTES - 4;
+                unpack_block_ptq1_0(&block[..QS], &block[QS..QS + 2], w);
+                read_f16(block, QS + 2)
+            } else {
+                unpack_block_pq2_0(&block[2..], w);
+                read_f16(block, 0)
+            };
+        }
+        let amax = scales.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let base = amax / PRISM_K_SCALE_MAX as f32;
+        let inv = if base > 0.0 { 1.0 / base } else { 0.0 };
+        out.d[s] = base;
+        for (h, &scale) in scales.iter().enumerate() {
+            let sc = (scale * inv).round() as i32;
+            debug_assert!(sc.abs() <= PRISM_K_SCALE_MAX);
+            for sub in 0..QK_PRISM / 32 {
+                out.sc[s * SUBS + h * (QK_PRISM / 32) + sub] = sc as i16;
+            }
+        }
     }
 }
 
@@ -3351,9 +3472,18 @@ fn store_tile(tl: usize, acc: &[f32; TOKEN_TILE], out: &mut [f32]) {
 /// are handled by the K-quant GEMM, and a type that satisfied neither would
 /// fall back to [`dot_unpacked_pair`] rather than being handled wrongly here.
 pub fn supports_flat(ggml_type: u32, in_dim: usize) -> bool {
+    // `PQ2_0`/`PTQ1_0` qualify the way `IQ4_NL` does: their scale is per 128
+    // rather than per 32, but `unpack_pq2_0`/`unpack_ptq1_0` repeat it across
+    // the block's four 32-groups, and a ternary weight has no min term. In
+    // `UnpackedRow` form they are indistinguishable from `Q8_0`.
     matches!(
         ggml_type,
-        GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 | GGML_TYPE_Q4_0 | GGML_TYPE_IQ4_NL
+        GGML_TYPE_Q8_0
+            | GGML_TYPE_Q5_0
+            | GGML_TYPE_Q4_0
+            | GGML_TYPE_IQ4_NL
+            | GGML_TYPE_PQ2_0
+            | GGML_TYPE_PTQ1_0
     ) && in_dim.is_multiple_of(ACT_BLOCK)
 }
 
@@ -3604,6 +3734,8 @@ fn dot_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8) -> f32 {
         GGML_TYPE_Q5_K => dot_q5_k::<ISA>(row, act),
         GGML_TYPE_Q6_K => dot_q6_k::<ISA>(row, act),
         GGML_TYPE_IQ4_XS => dot_iq4_xs::<ISA>(row, act),
+        GGML_TYPE_PQ2_0 => dot_pq2_0::<ISA>(row, act),
+        GGML_TYPE_PTQ1_0 => dot_ptq1_0::<ISA>(row, act),
         other => panic!("vecdot::dot_row called for unsupported ggml_type {other}"),
     }
 }
@@ -4113,6 +4245,49 @@ fn dot_q4_0<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     total
 }
 
+/// `block_pq2_0`, 128 elements: one `f16` scale over four 32-element
+/// activation blocks. Symmetric (`-1..=2`), so the four integer dots are
+/// scaled by their own activation scale and summed under the one weight
+/// scale — the same shape as [`dot_q4_0`] with the weight scale hoisted
+/// across four blocks. Unpacking goes through `quant::unpack_block_pq2_0`
+/// so the bit layout is written once.
+fn dot_pq2_0<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
+    let mut total = 0f32;
+    let mut w = [0i8; QK_PRISM];
+    for (b, block) in row.as_chunks::<PQ2_0_BLOCK_BYTES>().0.iter().enumerate() {
+        let dw = read_f16(block, 0);
+        unpack_block_pq2_0(&block[2..], &mut w);
+        total += dw * prism_block_dot::<ISA>(&w, act, b);
+    }
+    total
+}
+
+/// `block_ptq1_0`, 128 elements: `TQ1_0`'s trit packing with the scale
+/// last. Same accumulation as [`dot_pq2_0`]; only the unpack differs.
+fn dot_ptq1_0<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
+    const QS: usize = PTQ1_0_BLOCK_BYTES - 4;
+    let mut total = 0f32;
+    let mut w = [0i8; QK_PRISM];
+    for (b, block) in row.as_chunks::<PTQ1_0_BLOCK_BYTES>().0.iter().enumerate() {
+        let dw = read_f16(block, QS + 2);
+        unpack_block_ptq1_0(&block[..QS], &block[QS..QS + 2], &mut w);
+        total += dw * prism_block_dot::<ISA>(&w, act, b);
+    }
+    total
+}
+
+/// `sum_j d_act[j] · dot32(w[j], act[j])` over the four activation blocks
+/// that make up Prism block `b` — the per-128 weight scale is the caller's.
+#[inline(always)]
+fn prism_block_dot<const ISA: u8>(w: &[i8; QK_PRISM], act: &ActQ8, b: usize) -> f32 {
+    let mut sum = 0f32;
+    for s in 0..QK_PRISM / ACT_BLOCK {
+        let ab = b * (QK_PRISM / ACT_BLOCK) + s;
+        sum += act.d[ab] * dot32::<ISA>(&w[s * ACT_BLOCK..], &act.q[ab * ACT_BLOCK..]) as f32;
+    }
+    sum
+}
+
 /// `block_q5_1`, 32 elements: `Q5_0`'s bit layout with `value = d*q + m`.
 /// The `+m` is applied against the block's activation sum, the same way
 /// [`dot_q4_k`] applies `-dmin*m` — note the opposite sign.
@@ -4256,16 +4431,21 @@ pub struct ActQ8KRow {
     d: Vec<f32>,
     /// Per-[`GROUP`] `sum(q)`, for `Q2_K`'s min term.
     sums: Vec<i32>,
+    /// Per-[`QK_PRISM`] `sum(q)` — the `-1` bias of a ternary block folded
+    /// into one subtraction. Summed once here rather than from `sums` per
+    /// (row, block), which was a fifth of the Prism decode kernel's time.
+    prism_sums: Vec<i32>,
 }
 
 /// Quantizes one token's activations for [`dot_k_row`]. `x.len()` must be a
 /// multiple of [`SUPER_BLOCK`] — guaranteed by [`supports_k_row`].
 pub fn quantize_act_k_row(x: &[f32]) -> ActQ8KRow {
     debug_assert_eq!(x.len() % SUPER_BLOCK, 0);
+    let n_super = x.len() / SUPER_BLOCK;
     let mut q = vec![0i8; x.len()];
-    let mut d = Vec::with_capacity(x.len() / SUPER_BLOCK);
-    let mut sums = Vec::with_capacity(x.len() / GROUP);
-    for (s, chunk) in x.as_chunks::<SUPER_BLOCK>().0.iter().enumerate() {
+    let mut d = vec![0f32; n_super];
+    let mut sums = vec![0i32; x.len() / GROUP];
+    let quantize_super = |chunk: &[f32], q: &mut [i8], d: &mut f32, sums: &mut [i32]| {
         let amax = chunk.iter().fold(0f32, |m, v| m.max(v.abs()));
         // A super-block of exact zeros has no scale; leave it 0 so `q * d`
         // reproduces 0 rather than NaN. Same contract as `quantize_act`.
@@ -4275,14 +4455,36 @@ pub fn quantize_act_k_row(x: &[f32]) -> ActQ8KRow {
             let mut sum = 0i32;
             for (i, &v) in group.iter().enumerate() {
                 let qi = (v * inv).round().clamp(-127.0, 127.0) as i8;
-                q[s * SUPER_BLOCK + g * GROUP + i] = qi;
+                q[g * GROUP + i] = qi;
                 sum += qi as i32;
             }
-            sums.push(sum);
+            sums[g] = sum;
         }
-        d.push(scale);
+        *d = scale;
+    };
+    // Serial on purpose: this is one decode row, and fanning its
+    // super-blocks across the pool was measured to cost more in fork-join
+    // than the ~30 µs it spread (27B `PTQ1_0`, 8 threads).
+    for (s, chunk) in x.as_chunks::<SUPER_BLOCK>().0.iter().enumerate() {
+        quantize_super(
+            chunk,
+            &mut q[s * SUPER_BLOCK..(s + 1) * SUPER_BLOCK],
+            &mut d[s],
+            &mut sums[s * (SUPER_BLOCK / GROUP)..(s + 1) * (SUPER_BLOCK / GROUP)],
+        );
     }
-    ActQ8KRow { q, d, sums }
+    let prism_sums = sums
+        .as_chunks::<{ QK_PRISM / GROUP }>()
+        .0
+        .iter()
+        .map(|g| g.iter().sum())
+        .collect();
+    ActQ8KRow {
+        q,
+        d,
+        sums,
+        prism_sums,
+    }
 }
 
 /// Whether [`dot_k_row`] handles this type.
@@ -4314,6 +4516,12 @@ pub fn quantize_act_k_row(x: &[f32]) -> ActQ8KRow {
 /// All are at least an order of magnitude inside `i32::MAX` (2.1e9), the
 /// tightest being `Q6_K` and `IQ4_XS` at ~15x margin.
 pub fn supports_k_row(ggml_type: u32, in_dim: usize) -> bool {
+    // The Prism ternary types are not super-block types, but they take this
+    // path for the same reason the K-quants do: one weight scale per 128 and
+    // one activation scale per 256 let a whole block accumulate in `i32` —
+    // and, on `sdot` hardware, let the trit planes be dotted straight from
+    // the packed bytes with no unpacked row in between. Bound: `|w| <= 2`,
+    // `|x| <= 127`, 128 terms — 3.3e4 per block, nowhere near `i32`.
     matches!(
         ggml_type,
         GGML_TYPE_Q2_K
@@ -4322,6 +4530,8 @@ pub fn supports_k_row(ggml_type: u32, in_dim: usize) -> bool {
             | GGML_TYPE_Q5_K
             | GGML_TYPE_Q6_K
             | GGML_TYPE_IQ4_XS
+            | GGML_TYPE_PQ2_0
+            | GGML_TYPE_PTQ1_0
     ) && in_dim.is_multiple_of(SUPER_BLOCK)
 }
 
@@ -4388,6 +4598,8 @@ fn dot_k_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8KRow) ->
         GGML_TYPE_Q5_K => dot_k_row_q5_k::<ISA>(row, act),
         GGML_TYPE_Q6_K => dot_k_row_q6_k::<ISA>(row, act),
         GGML_TYPE_IQ4_XS => dot_k_row_iq4_xs::<ISA>(row, act),
+        GGML_TYPE_PQ2_0 => dot_k_row_prism::<ISA, false>(row, act),
+        GGML_TYPE_PTQ1_0 => dot_k_row_prism::<ISA, true>(row, act),
         other => panic!("vecdot::dot_k_row called for unsupported ggml_type {other}"),
     }
 }
@@ -4563,6 +4775,380 @@ unsafe fn dot_k_row_q6_k_avx2(row: &[u8], act: &ActQ8KRow) -> f32 {
             accf = _mm256_fmadd_ps(_mm256_set1_ps(act.d[s] * d), _mm256_cvtepi32_ps(acc), accf);
         }
         hsum_ps_avx2(accf)
+    }
+}
+
+/// Whether [`dot_k_row_pair`] has a two-row kernel for `ggml_type` — the
+/// Prism ternary types, whose decode is instruction-bound enough that
+/// sharing every activation load and the per-block scalar tail between two
+/// rows is measurable.
+pub fn supports_k_row_pair(ggml_type: u32, in_dim: usize) -> bool {
+    matches!(ggml_type, GGML_TYPE_PQ2_0 | GGML_TYPE_PTQ1_0) && supports_k_row(ggml_type, in_dim)
+}
+
+/// Two rows against one token — [`dot_k_row`] for `row0` and `row1` at
+/// once, the activations loaded once for both. `ggml_type` must have passed
+/// [`supports_k_row_pair`].
+pub fn dot_k_row_pair(ggml_type: u32, row0: &[u8], row1: &[u8], act: &ActQ8KRow) -> (f32, f32) {
+    #[cfg(target_arch = "aarch64")]
+    if have_dotprod() {
+        return dot_k_row_pair_impl::<ISA_DOTPROD>(ggml_type, row0, row1, act);
+    }
+    dot_k_row_pair_impl::<ISA_BASELINE>(ggml_type, row0, row1, act)
+}
+
+fn dot_k_row_pair_impl<const ISA: u8>(
+    ggml_type: u32,
+    row0: &[u8],
+    row1: &[u8],
+    act: &ActQ8KRow,
+) -> (f32, f32) {
+    match ggml_type {
+        GGML_TYPE_PQ2_0 => dot_k_row_prism_pair::<ISA, false>(row0, row1, act),
+        GGML_TYPE_PTQ1_0 => dot_k_row_prism_pair::<ISA, true>(row0, row1, act),
+        other => panic!("vecdot::dot_k_row_pair called for unsupported ggml_type {other}"),
+    }
+}
+
+/// [`dot_k_row_prism`] over two rows. A kernel that shared the activation
+/// loads between the rows was measured at +3% per core over two plain
+/// calls (9.0 → 9.3 G weights/s on a Cortex-A720) and dropped; what the
+/// two-row *task* buys is scheduling granularity, which `cpu.rs` keeps.
+fn dot_k_row_prism_pair<const ISA: u8, const TRITS: bool>(
+    row0: &[u8],
+    row1: &[u8],
+    act: &ActQ8KRow,
+) -> (f32, f32) {
+    (
+        dot_k_row_prism::<ISA, TRITS>(row0, act),
+        dot_k_row_prism::<ISA, TRITS>(row1, act),
+    )
+}
+
+/// `PQ2_0` (`TRITS = false`) and `PTQ1_0` (`TRITS = true`) decode: two
+/// 128-element blocks per activation super-block, each dotted in `i32`
+/// and scaled once, so the `f32` work is two multiplies per 256 weights
+/// where [`dot_pq2_0`]/[`dot_ptq1_0`] pay eight and reduce four times.
+///
+/// Measured on the 27B `PTQ1_0` file (CIX P1, `orangu-bench --depths 0`),
+/// this and the fused `sdot` unpack below took decode from 1.30 to 1.58
+/// tok/s, on top of the 0.19 -> 1.30 the NEON unpack gave; the per-32 path
+/// stays as the fallback for a width that is not a whole number of
+/// super-blocks.
+fn dot_k_row_prism<const ISA: u8, const TRITS: bool>(row: &[u8], act: &ActQ8KRow) -> f32 {
+    let block_bytes = if TRITS {
+        PTQ1_0_BLOCK_BYTES
+    } else {
+        PQ2_0_BLOCK_BYTES
+    };
+    #[cfg(target_arch = "aarch64")]
+    if ISA == ISA_DOTPROD {
+        // Safety: only reachable from a path `have_dotprod()` approved.
+        return unsafe {
+            if TRITS {
+                dot_k_row_ptq1_0_sdot(row, act)
+            } else {
+                dot_k_row_pq2_0_sdot(row, act)
+            }
+        };
+    }
+    let mut total = 0f32;
+    for (s, pair) in row.chunks_exact(2 * block_bytes).enumerate() {
+        let mut sum = 0f32;
+        for (h, block) in pair.chunks_exact(block_bytes).enumerate() {
+            let b = 2 * s + h;
+            let x = &act.q[b * QK_PRISM..(b + 1) * QK_PRISM];
+            let (dw, isum) = if TRITS {
+                const QS: usize = PTQ1_0_BLOCK_BYTES - 4;
+                (
+                    read_f16(block, QS + 2),
+                    ptq1_0_block_isum::<ISA>(&block[..QS], &block[QS..QS + 2], x, act, b),
+                )
+            } else {
+                (read_f16(block, 0), pq2_0_block_isum::<ISA>(&block[2..], x))
+            };
+            sum += dw * isum as f32;
+        }
+        total += act.d[s] * sum;
+    }
+    total
+}
+
+/// `sum_i w[i] · x[i]` over one `PQ2_0` block, in `i32`.
+#[inline(always)]
+fn pq2_0_block_isum<const ISA: u8>(qs: &[u8], x: &[i8]) -> i32 {
+    let mut w = [0i8; QK_PRISM];
+    unpack_block_pq2_0(qs, &mut w);
+    #[cfg(target_arch = "aarch64")]
+    if ISA == ISA_DOTPROD {
+        // Safety: only reachable from a path `have_dotprod()` approved.
+        return unsafe { sdot_128(&w, x) };
+    }
+    (0..QK_PRISM / 32)
+        .map(|s| dot32::<ISA>(&w[s * 32..], &x[s * 32..]))
+        .sum()
+}
+
+/// `sum_i w[i] · x[i]` over one `PTQ1_0` block, in `i32`. `b` is the
+/// block's index into `act`, for the activation sums the fused path needs.
+#[inline(always)]
+fn ptq1_0_block_isum<const ISA: u8>(
+    qs: &[u8],
+    qh: &[u8],
+    x: &[i8],
+    act: &ActQ8KRow,
+    b: usize,
+) -> i32 {
+    #[cfg(target_arch = "aarch64")]
+    if ISA == ISA_DOTPROD {
+        // Safety: only reachable from a path `have_dotprod()` approved.
+        return unsafe { ptq1_0_block_isum_sdot(qs, qh, x, act.prism_sums[b]) };
+    }
+    let _ = (act, b);
+    let mut w = [0i8; QK_PRISM];
+    unpack_block_ptq1_0(qs, qh, &mut w);
+    (0..QK_PRISM / 32)
+        .map(|s| dot32::<ISA>(&w[s * 32..], &x[s * 32..]))
+        .sum()
+}
+
+/// 128 `int8` pairs into one `i32`, two independent `sdot` chains, one
+/// horizontal reduction.
+///
+/// Intrinsics under `#[target_feature]` rather than the `asm!` block
+/// [`dot32_sdot`] uses: an `asm!` is a scheduling barrier, and with one
+/// accumulator that made the eight `sdot`s of a block a serial chain at
+/// the instruction's latency. Two chains, and the compiler free to
+/// interleave the trit extraction with them, is what the pair kernel
+/// below was written for and what this shares with it.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[inline]
+unsafe fn sdot_128(w: &[i8; QK_PRISM], x: &[i8]) -> i32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut acc0 = vdupq_n_s32(0);
+        let mut acc1 = vdupq_n_s32(0);
+        for h in (0..QK_PRISM / 16).step_by(2) {
+            acc0 = vdotq_s32(
+                acc0,
+                vld1q_s8(w.as_ptr().add(16 * h)),
+                vld1q_s8(x.as_ptr().add(16 * h)),
+            );
+            acc1 = vdotq_s32(
+                acc1,
+                vld1q_s8(w.as_ptr().add(16 * h + 16)),
+                vld1q_s8(x.as_ptr().add(16 * h + 16)),
+            );
+        }
+        vaddvq_s32(vaddq_s32(acc0, acc1))
+    }
+}
+
+/// The `PTQ1_0` block dot with no unpacked row at all: each trit plane of
+/// the 16-byte run *is* sixteen consecutive elements (`16n..16n+16`), so
+/// it is dotted against those activations as soon as it is extracted; the
+/// 8-byte run's planes pair up into the next three vectors the same way
+/// (`80..96`, `96..112`, and the last plane with the eight `qh` values at
+/// `112..128`), and `qh` itself is one 8-lane multiply of `[h0 h1 h0 h1 …]`
+/// by `[1 1 3 3 9 9 27 27]`. The trits are dotted as `0..=2` and the
+/// block's `-1` bias is one subtraction of the activation sum at the end,
+/// which is what `x_sum` is for.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn ptq1_0_block_isum_sdot(qs: &[u8], qh: &[u8], x: &[i8], x_sum: i32) -> i32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let planes = ptq1_0_planes(qs, qh);
+        let mut acc0 = vdupq_n_s32(0);
+        let mut acc1 = vdupq_n_s32(0);
+        for (n, pair) in planes.as_chunks::<2>().0.iter().enumerate() {
+            acc0 = vdotq_s32(acc0, pair[0], vld1q_s8(x.as_ptr().add(32 * n)));
+            acc1 = vdotq_s32(acc1, pair[1], vld1q_s8(x.as_ptr().add(32 * n + 16)));
+        }
+        vaddvq_s32(vaddq_s32(acc0, acc1)) - x_sum
+    }
+}
+
+/// The whole `PTQ1_0` row on `sdot` hardware: one `#[target_feature]`
+/// function, so [`ptq1_0_super_isum_sdot`] inlines into the super-block
+/// loop instead of being called once per 256 weights with sliced
+/// arguments, and the per-block activation sums come precomputed from
+/// [`ActQ8KRow::prism_sums`]. The wrapper this replaced was a fifth of the
+/// decode profile by itself.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn dot_k_row_ptq1_0_sdot(row: &[u8], act: &ActQ8KRow) -> f32 {
+    const QS: usize = PTQ1_0_BLOCK_BYTES - 4;
+    let mut total = 0f32;
+    for (s, pair) in row
+        .as_chunks::<{ 2 * PTQ1_0_BLOCK_BYTES }>()
+        .0
+        .iter()
+        .enumerate()
+    {
+        let (block0, block1) = pair.split_at(PTQ1_0_BLOCK_BYTES);
+        let (isum0, isum1) = unsafe {
+            ptq1_0_super_isum_sdot(
+                block0,
+                block1,
+                &act.q[s * SUPER_BLOCK..(s + 1) * SUPER_BLOCK],
+                act.prism_sums[2 * s],
+                act.prism_sums[2 * s + 1],
+            )
+        };
+        total += act.d[s]
+            * (read_f16(block0, QS + 2) * isum0 as f32 + read_f16(block1, QS + 2) * isum1 as f32);
+    }
+    total
+}
+
+/// The `PQ2_0` counterpart of [`dot_k_row_ptq1_0_sdot`]: the NEON field
+/// unpack and [`sdot_128`] inlined into one loop, so the unpacked block
+/// never leaves registers.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn dot_k_row_pq2_0_sdot(row: &[u8], act: &ActQ8KRow) -> f32 {
+    let mut total = 0f32;
+    let mut w = [0i8; QK_PRISM];
+    for (s, pair) in row
+        .as_chunks::<{ 2 * PQ2_0_BLOCK_BYTES }>()
+        .0
+        .iter()
+        .enumerate()
+    {
+        let mut sum = 0f32;
+        for (h, block) in pair.as_chunks::<PQ2_0_BLOCK_BYTES>().0.iter().enumerate() {
+            let b = 2 * s + h;
+            unsafe {
+                unpack_block_pq2_0_neon(&block[2..], &mut w);
+                sum += read_f16(block, 0)
+                    * sdot_128(&w, &act.q[b * QK_PRISM..(b + 1) * QK_PRISM]) as f32;
+            }
+        }
+        total += act.d[s] * sum;
+    }
+    total
+}
+
+/// Both `PTQ1_0` blocks of one activation super-block, dotted in `i32` —
+/// [`ptq1_0_block_isum_sdot`] with the two blocks' half-width work fused
+/// into full vectors: each 8-byte run's trit plane, and each block's `qh`,
+/// is extracted for both blocks in one 16-lane operation, and `vdotq`
+/// keeps the two blocks apart by itself — its lanes 0–1 sum the low eight
+/// bytes (block 0) and lanes 2–3 the high eight (block 1), so one
+/// accumulator carries both partial sums until the end. That removes
+/// 23 half-width operations per 256 weights against the one-block kernel.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[inline]
+unsafe fn ptq1_0_super_isum_sdot(
+    block0: &[u8],
+    block1: &[u8],
+    x: &[i8],
+    x_sum0: i32,
+    x_sum1: i32,
+) -> (i32, i32) {
+    use std::arch::aarch64::*;
+    const QS: usize = PTQ1_0_BLOCK_BYTES - 4;
+    unsafe {
+        let trits16 = |v: uint8x16_t| -> int8x16_t {
+            vreinterpretq_s8_u8(vshrq_n_u8::<6>(vhaddq_u8(v, vshrq_n_u8::<1>(v))))
+        };
+        let x0 = x.as_ptr();
+        let x1 = x.as_ptr().add(QK_PRISM);
+        // The 16-byte runs: five planes each, own accumulators.
+        let run0 = vld1q_u8(block0.as_ptr());
+        let run1 = vld1q_u8(block1.as_ptr());
+        let mut acc0 = vdotq_s32(vdupq_n_s32(0), trits16(run0), vld1q_s8(x0));
+        let mut acc1 = vdotq_s32(vdupq_n_s32(0), trits16(run1), vld1q_s8(x1));
+        for (n, &p) in [3u8, 9, 27, 81].iter().enumerate() {
+            let pv = vdupq_n_u8(p);
+            acc0 = vdotq_s32(
+                acc0,
+                trits16(vmulq_u8(run0, pv)),
+                vld1q_s8(x0.add(16 * (n + 1))),
+            );
+            acc1 = vdotq_s32(
+                acc1,
+                trits16(vmulq_u8(run1, pv)),
+                vld1q_s8(x1.add(16 * (n + 1))),
+            );
+        }
+        // The 8-byte runs, side by side: low half block 0, high half block 1.
+        let tail = vcombine_u8(
+            vld1_u8(block0.as_ptr().add(16)),
+            vld1_u8(block1.as_ptr().add(16)),
+        );
+        let xt =
+            |off: usize| -> int8x16_t { vcombine_s8(vld1_s8(x0.add(off)), vld1_s8(x1.add(off))) };
+        let mut acc = vdotq_s32(vdupq_n_s32(0), trits16(tail), xt(80));
+        for (n, &p) in [3u8, 9, 27, 81].iter().enumerate() {
+            acc = vdotq_s32(
+                acc,
+                trits16(vmulq_u8(tail, vdupq_n_u8(p))),
+                xt(80 + 8 * (n + 1)),
+            );
+        }
+        // `qh`: `[h0 h1 h0 h1 …]` of each block times `[1 1 3 3 9 9 27 27]`.
+        let hpow: [u8; 16] = [1, 1, 3, 3, 9, 9, 27, 27, 1, 1, 3, 3, 9, 9, 27, 27];
+        let hv = vcombine_u16(
+            vdup_n_u16(u16::from_le_bytes([block0[QS], block0[QS + 1]])),
+            vdup_n_u16(u16::from_le_bytes([block1[QS], block1[QS + 1]])),
+        );
+        acc = vdotq_s32(
+            acc,
+            trits16(vmulq_u8(vreinterpretq_u8_u16(hv), vld1q_u8(hpow.as_ptr()))),
+            xt(120),
+        );
+        let lo = vget_low_s32(acc);
+        let hi = vget_high_s32(acc);
+        (
+            vaddvq_s32(acc0) + vaddv_s32(lo) - x_sum0,
+            vaddvq_s32(acc1) + vaddv_s32(hi) - x_sum1,
+        )
+    }
+}
+
+/// The eight 16-lane trit vectors of one `PTQ1_0` block, in element order
+/// and as `0..=2` — the shared unpack of the one- and two-row `sdot`
+/// kernels. Kept in registers by the caller; nothing is stored.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn ptq1_0_planes(qs: &[u8], qh: &[u8]) -> [std::arch::aarch64::int8x16_t; 8] {
+    use std::arch::aarch64::*;
+    const POW3: [u8; 5] = [1, 3, 9, 27, 81];
+    unsafe {
+        let trits16 = |v: uint8x16_t| -> int8x16_t {
+            vreinterpretq_s8_u8(vshrq_n_u8::<6>(vhaddq_u8(v, vshrq_n_u8::<1>(v))))
+        };
+        let trits8 = |v: uint8x8_t| -> int8x8_t {
+            vreinterpret_s8_u8(vshr_n_u8::<6>(vhadd_u8(v, vshr_n_u8::<1>(v))))
+        };
+        let run16 = vld1q_u8(qs.as_ptr());
+        let run8 = vld1_u8(qs.as_ptr().add(16));
+        let plane = |n: usize| -> int8x8_t {
+            if n == 0 {
+                trits8(run8)
+            } else {
+                trits8(vmul_u8(run8, vdup_n_u8(POW3[n])))
+            }
+        };
+        let hpow: [u8; 8] = [1, 1, 3, 3, 9, 9, 27, 27];
+        let hq = trits8(vmul_u8(
+            vreinterpret_u8_u16(vdup_n_u16(u16::from_le_bytes([qh[0], qh[1]]))),
+            vld1_u8(hpow.as_ptr()),
+        ));
+        [
+            trits16(run16),
+            trits16(vmulq_u8(run16, vdupq_n_u8(3))),
+            trits16(vmulq_u8(run16, vdupq_n_u8(9))),
+            trits16(vmulq_u8(run16, vdupq_n_u8(27))),
+            trits16(vmulq_u8(run16, vdupq_n_u8(81))),
+            vcombine_s8(plane(0), plane(1)),
+            vcombine_s8(plane(2), plane(3)),
+            vcombine_s8(plane(4), hq),
+        ]
     }
 }
 
@@ -4869,6 +5455,8 @@ mod tests {
             GGML_TYPE_Q5_K => (176, 256),
             GGML_TYPE_Q6_K => (210, 256),
             GGML_TYPE_IQ4_XS => (136, 256),
+            GGML_TYPE_PQ2_0 => (34, 128),
+            GGML_TYPE_PTQ1_0 => (28, 128),
             other => panic!("unhandled {other}"),
         };
         let row_bytes = in_dim / block_elems * block_bytes;
@@ -4901,6 +5489,9 @@ mod tests {
                 GGML_TYPE_Q3_K => block[108..110].copy_from_slice(&[0x00, 0x30]),
                 GGML_TYPE_Q6_K => block[208..210].copy_from_slice(&[0x00, 0x30]),
                 GGML_TYPE_IQ4_XS => block[0..2].copy_from_slice(&[0x00, 0x30]),
+                GGML_TYPE_PQ2_0 => block[0..2].copy_from_slice(&[0x00, 0x30]),
+                // `PTQ1_0` is the other type with a trailing `d`.
+                GGML_TYPE_PTQ1_0 => block[26..28].copy_from_slice(&[0x00, 0x30]),
                 other => panic!("unhandled {other}"),
             }
         }
@@ -5080,6 +5671,8 @@ mod tests {
             GGML_TYPE_Q5_K => (176, 256),
             GGML_TYPE_Q6_K => (210, 256),
             GGML_TYPE_IQ4_XS => (136, 256),
+            GGML_TYPE_PQ2_0 => (34, 128),
+            GGML_TYPE_PTQ1_0 => (28, 128),
             other => panic!("unhandled {other}"),
         };
         let mut row = pseudo_bytes(in_dim / block_elems * block_bytes, seed);
@@ -5097,6 +5690,8 @@ mod tests {
                 }
                 GGML_TYPE_Q3_K => block[108..110].copy_from_slice(&[0x00, 0x30]),
                 GGML_TYPE_Q6_K => block[208..210].copy_from_slice(&[0x00, 0x30]),
+                GGML_TYPE_PQ2_0 => block[0..2].copy_from_slice(&[0x00, 0x30]),
+                GGML_TYPE_PTQ1_0 => block[26..28].copy_from_slice(&[0x00, 0x30]),
                 other => panic!("unhandled {other}"),
             }
         }
@@ -5488,6 +6083,8 @@ mod tests {
             GGML_TYPE_Q5_K,
             GGML_TYPE_Q6_K,
             GGML_TYPE_IQ4_XS,
+            GGML_TYPE_PQ2_0,
+            GGML_TYPE_PTQ1_0,
         ] {
             for in_dim in [256usize, 2048, 5632] {
                 for seed in [1u32, 7, 99] {
@@ -5667,6 +6264,139 @@ mod tests {
         }
     }
 
+    /// The fused `sdot` block dots — trit planes dotted straight from the
+    /// packed bytes, the `-1` bias folded into one activation-sum
+    /// subtraction — are integer arithmetic, so they must equal the
+    /// unpack-then-dot form exactly, block for block, over random payloads
+    /// and random activations.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn fused_prism_block_dots_equal_the_unpacked_form_exactly() {
+        if !have_dotprod() {
+            eprintln!("no dotprod on this machine; nothing to compare");
+            return;
+        }
+        for seed in 0..64u32 {
+            let bytes = pseudo_bytes(32, seed * 7 + 1);
+            let x: Vec<f32> = pseudo_bytes(256, seed * 13 + 5)
+                .iter()
+                .map(|&b| (b as f32 - 128.0) / 37.0)
+                .collect();
+            let act = quantize_act_k_row(&x);
+            let xq = &act.q[..QK_PRISM];
+            let mut w = [0i8; QK_PRISM];
+
+            unpack_block_ptq1_0(&bytes[..24], &bytes[24..26], &mut w);
+            let want: i32 = (0..4)
+                .map(|s| dot32::<ISA_BASELINE>(&w[s * 32..], &xq[s * 32..]))
+                .sum();
+            let got = ptq1_0_block_isum::<ISA_DOTPROD>(&bytes[..24], &bytes[24..26], xq, &act, 0);
+            assert_eq!(got, want, "ptq1_0 seed {seed}");
+
+            unpack_block_pq2_0(&bytes, &mut w);
+            let want: i32 = (0..4)
+                .map(|s| dot32::<ISA_BASELINE>(&w[s * 32..], &xq[s * 32..]))
+                .sum();
+            let got = pq2_0_block_isum::<ISA_DOTPROD>(&bytes, xq);
+            assert_eq!(got, want, "pq2_0 seed {seed}");
+        }
+        // And the whole row through the super-block kernel against the
+        // baseline ISA's unpack-then-dot: integer sums either way, the same
+        // float operations after, so equal to the bit.
+        for seed in 0..16u32 {
+            for ggml_type in [GGML_TYPE_PTQ1_0, GGML_TYPE_PQ2_0] {
+                let row = fixture_row(ggml_type, 2048, seed);
+                let act = quantize_act_k_row(&activations(2048));
+                let got = dot_k_row_impl::<ISA_DOTPROD>(ggml_type, &row, &act);
+                let want = dot_k_row_impl::<ISA_BASELINE>(ggml_type, &row, &act);
+                assert_eq!(got, want, "type {ggml_type} seed {seed}");
+            }
+        }
+    }
+
+    /// The two-row decode kernel is the one-row kernel's arithmetic with the
+    /// activations loaded once, so its two results must equal the one-row
+    /// results bit for bit — for both types, at a width with several
+    /// super-blocks, over random rows.
+    #[test]
+    fn the_row_pair_decode_kernel_equals_two_single_rows_exactly() {
+        for ggml_type in [GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0] {
+            for seed in [3u32, 11, 42] {
+                let in_dim = 1024;
+                let row0 = fixture_row(ggml_type, in_dim, seed);
+                let row1 = fixture_row(ggml_type, in_dim, seed + 100);
+                let act = quantize_act_k_row(&activations(in_dim));
+                assert!(supports_k_row_pair(ggml_type, in_dim));
+                let (got0, got1) = dot_k_row_pair(ggml_type, &row0, &row1, &act);
+                assert_eq!(
+                    got0,
+                    dot_k_row(ggml_type, &row0, &act),
+                    "type {ggml_type} row 0"
+                );
+                assert_eq!(
+                    got1,
+                    dot_k_row(ggml_type, &row1, &act),
+                    "type {ggml_type} row 1"
+                );
+            }
+        }
+        assert!(!supports_k_row_pair(GGML_TYPE_Q4_K, 1024));
+    }
+
+    /// Single-thread rate of the Prism decode kernels, in G weights/s —
+    /// the number the multi-threaded sweep cannot separate from scheduling.
+    /// `cargo test --profile release-with-debug --bin orangu-server
+    /// prism_decode_kernel_rate -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn prism_decode_kernel_rate() {
+        let in_dim = 5120;
+        let rows = 2048;
+        for (name, ggml_type) in [("PTQ1_0", GGML_TYPE_PTQ1_0), ("PQ2_0", GGML_TYPE_PQ2_0)] {
+            let row_bytes = fixture_row(ggml_type, in_dim, 1).len();
+            let raw: Vec<u8> = (0..rows)
+                .flat_map(|r| fixture_row(ggml_type, in_dim, r as u32))
+                .collect();
+            let act = quantize_act_k_row(&activations(in_dim));
+            let act8 = quantize_act(&activations(in_dim));
+            for (label, pair) in [("k_row", false), ("k_row_pair", true), ("dot_row", false)] {
+                let mut best = f64::MAX;
+                let mut sink = 0f32;
+                for _ in 0..5 {
+                    let t = std::time::Instant::now();
+                    if label == "dot_row" {
+                        for r in 0..rows {
+                            sink +=
+                                dot_row(ggml_type, &raw[r * row_bytes..(r + 1) * row_bytes], &act8);
+                        }
+                    } else if pair {
+                        for r in (0..rows).step_by(2) {
+                            let (a, b) = dot_k_row_pair(
+                                ggml_type,
+                                &raw[r * row_bytes..(r + 1) * row_bytes],
+                                &raw[(r + 1) * row_bytes..(r + 2) * row_bytes],
+                                &act,
+                            );
+                            sink += a + b;
+                        }
+                    } else {
+                        for r in 0..rows {
+                            sink += dot_k_row(
+                                ggml_type,
+                                &raw[r * row_bytes..(r + 1) * row_bytes],
+                                &act,
+                            );
+                        }
+                    }
+                    best = best.min(t.elapsed().as_secs_f64());
+                }
+                let gw = (rows * in_dim) as f64 / best / 1e9;
+                let gb = (rows * row_bytes) as f64 / best / 1e9;
+                eprintln!("{name:7} {label:11} {gw:6.2} G weights/s  {gb:5.2} GB/s  (sink {sink})");
+            }
+        }
+    }
+
     /// `supports_k_row` must be a **superset** of `supports_k`, with `Q2_K` the
     /// only difference.
     ///
@@ -5695,6 +6425,16 @@ mod tests {
         // The one deliberate asymmetry, pinned so it cannot drift silently.
         assert!(supports_k_row(GGML_TYPE_Q2_K, 2048));
         assert!(!supports_k(GGML_TYPE_Q2_K, 2048));
+        // The Prism pair: decode through the k-row path at a whole number of
+        // super-blocks, the flat GEMM at prefill, and the per-32 path at a
+        // width that is only a whole number of their own blocks.
+        for t in [GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0] {
+            assert!(supports_k_row(t, 2048), "type {t}");
+            assert!(!supports_k_row(t, 128 * 3), "type {t}");
+            assert!(supports_k(t, 2048), "type {t}");
+            assert!(!supports_k(t, 128 * 3), "type {t}");
+            assert!(supports_flat(t, 128 * 3), "type {t}");
+        }
         // Not super-block types: they have no 256-element accumulation to make.
         for t in [
             GGML_TYPE_Q8_0,
@@ -5806,6 +6546,29 @@ mod tests {
             check(GGML_TYPE_Q4_0, 32, seed);
             check(GGML_TYPE_Q4_0, 896, seed);
             check(GGML_TYPE_Q4_0, 4864, seed);
+        }
+    }
+
+    /// The two Prism ternary types: 128-element blocks, so the widths are
+    /// multiples of 128 that are *not* multiples of 256 (`Ternary-Bonsai-2-
+    /// 27B`'s own 5120 is the first). Random payload bytes exercise every
+    /// trit pattern `PTQ1_0`'s multiply-and-shift decode can meet, including
+    /// bytes above 242 that a real encoder never writes.
+    #[test]
+    fn pq2_0_matches_dequantize_reference() {
+        for seed in [1, 7, 99] {
+            check(GGML_TYPE_PQ2_0, 128, seed);
+            check(GGML_TYPE_PQ2_0, 5120, seed);
+            check(GGML_TYPE_PQ2_0, 17408, seed);
+        }
+    }
+
+    #[test]
+    fn ptq1_0_matches_dequantize_reference() {
+        for seed in [1, 7, 99] {
+            check(GGML_TYPE_PTQ1_0, 128, seed);
+            check(GGML_TYPE_PTQ1_0, 5120, seed);
+            check(GGML_TYPE_PTQ1_0, 17408, seed);
         }
     }
 
@@ -6134,14 +6897,16 @@ mod tests {
         n_tokens: usize,
         seed: u32,
     ) -> (Vec<u8>, Vec<f32>, usize) {
-        let block_bytes = match ggml_type {
-            GGML_TYPE_Q4_K => 144,
-            GGML_TYPE_IQ4_XS => 136, // 2 + 2 + 4 + 128
-            _ => 210,                // Q6_K
+        let (block_bytes, block_elems) = match ggml_type {
+            GGML_TYPE_Q4_K => (144, 256),
+            GGML_TYPE_IQ4_XS => (136, 256), // 2 + 2 + 4 + 128
+            GGML_TYPE_PQ2_0 => (34, 128),
+            GGML_TYPE_PTQ1_0 => (28, 128),
+            _ => (210, 256), // Q6_K
         };
-        let row_bytes = in_dim / 256 * block_bytes;
+        let row_bytes = in_dim / block_elems * block_bytes;
         let mut raw = pseudo_bytes(row_bytes * out_dim, seed);
-        for block in raw.chunks_exact_mut(block_bytes) {
+        for (i, block) in raw.chunks_exact_mut(block_bytes).enumerate() {
             match ggml_type {
                 GGML_TYPE_Q4_K => {
                     block[0..2].copy_from_slice(&[0x00, 0x30]); // d = 0.125
@@ -6151,6 +6916,16 @@ mod tests {
                 // what exercises the `scales_l`/`scales_h` split and the -32
                 // bias (so a sub-block scale can legitimately be negative).
                 GGML_TYPE_IQ4_XS => block[0..2].copy_from_slice(&[0x00, 0x30]),
+                // A scale that *differs* between the two blocks of every
+                // super-block (and is negative now and then), so the
+                // base-plus-integer encoding is exercised rather than hidden
+                // by a uniform 0.125.
+                GGML_TYPE_PQ2_0 | GGML_TYPE_PTQ1_0 => {
+                    let scale =
+                        0.125 * (1.0 + (i % 7) as f32 / 8.0) * if i % 5 == 3 { -1.0 } else { 1.0 };
+                    let at = if ggml_type == GGML_TYPE_PQ2_0 { 0 } else { 26 };
+                    block[at..at + 2].copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
+                }
                 _ => block[208..210].copy_from_slice(&[0x00, 0x30]),
             }
         }
@@ -6264,7 +7039,13 @@ mod tests {
     /// that the indexing is right.
     #[test]
     fn k_gemm_matches_dequantize_reference() {
-        for ggml_type in [GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS] {
+        for ggml_type in [
+            GGML_TYPE_Q4_K,
+            GGML_TYPE_Q6_K,
+            GGML_TYPE_IQ4_XS,
+            GGML_TYPE_PQ2_0,
+            GGML_TYPE_PTQ1_0,
+        ] {
             for in_dim in [256usize, 2048, 8192] {
                 // 5 rows and 7 tokens: odd both ways, so the trailing-row and
                 // tile-padding paths both run.
@@ -6303,7 +7084,7 @@ mod tests {
     fn k_gemm_result_is_independent_of_the_batch_size() {
         let in_dim = 512;
         let out_dim = 4;
-        for ggml_type in [GGML_TYPE_Q4_K, GGML_TYPE_Q6_K] {
+        for ggml_type in [GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_PTQ1_0] {
             let (raw, x, row_bytes) = k_fixture(ggml_type, in_dim, out_dim, 8, 77);
             let full = k_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, 8);
             for n in [2usize, 3, 5, 7] {
@@ -6403,15 +7184,17 @@ mod tests {
         n_tokens: usize,
         seed: u32,
     ) -> (Vec<u8>, Vec<f32>, usize) {
-        let block_bytes = match ggml_type {
-            GGML_TYPE_Q8_0 => 34,   // 2 + 32
-            GGML_TYPE_IQ4_NL => 18, // 2 + 16
-            _ => 22,                // Q5_0: 2 + 4 + 16
+        let (block_bytes, block_elems, d_at) = match ggml_type {
+            GGML_TYPE_Q8_0 => (34, 32, 0),     // 2 + 32
+            GGML_TYPE_IQ4_NL => (18, 32, 0),   // 2 + 16
+            GGML_TYPE_PQ2_0 => (34, 128, 0),   // 2 + 32
+            GGML_TYPE_PTQ1_0 => (28, 128, 26), // 24 + 2 + 2, scale last
+            _ => (22, 32, 0),                  // Q5_0: 2 + 4 + 16
         };
-        let row_bytes = in_dim / 32 * block_bytes;
+        let row_bytes = in_dim / block_elems * block_bytes;
         let mut raw = pseudo_bytes(row_bytes * out_dim, seed);
         for block in raw.chunks_exact_mut(block_bytes) {
-            block[0..2].copy_from_slice(&[0x00, 0x30]); // d = 0.125
+            block[d_at..d_at + 2].copy_from_slice(&[0x00, 0x30]); // d = 0.125
         }
         let x: Vec<f32> = (0..in_dim * n_tokens)
             .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.031)
@@ -6493,29 +7276,44 @@ mod tests {
     fn flat_gemm_is_bit_identical_to_the_generic_gemm() {
         for ggml_type in [GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL] {
             for in_dim in [32usize, 896, 4864] {
-                for n_tokens in [2usize, 7, 8] {
-                    let out_dim = 5; // odd, so the trailing-row path runs
-                    let (raw, x, row_bytes) =
-                        flat_fixture(ggml_type, in_dim, out_dim, n_tokens, 909);
-                    let flat = flat_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, n_tokens);
-                    let generic =
-                        generic_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, n_tokens);
-                    assert_eq!(flat.len(), generic.len());
-                    for (i, (f, g)) in flat.iter().zip(generic.iter()).enumerate() {
-                        assert!(
-                            (f - g).abs() <= 1e-4 * g.abs().max(1.0),
-                            "type {ggml_type} in_dim {in_dim} n_tokens {n_tokens} at {i}: {f} vs {g}"
-                        );
-                    }
-                }
+                flat_vs_generic(ggml_type, in_dim);
+            }
+        }
+        // The Prism types block at 128; `5120` is the served model's own
+        // width.
+        for ggml_type in [GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0] {
+            for in_dim in [128usize, 5120] {
+                flat_vs_generic(ggml_type, in_dim);
+            }
+        }
+    }
+
+    fn flat_vs_generic(ggml_type: u32, in_dim: usize) {
+        for n_tokens in [2usize, 7, 8] {
+            let out_dim = 5; // odd, so the trailing-row path runs
+            let (raw, x, row_bytes) = flat_fixture(ggml_type, in_dim, out_dim, n_tokens, 909);
+            let flat = flat_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, n_tokens);
+            let generic = generic_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, n_tokens);
+            assert_eq!(flat.len(), generic.len());
+            for (i, (f, g)) in flat.iter().zip(generic.iter()).enumerate() {
+                assert!(
+                    (f - g).abs() <= 1e-4 * g.abs().max(1.0),
+                    "type {ggml_type} in_dim {in_dim} n_tokens {n_tokens} at {i}: {f} vs {g}"
+                );
             }
         }
     }
 
     #[test]
     fn flat_gemm_matches_dequantize_reference() {
-        for ggml_type in [GGML_TYPE_Q8_0, GGML_TYPE_Q5_0, GGML_TYPE_IQ4_NL] {
-            for in_dim in [896usize, 4864] {
+        for (ggml_type, widths) in [
+            (GGML_TYPE_Q8_0, [896usize, 4864]),
+            (GGML_TYPE_Q5_0, [896, 4864]),
+            (GGML_TYPE_IQ4_NL, [896, 4864]),
+            (GGML_TYPE_PQ2_0, [128, 5120]),
+            (GGML_TYPE_PTQ1_0, [128, 5120]),
+        ] {
+            for in_dim in widths {
                 let (out_dim, n_tokens) = (5usize, 7usize);
                 let (raw, x, row_bytes) = flat_fixture(ggml_type, in_dim, out_dim, n_tokens, 4242);
                 let got = flat_gemm(ggml_type, &raw, row_bytes, in_dim, out_dim, &x, n_tokens);

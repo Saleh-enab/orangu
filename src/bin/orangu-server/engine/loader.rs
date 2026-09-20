@@ -511,10 +511,19 @@ fn supported_architecture_names() -> Vec<&'static str> {
 /// the tensor *directory* is consulted, never the data, so this stays as
 /// cheap as reading the header.
 ///
+/// A third thing is checked beside those two: a file whose weights are
+/// Hadamard-folded (`prism.hadamard.*`, see `engine::hadamard`) in a way
+/// this build does not implement — a newer fold version, an unknown
+/// transform — would load and generate nonsense, so it reports `No` with
+/// the fold as the reason, through the same cell an unreadable type uses.
+/// A fold this build *does* run is only served by the Qwen 3.5-family
+/// architectures; that is a per-architecture refusal at load
+/// (`main::build_model`), not something the header alone decides.
+///
 /// Returns `(architecture, unsupported_quant)`. `architecture` is `None`
 /// only when the file has no `general.architecture` at all;
-/// `unsupported_quant` names the first tensor type this build can't decode,
-/// and is `None` when every type is readable.
+/// `unsupported_quant` names the first tensor type this build can't decode
+/// (or the fold it can't run), and is `None` when every type is readable.
 pub fn model_load_support(gguf: &GgufFile) -> (Option<String>, Option<String>) {
     let architecture = metadata_string(gguf, "general.architecture");
     let unsupported = gguf
@@ -527,7 +536,8 @@ pub fn model_load_support(gguf: &GgufFile) -> (Option<String>, Option<String>) {
                     (26, name) if name.ends_with(".ffn_gate_tid2eid.weight")
                 )
         })
-        .map(|t| orangu::gguf::ggml_type_name(t.ggml_type));
+        .map(|t| orangu::gguf::ggml_type_name(t.ggml_type))
+        .or_else(|| crate::engine::hadamard::HadamardFold::header_support(&gguf.metadata));
     (architecture, unsupported)
 }
 
@@ -651,6 +661,33 @@ pub struct LoadedModel {
     expert_residency: HashMap<String, Arc<[bool]>>,
 }
 
+/// Whether [`LoadedModel::matrix`] hands out a `PTQ1_0` tensor repacked
+/// as `PQ2_0` (`QuantMatrix::repacked_two_bit`): set by `main` for a
+/// device whose `PQ2_0` kernel outruns its `PTQ1_0` one (the Vulkan
+/// backend; `ORANGU_TERNARY_REPACK=0` keeps the file's format), before
+/// the architecture loads its layers. The CPU paths read either format
+/// at the same rate, so a host prefill against a device decode shares the
+/// repacked copy.
+pub mod ternary_repack {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ON: AtomicBool = AtomicBool::new(false);
+    pub fn set(on: bool) {
+        ON.store(on, Ordering::Relaxed);
+    }
+    pub fn on() -> bool {
+        ON.load(Ordering::Relaxed)
+    }
+}
+
+/// The type a tensor of `ggml_type` is served as — see `ternary_repack`.
+fn served_type(ggml_type: u32) -> u32 {
+    if ggml_type == quant::GGML_TYPE_PTQ1_0 && ternary_repack::on() {
+        quant::GGML_TYPE_PQ2_0
+    } else {
+        ggml_type
+    }
+}
+
 /// A lazy view onto a 2D GGUF tensor (an `[in_dim, out_dim]` matmul weight,
 /// or an embedding table read by row) — `mmap`-backed, dequantizing one row
 /// at a time on demand rather than materializing the whole matrix as `f32`
@@ -761,6 +798,70 @@ impl QuantMatrix {
             // and produce a result that is wrong only on a split model.
             device: self.device,
             layer: NO_LAYER,
+        }
+    }
+
+    /// A **copy** of every `index`-th run of `group` rows out of each run
+    /// of `of · group` — the rows of one projection out of a tensor that
+    /// interleaves several per head, the way `qwen35`'s `attn_q.weight`
+    /// holds `[Q(head_dim), gate(head_dim)]` for every head. Rows are
+    /// self-contained (see [`Self::rows`]), so this is a row gather; the
+    /// result owns its bytes and keeps the tensor's device and layer.
+    ///
+    /// A copy rather than a view because the rows are not contiguous, and
+    /// a matmul wants one byte run. `out_dim` must be a multiple of
+    /// `of · group`.
+    pub fn deinterleave(&self, group: usize, index: usize, of: usize) -> QuantMatrix {
+        let stride = of * group;
+        assert!(
+            index < of && self.out_dim.is_multiple_of(stride),
+            "cannot take run {index} of {of} × {group} rows out of {} rows",
+            self.out_dim
+        );
+        let runs = self.out_dim / stride;
+        let src = self.raw_bytes();
+        let mut bytes = Vec::with_capacity(runs * group * self.row_bytes);
+        for run in 0..runs {
+            let first = (run * stride + index * group) * self.row_bytes;
+            bytes.extend_from_slice(&src[first..first + group * self.row_bytes]);
+        }
+        QuantMatrix {
+            bytes: Arc::new(bytes) as TensorBytes,
+            ggml_type: self.ggml_type,
+            start: 0,
+            row_bytes: self.row_bytes,
+            in_dim: self.in_dim,
+            out_dim: runs * group,
+            device: self.device,
+            layer: self.layer,
+        }
+    }
+
+    /// This `PTQ1_0` matrix as a `PQ2_0` one — the same weights, two bits
+    /// an element (`quant::repack_ptq1_0_to_pq2_0`), a copy in memory
+    /// rather than a view of the file. Rows are repacked in parallel; the
+    /// 27B model takes a few seconds.
+    pub fn repacked_two_bit(&self) -> QuantMatrix {
+        use rayon::prelude::*;
+        assert_eq!(self.ggml_type, quant::GGML_TYPE_PTQ1_0);
+        let row_bytes = self.in_dim / quant::QK_PRISM * quant::PQ2_0_BLOCK_BYTES;
+        let src = self.raw_bytes();
+        let mut bytes = vec![0u8; row_bytes * self.out_dim];
+        bytes
+            .par_chunks_mut(row_bytes * 64)
+            .zip(src.par_chunks(self.row_bytes * 64))
+            .for_each(|(dst, rows)| {
+                dst.copy_from_slice(&quant::repack_ptq1_0_to_pq2_0(rows));
+            });
+        QuantMatrix {
+            bytes: Arc::new(bytes) as TensorBytes,
+            ggml_type: quant::GGML_TYPE_PQ2_0,
+            start: 0,
+            row_bytes,
+            in_dim: self.in_dim,
+            out_dim: self.out_dim,
+            device: self.device,
+            layer: self.layer,
         }
     }
 
@@ -1410,10 +1511,13 @@ impl LoadedModel {
     /// walking a single [`GgufFile`]'s directory, which for a split model
     /// only sees shard 1. Used by `engine::backend::unsupported_tensor_types`
     /// to decide whether the selected backend can run this model at all.
+    /// Every tensor's name and the type it is *served* as: the file's,
+    /// except a `PTQ1_0` tensor under `ternary_repack`, which is `PQ2_0`
+    /// by the time a kernel reads it.
     pub fn tensor_types(&self) -> impl Iterator<Item = (&str, u32)> {
         self.tensors
             .iter()
-            .map(|(name, loc)| (name.as_str(), loc.ggml_type))
+            .map(|(name, loc)| (name.as_str(), served_type(loc.ggml_type)))
     }
 
     /// Records which device each transformer layer will run on, so that
@@ -1510,10 +1614,20 @@ impl LoadedModel {
     ///
     /// Reads the tensor *directory* only — the mapping is already open, so
     /// this touches no weight bytes and pages nothing in.
+    /// Every tensor's name and its size in bytes as served — a `PTQ1_0`
+    /// tensor under `ternary_repack` at its `PQ2_0` size (34 bytes a block
+    /// for 28), which is what the device holds and a placement has to
+    /// fit.
     pub fn tensor_sizes(&self) -> impl Iterator<Item = (&str, u64)> {
-        self.tensors
-            .iter()
-            .map(|(name, loc)| (name.as_str(), loc.len as u64))
+        self.tensors.iter().map(|(name, loc)| {
+            let len = loc.len as u64;
+            let served = if served_type(loc.ggml_type) != loc.ggml_type {
+                len / quant::PTQ1_0_BLOCK_BYTES as u64 * quant::PQ2_0_BLOCK_BYTES as u64
+            } else {
+                len
+            };
+            (name.as_str(), served)
+        })
     }
 
     /// Reads the tensors `keep` names into the page cache, in file order,
@@ -1641,7 +1755,11 @@ impl LoadedModel {
     /// and its norms at `F32`, and a warning that skipped those would miss
     /// the type the model actually spends its time in.
     pub fn quantization_types(&self) -> Vec<u32> {
-        let mut types: Vec<u32> = self.tensors.values().map(|t| t.ggml_type).collect();
+        let mut types: Vec<u32> = self
+            .tensors
+            .values()
+            .map(|t| served_type(t.ggml_type))
+            .collect();
         types.sort_unstable();
         types.dedup();
         types
@@ -1957,6 +2075,13 @@ impl LoadedModel {
         self.tensors.contains_key(name)
     }
 
+    /// Whether any tensor is `PTQ1_0` — what `ternary_repack` is for.
+    pub fn has_ternary_ptq1_0(&self) -> bool {
+        self.tensors
+            .values()
+            .any(|t| t.ggml_type == quant::GGML_TYPE_PTQ1_0)
+    }
+
     /// A lazy, `mmap`-backed view of tensor `name`, for weight matrices and
     /// embedding tables (see [`QuantMatrix`]) — anything large enough that
     /// eagerly dequantizing the whole thing at load time would matter. The
@@ -1982,7 +2107,7 @@ impl LoadedModel {
             "tensor '{name}': row size {row_bytes} x {out_dim} rows doesn't match the tensor's {} total bytes",
             loc.len
         );
-        Ok(QuantMatrix {
+        let matrix = QuantMatrix {
             bytes: loc.bytes.clone(),
             ggml_type: loc.ggml_type,
             start: loc.start,
@@ -1993,7 +2118,14 @@ impl LoadedModel {
             layer: block_index(name)
                 .and_then(|l| u32::try_from(l).ok())
                 .unwrap_or(NO_LAYER),
-        })
+        };
+        Ok(
+            if ternary_repack::on() && loc.ggml_type == quant::GGML_TYPE_PTQ1_0 {
+                matrix.repacked_two_bit()
+            } else {
+                matrix
+            },
+        )
     }
 
     /// Like [`LoadedModel::matrix`], for a 3D "stacked per-expert" tensor
@@ -2964,6 +3096,52 @@ mod tests {
         let (arch, bad_quant) = model_load_support(&gguf);
         assert_eq!(arch.as_deref(), Some("llama"));
         assert_eq!(bad_quant.as_deref(), Some("TQ1_0"));
+    }
+
+    /// The Prism ternary types read, and a fold this build runs is `Yes`;
+    /// a fold it does not — a later version — is `No` with the fold named,
+    /// since that file would otherwise load and generate nonsense.
+    #[test]
+    fn model_load_support_reads_prism_ternary_types_and_checks_the_fold() {
+        let mut gguf = header_only("qwen35", &["blk.0.attn_qkv.weight", "output.weight"]);
+        gguf.tensors[0].ggml_type = crate::engine::quant::GGML_TYPE_PTQ1_0;
+        gguf.tensors[1].ggml_type = crate::engine::quant::GGML_TYPE_PQ2_0;
+        assert_eq!(model_load_support(&gguf).1, None);
+
+        let fold = |version: u32| {
+            vec![
+                ("prism.hadamard.version", GgufValue::U32(version)),
+                ("prism.hadamard.block_size", GgufValue::U32(1024)),
+                (
+                    "prism.hadamard.transform",
+                    GgufValue::String("normalized-sylvester-walsh-hadamard".into()),
+                ),
+                (
+                    "prism.hadamard.axis",
+                    GgufValue::String("input-last-dimension".into()),
+                ),
+                (
+                    "prism.hadamard.sign_mode",
+                    GgufValue::String("identity".into()),
+                ),
+                (
+                    "prism.hadamard.weight_names",
+                    GgufValue::Array(vec![GgufValue::String("output.weight".into())]),
+                ),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+        };
+        gguf.metadata.extend(fold(1));
+        assert_eq!(model_load_support(&gguf).1, None);
+
+        let mut newer = header_only("qwen35", &["output.weight"]);
+        newer.metadata.extend(fold(2));
+        let (arch, reason) = model_load_support(&newer);
+        assert_eq!(arch.as_deref(), Some("qwen35"));
+        let reason = reason.expect("a fold this build cannot run is reported");
+        assert!(reason.starts_with("prism.hadamard:"), "{reason}");
+        assert!(reason.contains("version 2"), "{reason}");
     }
 
     #[test]

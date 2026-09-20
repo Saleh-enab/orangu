@@ -535,6 +535,11 @@ impl Qwen4ExpModel {
         let dims = Dims::from_loaded(loaded)?;
         let n_layer = trunk_layer_count(loaded)?;
         let is_recr = recurrent_layer_mask(loaded, n_layer);
+        // The shared sub-layers apply a Hadamard fold themselves; nothing
+        // else here does, so a folded file of this architecture is refused
+        // by `finish` below, naming the first weight it cannot serve.
+        let hadamard = crate::engine::hadamard::from_loaded(loaded)?;
+        let mut fold = crate::engine::hadamard::FoldLedger::new(hadamard.as_ref());
 
         let hc = loaded
             .metadata_u64("hyper_connection.count")
@@ -608,7 +613,7 @@ impl Qwen4ExpModel {
                     dims.ssm_dt_rank,
                     dims.ssm_head_dim,
                 ));
-                Mixer::Recurrent(Recurrent::load(&t, &dims, cache_index)?)
+                Mixer::Recurrent(Recurrent::load(&t, &dims, cache_index, &mut fold)?)
             } else {
                 let attn_slot = kv_dims.len();
                 kv_dims.push(dims.n_head_kv * dims.head_dim);
@@ -620,7 +625,7 @@ impl Qwen4ExpModel {
                     "layer {i} is a full-attention layer with attention.compress_ratios[{i}] = 0"
                 );
                 Mixer::FullAttn {
-                    attn: FullAttn::load(&t, attn_slot)?,
+                    attn: FullAttn::load(&t, attn_slot, &mut fold)?,
                     indexer: Indexer {
                         q_proj: t.matrix("indexer.q_proj.weight")?,
                         k_proj: t.matrix("indexer.k_proj.weight")?,
@@ -676,6 +681,7 @@ impl Qwen4ExpModel {
                 ffn: MoeFfn::load(&t, n_expert_used)?,
             });
         }
+        fold.finish()?;
 
         Ok(Self {
             config: loaded.config.clone(),

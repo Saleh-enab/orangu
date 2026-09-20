@@ -64,7 +64,8 @@ use layouts::{
     argmax_bind_group_layout, argmax_split_bind_group_layout, attn_bind_group_layout,
     attn_paged_bind_group_layout, bind_group_layout, elem2_bind_group_layout,
     elem3_bind_group_layout, elem4_bind_group_layout, elem5_bind_group_layout,
-    indexed_bind_group_layout, kv_epilogue_bind_group_layout, norm_pair_bind_group_layout,
+    elem6_bind_group_layout, indexed_bind_group_layout, kv_epilogue_bind_group_layout,
+    norm_pair_bind_group_layout,
 };
 use pipeline_cache::{pipeline_cache_file_path, save_pipeline_cache};
 // `RopeYarn` and `rope_layout_code` keep their `vulkan::` path: four
@@ -760,6 +761,36 @@ pub struct VulkanBackend {
     /// Bind group layout shared by `gelu_pipeline`/`scale_pipeline` — see
     /// `elem3_bind_group_layout`.
     elem3_bind_group_layout: wgpu::BindGroupLayout,
+    /// Kept for the pipelines built after construction — the Hadamard
+    /// kernel is per block size, which only a file says.
+    elem3_pipeline_layout: wgpu::PipelineLayout,
+    /// Likewise, for the gated-DeltaNet kernel, which is per head geometry.
+    elem4_pipeline_layout: wgpu::PipelineLayout,
+    /// `vulkan_shaders::shader_source_gated_delta`, one per `(head_dim,
+    /// n_k, n_v, sigmoid gate)`, built on first use.
+    gated_delta_pipelines: Mutex<HashMap<(u32, u32, u32, bool), wgpu::ComputePipeline>>,
+    /// Per recurrent layer (keyed by its `ssm_out` weight), the buffers
+    /// [`Self::fused_recurrent_tail`] uploads into and reads back from.
+    gated_delta_resources: Mutex<HashMap<(usize, usize), GatedDeltaResources>>,
+    /// [`Self::fused_ffn_prefill`]'s activation meta and bind group, per
+    /// (gate, up, down, token count).
+    #[allow(clippy::type_complexity)]
+    fused_ffn_activation_cache: Mutex<
+        HashMap<
+            ((usize, usize), (usize, usize), (usize, usize), usize),
+            (wgpu::Buffer, wgpu::BindGroup),
+        >,
+    >,
+    /// `vulkan_shaders::shader_source_hadamard`, one per block size, built
+    /// on first use. See [`Self::record_hadamard`].
+    hadamard_pipelines: Mutex<HashMap<u32, wgpu::ComputePipeline>>,
+    /// `shader_source_hadamard_q8`, per `(block, silu_mul)` — see
+    /// [`Self::hadamard_q8_dispatch`].
+    hadamard_q8_pipelines: Mutex<HashMap<(u32, bool), wgpu::ComputePipeline>>,
+    /// A fold's sign vectors on the device, keyed by the address of the
+    /// `Arc` `hadamard::Rotation` shares them through — uploaded once per
+    /// width per model, not per call.
+    hadamard_signs: Mutex<HashMap<usize, wgpu::Buffer>>,
     add_pipeline: wgpu::ComputePipeline,
     mul_pipeline: wgpu::ComputePipeline,
     /// Fused GELU+multiply (`shader_source_gelu_mul`) — one dispatch replacing
@@ -806,6 +837,15 @@ pub struct VulkanBackend {
     /// Bind group layout for `rmsnorm_add_pipeline` — see
     /// `elem5_bind_group_layout`.
     elem5_bind_group_layout: wgpu::BindGroupLayout,
+    /// For `add_rmsnorm_wide_pipeline` and the fused Hadamard + q8 kernels
+    /// — see `elem6_bind_group_layout`.
+    elem6_bind_group_layout: wgpu::BindGroupLayout,
+    elem6_pipeline_layout: wgpu::PipelineLayout,
+    /// The pre-norm pair (a residual add, then the norm of the sum) as one
+    /// dispatch, for the Qwen hybrid trunk's decode chain — see
+    /// `vulkan_shaders::shader_source_add_rmsnorm_wide`. Wide form only:
+    /// a row the wide norm does not take keeps the two dispatches.
+    add_rmsnorm_wide_pipeline: wgpu::ComputePipeline,
     /// RMSNorm fused with the residual add that immediately follows it —
     /// see `vulkan_shaders::shader_source_rmsnorm_add`'s own doc comment.
     /// Used at `wo`'s and `ffn_down`'s own post-matmul norm+add call sites
@@ -817,6 +857,32 @@ pub struct VulkanBackend {
     /// `vulkan_shaders::shader_source_rmsnorm_add_scale`. Folds the separate
     /// post-norm `scale_pipeline` dispatch into the norm+add, at the PLE
     /// post-projection norm (`build_ple_resources`); gated by
+    /// The prep kernel of `fused_recurrent_layer`, per `(conv channels,
+    /// d_conv, value width, value heads)`, built on first use.
+    recurrent_prep_pipelines: Mutex<HashMap<(u32, u32, u32, u32), wgpu::ComputePipeline>>,
+    /// The Qwen hybrid trunk's device-resident decode step
+    /// (`hybrid_decode_begin`), per model width — see `HybridChainResources`.
+    hybrid_chains: Mutex<HashMap<usize, Arc<HybridChainResources>>>,
+    /// `record_ffn_decode`'s per-FFN bind groups (the activation, the
+    /// intermediate's fold), keyed by the three weights and the fold.
+    #[allow(clippy::type_complexity)]
+    ffn_decode_bind_groups: Mutex<
+        HashMap<
+            (
+                (usize, usize),
+                (usize, usize),
+                (usize, usize),
+                RotationKey,
+                bool,
+            ),
+            Arc<FfnDecodeBindGroups>,
+        >,
+    >,
+    /// `fused_attention_layer`'s tail bind groups, per `(wo, attention
+    /// output buffer)` — see `AttentionTailBindGroups`.
+    #[allow(clippy::type_complexity)]
+    attention_tail_bind_groups:
+        Mutex<HashMap<((usize, usize), wgpu::Buffer, RotationKey), Arc<AttentionTailBindGroups>>>,
     /// `ORANGU_NO_FUSED_SCALE`.
     rmsnorm_add_scale_pipeline: NormPipelines,
     /// The wide forms of the three whole-row norms above — `vec4`, straight-
@@ -1226,6 +1292,14 @@ pub struct VulkanBackend {
     /// the E2B UD-Q2_K_XL token from 14.8 to 12.0 ms (gate/up −34%, down
     /// −37%). The CPU-orchestrated batch paths quantize per op themselves.
     decode_mmvq: bool,
+    /// The integer-dot decode kernels for Prism's ternary types
+    /// (`vulkan_shaders::shader_source_ternary_idot`), at
+    /// [`BLOCK_HOISTED_WIDE_ROWS`] rows per workgroup, taken ahead of
+    /// `block_hoisted_wide_pipelines` wherever those apply. Built when the
+    /// device executes `dot4I8Packed` natively (the same property that
+    /// selects the integer-dot prefill GEMMs) or `ORANGU_TERNARY_IDOT=1`
+    /// insists; `ORANGU_TERNARY_IDOT=0` keeps the float words kernels.
+    ternary_idot_pipelines: HashMap<u32, wgpu::ComputePipeline>,
     /// The `vec4`, loads-in-flight decode matvec for the float weight types
     /// (`vulkan_shaders::shader_source_reduce_float_wide`), taken ahead of
     /// the generic `reduce` for `F32`/`F16` at decode. Opt out with
@@ -1875,7 +1949,7 @@ struct TimestampQueries {
 /// `OpCacheKey`'s own doc comment (same reservation: `0` for the ordinary
 /// single-sequence path, `1..=batch_len` for `GemmaModel::record_batched_
 /// decode_forward`'s per-sequence chain).
-type FusedAttnLayerCacheKey = (usize, usize, usize, usize, usize, bool, bool, usize);
+type FusedAttnLayerCacheKey = (usize, usize, usize, usize, usize, bool, bool, usize, bool);
 
 /// `(wo.cache_key().0, wo.cache_key().1, ffn_gate.out_dim, PLE's
 /// per_layer_dim (0 if this layer has no PLE), layer_output_scale.is_some(),
@@ -2342,6 +2416,31 @@ static Q4K_GLSL_GEMV_SPIRV: &[u8] = include_bytes!("shaders/q4k_gemv.spv");
 /// `VulkanBackend::block_hoisted_wide_pipelines`.
 const BLOCK_HOISTED_WIDE_ROWS: usize = 4;
 const BLOCK_HOISTED_WIDE_MIN_OUT: usize = 2048;
+/// Rows per workgroup of the integer-dot ternary decode kernels
+/// (`ternary_idot_pipelines`): the activations are quantized once per block
+/// per workgroup and reused for every row, so more rows amortize that.
+/// `ORANGU_TERNARY_IDOT_ROWS` overrides it for measurement.
+const TERNARY_IDOT_ROWS_DEFAULT: usize = 8;
+static TERNARY_IDOT_ROWS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    super::env_tuning_value(
+        "ORANGU_TERNARY_IDOT_ROWS",
+        TERNARY_IDOT_ROWS_DEFAULT,
+        "an integer in 1..=16",
+        |n| (1..=16).contains(&n),
+    )
+});
+/// Runs of [`TERNARY_IDOT_ROWS`] rows one workgroup takes in sequence
+/// (`ORANGU_TERNARY_IDOT_GROUPS`): the lane's role constants, the launch
+/// and the drain are paid once per workgroup rather than once per run.
+const TERNARY_IDOT_GROUPS_DEFAULT: usize = 4;
+static TERNARY_IDOT_GROUPS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    super::env_tuning_value(
+        "ORANGU_TERNARY_IDOT_GROUPS",
+        TERNARY_IDOT_GROUPS_DEFAULT,
+        "an integer in 1..=16",
+        |n| (1..=16).contains(&n),
+    )
+});
 
 fn reduce_n_rows() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -2693,7 +2792,7 @@ impl TraceClock {
 
 /// How many readbacks of each byte length have happened and what the four
 /// parts of [`ReadbackSplit`] have summed to across them.
-type ReadbackTotals = HashMap<u64, (u64, [f64; 4])>;
+type ReadbackTotals = HashMap<u64, (u64, [f64; 5])>;
 
 /// Accumulates [`ReadbackSplit`] and reports every 256 readbacks.
 ///
@@ -2704,7 +2803,7 @@ type ReadbackTotals = HashMap<u64, (u64, [f64; 4])>;
 /// and `copy_ms` is mapping and copying 12 KB back out. Reported in
 /// aggregate rather than per call because printing inside the submission
 /// loop changes the cost being measured.
-fn record_readback_split(byte_len: u64, alloc_ms: f64, submit_ms: f64, wait_ms: f64, copy_ms: f64) {
+fn record_readback_split(byte_len: u64, phases_ms: [f64; 5]) {
     // **Keyed by size.** One process mixes readbacks of very different
     // shapes — a decode seam brings back `n_embd` floats after one layer, a
     // prefill chunk brings back far more after far more work — and averaged
@@ -2719,13 +2818,9 @@ fn record_readback_split(byte_len: u64, alloc_ms: f64, submit_ms: f64, wait_ms: 
     let entry = by_size
         .get_or_insert_with(HashMap::new)
         .entry(byte_len)
-        .or_insert((0, [0.0; 4]));
+        .or_insert((0, [0.0; 5]));
     entry.0 += 1;
-    for (slot, ms) in entry
-        .1
-        .iter_mut()
-        .zip([alloc_ms, submit_ms, wait_ms, copy_ms])
-    {
+    for (slot, ms) in entry.1.iter_mut().zip(phases_ms) {
         *slot += ms;
     }
     let (n, sums) = *entry;
@@ -2733,13 +2828,18 @@ fn record_readback_split(byte_len: u64, alloc_ms: f64, submit_ms: f64, wait_ms: 
         return;
     }
     let us = |i: usize| sums[i] * 1000.0 / n as f64;
+    // `finish` is the encoder's own — the commands recorded since it was
+    // opened, translated for the driver (~7 µs a dispatch on the CIX P1);
+    // `submit` the queue's. Both are host time the device idles through
+    // unless an earlier submission is still running.
     eprintln!(
         "orangu-server: [readback] {n} of {byte_len} bytes, us each: alloc {:.0}, \
-         submit {:.0}, wait {:.0}, copy {:.0}",
+         finish {:.0}, submit {:.0}, wait {:.0}, copy {:.0}",
         us(0),
         us(1),
         us(2),
-        us(3)
+        us(3),
+        us(4)
     );
 }
 
@@ -2914,6 +3014,7 @@ struct DisabledKernels {
     block_hoisted_wide: Option<wgpu::ComputePipeline>,
     block_hoisted_i8: Option<wgpu::ComputePipeline>,
     block_hoisted_i8_wide: Option<wgpu::ComputePipeline>,
+    ternary_idot: Option<wgpu::ComputePipeline>,
     kq_light: Option<wgpu::ComputePipeline>,
     wide_load: Option<wgpu::ComputePipeline>,
     q4_k_mmvq: bool,
@@ -2946,6 +3047,8 @@ pub(crate) const SUPPORTED_TYPES: &[u32] = &[
     crate::engine::quant::GGML_TYPE_IQ4_NL,
     crate::engine::quant::GGML_TYPE_IQ4_XS,
     crate::engine::quant::GGML_TYPE_MXFP4,
+    crate::engine::quant::GGML_TYPE_PQ2_0,
+    crate::engine::quant::GGML_TYPE_PTQ1_0,
 ];
 
 /// The KV storage the configuration asked for, for backends built after
@@ -3655,6 +3758,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                 // device — off where the driver does not accelerate the
                 // packed dot, which a split model's overflow device may not.
                 "prefill_mmq": self.prefill_mmq,
+                "ternary_idot": !self.ternary_idot_pipelines.is_empty(),
                 "prefill_mmq_wide": self.mmq_q4k_wide_pipeline.is_some(),
             },
             "tuning": {
@@ -4448,6 +4552,17 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             &elem5_pipeline_layout,
             vulkan_shaders::shader_source_rmsnorm_add_wide(),
         );
+        let elem6_bind_group_layout = elem6_bind_group_layout(&device);
+        let elem6_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("orangu-server elem6 pipeline layout"),
+                bind_group_layouts: &[Some(&elem6_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let add_rmsnorm_wide_pipeline = build_elem_pipeline(
+            &elem6_pipeline_layout,
+            vulkan_shaders::shader_source_add_rmsnorm_wide(),
+        );
         let rmsnorm_add_scale_wide_pipeline = build_elem_pipeline(
             &elem5_pipeline_layout,
             vulkan_shaders::shader_source_rmsnorm_add_scale_wide(),
@@ -4625,13 +4740,35 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             Ok(_) => crate::engine::env::flag_on_unless_disabled("ORANGU_DECODE_MMVQ"),
             Err(_) => super::vulkan_replay::integer_dot_accelerated(&device).unwrap_or(false),
         };
-        let build_i8 = |n_rows: usize| -> HashMap<u32, wgpu::ComputePipeline> {
+        // `wide` selects the ternary types' row-group form; the narrow one
+        // is a single run of one row (see `TERNARY_IDOT_ROWS`).
+        // `ORANGU_TERNARY_I8=0` keeps the ternary types on the `f32`-input
+        // integer-dot kernel (`ternary_idot_pipelines`), for the A/B.
+        let ternary_i8_on = decode_mmvq
+            && supports_subgroup
+            && crate::engine::env::flag_on_unless_disabled("ORANGU_TERNARY_IDOT")
+            && crate::engine::env::flag_on_unless_disabled("ORANGU_TERNARY_I8");
+        let build_i8 = |n_rows: usize, wide: bool| -> HashMap<u32, wgpu::ComputePipeline> {
             if !decode_mmvq {
                 return HashMap::new();
             }
             SUPPORTED_TYPES
                 .iter()
                 .filter_map(|&ggml_type| {
+                    if vulkan_shaders::is_ternary(ggml_type) {
+                        if !ternary_i8_on {
+                            return None;
+                        }
+                        let (rows, groups) = if wide {
+                            (*TERNARY_IDOT_ROWS, *TERNARY_IDOT_GROUPS)
+                        } else {
+                            (1, 1)
+                        };
+                        let source = vulkan_shaders::shader_source_ternary_i8(
+                            ggml_type, rows, groups, true,
+                        )?;
+                        return Some((ggml_type, build_pipeline(source)));
+                    }
                     let source = vulkan_shaders::shader_source_reduce_block_hoisted_i8(
                         ggml_type,
                         n_rows,
@@ -4641,7 +4778,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                 })
                 .collect()
         };
-        let block_hoisted_i8_pipelines = build_i8(reduce_n_rows());
+        let block_hoisted_i8_pipelines = build_i8(reduce_n_rows(), false);
         let q8_placeholder = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orangu-server q8 placeholder"),
             size: 64,
@@ -4670,7 +4807,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             } else {
                 HashMap::new()
             };
-        let block_hoisted_i8_wide_pipelines = build_i8(BLOCK_HOISTED_WIDE_ROWS);
+        let block_hoisted_i8_wide_pipelines = build_i8(BLOCK_HOISTED_WIDE_ROWS, true);
         let q8_quantize_pipeline = (q4_k_mmvq || decode_mmvq).then(|| {
             build_elem_pipeline(
                 &elem3_pipeline_layout,
@@ -4861,6 +4998,35 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             } else {
                 HashMap::new()
             };
+
+        let ternary_idot_pipelines: HashMap<u32, wgpu::ComputePipeline> = {
+            let on = match std::env::var("ORANGU_TERNARY_IDOT") {
+                Ok(_) => crate::engine::env::flag_on_unless_disabled("ORANGU_TERNARY_IDOT"),
+                Err(_) => integer_dot_accelerated,
+            };
+            if on && !block_hoisted_wide_pipelines.is_empty() && supports_subgroup {
+                SUPPORTED_TYPES
+                    .iter()
+                    .filter_map(|&ggml_type| {
+                        // The subgroup reduction unconditionally: these
+                        // kernels need subgroups for their block maximum
+                        // anyway, and on the Mali-G720 the tree reduction
+                        // was 14% of the gate projection's time (1219 →
+                        // 1070 µs) — the per-workgroup barriers, at 2176
+                        // workgroups of five block iterations each.
+                        let source = vulkan_shaders::shader_source_ternary_idot(
+                            ggml_type,
+                            *TERNARY_IDOT_ROWS,
+                            *TERNARY_IDOT_GROUPS,
+                            true,
+                        )?;
+                        Some((ggml_type, build_pipeline(source)))
+                    })
+                    .collect()
+            } else {
+                HashMap::new()
+            }
+        };
 
         // See `Self::q4_k_unroll_packed_pipeline`'s own doc comment. Built
         // only when both the block-unroll (default) and the packed-`f16` dot
@@ -5145,6 +5311,18 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             wgpu_backend,
             elem4_bind_group_layout,
             elem3_bind_group_layout,
+            elem3_pipeline_layout,
+            elem4_pipeline_layout,
+            gated_delta_pipelines: Mutex::new(HashMap::new()),
+            recurrent_prep_pipelines: Mutex::new(HashMap::new()),
+            attention_tail_bind_groups: Mutex::new(HashMap::new()),
+            hybrid_chains: Mutex::new(HashMap::new()),
+            ffn_decode_bind_groups: Mutex::new(HashMap::new()),
+            gated_delta_resources: Mutex::new(HashMap::new()),
+            fused_ffn_activation_cache: Mutex::new(HashMap::new()),
+            hadamard_pipelines: Mutex::new(HashMap::new()),
+            hadamard_q8_pipelines: Mutex::new(HashMap::new()),
+            hadamard_signs: Mutex::new(HashMap::new()),
             add_pipeline,
             mul_pipeline,
             gelu_mul_pipeline,
@@ -5157,6 +5335,9 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             scale_pipeline,
             rmsnorm_pipeline,
             elem5_bind_group_layout,
+            elem6_bind_group_layout,
+            elem6_pipeline_layout,
+            add_rmsnorm_wide_pipeline,
             rmsnorm_add_pipeline,
             rmsnorm_rows_pipeline,
             rmsnorm_add_rows_pipeline,
@@ -5244,6 +5425,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             silu_mul_q8_pipeline,
             rmsnorm_wide_q8_pipeline,
             decode_mmvq,
+            ternary_idot_pipelines,
             float_wide_pipelines,
             q4_k_unroll_packed_pipeline,
             q4_k_dual_pipeline,
@@ -5390,6 +5572,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             block_hoisted_wide: self.block_hoisted_wide_pipelines.remove(&ggml_type),
             block_hoisted_i8: self.block_hoisted_i8_pipelines.remove(&ggml_type),
             block_hoisted_i8_wide: self.block_hoisted_i8_wide_pipelines.remove(&ggml_type),
+            ternary_idot: self.ternary_idot_pipelines.remove(&ggml_type),
             kq_light: self.kq_light_pipelines.remove(&ggml_type),
             wide_load: self.wide_load_pipelines.remove(&ggml_type),
             ..DisabledKernels::default()
@@ -5429,6 +5612,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             block_hoisted_wide,
             block_hoisted_i8,
             block_hoisted_i8_wide,
+            ternary_idot,
             kq_light,
             wide_load,
             q4_k_mmvq,
@@ -5450,6 +5634,9 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         }
         if let Some(p) = block_hoisted_i8_wide {
             self.block_hoisted_i8_wide_pipelines.insert(ggml_type, p);
+        }
+        if let Some(p) = ternary_idot {
+            self.ternary_idot_pipelines.insert(ggml_type, p);
         }
         if let Some(p) = kq_light {
             self.kq_light_pipelines.insert(ggml_type, p);
@@ -5616,6 +5803,9 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             self.block_hoisted_i8_pipelines.remove(&ggml_type),
             self.block_hoisted_i8_wide_pipelines.remove(&ggml_type),
         );
+        // Likewise the integer-dot ternary kernel, which quantizes the
+        // activation to 8 bits per 128-block inside the kernel.
+        let ternary = self.ternary_idot_pipelines.remove(&ggml_type);
         let tuned: Vec<Vec<f32>> = cases
             .iter()
             .map(|(x, n, w)| self.matmul(x, *n, w))
@@ -5638,6 +5828,44 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             return false;
         }
         self.restore_optional_decode_kernels(ggml_type, saved);
+        let rounding_bound = |integer: &[Vec<f32>], float: &[Vec<f32>]| {
+            // An 8-bit activation moves an output by a small fraction of
+            // the *terms* that formed it, not of the result they cancel
+            // to, so the bound is 2% of the largest output of the case: a
+            // kernel that is wrong is off by that whole magnitude, not a
+            // fraction of it.
+            integer.iter().zip(float).all(|(a, b)| {
+                let scale = b.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+                a.len() == b.len() && a.iter().zip(b).all(|(a, b)| (a - b).abs() <= 0.02 * scale)
+            })
+        };
+        if let Some(p) = ternary {
+            self.ternary_idot_pipelines.insert(ggml_type, p);
+            let integer: Vec<Vec<f32>> = cases
+                .iter()
+                .map(|(x, n, w)| self.matmul(x, *n, w))
+                .collect();
+            if std::env::var_os("ORANGU_PROBE_TRACE").is_some() {
+                for (case, (a, b)) in integer.iter().zip(&tuned).enumerate() {
+                    let scale = b.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+                    let worst = a
+                        .iter()
+                        .zip(b)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    eprintln!(
+                        "orangu-server: [probe] ternary type {ggml_type} case {case}: worst {worst:.4} of scale {scale:.4} ({:.2}%)",
+                        100.0 * worst / scale
+                    );
+                }
+            }
+            if !rounding_bound(&integer, &tuned) {
+                self.ternary_idot_pipelines.remove(&ggml_type);
+                eprintln!(
+                    "orangu-server: integer-dot ternary decode kernel for ggml type {ggml_type} disagrees with the float one; float kernel kept"
+                );
+            }
+        }
         let (Some(p1), p4) = i8 else {
             return true;
         };
@@ -5649,15 +5877,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             .iter()
             .map(|(x, n, w)| self.matmul(x, *n, w))
             .collect();
-        // An 8-bit activation moves an output by a small fraction of the
-        // *terms* that formed it, not of the result they cancel to, so the
-        // bound is 2% of the largest output of the case: a kernel that is
-        // wrong is off by that whole magnitude, not a fraction of it.
-        let integer_agrees = integer.iter().zip(&tuned).all(|(a, b)| {
-            let scale = b.iter().fold(1.0f32, |m, v| m.max(v.abs()));
-            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| (a - b).abs() <= 0.02 * scale)
-        });
-        if !integer_agrees {
+        if !rounding_bound(&integer, &tuned) {
             self.block_hoisted_i8_pipelines.remove(&ggml_type);
             self.block_hoisted_i8_wide_pipelines.remove(&ggml_type);
             eprintln!(
@@ -7024,7 +7244,20 @@ impl VulkanBackend {
         reps: u32,
     ) -> Option<(f64, &'static str)> {
         let op = MatmulOp { x, n_tokens, w };
-        let (pipeline, name) = self.pipeline_for_named(w.ggml_type(), w.in_dim, n_tokens);
+        // The pipeline the op's grid was sized for — `matmul_pipeline_for`,
+        // as `matmul_batch_dispatch_streamed` picks it — not the ladder's
+        // one-row choice. Asking the ladder here paired the one-row kernel
+        // with a grid of `out_dim / 4` workgroups on every word-reading
+        // type, so the "kernel time" of `PTQ1_0`, `PQ2_0`, `Q2_K` and the
+        // rest was a quarter of the matrix, and their rates read 4× too
+        // high (29 GB/s for a kernel that streams at 7).
+        let (_, name) = self.pipeline_for_named(w.ggml_type(), w.in_dim, n_tokens);
+        let pipeline = self.matmul_pipeline_for(w, n_tokens);
+        let name = if self.block_hoisted_wide_for(w, n_tokens).is_some() {
+            "block-hoisted-wide"
+        } else {
+            name
+        };
         let _region_guard = self.prefill_region_guard();
         let entry = self.op_entry_streamed(&op, 0, ROLE_BATCH, false);
         let guard = entry.lock().expect("op cache entry poisoned");
@@ -7069,7 +7302,14 @@ impl VulkanBackend {
         workgroups: (u32, u32, u32),
         reps: u32,
     ) -> Option<f64> {
-        let bind_group = bind_groups[0];
+        self.dispatch_sequence_us(&[(pipeline, bind_groups, workgroups)], reps)
+    }
+
+    /// [`Self::dispatch_kernels_us`] over a sequence of dispatches — the
+    /// time of one repetition of the whole sequence, for a kernel that
+    /// comes with a follow-up dispatch.
+    #[cfg(test)]
+    fn dispatch_sequence_us(&self, steps: &[ProbeDispatch<'_>], reps: u32) -> Option<f64> {
         if !self
             .device
             .features()
@@ -7095,20 +7335,21 @@ impl VulkanBackend {
             mapped_at_creation: false,
         });
         let mut encoder = self.new_encoder("orangu-server kernel probe encoder");
-        let (wx, wy, wz) = workgroups;
         // `ORANGU_PROBE_PASS_PER_DISPATCH=1` opens a compute pass per
         // dispatch instead of one for all of them — the difference between
         // the two readings is what a pass boundary costs on this device.
         if crate::engine::env::flag_on("ORANGU_PROBE_PASS_PER_DISPATCH") {
             encoder.write_timestamp(&query_set, 0);
-            for _ in 0..reps {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("orangu-server kernel probe pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, bind_group, &[]);
-                pass.dispatch_workgroups(wx, wy, wz);
+            for i in 0..reps as usize {
+                for (pipeline, bind_groups, (wx, wy, wz)) in steps {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("orangu-server kernel probe pass"),
+                        timestamp_writes: None,
+                    });
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, bind_groups[i % bind_groups.len()], &[]);
+                    pass.dispatch_workgroups(*wx, *wy, *wz);
+                }
             }
             encoder.write_timestamp(&query_set, 1);
         } else {
@@ -7120,10 +7361,12 @@ impl VulkanBackend {
                     end_of_pass_write_index: Some(1),
                 }),
             });
-            pass.set_pipeline(pipeline);
             for i in 0..reps as usize {
-                pass.set_bind_group(0, bind_groups[i % bind_groups.len()], &[]);
-                pass.dispatch_workgroups(wx, wy, wz);
+                for (pipeline, bind_groups, (wx, wy, wz)) in steps {
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, bind_groups[i % bind_groups.len()], &[]);
+                    pass.dispatch_workgroups(*wx, *wy, *wz);
+                }
             }
         }
         encoder.resolve_query_set(&query_set, 0..2, &resolve_buffer, 0);
@@ -7197,6 +7440,18 @@ impl VulkanBackend {
             return Vec::new();
         }
 
+        // The op's grid (`build_op_resources`) is sized by
+        // `decode_rows_per_workgroup`, which is four rows when the wide
+        // block-hoisted kernel applies — so the pipeline has to be the one
+        // that grid belongs to, exactly as `record_matmul` picks it. This
+        // used to ask the ladder (`pipeline_for`) instead, which knows
+        // nothing about the wide kernel and answered with the one-row
+        // block-hoisted pipeline: a quarter of the workgroups the kernel
+        // needed, and rows past `out_dim / 4` left at zero on every
+        // word-reading type (`Q2_K`, `Q3_K`, `IQ4_XS`, `IQ3_S`, `IQ2_S`,
+        // `PQ2_0`, `PTQ1_0`) whose projection was 2048 rows or wider —
+        // every batched decode matmul outside the fused chains. Caught by
+        // the `PQ2_0` cross-check at 2048 rows; `Q2_K` failed the same way.
         let pipelines: Vec<&wgpu::ComputePipeline> = ops
             .iter()
             .map(|op| self.matmul_pipeline_for(op.w, op.n_tokens))
@@ -7522,9 +7777,43 @@ impl VulkanBackend {
         if w.out_dim < BLOCK_HOISTED_WIDE_MIN_OUT {
             return None;
         }
-        let pipeline = self.block_hoisted_wide_pipelines.get(&w.ggml_type())?;
+        let (pipeline, _) = self.wide_decode_for(w, n_tokens)?;
+        Some(pipeline)
+    }
+
+    /// The wide decode pipeline for `w` and the rows per workgroup it was
+    /// built for — the integer-dot ternary kernel at [`TERNARY_IDOT_ROWS`]
+    /// where it exists, else the block-hoisted words kernel at
+    /// [`BLOCK_HOISTED_WIDE_ROWS`]; `None` below
+    /// [`BLOCK_HOISTED_WIDE_MIN_OUT`] rows or where the ladder would not
+    /// pick the block-hoisted family at all.
+    fn wide_decode_for(
+        &self,
+        w: &QuantMatrix,
+        n_tokens: usize,
+    ) -> Option<(&wgpu::ComputePipeline, usize)> {
+        if w.out_dim < BLOCK_HOISTED_WIDE_MIN_OUT {
+            return None;
+        }
+        let picked = self
+            .ternary_idot_pipelines
+            .get(&w.ggml_type())
+            .map(|p| (p, *TERNARY_IDOT_ROWS * *TERNARY_IDOT_GROUPS))
+            .or_else(|| {
+                self.block_hoisted_wide_pipelines
+                    .get(&w.ggml_type())
+                    .map(|p| (p, BLOCK_HOISTED_WIDE_ROWS))
+            })?;
         (self.pipeline_for_named(w.ggml_type(), w.in_dim, n_tokens).1 == "block-hoisted")
-            .then_some(pipeline)
+            .then_some(picked)
+    }
+
+    /// Whether `matmul` on `w` at `n_tokens` runs the integer-dot ternary
+    /// kernel — what its cross-check has to compare against.
+    #[cfg(test)]
+    pub(super) fn ternary_idot_for(&self, w: &QuantMatrix, n_tokens: usize) -> bool {
+        self.ternary_idot_pipelines.contains_key(&w.ggml_type())
+            && self.block_hoisted_wide_for(w, n_tokens).is_some()
     }
 
     /// Whether any decode matmul may run on the integer dot — the chain
@@ -7555,14 +7844,20 @@ impl VulkanBackend {
         if self.pipeline_for_named(w.ggml_type(), w.in_dim, n_tokens).1 != "block-hoisted" {
             return None;
         }
+        let ternary = vulkan_shaders::is_ternary(w.ggml_type());
         if w.out_dim >= BLOCK_HOISTED_WIDE_MIN_OUT
             && let Some(p) = self.block_hoisted_i8_wide_pipelines.get(&w.ggml_type())
         {
-            return Some((p, BLOCK_HOISTED_WIDE_ROWS));
+            let rows = if ternary {
+                *TERNARY_IDOT_ROWS * *TERNARY_IDOT_GROUPS
+            } else {
+                BLOCK_HOISTED_WIDE_ROWS
+            };
+            return Some((p, rows));
         }
         self.block_hoisted_i8_pipelines
             .get(&w.ggml_type())
-            .map(|p| (p, reduce_n_rows()))
+            .map(|p| (p, if ternary { 1 } else { reduce_n_rows() }))
     }
 
     /// [`Self::pipeline_for`] for a matmul op — the wide block-hoisted
@@ -7575,11 +7870,8 @@ impl VulkanBackend {
     /// Rows per workgroup of the decode pipeline `matmul_pipeline_for`
     /// picks — what its dispatch grid is sized by.
     fn decode_rows_per_workgroup(&self, w: &QuantMatrix, n_tokens: usize) -> usize {
-        if self.block_hoisted_wide_for(w, n_tokens).is_some() {
-            BLOCK_HOISTED_WIDE_ROWS
-        } else {
-            reduce_n_rows()
-        }
+        self.wide_decode_for(w, n_tokens)
+            .map_or_else(reduce_n_rows, |(_, rows)| rows)
     }
 
     /// [`Self::pipeline_for`] plus the *name* of the kernel it picked.
@@ -8518,6 +8810,440 @@ pub enum GpuInput<'a> {
 /// otherwise identical chain — the two kernels have the same bindings, the same
 /// workgroup size and the same dispatch count — so it is a parameter rather
 /// than a second copy of the chain.
+/// [`VulkanBackend::fused_recurrent_tail`]'s parameters — everything a
+/// recurrent layer's decode step has once its projections and the host's
+/// conv/norm/scale pass are done.
+pub struct GatedDeltaInput<'a> {
+    /// Per key head, `[n_k, head_dim]`, L2-normed and scaled.
+    pub q: &'a [f32],
+    pub k: &'a [f32],
+    /// Per value head, `[n_v, head_dim]`.
+    pub v: &'a [f32],
+    /// Per value head, already through the sigmoid.
+    pub beta: &'a [f32],
+    /// Per value head, `exp(softplus(alpha + dt_bias) * a)`.
+    pub decay: &'a [f32],
+    /// The output gate's projection, `[n_v, head_dim]`, pre-activation.
+    pub z: &'a [f32],
+    /// Every head's state, `[n_v, head_dim, head_dim]` — the cache's
+    /// device-step access: uploaded when the host wrote last, kept on the
+    /// device otherwise (`VulkanStateMirror`), and left there, current,
+    /// after the step.
+    pub state: crate::engine::kv_cache::DeviceStateAccess<'a>,
+    pub ssm_norm: &'a [f32],
+    pub eps: f32,
+    /// `sigmoid(z)` rather than `silu(z)` — `qwen_hybrid::OutputGate`.
+    pub sigmoid_gate: bool,
+    pub n_k: usize,
+    pub n_v: usize,
+    pub head_dim: usize,
+    /// The fold on `ssm_out`'s input, permutation included — the kernel
+    /// stores in grouped order when the rotation asks for it.
+    pub out_rotation: Option<&'a crate::engine::hadamard::Rotation>,
+    pub ssm_out: &'a QuantMatrix,
+    pub batch_slot: usize,
+}
+
+/// [`VulkanBackend::fused_recurrent_layer`]'s parameters — a recurrent
+/// layer's whole decode step from its normed input: the projections, the
+/// conv step, the norms, the delta rule and `ssm_out`, one submission.
+pub struct RecurrentLayerInput<'a> {
+    /// The layer's normed input, `[n_embd]`, in the unrotated basis.
+    pub normed: &'a [f32],
+    /// The fold on the QKV mix and gate projections' input, and on
+    /// beta/alpha's — the layer takes the device path only when the two
+    /// are the same rotation (or both absent).
+    pub qkv_rotation: Option<&'a crate::engine::hadamard::Rotation>,
+    pub ba_rotation: Option<&'a crate::engine::hadamard::Rotation>,
+    /// `[n_embd → 2·key_dim + value_dim]`, the conv's input.
+    pub wqkv: &'a QuantMatrix,
+    /// `[n_embd → value_dim]`, the output gate `z`.
+    pub wgate: &'a QuantMatrix,
+    /// `[n_embd → n_v]` each.
+    pub wbeta: &'a QuantMatrix,
+    pub walpha: &'a QuantMatrix,
+    /// `ssm_conv1d.weight`, `[conv_channels, d_conv]` channel-major.
+    pub conv_kernel: &'a [f32],
+    pub d_conv: usize,
+    /// `ssm_dt.bias` and `ssm_a`, `[n_v]` each.
+    pub dt_bias: &'a [f32],
+    pub ssm_a: &'a [f32],
+    /// The state, as for the tail.
+    pub state: crate::engine::kv_cache::DeviceStateAccess<'a>,
+    pub ssm_norm: &'a [f32],
+    pub eps: f32,
+    pub sigmoid_gate: bool,
+    pub n_k: usize,
+    pub n_v: usize,
+    pub head_dim: usize,
+    pub out_rotation: Option<&'a crate::engine::hadamard::Rotation>,
+    pub ssm_out: &'a QuantMatrix,
+    pub batch_slot: usize,
+}
+
+/// [`VulkanBackend::fused_attention_layer`]'s parameters — a full-attention
+/// sub-layer's whole decode step from its (already rotated) normed input,
+/// for the Qwen hybrid trunk: `record_fused_attention` with the sigmoid
+/// gate, then the output fold and `wo`.
+pub struct FusedAttentionLayerInput<'a> {
+    /// The layer's normed input, `[n_embd]`, in the projections' basis
+    /// (the QKV fold applied on the host — a few thousand floats).
+    pub normed: &'a [f32],
+    /// `[n_embd → n_head · head_dim]` each: the query and its gate.
+    pub wq: &'a QuantMatrix,
+    pub wgate: &'a QuantMatrix,
+    pub wk: &'a QuantMatrix,
+    pub wv: &'a QuantMatrix,
+    /// `[head_dim]` each.
+    pub q_norm: &'a [f32],
+    pub k_norm: &'a [f32],
+    pub n_head: usize,
+    pub n_head_kv: usize,
+    pub head_dim: usize,
+    pub rope_dim: usize,
+    pub rope_freq_base: f32,
+    pub eps: f32,
+    /// This token's position — also where the cache's next row goes.
+    pub pos: usize,
+    /// The fold on `wo`'s input.
+    pub o_rotation: Option<&'a crate::engine::hadamard::Rotation>,
+    pub wo: &'a QuantMatrix,
+    pub cache: &'a mut crate::engine::kv_cache::LayerCache,
+    pub batch_slot: usize,
+}
+
+/// What `VulkanBackend::record_ffn_decode` builds once per FFN: the
+/// activation's meta and bind group, and the intermediate's fold.
+struct FfnDecodeBindGroups {
+    activation: wgpu::BindGroup,
+    rotation: Option<(wgpu::ComputePipeline, wgpu::BindGroup, u32)>,
+    /// Gate's and up's integer-dot bind groups over the norm's own q8
+    /// (`record_ffn_decode`'s `normed_q8`), for an entry on the integer
+    /// dot — no copy of the input and no quantize of their own then.
+    gate_q8: Option<wgpu::BindGroup>,
+    up_q8: Option<wgpu::BindGroup>,
+    /// The activation, the intermediate's fold and its quantize as one
+    /// dispatch into `down`'s input region and q8 buffer
+    /// (`shader_source_hadamard_q8` with `silu_mul`), when there is a fold
+    /// and `down` is on the integer dot. Replaces `activation`, `rotation`
+    /// and `down`'s quantize.
+    down_fused: Option<(wgpu::ComputePipeline, wgpu::BindGroup, u32)>,
+}
+
+/// The Qwen hybrid trunk's decode step on the device — the residual stream
+/// in a buffer pair (`x[side]`, alternating at every residual add), the
+/// current norm's output in `n`, and the bind groups over them: the norm
+/// per (norm weight, side), the add per (sub-layer output region, side),
+/// the fold over `n` per rotation. One per model width, kept for the
+/// process; the norm weights are uploaded once each.
+struct HybridChainResources {
+    n_embd: usize,
+    x: [wgpu::Buffer; 2],
+    n: wgpu::Buffer,
+    /// `n`'s 8-bit form (`shader_source_quantize_q8`'s layout, the length
+    /// in bytes) and the quantize dispatch that writes it, when the device
+    /// has integer-dot decode kernels: the attention projections with one
+    /// read it instead of `n`.
+    n_q8: Option<NormedQ8>,
+    /// `len = n_embd`, `extra = eps` — the norm's and the add's meta.
+    meta: wgpu::Buffer,
+    norm_weights: Mutex<HashMap<usize, wgpu::Buffer>>,
+    norm_bind_groups: Mutex<HashMap<(usize, usize), wgpu::BindGroup>>,
+    add_bind_groups: Mutex<HashMap<(wgpu::Buffer, u64, usize), wgpu::BindGroup>>,
+    /// The fused add + norm's, keyed by the sub-layer output, the side and
+    /// the norm weight — see [`VulkanBackend::hybrid_record_add_norm`].
+    #[allow(clippy::type_complexity)]
+    add_norm_bind_groups: Mutex<HashMap<(wgpu::Buffer, u64, usize, usize), wgpu::BindGroup>>,
+    rotations: Mutex<HashMap<RotationKey, (wgpu::ComputePipeline, wgpu::BindGroup, u32)>>,
+    /// The fold and the quantize of `n` as one dispatch, per rotation —
+    /// see [`VulkanBackend::hybrid_record_input`].
+    fold_q8: Mutex<HashMap<RotationKey, (wgpu::ComputePipeline, wgpu::BindGroup, u32)>>,
+    /// The output head's bind groups over `n` (the float kernel's) and its
+    /// q8 (the integer-dot kernel's, when the head is on it), per head
+    /// weight — see [`VulkanBackend::hybrid_record_head`].
+    #[allow(clippy::type_complexity)]
+    head_bind_groups: Mutex<HashMap<(usize, usize), (wgpu::BindGroup, Option<wgpu::BindGroup>)>>,
+}
+
+/// One dispatch of a kernel probe's sequence: the pipeline, the bind
+/// groups cycled across the repetitions, the grid.
+#[cfg(test)]
+type ProbeDispatch<'a> = (
+    &'a wgpu::ComputePipeline,
+    &'a [&'a wgpu::BindGroup],
+    (u32, u32, u32),
+);
+
+/// A norm output's q8 twin: the buffer, its length in bytes, and the
+/// quantize dispatch that fills it.
+type NormedQ8 = (wgpu::Buffer, u64, wgpu::BindGroup, (u32, u32, u32));
+
+/// One token of the Qwen hybrid trunk being recorded — see
+/// [`VulkanBackend::hybrid_decode_begin`]. Holds the encoder every layer
+/// records into; `finish` submits it.
+pub struct HybridDecodeToken {
+    encoder: wgpu::CommandEncoder,
+    res: Arc<HybridChainResources>,
+    /// Which of the two residual buffers holds the stream now.
+    side: usize,
+}
+
+/// The bind groups [`VulkanBackend::fused_attention_layer`] builds once per
+/// layer over the attention chain's output buffer: the output fold and
+/// `wo`. Keyed by that buffer, which belongs to the cache's dispatch
+/// resources and so differs per request.
+struct AttentionTailBindGroups {
+    /// The output fold and the quantize into `wo`'s q8 buffer.
+    input: TailInput,
+    /// `wo` over the chain's `f32` output.
+    wo: wgpu::BindGroup,
+}
+
+/// How a projection at the end of a sub-layer takes the `f32` output before
+/// it: folded in place where the weight reads a rotated basis, and
+/// quantized into the projection's own q8 buffer where it is on the integer
+/// dot — as one dispatch when both (`shader_source_hadamard_q8`), else
+/// whichever applies. See [`VulkanBackend::tail_input`].
+struct TailInput {
+    fused: Option<(wgpu::ComputePipeline, wgpu::BindGroup, u32)>,
+    rotation: Option<(wgpu::ComputePipeline, wgpu::BindGroup, u32)>,
+    quantize: Option<(wgpu::BindGroup, (u32, u32, u32))>,
+}
+
+impl TailInput {
+    /// Whether the projection reads its q8 buffer after the dispatches.
+    fn quantized(&self) -> bool {
+        self.fused.is_some() || self.quantize.is_some()
+    }
+}
+
+/// The device buffers one recurrent layer's [`VulkanBackend::
+/// fused_recurrent_tail`] and [`VulkanBackend::fused_recurrent_layer`]
+/// reuse across tokens, keyed by its `ssm_out`.
+struct GatedDeltaResources {
+    /// The four projections' outputs copied together for the prep kernel
+    /// (`fused_recurrent_layer`), `[qkv mix | z | beta | alpha]`.
+    proj: wgpu::Buffer,
+    /// The prep kernel's constants `[conv kernel | dt_bias | A]`, uploaded
+    /// on the layer path's first call.
+    consts: wgpu::Buffer,
+    norm: wgpu::Buffer,
+    /// The delta kernel's meta, written per call.
+    meta: wgpu::Buffer,
+    /// The prep kernel's meta, written per call.
+    prep_meta: wgpu::Buffer,
+    consts_uploaded: bool,
+    /// `fused_recurrent_layer`'s per-layer bind groups, built on first use.
+    layer_bind_groups: Arc<Mutex<HashMap<LayerBgKey, Arc<LayerBindGroups>>>>,
+}
+
+impl GatedDeltaResources {
+    fn clone_handles(&self) -> Self {
+        Self {
+            proj: self.proj.clone(),
+            consts: self.consts.clone(),
+            norm: self.norm.clone(),
+            meta: self.meta.clone(),
+            prep_meta: self.prep_meta.clone(),
+            consts_uploaded: self.consts_uploaded,
+            layer_bind_groups: self.layer_bind_groups.clone(),
+        }
+    }
+}
+
+/// The shape half of a recurrent step, shared by both entry points —
+/// see `VulkanBackend::recurrent_core`.
+struct RecurrentCore<'a> {
+    state: crate::engine::kv_cache::DeviceStateAccess<'a>,
+    ssm_norm: &'a [f32],
+    eps: f32,
+    sigmoid_gate: bool,
+    n_k: usize,
+    n_v: usize,
+    head_dim: usize,
+    out_rotation: Option<&'a crate::engine::hadamard::Rotation>,
+    ssm_out: &'a QuantMatrix,
+    batch_slot: usize,
+}
+
+/// A recurrent step ready to record: what `VulkanBackend::recurrent_core`
+/// resolved from a `RecurrentCore`.
+struct RecurrentPrepared<'a> {
+    pipeline: wgpu::ComputePipeline,
+    res: GatedDeltaResources,
+    scratch: wgpu::Buffer,
+    bgs: Arc<MirrorBindGroups>,
+    layout: RecurrentScratch,
+    entry: Arc<Mutex<CachedOpResources>>,
+    fresh: &'a mut crate::engine::kv_cache::Fresh,
+    n_embd: usize,
+    n_v: usize,
+    eps: f32,
+    out_rotation: Option<&'a crate::engine::hadamard::Rotation>,
+    ssm_out: &'a QuantMatrix,
+}
+
+/// A recurrent layer's state matrices resident on this device — the
+/// cache's [`crate::engine::kv_cache::DeviceStateMirror`] for the Vulkan
+/// backend. `scratch` is the gated-delta kernel's own buffer: the state at
+/// offset 0, then its output (the `ssm_out` matmul's input), then room for
+/// the matmul's result; a token's step reads and writes the state in place
+/// and only the layer's output comes home. `download` is for the host
+/// paths that need the state itself — a slot snapshot, a prefix-cache
+/// copy, a prefill on the host — and blocks for one copy.
+struct VulkanStateMirror {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    scratch: wgpu::Buffer,
+    /// A `MAP_READ` staging buffer for the state and the conv history,
+    /// kept so a download allocates nothing.
+    readback: wgpu::Buffer,
+    layout: RecurrentScratch,
+    /// Which backend made it — `VulkanBackend::identity` — so a state that
+    /// moves between devices is uploaded again rather than trusted.
+    backend: usize,
+    /// The bind groups over this scratch, per output-rotation and
+    /// permutation mode, built on first use: creating and dropping `wgpu`
+    /// bind groups every token measured at tens of milliseconds a call on
+    /// the fused FFN, and a recurrent step has five of them.
+    bind_groups: Mutex<HashMap<RecurrentBgKey, Arc<MirrorBindGroups>>>,
+}
+
+/// A rotation's identity for a bind-group cache: its block and its sign
+/// vector by address (`None` for no rotation) — `rotation_key`.
+type RotationKey = Option<(usize, usize)>;
+
+fn rotation_key(rot: Option<&crate::engine::hadamard::Rotation>) -> RotationKey {
+    rot.map(|r| {
+        (
+            r.block_size(),
+            r.signs()
+                .map_or(0, |s| Arc::as_ptr(s) as *const f32 as usize),
+        )
+    })
+}
+
+/// What a recurrent step's bind groups over a mirror's scratch depend on
+/// besides the mirror itself: the output rotation and whether the kernel
+/// stores in grouped order.
+type RecurrentBgKey = (RotationKey, bool);
+
+/// The bind groups of one recurrent step over one mirror — see
+/// `VulkanStateMirror::bind_groups`.
+struct MirrorBindGroups {
+    delta: wgpu::BindGroup,
+    /// `ssm_out` over the kernel's `f32` output in the scratch.
+    matmul: wgpu::BindGroup,
+    /// The output fold and the quantize into `ssm_out`'s q8 buffer.
+    out_input: TailInput,
+    prep: wgpu::BindGroup,
+}
+
+/// The bind groups of a recurrent layer's projections that share the QKV
+/// entry's input region, and the input rotation over it — per layer,
+/// independent of the slot (`GatedDeltaResources::layer_bind_groups`).
+struct LayerBindGroups {
+    /// The QKV fold alone, in place — when the QKV projection is not on
+    /// the integer dot; otherwise the fold and its quantize are one
+    /// dispatch, `fold_q8`.
+    in_rotation: Option<(wgpu::ComputePipeline, wgpu::BindGroup, u32)>,
+    /// The QKV fold and the quantize into the QKV entry's own q8 buffer as
+    /// one dispatch (`shader_source_hadamard_q8`), which every sharing
+    /// projection on the integer dot then reads.
+    fold_q8: Option<(wgpu::ComputePipeline, wgpu::BindGroup, u32)>,
+    /// The projections that read the QKV entry's input region — the gate,
+    /// then beta and alpha when they share its fold: the float kernel's
+    /// bind group over that region and, for a projection on the integer
+    /// dot, its integer-dot bind group over the QKV entry's q8.
+    shared: Vec<SharedInputDispatch>,
+}
+
+/// One projection's way of reading another entry's input region.
+type SharedInputDispatch = (wgpu::BindGroup, Option<wgpu::BindGroup>);
+
+/// What a layer's projection bind groups depend on: the QKV fold (block
+/// and signs, by address) and whether beta/alpha share its input.
+type LayerBgKey = (RotationKey, bool);
+
+/// Where everything sits in a recurrent layer's scratch, in floats: the
+/// state matrices, then the delta kernel's output / `ssm_out`'s input
+/// (wide enough for the matmul's result as well), then the conv1d rolling
+/// history, then the delta kernel's inputs `[q | k | v | beta | decay | z]`
+/// — the last two stepped in place by the device (`fused_recurrent_layer`)
+/// or written by the host (`fused_recurrent_tail`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecurrentScratch {
+    state_len: usize,
+    tail_len: usize,
+    conv_len: usize,
+    inputs_len: usize,
+}
+
+impl RecurrentScratch {
+    fn tail_off(&self) -> usize {
+        self.state_len
+    }
+    fn conv_off(&self) -> usize {
+        self.state_len + self.tail_len
+    }
+    fn inputs_off(&self) -> usize {
+        self.conv_off() + self.conv_len
+    }
+    fn len(&self) -> usize {
+        self.inputs_off() + self.inputs_len
+    }
+}
+
+impl crate::engine::kv_cache::DeviceStateMirror for VulkanStateMirror {
+    fn download(&self, state: &mut [f32], conv: &mut [f32]) {
+        let l = self.layout;
+        debug_assert_eq!(state.len(), l.state_len);
+        debug_assert_eq!(conv.len(), l.conv_len);
+        let state_bytes = (l.state_len as u64) * 4;
+        let conv_bytes = (l.conv_len as u64) * 4;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("orangu-server recurrent state download"),
+            });
+        encoder.copy_buffer_to_buffer(&self.scratch, 0, &self.readback, 0, state_bytes);
+        if conv_bytes > 0 {
+            encoder.copy_buffer_to_buffer(
+                &self.scratch,
+                (l.conv_off() as u64) * 4,
+                &self.readback,
+                state_bytes,
+                conv_bytes,
+            );
+        }
+        self.queue.submit(Some(encoder.finish()));
+        const CONTEXT: &str = "downloading a recurrent layer's state";
+        let wait = MapWait::new();
+        self.readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, wait.callback());
+        if let Err(err) = self.device.poll(wgpu::PollType::wait_indefinitely()) {
+            crate::device_lost::fail(CONTEXT, err);
+        }
+        wait.check(CONTEXT);
+        {
+            let view = self
+                .readback
+                .slice(..)
+                .get_mapped_range()
+                .unwrap_or_else(|err| crate::device_lost::fail(CONTEXT, err));
+            let all: &[f32] = bytemuck::cast_slice(&view);
+            state.copy_from_slice(&all[..l.state_len]);
+            conv.copy_from_slice(&all[l.state_len..l.state_len + l.conv_len]);
+        }
+        self.readback.unmap();
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FfnActivation {
     /// `gelu(gate) * up` — gemma.
@@ -9373,9 +10099,8 @@ impl VulkanBackend {
         buffer
     }
 
-    /// Like `elem_meta_buffer` with `aux` set — the row quantizer reads the
-    /// row width there.
-    /// `ElemMeta` with both `aux` and `extra` set.
+    /// `ElemMeta` with both `aux` and `extra` set — the gated-delta kernel's
+    /// store mode and its norm epsilon, the row quantizer's row width.
     fn elem_meta_buffer_aux_extra(&self, len: u32, aux: u32, extra: f32) -> wgpu::Buffer {
         let meta = ElemMeta {
             len,
@@ -11545,7 +12270,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let alloc_ms = t_alloc.ms();
         let t_submit = TraceClock::start();
         encoder.copy_buffer_to_buffer(src, src_offset, &readback_buffer, 0, byte_len);
-        self.queue.submit(Some(encoder.finish()));
+        let commands = encoder.finish();
+        let finish_ms = t_submit.ms();
+        self.queue.submit(Some(commands));
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::engine::decode_stages::record_submission();
@@ -11565,7 +12292,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         readback_buffer.unmap();
         let copy_ms = t_copy.ms();
         self.put_readback(byte_len, readback_buffer);
-        record_readback_split(byte_len, alloc_ms, submit_ms, wait_ms, copy_ms);
+        record_readback_split(
+            byte_len,
+            [alloc_ms, finish_ms, submit_ms - finish_ms, wait_ms, copy_ms],
+        );
         (
             result,
             ReadbackSplit {
@@ -14093,6 +14823,1951 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         Some(out)
     }
 
+    /// The whole device side of one recurrent layer's decode step after its
+    /// projections — [`GatedDeltaInput`] in, the layer's `ssm_out` output
+    /// back, the delta-net state updated in place — as **one submission**:
+    /// the token's inputs and the state uploaded, the delta-rule kernel
+    /// (`shader_source_gated_delta`), the Hadamard rotation of its output
+    /// when the file folds `ssm_out`, the `ssm_out` matmul reading that
+    /// output where it lies, and one readback carrying the state and the
+    /// result together.
+    ///
+    /// The state travels every token — 3 MB up and 3 MB down per layer on
+    /// the 27B — rather than living on the device. That is deliberate for
+    /// this increment: it keeps every host-side reader of the state (slot
+    /// persistence, prefix carry-over, the CPU path) correct with no mirror
+    /// bookkeeping, at ~30 ms a token on the development board against the
+    /// ~170 ms of host work it replaces; `doc/PERF-BONSAI.md` task 1b says
+    /// where residency comes in.
+    ///
+    /// `None` when the device declines — the integer-dot configuration, a
+    /// head geometry the kernel does not cover, or a fold with a block the
+    /// rotation kernel cannot take — and the caller runs the host sequence.
+    /// A full-attention sub-layer's whole decode step on the device — the
+    /// Qwen hybrid trunk's counterpart of [`Self::fused_recurrent_layer`]:
+    /// [`Self::record_fused_attention`] (Q, gate, K, V from the uploaded
+    /// input; the per-head norms and RoPE; the cache write; attention; the
+    /// sigmoid gate), then the output fold and `wo`, one submission and one
+    /// readback of `wo`'s result. `None` where the fold's block does not
+    /// divide the attention width — the host path takes it.
+    pub fn fused_attention_layer(&self, input: FusedAttentionLayerInput<'_>) -> Option<Vec<f32>> {
+        let mut encoder = self.new_encoder("orangu-server fused attention layer encoder");
+        let (buffer, offset, n_embd) =
+            self.record_attention_layer(&mut encoder, input, None, None)?;
+        Some(self.submit_and_readback(encoder, &buffer, offset, n_embd))
+    }
+
+    /// [`Self::fused_attention_layer`]'s recording half — see
+    /// [`Self::record_recurrent_layer`] for the contract.
+    fn record_attention_layer(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        input: FusedAttentionLayerInput<'_>,
+        normed_on_device: Option<(&wgpu::Buffer, u64)>,
+        normed_q8: Option<(&wgpu::Buffer, u64)>,
+    ) -> Option<(wgpu::Buffer, u64, usize)> {
+        let FusedAttentionLayerInput {
+            normed,
+            wq,
+            wgate,
+            wk,
+            wv,
+            q_norm,
+            k_norm,
+            n_head,
+            n_head_kv,
+            head_dim,
+            rope_dim,
+            rope_freq_base,
+            eps,
+            pos,
+            o_rotation,
+            wo,
+            cache,
+            batch_slot,
+        } = input;
+        if self.q4_k_mmvq {
+            return None;
+        }
+        let attn_width = n_head * head_dim;
+        if let Some(rot) = o_rotation
+            && (rot.has_permutation()
+                || !attn_width.is_multiple_of(rot.block_size())
+                || (rot.block_size() as u32) < 2 * vulkan_shaders::HADAMARD_WG)
+        {
+            return None;
+        }
+        if wo.in_dim != attn_width || wq.out_dim != attn_width || wgate.out_dim != attn_width {
+            return None;
+        }
+        let n_embd = wo.out_dim;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+
+        let mut cursor = PassCursor::new(encoder);
+        let out_buf = self.record_fused_attention(
+            &mut cursor,
+            FusedAttnInput {
+                normed: match normed_on_device {
+                    Some((buf, off)) => GpuInput::Gpu(buf, (off / 4) as usize),
+                    None => GpuInput::Cpu(normed),
+                },
+                normed_q8,
+                wq,
+                q_bias: None,
+                normalize_v: false,
+                attn_gate: Some(wgate),
+                q_norm: Some(q_norm),
+                pairing: crate::engine::tensor::RopeLayout::Neox,
+                kv: Some(FusedAttnProjection {
+                    wk,
+                    k_bias: None,
+                    v_bias: None,
+                    k_norm: Some(k_norm),
+                    wv: Some(wv),
+                }),
+                n_head,
+                n_head_kv,
+                head_dim,
+                rope_dim,
+                rope_freq_base,
+                yarn: RopeYarn::IDENTITY,
+                freq_factors: None,
+                eps,
+                pos,
+                window_start: 0,
+                window: None,
+                scale,
+                cache,
+                batch_slot,
+                attn_ts: None,
+                projections_ready: false,
+            },
+        );
+        // The tail's bind groups, once per (layer, output buffer).
+        let wo_entry = self.op_entry_for(wo, batch_slot);
+        let wo_g = wo_entry.lock().expect("op cache entry poisoned");
+        let tail = {
+            let key = (wo.cache_key(), out_buf.clone(), rotation_key(o_rotation));
+            let mut cache = self
+                .attention_tail_bind_groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache
+                .entry(key)
+                .or_insert_with(|| {
+                    let bytes = (attn_width as u64) * 4;
+                    Arc::new(AttentionTailBindGroups {
+                        input: self.tail_input(
+                            o_rotation,
+                            wo,
+                            &wo_g,
+                            BindSrc::Slice(&out_buf, 0, bytes),
+                            attn_width,
+                        ),
+                        wo: self.matmul_bind_group_with_input(wo, &out_buf, 0, bytes, &wo_g),
+                    })
+                })
+                .clone()
+        };
+        {
+            // A pass boundary before the tail: the gate multiply and the
+            // fold both write the attention output in place.
+            cursor.encoder();
+            let pass = cursor.pass();
+            self.record_tail_input(pass, &tail.input);
+            self.record_matmul_q8_or_float(
+                pass,
+                wo,
+                &wo_g,
+                tail.input.quantized(),
+                &tail.wo,
+                &out_buf,
+                0,
+            );
+        }
+        drop(cursor);
+        Some((wo_g.output_buffer.clone(), wo_g.output_offset, n_embd))
+    }
+
+    /// The dense FFN of a decode step, recorded from a device-resident
+    /// input: gate and up over `x`, the activation, the intermediate's
+    /// fold, `down` — [`Self::fused_ffn_prefill`]'s decode form with no
+    /// submission, the output left in `down`'s output region.
+    #[allow(clippy::too_many_arguments)]
+    fn record_ffn_decode(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        x: GpuInput<'_>,
+        gate: &QuantMatrix,
+        up: &QuantMatrix,
+        down: &QuantMatrix,
+        activation: FfnActivation,
+        mid_rotation: Option<&crate::engine::hadamard::Rotation>,
+        normed_q8: Option<(&wgpu::Buffer, u64)>,
+    ) -> Option<(wgpu::Buffer, u64, usize)> {
+        if self.q4_k_mmvq {
+            return None;
+        }
+        let ffn_len = gate.out_dim;
+        let n_embd = down.out_dim;
+        if let Some(rot) = mid_rotation
+            && (rot.has_permutation()
+                || !ffn_len.is_multiple_of(rot.block_size())
+                || (rot.block_size() as u32) < 2 * vulkan_shaders::HADAMARD_WG)
+        {
+            return None;
+        }
+        let dummy: Vec<f32>;
+        let x_host: &[f32] = match x {
+            GpuInput::Cpu(h) => h,
+            GpuInput::Gpu(..) => {
+                dummy = vec![0.0; gate.in_dim];
+                &dummy
+            }
+        };
+        let gate_op = MatmulOp {
+            x: x_host,
+            n_tokens: 1,
+            w: gate,
+        };
+        let up_op = MatmulOp {
+            x: x_host,
+            n_tokens: 1,
+            w: up,
+        };
+        let down_op = MatmulOp {
+            x: &[],
+            n_tokens: 1,
+            w: down,
+        };
+        let _region_guard = self.prefill_region_guard();
+        let gate_entry = self.op_entry_at(&gate_op, 0, ROLE_FFN);
+        let up_entry = self.op_entry_at(&up_op, 0, ROLE_FFN + 1);
+        let down_entry = self.op_entry_at(&down_op, 0, ROLE_FFN + 2);
+        let gate_g = gate_entry.lock().expect("op cache entry poisoned");
+        let up_g = up_entry.lock().expect("op cache entry poisoned");
+        let down_g = down_entry.lock().expect("op cache entry poisoned");
+        let bgs = {
+            let key = (
+                gate.cache_key(),
+                up.cache_key(),
+                down.cache_key(),
+                rotation_key(mid_rotation),
+                normed_q8.is_some(),
+            );
+            let mut cache = self
+                .ffn_decode_bind_groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache
+                .entry(key)
+                .or_insert_with(|| {
+                    let bytes = (ffn_len as u64) * 4;
+                    let meta = self.elem_meta_buffer(ffn_len as u32, 0.0);
+                    let over_q8 = |w: &QuantMatrix, g: &CachedOpResources| {
+                        let (q8, len) = normed_q8?;
+                        self.entry_on_integer_dot(w, g)
+                            .then(|| self.matmul_bind_group_with_input(w, q8, 0, len, g))
+                    };
+                    let down_fused = match (mid_rotation, activation) {
+                        (Some(rot), FfnActivation::Swiglu)
+                            if self.entry_on_integer_dot(down, &down_g) =>
+                        {
+                            let mmvq = down_g.mmvq.as_ref().expect("on the integer dot");
+                            Some(self.hadamard_q8_dispatch(
+                                rot,
+                                Some((gate_g.output_src(), up_g.output_src())),
+                                BindSrc::Slice(&down_g.x_buffer, down_g.x_offset, bytes),
+                                BindSrc::Slice(&mmvq.q8_buffer, 0, mmvq.q8_len),
+                                ffn_len,
+                            ))
+                        }
+                        _ => None,
+                    };
+                    Arc::new(FfnDecodeBindGroups {
+                        activation: self.elem4_bind_group(
+                            gate_g.output_src(),
+                            up_g.output_src(),
+                            BindSrc::Slice(&down_g.x_buffer, down_g.x_offset, bytes),
+                            &meta,
+                        ),
+                        rotation: mid_rotation.map(|rot| {
+                            self.hadamard_dispatch(
+                                rot,
+                                BindSrc::Slice(&down_g.x_buffer, down_g.x_offset, bytes),
+                                ffn_len,
+                                1,
+                            )
+                        }),
+                        gate_q8: over_q8(gate, &gate_g),
+                        up_q8: over_q8(up, &up_g),
+                        down_fused,
+                    })
+                })
+                .clone()
+        };
+        for (g, q8) in [(&*gate_g, &bgs.gate_q8), (&*up_g, &bgs.up_q8)] {
+            if q8.is_some() {
+                continue;
+            }
+            match x {
+                GpuInput::Cpu(h) => {
+                    self.queue
+                        .write_buffer(&g.x_buffer, g.x_offset, bytemuck::cast_slice(h))
+                }
+                GpuInput::Gpu(buf, off) => encoder.copy_buffer_to_buffer(
+                    buf,
+                    (off as u64) * 4,
+                    &g.x_buffer,
+                    g.x_offset,
+                    (gate.in_dim as u64) * 4,
+                ),
+            }
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server decode FFN pass"),
+                timestamp_writes: None,
+            });
+            if bgs.gate_q8.is_none() {
+                self.record_entry_quantize(&mut pass, gate, &gate_g);
+            }
+            if bgs.up_q8.is_none() {
+                self.record_entry_quantize(&mut pass, up, &up_g);
+            }
+            self.op_stamp(&mut pass, "ffn.quantize");
+            for (w, g, q8) in [(gate, &*gate_g, &bgs.gate_q8), (up, &*up_g, &bgs.up_q8)] {
+                match q8 {
+                    Some(bg) => self.record_mmvq_matmul_shared(&mut pass, w, g, bg),
+                    None => self.record_entry_matmul(&mut pass, w, g),
+                }
+            }
+            self.op_stamp(&mut pass, "ffn.gate_up");
+            if let Some((pipeline, bg, workgroups)) = &bgs.down_fused {
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, bg, &[]);
+                pass.dispatch_workgroups(*workgroups, 1, 1);
+            } else {
+                pass.set_pipeline(self.ffn_activation_pipeline(activation));
+                pass.set_bind_group(0, &bgs.activation, &[]);
+                pass.dispatch_workgroups(self.strided_workgroups(ffn_len), 1, 1);
+                if let Some((pipeline, bg, workgroups)) = &bgs.rotation {
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups(*workgroups, 1, 1);
+                }
+                self.record_entry_quantize(&mut pass, down, &down_g);
+            }
+            self.op_stamp(&mut pass, "ffn.act_fold_quantize");
+            self.record_entry_matmul(&mut pass, down, &down_g);
+            self.op_stamp(&mut pass, "ffn.down");
+        }
+        Some((down_g.output_buffer.clone(), down_g.output_offset, n_embd))
+    }
+
+    /// Starts recording one token of the Qwen hybrid trunk with the residual
+    /// stream `x` on the device: every layer then records its norms, its
+    /// sub-layer, the residual adds and its FFN into the token's encoder
+    /// through the `hybrid_record_*` methods, and
+    /// [`Self::hybrid_decode_finish`] submits the lot and brings the stream
+    /// back — one submission and one readback per token where the host
+    /// path pays two of each per layer.
+    pub fn hybrid_decode_begin(&self, x: &[f32], eps: f32) -> HybridDecodeToken {
+        let n_embd = x.len();
+        let res = {
+            let mut chains = self
+                .hybrid_chains
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            chains
+                .entry(n_embd)
+                .or_insert_with(|| {
+                    let storage = |label: &str| {
+                        self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some(label),
+                            size: (n_embd as u64) * 4,
+                            usage: wgpu::BufferUsages::STORAGE
+                                | wgpu::BufferUsages::COPY_DST
+                                | wgpu::BufferUsages::COPY_SRC,
+                            mapped_at_creation: false,
+                        })
+                    };
+                    let n = storage("orangu-server hybrid normed");
+                    // The q8 twin, in the per-op quantize's layout.
+                    let n_q8 =
+                        (self.decode_mmvq && self.q8_quantize_pipeline.is_some()).then(|| {
+                            let len = (n_embd / 32 * 10) as u64 * 4;
+                            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                                label: Some("orangu-server hybrid normed q8"),
+                                size: len,
+                                usage: wgpu::BufferUsages::STORAGE,
+                                mapped_at_creation: false,
+                            });
+                            let meta = self.cast_meta_buffer(n_embd as u32, 0);
+                            let bg = self.elem3_bind_group(
+                                BindSrc::Slice(&n, 0, (n_embd as u64) * 4),
+                                BindSrc::Slice(&buf, 0, len),
+                                &meta,
+                            );
+                            let grid = Self::workgroup_dims((n_embd as u32 / 32).div_ceil(64));
+                            (buf, len, bg, grid)
+                        });
+                    Arc::new(HybridChainResources {
+                        n_embd,
+                        x: [
+                            storage("orangu-server hybrid residual a"),
+                            storage("orangu-server hybrid residual b"),
+                        ],
+                        n: n.clone(),
+                        n_q8,
+                        meta: self.elem_meta_buffer(n_embd as u32, eps),
+                        norm_weights: Mutex::new(HashMap::new()),
+                        norm_bind_groups: Mutex::new(HashMap::new()),
+                        add_bind_groups: Mutex::new(HashMap::new()),
+                        add_norm_bind_groups: Mutex::new(HashMap::new()),
+                        rotations: Mutex::new(HashMap::new()),
+                        fold_q8: Mutex::new(HashMap::new()),
+                        head_bind_groups: Mutex::new(HashMap::new()),
+                    })
+                })
+                .clone()
+        };
+        self.queue
+            .write_buffer(&res.x[0], 0, bytemuck::cast_slice(x));
+        let mut encoder = self.new_encoder("orangu-server hybrid decode token encoder");
+        self.begin_op_step(&mut encoder);
+        HybridDecodeToken {
+            encoder,
+            res,
+            side: 0,
+        }
+    }
+
+    /// Submits what the token has recorded so far and starts a fresh
+    /// encoder for the rest, so the device runs the layers already recorded
+    /// while the host encodes the next — `CommandEncoder::finish` is
+    /// ~7 µs a dispatch on this host (14 ms for the 27B's token of two
+    /// thousand), and with one submission per token the device idles for
+    /// all of it. Ordering holds on the one queue; the residual stream and
+    /// the norm's buffers persist across encoders.
+    pub fn hybrid_flush(&self, tok: &mut HybridDecodeToken) {
+        let encoder = std::mem::replace(
+            &mut tok.encoder,
+            self.new_encoder("orangu-server hybrid decode token encoder"),
+        );
+        self.queue.submit(Some(encoder.finish()));
+        self.submission_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::engine::decode_stages::record_submission();
+    }
+
+    /// Names the dispatches recorded since the last stamp, for
+    /// `ORANGU_GPU_TIMESTAMPS=ops` — a no-op otherwise.
+    pub fn hybrid_stamp(&self, tok: &mut HybridDecodeToken, label: &'static str) {
+        self.op_stamp_encoder(&mut tok.encoder, label);
+    }
+
+    /// `n = rmsnorm(x) · weight` — the norm in front of a sub-layer or FFN.
+    pub fn hybrid_record_norm(&self, tok: &mut HybridDecodeToken, weight: &[f32]) {
+        let res = tok.res.clone();
+        debug_assert_eq!(weight.len(), res.n_embd);
+        let key = (weight.as_ptr() as usize, tok.side);
+        let bg = {
+            let mut bgs = res
+                .norm_bind_groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            bgs.entry(key)
+                .or_insert_with(|| {
+                    let mut weights = res
+                        .norm_weights
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let w = weights
+                        .entry(key.0)
+                        .or_insert_with(|| self.upload_new(weight))
+                        .clone();
+                    self.elem4_bind_group(&res.x[tok.side], &w, &res.n, &res.meta)
+                })
+                .clone()
+        };
+        let mut pass = tok
+            .encoder
+            .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server hybrid norm pass"),
+                timestamp_writes: None,
+            });
+        pass.set_pipeline(self.rmsnorm_for(res.n_embd));
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+        self.op_stamp(&mut pass, "chain.norm");
+    }
+
+    /// The current norm's output made ready for a sub-layer's projections:
+    /// folded in place where the sub-layer reads a rotated basis (`rot`),
+    /// and quantized into the chain's q8 twin where the device has
+    /// integer-dot kernels — one dispatch when both
+    /// (`shader_source_hadamard_q8`), the plain fold or the plain quantize
+    /// when one. The attention layer and the FFN then read `n` or its q8.
+    pub fn hybrid_record_input(
+        &self,
+        tok: &mut HybridDecodeToken,
+        rot: Option<&crate::engine::hadamard::Rotation>,
+    ) {
+        let res = tok.res.clone();
+        match (rot, &res.n_q8) {
+            (Some(rot), Some((q8, len, _, _))) => {
+                let (pipeline, bg, workgroups) = {
+                    let mut folds = res
+                        .fold_q8
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    folds
+                        .entry(rotation_key(Some(rot)))
+                        .or_insert_with(|| {
+                            self.hadamard_q8_dispatch(
+                                rot,
+                                None,
+                                BindSrc::Slice(&res.n, 0, (res.n_embd as u64) * 4),
+                                BindSrc::Slice(q8, 0, *len),
+                                res.n_embd,
+                            )
+                        })
+                        .clone()
+                };
+                let mut pass = tok
+                    .encoder
+                    .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("orangu-server hybrid fold+quantize pass"),
+                        timestamp_writes: None,
+                    });
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(workgroups, 1, 1);
+                self.op_stamp(&mut pass, "chain.fold_quantize");
+            }
+            (Some(rot), None) => self.hybrid_record_rotation(tok, rot),
+            (None, Some((_, _, bg, grid))) => {
+                let mut pass = tok
+                    .encoder
+                    .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("orangu-server hybrid normed quantize pass"),
+                        timestamp_writes: None,
+                    });
+                self.record_quantize_bg(&mut pass, &(bg.clone(), *grid));
+                self.op_stamp(&mut pass, "chain.quantize");
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// The fold over the current norm's output, in place — a sub-layer
+    /// whose projections read a rotated basis.
+    pub fn hybrid_record_rotation(
+        &self,
+        tok: &mut HybridDecodeToken,
+        rot: &crate::engine::hadamard::Rotation,
+    ) {
+        let res = tok.res.clone();
+        let (pipeline, bg, workgroups) = {
+            let mut rots = res
+                .rotations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            rots.entry(rotation_key(Some(rot)))
+                .or_insert_with(|| {
+                    self.hadamard_dispatch(
+                        rot,
+                        BindSrc::Slice(&res.n, 0, (res.n_embd as u64) * 4),
+                        res.n_embd,
+                        1,
+                    )
+                })
+                .clone()
+        };
+        let mut pass = tok
+            .encoder
+            .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server hybrid fold pass"),
+                timestamp_writes: None,
+            });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(workgroups, 1, 1);
+        self.op_stamp(&mut pass, "chain.rotation");
+    }
+
+    /// `x += out` — the residual add after a sub-layer or FFN, into the
+    /// other residual buffer, which becomes the stream.
+    fn hybrid_record_add(&self, tok: &mut HybridDecodeToken, out: (&wgpu::Buffer, u64)) {
+        let res = tok.res.clone();
+        let dst = 1 - tok.side;
+        let key = (out.0.clone(), out.1, tok.side);
+        let bg = {
+            let mut bgs = res
+                .add_bind_groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            bgs.entry(key)
+                .or_insert_with(|| {
+                    self.elem4_bind_group(
+                        &res.x[tok.side],
+                        BindSrc::Slice(out.0, out.1, (res.n_embd as u64) * 4),
+                        &res.x[dst],
+                        &res.meta,
+                    )
+                })
+                .clone()
+        };
+        let mut pass = tok
+            .encoder
+            .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server hybrid residual add pass"),
+                timestamp_writes: None,
+            });
+        pass.set_pipeline(&self.add_pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(self.strided_workgroups(res.n_embd), 1, 1);
+        self.op_stamp(&mut pass, "chain.add");
+        drop(pass);
+        tok.side = dst;
+    }
+
+    /// The residual add, fused with the next norm when the caller knows it.
+    fn hybrid_record_add_then(
+        &self,
+        tok: &mut HybridDecodeToken,
+        out: (&wgpu::Buffer, u64),
+        next_norm: Option<&[f32]>,
+    ) {
+        match next_norm {
+            Some(weight) => self.hybrid_record_add_norm(tok, out, weight),
+            None => self.hybrid_record_add(tok, out),
+        }
+    }
+
+    /// [`Self::hybrid_record_add`] and the next sub-layer's norm
+    /// ([`Self::hybrid_record_norm`] with `weight`) as one dispatch — the
+    /// pre-norm pair `x' = x + out; n = rmsnorm(x') · w`
+    /// (`shader_source_add_rmsnorm_wide`), where the two were a dependent
+    /// pair whose second booked the first's drain, 128 times a token.
+    /// Falls back to the pair for a width the wide norm does not take.
+    pub fn hybrid_record_add_norm(
+        &self,
+        tok: &mut HybridDecodeToken,
+        out: (&wgpu::Buffer, u64),
+        weight: &[f32],
+    ) {
+        let res = tok.res.clone();
+        if !self.norm_wide_for(res.n_embd) {
+            self.hybrid_record_add(tok, out);
+            self.hybrid_record_norm(tok, weight);
+            return;
+        }
+        debug_assert_eq!(weight.len(), res.n_embd);
+        let dst = 1 - tok.side;
+        let weight_key = weight.as_ptr() as usize;
+        let key = (out.0.clone(), out.1, tok.side, weight_key);
+        let bg = {
+            let mut bgs = res
+                .add_norm_bind_groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            bgs.entry(key)
+                .or_insert_with(|| {
+                    let w = {
+                        let mut weights = res
+                            .norm_weights
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        weights
+                            .entry(weight_key)
+                            .or_insert_with(|| self.upload_new(weight))
+                            .clone()
+                    };
+                    let bytes = (res.n_embd as u64) * 4;
+                    self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("orangu-server hybrid add+norm bind group"),
+                        layout: &self.elem6_bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: res.x[tok.side].as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: w.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: BindSrc::Slice(out.0, out.1, bytes).resource(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: res.x[dst].as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: res.n.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 5,
+                                resource: res.meta.as_entire_binding(),
+                            },
+                        ],
+                    })
+                })
+                .clone()
+        };
+        let mut pass = tok
+            .encoder
+            .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server hybrid add+norm pass"),
+                timestamp_writes: None,
+            });
+        pass.set_pipeline(&self.add_rmsnorm_wide_pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+        self.op_stamp(&mut pass, "chain.add_norm");
+        drop(pass);
+        tok.side = dst;
+    }
+
+    /// A recurrent sub-layer over the current norm's output, and its
+    /// residual add. `input.normed` is ignored (the norm's output is on the
+    /// device); `false` when the device declines the layer — the token is
+    /// then unusable and the caller falls back to the host for this token.
+    pub fn hybrid_record_recurrent(
+        &self,
+        tok: &mut HybridDecodeToken,
+        input: RecurrentLayerInput<'_>,
+        next_norm: Option<&[f32]>,
+    ) -> bool {
+        let normed = (tok.res.n.clone(), 0u64);
+        let Some((buf, off, _)) =
+            self.record_recurrent_layer(&mut tok.encoder, input, Some((&normed.0, normed.1)))
+        else {
+            return false;
+        };
+        self.hybrid_record_add_then(tok, (&buf, off), next_norm);
+        true
+    }
+
+    /// A full-attention sub-layer over the current norm's output (already
+    /// rotated by [`Self::hybrid_record_rotation`] where the file folds
+    /// it), and its residual add.
+    pub fn hybrid_record_attention(
+        &self,
+        tok: &mut HybridDecodeToken,
+        input: FusedAttentionLayerInput<'_>,
+        next_norm: Option<&[f32]>,
+    ) -> bool {
+        let res = tok.res.clone();
+        // The norm's q8 (written by `hybrid_record_input`): the projections
+        // with an integer-dot kernel read it in place of `n`.
+        let normed_q8 = res.n_q8.as_ref().map(|(buf, len, _, _)| (buf, *len));
+        let Some((buf, off, _)) =
+            self.record_attention_layer(&mut tok.encoder, input, Some((&res.n, 0)), normed_q8)
+        else {
+            return false;
+        };
+        self.hybrid_record_add_then(tok, (&buf, off), next_norm);
+        true
+    }
+
+    /// The dense FFN over the current norm's output (rotated first where
+    /// the file folds its gate/up input), and its residual add.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hybrid_record_ffn(
+        &self,
+        tok: &mut HybridDecodeToken,
+        gate: &QuantMatrix,
+        up: &QuantMatrix,
+        down: &QuantMatrix,
+        activation: FfnActivation,
+        mid_rotation: Option<&crate::engine::hadamard::Rotation>,
+        next_norm: Option<&[f32]>,
+    ) -> bool {
+        let res = tok.res.clone();
+        let Some((buf, off, _)) = self.record_ffn_decode(
+            &mut tok.encoder,
+            GpuInput::Gpu(&res.n, 0),
+            gate,
+            up,
+            down,
+            activation,
+            mid_rotation,
+            res.n_q8.as_ref().map(|(buf, len, _, _)| (buf, *len)),
+        ) else {
+            return false;
+        };
+        self.hybrid_record_add_then(tok, (&buf, off), next_norm);
+        true
+    }
+
+    /// Submits the token and brings the residual stream back — the token's
+    /// end before the head joined it (`hybrid_decode_finish_logits`); the
+    /// chain's own tests end with it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn hybrid_decode_finish(&self, tok: HybridDecodeToken, pos: usize) -> Vec<f32> {
+        let HybridDecodeToken {
+            mut encoder,
+            res,
+            side,
+        } = tok;
+        self.finish_op_step(&mut encoder);
+        let out = self.submit_and_readback(encoder, &res.x[side], 0, res.n_embd);
+        self.report_op_step(pos);
+        out
+    }
+
+    /// The output head over the current norm's output (the final norm,
+    /// recorded fused with the last residual add, then
+    /// [`Self::hybrid_record_input`] with the head's fold): the logits are
+    /// left in the head entry's output region. The token then ends with
+    /// [`Self::hybrid_decode_finish_logits`], and the residual stream never
+    /// comes back — the head's own submission and round trip are gone.
+    pub fn hybrid_record_head(
+        &self,
+        tok: &mut HybridDecodeToken,
+        w: &QuantMatrix,
+    ) -> (wgpu::Buffer, u64, usize) {
+        let res = tok.res.clone();
+        let entry = self.op_entry_for(w, 0);
+        let g = entry.lock().expect("op cache entry poisoned");
+        let (float_bg, q8_bg) = {
+            let mut bgs = res
+                .head_bind_groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            bgs.entry(w.cache_key())
+                .or_insert_with(|| {
+                    let bytes = (res.n_embd as u64) * 4;
+                    (
+                        self.matmul_bind_group_with_input(w, &res.n, 0, bytes, &g),
+                        res.n_q8.as_ref().and_then(|(q8, len, _, _)| {
+                            self.entry_on_integer_dot(w, &g)
+                                .then(|| self.matmul_bind_group_with_input(w, q8, 0, *len, &g))
+                        }),
+                    )
+                })
+                .clone()
+        };
+        let mut pass = tok
+            .encoder
+            .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server hybrid head pass"),
+                timestamp_writes: None,
+            });
+        match &q8_bg {
+            Some(bg) => self.record_mmvq_matmul_shared(&mut pass, w, &g, bg),
+            None => self.record_matmul_shared_input(&mut pass, w, &g, &float_bg, &res.n, 0),
+        }
+        self.op_stamp(&mut pass, "head");
+        drop(pass);
+        (g.output_buffer.clone(), g.output_offset, w.out_dim)
+    }
+
+    /// Submits the token and brings the logits [`Self::hybrid_record_head`]
+    /// left back.
+    pub fn hybrid_decode_finish_logits(
+        &self,
+        tok: HybridDecodeToken,
+        pos: usize,
+        logits: (&wgpu::Buffer, u64, usize),
+    ) -> Vec<f32> {
+        let HybridDecodeToken {
+            mut encoder,
+            res: _,
+            side: _,
+        } = tok;
+        self.finish_op_step(&mut encoder);
+        let out = self.submit_and_readback(encoder, logits.0, logits.1, logits.2);
+        self.report_op_step(pos);
+        out
+    }
+
+    /// Whether `w`'s decode matmul over `entry` goes through the entry's
+    /// own quantize pass and integer-dot kernel — the entry was built with
+    /// one and the pipeline is still there (the start-up check may have
+    /// taken it).
+    fn entry_on_integer_dot(&self, w: &QuantMatrix, entry: &CachedOpResources) -> bool {
+        entry.mmvq.is_some() && self.mmvq_pipeline_for(w, entry.n_tokens).is_some()
+    }
+
+    /// The quantize dispatch of an entry on the integer dot, from the
+    /// entry's own input region — a no-op for an entry on the float kernel.
+    /// Dispatches in one pass are ordered, so it may share the matmul's.
+    fn record_entry_quantize(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        w: &QuantMatrix,
+        entry: &CachedOpResources,
+    ) {
+        if self.entry_on_integer_dot(w, entry) {
+            self.record_mmvq_quantize(pass, entry);
+        }
+    }
+
+    /// The decode matmul of `w` over `entry`'s own input region: the
+    /// integer-dot kernel over the q8 the quantize pass left, or the float
+    /// kernel over the `f32` input.
+    fn record_entry_matmul(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        w: &QuantMatrix,
+        entry: &CachedOpResources,
+    ) {
+        if let Some(mmvq) = &entry.mmvq
+            && let Some((pipeline, _)) = self.mmvq_pipeline_for(w, entry.n_tokens)
+        {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &mmvq.mmvq_bind_group, &[]);
+            let (wx, wy, wz) = mmvq.mmvq_workgroups;
+            pass.dispatch_workgroups(wx, wy, wz);
+            return;
+        }
+        // Not `record_matmul`: it takes the integer dot only under the
+        // legacy `ORANGU_Q4K_MMVQ`, and this path decides for itself.
+        pass.set_pipeline(self.matmul_pipeline_for(w, entry.n_tokens));
+        pass.set_bind_group(0, &entry.bind_group, &[]);
+        let (wx, wy, wz) = entry.workgroups;
+        pass.dispatch_workgroups(wx, wy, wz);
+    }
+
+    /// A quantize bind group from a device-resident input that is not the
+    /// entry's own region (a chain's intermediate) into the entry's q8
+    /// buffer — `None` for an entry on the float kernel. The caller keeps
+    /// it beside the bind groups over that intermediate.
+    fn entry_quantize_from(
+        &self,
+        w: &QuantMatrix,
+        entry: &CachedOpResources,
+        src: BindSrc<'_>,
+        len_f32: usize,
+    ) -> Option<(wgpu::BindGroup, (u32, u32, u32))> {
+        if !self.entry_on_integer_dot(w, entry) {
+            return None;
+        }
+        let mmvq = entry.mmvq.as_ref()?;
+        let meta = self.cast_meta_buffer(len_f32 as u32, 0);
+        let bg = self.elem3_bind_group(src, BindSrc::Slice(&mmvq.q8_buffer, 0, mmvq.q8_len), &meta);
+        Some((bg, Self::workgroup_dims((len_f32 / 32) as u32 / 64 + 1)))
+    }
+
+    /// A [`TailInput`] for `w`'s entry over the `f32` output `x` (one row
+    /// of `width`): the fused fold + quantize when `rot` applies and the
+    /// entry is on the integer dot, else the fold alone and/or the
+    /// quantize alone.
+    fn tail_input(
+        &self,
+        rot: Option<&crate::engine::hadamard::Rotation>,
+        w: &QuantMatrix,
+        entry: &CachedOpResources,
+        x: BindSrc<'_>,
+        width: usize,
+    ) -> TailInput {
+        let on_i8 = self.entry_on_integer_dot(w, entry);
+        match (rot, on_i8.then_some(entry.mmvq.as_ref()).flatten()) {
+            (Some(rot), Some(mmvq)) => TailInput {
+                fused: Some(self.hadamard_q8_dispatch(
+                    rot,
+                    None,
+                    x,
+                    BindSrc::Slice(&mmvq.q8_buffer, 0, mmvq.q8_len),
+                    width,
+                )),
+                rotation: None,
+                quantize: None,
+            },
+            (rot, _) => TailInput {
+                fused: None,
+                rotation: rot.map(|rot| self.hadamard_dispatch(rot, x, width, 1)),
+                quantize: self.entry_quantize_from(w, entry, x, width),
+            },
+        }
+    }
+
+    /// Records a [`TailInput`]'s dispatches, in order.
+    fn record_tail_input(&self, pass: &mut wgpu::ComputePass<'_>, input: &TailInput) {
+        if let Some((pipeline, bg, workgroups)) = &input.fused {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(*workgroups, 1, 1);
+            return;
+        }
+        if let Some((pipeline, bg, workgroups)) = &input.rotation {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, bg, &[]);
+            pass.dispatch_workgroups(*workgroups, 1, 1);
+        }
+        if let Some(q) = &input.quantize {
+            self.record_quantize_bg(pass, q);
+        }
+    }
+
+    /// Records a quantize built by [`Self::entry_quantize_from`].
+    fn record_quantize_bg(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        q: &(wgpu::BindGroup, (u32, u32, u32)),
+    ) {
+        pass.set_pipeline(
+            self.q8_quantize_pipeline
+                .as_ref()
+                .expect("an entry on the integer dot implies the quantize pipeline"),
+        );
+        pass.set_bind_group(0, &q.0, &[]);
+        let (wx, wy, wz) = q.1;
+        pass.dispatch_workgroups(wx, wy, wz);
+    }
+
+    /// The integer-dot matmul of `w` over its entry's q8 buffer (filled by a
+    /// [`Self::record_quantize_bg`] dispatch), or the float kernel over the
+    /// `f32` input bound in `float_bg`.
+    #[allow(clippy::too_many_arguments)]
+    fn record_matmul_q8_or_float(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        w: &QuantMatrix,
+        entry: &CachedOpResources,
+        quantized: bool,
+        float_bg: &wgpu::BindGroup,
+        input_buf: &wgpu::Buffer,
+        input_offset: u64,
+    ) {
+        if quantized
+            && let Some(mmvq) = &entry.mmvq
+            && let Some((pipeline, _)) = self.mmvq_pipeline_for(w, entry.n_tokens)
+        {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &mmvq.mmvq_bind_group, &[]);
+            let (wx, wy, wz) = mmvq.mmvq_workgroups;
+            pass.dispatch_workgroups(wx, wy, wz);
+            return;
+        }
+        self.record_matmul_shared_input(pass, w, entry, float_bg, input_buf, input_offset);
+    }
+
+    pub fn fused_recurrent_tail(&self, input: GatedDeltaInput<'_>) -> Option<Vec<f32>> {
+        let GatedDeltaInput {
+            q,
+            k,
+            v,
+            beta,
+            decay,
+            z,
+            state,
+            ssm_norm,
+            eps,
+            sigmoid_gate,
+            n_k,
+            n_v,
+            head_dim,
+            out_rotation,
+            ssm_out,
+            batch_slot,
+        } = input;
+        let hd = head_dim;
+        debug_assert_eq!(q.len(), n_k * hd);
+        debug_assert_eq!(k.len(), n_k * hd);
+        debug_assert_eq!(v.len(), n_v * hd);
+        debug_assert_eq!(beta.len(), n_v);
+        debug_assert_eq!(decay.len(), n_v);
+        debug_assert_eq!(z.len(), n_v * hd);
+        let core = self.recurrent_core(RecurrentCore {
+            state,
+            ssm_norm,
+            eps,
+            sigmoid_gate,
+            n_k,
+            n_v,
+            head_dim,
+            out_rotation,
+            ssm_out,
+            batch_slot,
+        })?;
+        // The host's inputs, already normed and scaled, into the scratch
+        // where the kernel reads them.
+        let mut packed: Vec<f32> = Vec::with_capacity(core.layout.inputs_len);
+        packed.extend_from_slice(q);
+        packed.extend_from_slice(k);
+        packed.extend_from_slice(v);
+        packed.extend_from_slice(beta);
+        packed.extend_from_slice(decay);
+        packed.extend_from_slice(z);
+        self.queue.write_buffer(
+            &core.scratch,
+            (core.layout.inputs_off() as u64) * 4,
+            bytemuck::cast_slice(&packed),
+        );
+        let mut encoder = self.new_encoder("orangu-server fused recurrent tail encoder");
+        self.record_recurrent_delta_and_out(&mut encoder, &core, false);
+        Some(self.finish_recurrent(encoder, core))
+    }
+
+    /// A recurrent layer's whole decode step on the device: the normed
+    /// input uploaded once and rotated in place where the fold asks, the
+    /// four projections against it, their outputs gathered for the prep
+    /// kernel (`shader_source_recurrent_prep`: the conv step over the
+    /// resident history, SiLU, `beta`, `decay`, `z`), then the delta rule
+    /// with its own L2 norms of `q` and `k`, the gated norm, the fold and
+    /// `ssm_out` — one submission, one readback of the layer's output.
+    /// What [`Self::fused_recurrent_tail`] left on the host (the conv step,
+    /// the norms, the projections' round trip) is here too. `None` when the
+    /// QKV and beta/alpha folds differ (the host path takes each rotation
+    /// once) or the shape is outside the kernels' range.
+    pub fn fused_recurrent_layer(&self, input: RecurrentLayerInput<'_>) -> Option<Vec<f32>> {
+        let mut encoder = self.new_encoder("orangu-server fused recurrent layer encoder");
+        let (buffer, offset, n_embd) = self.record_recurrent_layer(&mut encoder, input, None)?;
+        Some(self.submit_and_readback(encoder, &buffer, offset, n_embd))
+    }
+
+    /// [`Self::fused_recurrent_layer`]'s recording half: everything into
+    /// `encoder`, nothing submitted, the layer's output left in `ssm_out`'s
+    /// output region — `(buffer, byte offset, length)`. `normed_on_device`
+    /// replaces `input.normed` with a device copy of the same value (the
+    /// decode chain's norm output); the state's freshness is set as if the
+    /// step had run, which it has by the time anything reads the result.
+    fn record_recurrent_layer(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        input: RecurrentLayerInput<'_>,
+        normed_on_device: Option<(&wgpu::Buffer, u64)>,
+    ) -> Option<(wgpu::Buffer, u64, usize)> {
+        let RecurrentLayerInput {
+            normed,
+            qkv_rotation,
+            ba_rotation,
+            wqkv,
+            wgate,
+            wbeta,
+            walpha,
+            conv_kernel,
+            d_conv,
+            dt_bias,
+            ssm_a,
+            state,
+            ssm_norm,
+            eps,
+            sigmoid_gate,
+            n_k,
+            n_v,
+            head_dim,
+            out_rotation,
+            ssm_out,
+            batch_slot,
+        } = input;
+        let hd = head_dim;
+        let key_dim = n_k * hd;
+        let value_dim = n_v * hd;
+        let conv_channels = 2 * key_dim + value_dim;
+        // The decode chain hands the input on the device and an empty
+        // `normed`; the width is the projections' then.
+        let n_embd = if normed_on_device.is_some() {
+            wqkv.in_dim
+        } else {
+            normed.len()
+        };
+        // Beta/alpha read the QKV input where their fold is the same one
+        // (or there is none anywhere); with no fold of their own against a
+        // folded QKV they read the unrotated input from their own regions;
+        // two different folds is the host path's problem.
+        let ba_shares_qkv = match (qkv_rotation, ba_rotation) {
+            (None, None) => true,
+            (Some(a), Some(b)) if a.same_as(b) => true,
+            (Some(_), None) => false,
+            _ => return None,
+        };
+        if let Some(rot) = qkv_rotation
+            && (rot.has_permutation()
+                || !n_embd.is_multiple_of(rot.block_size())
+                || (rot.block_size() as u32) < 2 * vulkan_shaders::HADAMARD_WG)
+        {
+            return None;
+        }
+        if wqkv.in_dim != n_embd
+            || wqkv.out_dim != conv_channels
+            || wgate.in_dim != n_embd
+            || wgate.out_dim != value_dim
+            || wbeta.out_dim != n_v
+            || walpha.out_dim != n_v
+            || conv_kernel.len() != conv_channels * d_conv
+            || dt_bias.len() != n_v
+            || ssm_a.len() != n_v
+            || state.conv.len() != conv_channels * (d_conv - 1)
+            || !(1..=8).contains(&d_conv)
+        {
+            return None;
+        }
+        let core = self.recurrent_core(RecurrentCore {
+            state,
+            ssm_norm,
+            eps,
+            sigmoid_gate,
+            n_k,
+            n_v,
+            head_dim,
+            out_rotation,
+            ssm_out,
+            batch_slot,
+        })?;
+
+        // The projections' entries; the QKV one's input region carries the
+        // uploaded (and rotated) input the other three share.
+        let qkv_entry = self.op_entry_for(wqkv, batch_slot);
+        let gate_entry = self.op_entry_for(wgate, batch_slot);
+        let beta_entry = self.op_entry_for(wbeta, batch_slot);
+        let alpha_entry = self.op_entry_for(walpha, batch_slot);
+        let qkv_g = qkv_entry.lock().expect("op cache entry poisoned");
+        let gate_g = gate_entry.lock().expect("op cache entry poisoned");
+        let beta_g = beta_entry.lock().expect("op cache entry poisoned");
+        let alpha_g = alpha_entry.lock().expect("op cache entry poisoned");
+        let normed_src = |dst: &wgpu::Buffer,
+                          dst_offset: u64,
+                          encoder: &mut wgpu::CommandEncoder| {
+            match normed_on_device {
+                Some((buf, off)) => {
+                    encoder.copy_buffer_to_buffer(buf, off, dst, dst_offset, (n_embd as u64) * 4);
+                }
+                None => self
+                    .queue
+                    .write_buffer(dst, dst_offset, bytemuck::cast_slice(normed)),
+            }
+        };
+        // The QKV entry's input region gets the input (and the fold, in
+        // place); the gate, and beta/alpha when they share the fold, read
+        // it from there through the layer's bind groups; otherwise
+        // beta/alpha get the unfolded input in their own regions.
+        normed_src(&qkv_g.x_buffer, qkv_g.x_offset, encoder);
+        if !ba_shares_qkv {
+            for g in [&*beta_g, &*alpha_g] {
+                normed_src(&g.x_buffer, g.x_offset, encoder);
+            }
+        }
+        let in_bytes = (n_embd as u64) * 4;
+        let layer_bgs = {
+            let key = (rotation_key(qkv_rotation), ba_shares_qkv);
+            let mut cache = core
+                .res
+                .layer_bind_groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache
+                .entry(key)
+                .or_insert_with(|| {
+                    let mut sharing: Vec<(&QuantMatrix, &CachedOpResources)> =
+                        vec![(wgate, &gate_g)];
+                    if ba_shares_qkv {
+                        sharing.push((wbeta, &beta_g));
+                        sharing.push((walpha, &alpha_g));
+                    }
+                    // The QKV entry's q8, shared by every projection on the
+                    // integer dot that reads its input.
+                    let qkv_q8 = self
+                        .entry_on_integer_dot(wqkv, &qkv_g)
+                        .then(|| qkv_g.mmvq.as_ref())
+                        .flatten();
+                    let x = || BindSrc::Slice(&qkv_g.x_buffer, qkv_g.x_offset, in_bytes);
+                    let fold_q8 = match (qkv_rotation, qkv_q8) {
+                        (Some(rot), Some(mmvq)) => Some(self.hadamard_q8_dispatch(
+                            rot,
+                            None,
+                            x(),
+                            BindSrc::Slice(&mmvq.q8_buffer, 0, mmvq.q8_len),
+                            n_embd,
+                        )),
+                        _ => None,
+                    };
+                    Arc::new(LayerBindGroups {
+                        in_rotation: match (qkv_rotation, fold_q8.is_some()) {
+                            (Some(rot), false) => Some(self.hadamard_dispatch(rot, x(), n_embd, 1)),
+                            _ => None,
+                        },
+                        fold_q8,
+                        shared: sharing
+                            .into_iter()
+                            .map(|(w, g)| {
+                                (
+                                    self.matmul_bind_group_with_input(
+                                        w,
+                                        &qkv_g.x_buffer,
+                                        qkv_g.x_offset,
+                                        in_bytes,
+                                        g,
+                                    ),
+                                    qkv_q8.filter(|_| self.entry_on_integer_dot(w, g)).map(
+                                        |mmvq| {
+                                            self.matmul_bind_group_with_input(
+                                                w,
+                                                &mmvq.q8_buffer,
+                                                0,
+                                                mmvq.q8_len,
+                                                g,
+                                            )
+                                        },
+                                    ),
+                                )
+                            })
+                            .collect(),
+                    })
+                })
+                .clone()
+        };
+
+        // The prep kernel's constants and meta, and its pipeline.
+        if !core.res.consts_uploaded {
+            let mut consts: Vec<f32> = Vec::with_capacity(conv_channels * d_conv + 2 * n_v);
+            consts.extend_from_slice(conv_kernel);
+            consts.extend_from_slice(dt_bias);
+            consts.extend_from_slice(ssm_a);
+            self.queue
+                .write_buffer(&core.res.consts, 0, bytemuck::cast_slice(&consts));
+            let mut cache = self
+                .gated_delta_resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(r) = cache.get_mut(&ssm_out.cache_key()) {
+                r.consts_uploaded = true;
+            }
+        }
+        let prep_meta = ElemMeta {
+            len: core.layout.inputs_off() as u32,
+            aux: core.layout.conv_off() as u32,
+            extra: 0.0,
+            out_scale: 0.0,
+        };
+        self.queue
+            .write_buffer(&core.res.prep_meta, 0, bytemuck::bytes_of(&prep_meta));
+        let prep_pipeline = {
+            let key = (
+                conv_channels as u32,
+                d_conv as u32,
+                value_dim as u32,
+                n_v as u32,
+            );
+            let mut pipelines = self
+                .recurrent_prep_pipelines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pipelines
+                .entry(key)
+                .or_insert_with(|| {
+                    let module = self
+                        .device
+                        .create_shader_module(wgpu::ShaderModuleDescriptor {
+                            label: Some("orangu-server recurrent prep shader"),
+                            source: wgpu::ShaderSource::Wgsl(
+                                vulkan_shaders::shader_source_recurrent_prep(
+                                    key.0, key.1, key.2, key.3,
+                                )
+                                .into(),
+                            ),
+                        });
+                    self.device
+                        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                            label: Some("orangu-server recurrent prep pipeline"),
+                            layout: Some(&self.elem4_pipeline_layout),
+                            module: &module,
+                            entry_point: Some("main"),
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                            cache: None,
+                        })
+                })
+                .clone()
+        };
+        let prep_elems = conv_channels + 2 * n_v + value_dim;
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server fused recurrent layer pass"),
+                timestamp_writes: None,
+            });
+            // The QKV input's fold and quantize — one dispatch, or the
+            // fold then the entry's own quantize — then beta/alpha's own
+            // quantizes where they read their own regions; every quantize
+            // before any matmul.
+            match (&layer_bgs.fold_q8, &layer_bgs.in_rotation) {
+                (Some((pipeline, bg, workgroups)), _) => {
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.dispatch_workgroups(*workgroups, 1, 1);
+                }
+                (None, rotation) => {
+                    if let Some((pipeline, bg, workgroups)) = rotation {
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, bg, &[]);
+                        pass.dispatch_workgroups(*workgroups, 1, 1);
+                    }
+                    self.record_entry_quantize(&mut pass, wqkv, &qkv_g);
+                }
+            }
+            let mut own: Vec<(&QuantMatrix, &CachedOpResources)> = vec![(wqkv, &qkv_g)];
+            if !ba_shares_qkv {
+                own.push((wbeta, &beta_g));
+                own.push((walpha, &alpha_g));
+                self.record_entry_quantize(&mut pass, wbeta, &beta_g);
+                self.record_entry_quantize(&mut pass, walpha, &alpha_g);
+            }
+            self.op_stamp(&mut pass, "rec.fold_quantize");
+            for (w, g) in &own {
+                self.record_entry_matmul(&mut pass, w, g);
+            }
+            let mut sharing: Vec<(&QuantMatrix, &CachedOpResources)> = vec![(wgate, &gate_g)];
+            if ba_shares_qkv {
+                sharing.push((wbeta, &beta_g));
+                sharing.push((walpha, &alpha_g));
+            }
+            for ((w, g), (float_bg, q8)) in sharing.iter().zip(&layer_bgs.shared) {
+                match q8 {
+                    Some(bg) => self.record_mmvq_matmul_shared(&mut pass, w, g, bg),
+                    None => self.record_matmul_shared_input(
+                        &mut pass,
+                        w,
+                        g,
+                        float_bg,
+                        &qkv_g.x_buffer,
+                        qkv_g.x_offset,
+                    ),
+                }
+            }
+            self.op_stamp(&mut pass, "rec.proj");
+        }
+        // The projections together, in the prep kernel's order.
+        let mut at = 0u64;
+        for (g, len) in [
+            (&*qkv_g, conv_channels),
+            (&*gate_g, value_dim),
+            (&*beta_g, n_v),
+            (&*alpha_g, n_v),
+        ] {
+            let bytes = (len as u64) * 4;
+            encoder.copy_buffer_to_buffer(
+                &g.output_buffer,
+                g.output_offset,
+                &core.res.proj,
+                at,
+                bytes,
+            );
+            at += bytes;
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("orangu-server fused recurrent layer pass 2"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&prep_pipeline);
+            pass.set_bind_group(0, &core.bgs.prep, &[]);
+            pass.dispatch_workgroups(self.strided_workgroups(prep_elems), 1, 1);
+            self.op_stamp(&mut pass, "rec.prep");
+        }
+        self.record_recurrent_delta_and_out(encoder, &core, true);
+        Some(self.finish_recurrent_recorded(core))
+    }
+
+    /// What the two recurrent entry points share: the shape checks, the
+    /// delta pipeline, the per-layer resources, the state's mirror (made or
+    /// uploaded as the cache's freshness says), `ssm_out`'s entry and the
+    /// bind groups of the delta kernel, the rotation and the matmul.
+    fn recurrent_core<'a>(&'a self, core: RecurrentCore<'a>) -> Option<RecurrentPrepared<'a>> {
+        if self.q4_k_mmvq {
+            return None;
+        }
+        let RecurrentCore {
+            state,
+            ssm_norm,
+            eps,
+            sigmoid_gate,
+            n_k,
+            n_v,
+            head_dim,
+            out_rotation,
+            ssm_out,
+            batch_slot,
+        } = core;
+        let hd = head_dim;
+        if hd > 256 || !hd.is_power_of_two() || !n_v.is_multiple_of(n_k) {
+            return None;
+        }
+        if let Some(rot) = out_rotation
+            && (!(n_v * hd).is_multiple_of(rot.block_size())
+                || (rot.block_size() as u32) < 2 * vulkan_shaders::HADAMARD_WG)
+        {
+            return None;
+        }
+        debug_assert_eq!(state.host.len(), n_v * hd * hd);
+        debug_assert_eq!(ssm_norm.len(), hd);
+        debug_assert_eq!(ssm_out.in_dim, n_v * hd);
+        let n_embd = ssm_out.out_dim;
+        let out_len = n_v * hd;
+        let layout = RecurrentScratch {
+            state_len: n_v * hd * hd,
+            // The kernel's output (the matmul's input), and past that room
+            // for the matmul's result — sized for whichever is wider.
+            tail_len: out_len.max(n_embd),
+            conv_len: state.conv.len(),
+            inputs_len: 2 * n_k * hd + n_v * hd + 2 * n_v + n_v * hd,
+        };
+
+        let pipeline = {
+            let key = (hd as u32, n_k as u32, n_v as u32, sigmoid_gate);
+            let mut pipelines = self
+                .gated_delta_pipelines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pipelines
+                .entry(key)
+                .or_insert_with(|| {
+                    let module = self
+                        .device
+                        .create_shader_module(wgpu::ShaderModuleDescriptor {
+                            label: Some("orangu-server gated delta shader"),
+                            source: wgpu::ShaderSource::Wgsl(
+                                vulkan_shaders::shader_source_gated_delta(
+                                    key.0,
+                                    key.1,
+                                    key.2,
+                                    sigmoid_gate,
+                                )
+                                .into(),
+                            ),
+                        });
+                    self.device
+                        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                            label: Some("orangu-server gated delta pipeline"),
+                            layout: Some(&self.elem4_pipeline_layout),
+                            module: &module,
+                            entry_point: Some("main"),
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                            cache: None,
+                        })
+                })
+                .clone()
+        };
+
+        let entry = self.op_entry_for(ssm_out, batch_slot);
+        let res = {
+            let mut cache = self
+                .gated_delta_resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache
+                .entry(ssm_out.cache_key())
+                .or_insert_with(|| {
+                    let storage = |label: &str, len: usize| {
+                        self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some(label),
+                            size: (len.max(4) as u64) * 4,
+                            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        })
+                    };
+                    let norm = storage("orangu-server gated delta norm", hd);
+                    self.queue
+                        .write_buffer(&norm, 0, bytemuck::cast_slice(ssm_norm));
+                    // The prep kernel's operands are sized by the layer's
+                    // conv width, which the tail does not know; a generous
+                    // bound from the delta inputs covers every shape here.
+                    let conv_channels = 2 * n_k * hd + n_v * hd;
+                    GatedDeltaResources {
+                        proj: storage(
+                            "orangu-server recurrent projections",
+                            conv_channels + n_v * hd + 2 * n_v,
+                        ),
+                        consts: storage(
+                            "orangu-server recurrent constants",
+                            conv_channels * 8 + 2 * n_v,
+                        ),
+                        norm,
+                        meta: self.elem_meta_buffer_aux_extra(0, 0, eps),
+                        prep_meta: self.elem_meta_buffer_aux_extra(0, 0, 0.0),
+                        consts_uploaded: false,
+                        layer_bind_groups: Arc::new(Mutex::new(HashMap::new())),
+                    }
+                })
+                .clone_handles()
+        };
+
+        // The state's device copy: this backend's own mirror of the right
+        // layout, made (and the host state uploaded) on first use, uploaded
+        // again whenever the host wrote since, otherwise left exactly where
+        // the last step put it.
+        let crate::engine::kv_cache::DeviceStateAccess {
+            host,
+            conv,
+            mirror,
+            fresh,
+        } = state;
+        let mine = mirror
+            .as_ref()
+            .and_then(|m| m.as_any().downcast_ref::<VulkanStateMirror>())
+            .is_some_and(|m| m.backend == self.identity() && m.layout == layout);
+        if !mine {
+            let scratch = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("orangu-server recurrent state mirror"),
+                size: (layout.len() as u64) * 4,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("orangu-server recurrent state mirror readback"),
+                size: ((layout.state_len + layout.conv_len).max(4) as u64) * 4,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            *mirror = Some(Box::new(VulkanStateMirror {
+                device: self.device.clone(),
+                queue: self.queue.clone(),
+                scratch,
+                readback,
+                layout,
+                backend: self.identity(),
+                bind_groups: Mutex::new(HashMap::new()),
+            }));
+            *fresh = crate::engine::kv_cache::Fresh::Host;
+        }
+        let vm = mirror
+            .as_ref()
+            .and_then(|m| m.as_any().downcast_ref::<VulkanStateMirror>())
+            .expect("the mirror was just checked or made");
+        let scratch = vm.scratch.clone();
+        let bgs = {
+            let key: RecurrentBgKey = (
+                rotation_key(out_rotation),
+                out_rotation.is_some_and(|r| r.has_permutation()),
+            );
+            let mut cache = vm
+                .bind_groups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache
+                .entry(key)
+                .or_insert_with(|| {
+                    let g = entry.lock().expect("op cache entry poisoned");
+                    let tail_bytes = (out_len as u64) * 4;
+                    let tail_off = (layout.tail_off() as u64) * 4;
+                    Arc::new(MirrorBindGroups {
+                        delta: self.elem4_bind_group(&res.norm, &res.norm, &scratch, &res.meta),
+                        matmul: self.matmul_bind_group_with_input(
+                            ssm_out, &scratch, tail_off, tail_bytes, &g,
+                        ),
+                        out_input: self.tail_input(
+                            out_rotation.map(|r| r.without_permutation()).as_ref(),
+                            ssm_out,
+                            &g,
+                            BindSrc::Slice(&scratch, tail_off, tail_bytes),
+                            out_len,
+                        ),
+                        prep: self.elem4_bind_group(
+                            &res.proj,
+                            &res.consts,
+                            &scratch,
+                            &res.prep_meta,
+                        ),
+                    })
+                })
+                .clone()
+        };
+        if *fresh != crate::engine::kv_cache::Fresh::Device {
+            self.queue
+                .write_buffer(&scratch, 0, bytemuck::cast_slice(host));
+            if !conv.is_empty() {
+                self.queue.write_buffer(
+                    &scratch,
+                    (layout.conv_off() as u64) * 4,
+                    bytemuck::cast_slice(conv),
+                );
+            }
+        }
+        Some(RecurrentPrepared {
+            pipeline,
+            res,
+            scratch,
+            bgs,
+            layout,
+            entry,
+            fresh,
+            n_embd,
+            n_v,
+            eps,
+            out_rotation,
+            ssm_out,
+        })
+    }
+
+    /// The delta rule, the fold and `ssm_out`, recorded into `pass` over a
+    /// prepared layer — `raw_inputs` when the prep kernel wrote the inputs
+    /// (the kernel norms `q` and `k` itself), false when the host did.
+    fn record_recurrent_delta_and_out(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        core: &RecurrentPrepared<'_>,
+        raw_inputs: bool,
+    ) {
+        let l = core.layout;
+        // Written every call rather than once: the store mode follows the
+        // rotation the caller hands in, and a test drives one weight with
+        // several.
+        let meta = ElemMeta {
+            len: l.inputs_off() as u32,
+            aux: u32::from(core.out_rotation.is_some_and(|r| r.has_permutation()))
+                | if raw_inputs { 2 } else { 0 },
+            extra: core.eps,
+            out_scale: 0.0,
+        };
+        self.queue
+            .write_buffer(&core.res.meta, 0, bytemuck::bytes_of(&meta));
+        let tail_off = (l.tail_off() as u64) * 4;
+        let g = core.entry.lock().expect("op cache entry poisoned");
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("orangu-server recurrent delta pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&core.pipeline);
+        pass.set_bind_group(0, &core.bgs.delta, &[]);
+        pass.dispatch_workgroups(core.n_v as u32, 1, 1);
+        self.op_stamp(&mut pass, "rec.delta");
+        self.record_tail_input(&mut pass, &core.bgs.out_input);
+        self.op_stamp(&mut pass, "rec.out_fold_quantize");
+        // The matmul reads the kernel's output where it lies in the scratch,
+        // or its quantized form.
+        self.record_matmul_q8_or_float(
+            &mut pass,
+            core.ssm_out,
+            &g,
+            core.bgs.out_input.quantized(),
+            &core.bgs.matmul,
+            &core.scratch,
+            tail_off,
+        );
+        self.op_stamp(&mut pass, "rec.out");
+    }
+
+    /// Submits a recurrent step and reads back the layer's output; the
+    /// state stays on the device, current from here on.
+    fn finish_recurrent(
+        &self,
+        encoder: wgpu::CommandEncoder,
+        core: RecurrentPrepared<'_>,
+    ) -> Vec<f32> {
+        let (buffer, offset, n_embd) = self.finish_recurrent_recorded(core);
+        self.submit_and_readback(encoder, &buffer, offset, n_embd)
+    }
+
+    /// The recorded step's output region, with the state marked current on
+    /// the device — for a caller that submits later.
+    fn finish_recurrent_recorded(&self, core: RecurrentPrepared<'_>) -> (wgpu::Buffer, u64, usize) {
+        let g = core.entry.lock().expect("op cache entry poisoned");
+        *core.fresh = crate::engine::kv_cache::Fresh::Device;
+        (g.output_buffer.clone(), g.output_offset, core.n_embd)
+    }
+
+    /// A number naming this backend instance, for a device-side object to
+    /// say whose it is (`VulkanStateMirror`): the backend's own address,
+    /// stable for as long as it is alive, which is the process.
+    fn identity(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
+    /// The pipeline, bind group and workgroup count that rotate `rows`
+    /// (`n_rows` rows of `width`, on the device at `x`) by `rot` in place —
+    /// `engine::hadamard`'s forward transform as one dispatch, one workgroup
+    /// per 1024-block. The pipeline is built on first use for the fold's
+    /// block size and the sign vector uploaded once per width; both are
+    /// cached on the backend.
+    ///
+    /// The caller records the dispatch where its chain needs it. The
+    /// forward form only: signs before the butterflies (`aux & 1`), which is
+    /// every matmul input; a folded lookup table's inverse (`aux & 2`) is
+    /// wired the same way whenever an embedding lookup moves to the device.
+    fn hadamard_dispatch(
+        &self,
+        rot: &crate::engine::hadamard::Rotation,
+        x: BindSrc<'_>,
+        width: usize,
+        n_rows: usize,
+    ) -> (wgpu::ComputePipeline, wgpu::BindGroup, u32) {
+        let block = rot.block_size() as u32;
+        debug_assert!(!rot.has_permutation());
+        debug_assert!(width.is_multiple_of(block as usize));
+        let pipeline = {
+            let mut pipelines = self
+                .hadamard_pipelines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pipelines
+                .entry(block)
+                .or_insert_with(|| {
+                    let module = self
+                        .device
+                        .create_shader_module(wgpu::ShaderModuleDescriptor {
+                            label: Some("orangu-server hadamard shader"),
+                            source: wgpu::ShaderSource::Wgsl(
+                                vulkan_shaders::shader_source_hadamard(block).into(),
+                            ),
+                        });
+                    self.device
+                        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                            label: Some("orangu-server hadamard pipeline"),
+                            layout: Some(&self.elem3_pipeline_layout),
+                            module: &module,
+                            entry_point: Some("main"),
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                            cache: None,
+                        })
+                })
+                .clone()
+        };
+        let (signs, aux) = self.hadamard_signs_for(rot, width);
+        let meta = self.elem_meta_buffer_aux(width as u32, aux);
+        let bg = self.elem3_bind_group(&signs, x, &meta);
+        let workgroups = (n_rows * width / block as usize) as u32;
+        (pipeline, bg, workgroups)
+    }
+
+    /// The sign vector of `rot` on the device and the kernel's `aux` flags,
+    /// or — in identity sign mode — any readable buffer the kernel will not
+    /// read, and `0`. A `Rotation` shares one `Arc` per width across every
+    /// folded weight, so its address is the cache key.
+    fn hadamard_signs_for(
+        &self,
+        rot: &crate::engine::hadamard::Rotation,
+        width: usize,
+    ) -> (wgpu::Buffer, u32) {
+        match rot.signs() {
+            Some(signs) => {
+                let key = Arc::as_ptr(signs) as *const f32 as usize;
+                let mut cache = self
+                    .hadamard_signs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let buffer = cache
+                    .entry(key)
+                    .or_insert_with(|| {
+                        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("orangu-server hadamard signs"),
+                            size: (signs.len() as u64) * 4,
+                            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+                        self.queue
+                            .write_buffer(&buffer, 0, bytemuck::cast_slice(signs));
+                        buffer
+                    })
+                    .clone();
+                debug_assert_eq!(signs.len(), width);
+                (buffer, 1u32)
+            }
+            None => {
+                // Identity sign mode: a storage buffer the kernel never
+                // reads, cached under the address no `Arc` can have.
+                let mut cache = self
+                    .hadamard_signs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let buffer = cache
+                    .entry(0)
+                    .or_insert_with(|| {
+                        self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("orangu-server hadamard no-signs"),
+                            size: 16,
+                            usage: wgpu::BufferUsages::STORAGE,
+                            mapped_at_creation: false,
+                        })
+                    })
+                    .clone();
+                (buffer, 0u32)
+            }
+        }
+    }
+
+    /// [`Self::hadamard_dispatch`]'s fused decode form
+    /// (`shader_source_hadamard_q8`): the fold of one row of `width` in
+    /// `x`, in place, and its per-32 q8 into `q8` — from `x` itself, or
+    /// with `silu_mul` from `silu(a) · b` (the FFN's gate and up outputs;
+    /// `a`/`b` are then read and `x` only written).
+    #[allow(clippy::too_many_arguments)]
+    fn hadamard_q8_dispatch(
+        &self,
+        rot: &crate::engine::hadamard::Rotation,
+        silu_mul: Option<(BindSrc<'_>, BindSrc<'_>)>,
+        x: BindSrc<'_>,
+        q8: BindSrc<'_>,
+        width: usize,
+    ) -> (wgpu::ComputePipeline, wgpu::BindGroup, u32) {
+        let block = rot.block_size() as u32;
+        debug_assert!(!rot.has_permutation());
+        debug_assert!(width.is_multiple_of(block as usize));
+        let pipeline = {
+            let key = (block, silu_mul.is_some());
+            let mut pipelines = self
+                .hadamard_q8_pipelines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pipelines
+                .entry(key)
+                .or_insert_with(|| {
+                    let module = self
+                        .device
+                        .create_shader_module(wgpu::ShaderModuleDescriptor {
+                            label: Some("orangu-server hadamard q8 shader"),
+                            source: wgpu::ShaderSource::Wgsl(
+                                vulkan_shaders::shader_source_hadamard_q8(key.0, key.1).into(),
+                            ),
+                        });
+                    self.device
+                        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                            label: Some("orangu-server hadamard q8 pipeline"),
+                            layout: Some(&self.elem6_pipeline_layout),
+                            module: &module,
+                            entry_point: Some("main"),
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                            cache: None,
+                        })
+                })
+                .clone()
+        };
+        let (signs, aux) = self.hadamard_signs_for(rot, width);
+        let meta = self.elem_meta_buffer_aux(width as u32, aux);
+        let (a, b) = match silu_mul {
+            Some((a, b)) => (a, b),
+            None => (BindSrc::from(&signs), BindSrc::from(&signs)),
+        };
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("orangu-server hadamard q8 bind group"),
+            layout: &self.elem6_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a.resource(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: b.resource(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: signs.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: x.resource(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: q8.resource(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: meta.as_entire_binding(),
+                },
+            ],
+        });
+        (pipeline, bg, (width / block as usize) as u32)
+    }
+
     /// A prefill layer's whole dense FFN block — gate and up projections, the
     /// GEGLU elementwise step, and the down projection — recorded into **one**
     /// encoder and submitted once, returning `[n_tokens, n_embd]`.
@@ -14121,6 +16796,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// *submission*, not against position within an encoder, so two stripes
     /// recorded together would race for that one region. Fusing therefore
     /// happens within a stripe — which is where the round trips were.
+    ///
+    /// `activation` picks GEGLU or SwiGLU between the projections, and
+    /// `mid_rotation` is a Hadamard-folded `down` (`engine::hadamard`): the
+    /// activation's output is rotated in place, on the device, before the
+    /// down projection reads it — the one step of a folded FFN that cannot
+    /// stay on the host without a round trip. A rotation that permutes its
+    /// input first is refused (`None`); no FFN weight has one.
+    ///
+    /// Decode (`n_tokens == 1`) takes this too: it is three dispatches in
+    /// one submission where the batched path is two submissions and two
+    /// readbacks.
+    #[allow(clippy::too_many_arguments)]
     pub fn fused_ffn_prefill(
         &self,
         x: &[f32],
@@ -14128,8 +16815,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         gate: &QuantMatrix,
         up: &QuantMatrix,
         down: &QuantMatrix,
+        activation: FfnActivation,
+        mid_rotation: Option<&crate::engine::hadamard::Rotation>,
     ) -> Option<Vec<f32>> {
+        let t_enter = crate::engine::env::flag_on("ORANGU_FFN_TRACE").then(std::time::Instant::now);
         if self.q4_k_mmvq {
+            return None;
+        }
+        if let Some(rot) = mid_rotation
+            && (rot.has_permutation()
+                || !down.in_dim.is_multiple_of(rot.block_size())
+                || (rot.block_size() as u32) < 2 * vulkan_shaders::HADAMARD_WG)
+        {
             return None;
         }
         let n_embd = down.out_dim;
@@ -14151,7 +16848,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     n_tokens,
                     gate.in_dim,
                     n_embd,
-                    |x, n| self.fused_ffn_prefill(x, n, gate, up, down),
+                    |x, n| self.fused_ffn_prefill(x, n, gate, up, down, activation, mid_rotation),
                 )?);
                 start = end;
             }
@@ -14176,6 +16873,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             w: down,
         };
 
+        let trace = crate::engine::env::flag_on("ORANGU_FFN_TRACE");
+        let t0 = std::time::Instant::now();
+        let t_enter = t_enter.unwrap_or(t0);
         let _region_guard = self.prefill_region_guard();
         let gate_entry = self.op_entry_at(&gate_op, 0, ROLE_FFN);
         let up_entry = self.op_entry_at(&up_op, 0, ROLE_FFN + 1);
@@ -14183,20 +16883,49 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let gate_g = gate_entry.lock().expect("op cache entry poisoned");
         let up_g = up_entry.lock().expect("op cache entry poisoned");
         let down_g = down_entry.lock().expect("op cache entry poisoned");
+        let t1 = std::time::Instant::now();
 
         self.queue
             .write_buffer(&gate_g.x_buffer, gate_g.x_offset, bytemuck::cast_slice(x));
         self.queue
             .write_buffer(&up_g.x_buffer, up_g.x_offset, bytemuck::cast_slice(x));
+        let t2 = std::time::Instant::now();
 
         let elems = n_tokens * ffn_len;
-        let meta = self.elem_meta_buffer(elems as u32, 0.0);
-        let bg_gelu_mul = self.elem4_bind_group(
-            gate_g.output_src(),
-            up_g.output_src(),
-            BindSrc::Slice(&down_g.x_buffer, down_g.x_offset, (elems as u64) * 4),
-            &meta,
-        );
+        // The activation's meta and bind group, built once per (FFN, width)
+        // and kept: creating and dropping them every call measured at tens
+        // of milliseconds a call on a decode step — the `wgpu` object
+        // teardown, not the arithmetic — against 8 ms for the whole
+        // submission.
+        let (_meta, bg_gelu_mul) = {
+            let key = (gate.cache_key(), up.cache_key(), down.cache_key(), n_tokens);
+            let mut cache = self
+                .fused_ffn_activation_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (meta, bg) = cache.entry(key).or_insert_with(|| {
+                let meta = self.elem_meta_buffer(elems as u32, 0.0);
+                let bg = self.elem4_bind_group(
+                    gate_g.output_src(),
+                    up_g.output_src(),
+                    BindSrc::Slice(&down_g.x_buffer, down_g.x_offset, (elems as u64) * 4),
+                    &meta,
+                );
+                (meta, bg)
+            });
+            (meta.clone(), bg.clone())
+        };
+
+        // Built outside the pass: a pipeline may be compiled here on first
+        // use, and the sign buffer looked up or uploaded.
+        let rotation = mid_rotation.map(|rot| {
+            self.hadamard_dispatch(
+                rot,
+                BindSrc::Slice(&down_g.x_buffer, down_g.x_offset, (elems as u64) * 4),
+                ffn_len,
+                n_tokens,
+            )
+        });
 
         let mut encoder = self.new_encoder("orangu-server fused prefill FFN encoder");
         {
@@ -14207,18 +16936,40 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             self.record_matmul(&mut pass, gate, &gate_g);
             self.record_matmul(&mut pass, up, &up_g);
 
-            pass.set_pipeline(&self.gelu_mul_pipeline);
+            pass.set_pipeline(self.ffn_activation_pipeline(activation));
             pass.set_bind_group(0, &bg_gelu_mul, &[]);
             pass.dispatch_workgroups(self.strided_workgroups(elems), 1, 1);
 
+            if let Some((pipeline, bg, workgroups)) = &rotation {
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, bg, &[]);
+                pass.dispatch_workgroups(*workgroups, 1, 1);
+            }
+
             self.record_matmul(&mut pass, down, &down_g);
         }
-        Some(self.submit_and_readback(
+        let t3 = std::time::Instant::now();
+        let (out, split) = self.submit_and_readback_split(
             encoder,
             &down_g.output_buffer,
             down_g.output_offset,
             n_tokens * n_embd,
-        ))
+        );
+        if trace {
+            eprintln!(
+                "ffn trace: pre {:.2} ms, entries {:.2} ms, upload {:.2} ms, record {:.2} ms, readback alloc {:.2} submit {:.2} wait {:.2} copy {:.2} ms, total {:.2} ms",
+                (t0 - t_enter).as_secs_f64() * 1e3,
+                (t1 - t0).as_secs_f64() * 1e3,
+                (t2 - t1).as_secs_f64() * 1e3,
+                (t3 - t2).as_secs_f64() * 1e3,
+                split.alloc_ms,
+                split.submit_ms,
+                split.wait_ms,
+                split.copy_ms,
+                t_enter.elapsed().as_secs_f64() * 1e3,
+            );
+        }
+        Some(out)
     }
 
     /// Multi-query attention for a prefill layer: every query token in the
@@ -17325,6 +20076,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         wq_g: &CachedOpResources,
         wk_g: Option<&CachedOpResources>,
         wv_g: Option<&CachedOpResources>,
+        gate_g: Option<&CachedOpResources>,
     ) -> FusedAttnLayerResources {
         let half = input.rope_dim / 2;
         let ff_owned;
@@ -17563,7 +20315,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 _ => (None, None, None, None),
             };
 
-        let producer_q8: [Option<wgpu::BindGroup>; 3] = match input.normed_q8 {
+        let producer_q8: [Option<wgpu::BindGroup>; 4] = match input.normed_q8 {
             Some((q8, len)) if self.decode_mmvq => {
                 let bg = |w: &QuantMatrix, g: &CachedOpResources| {
                     (g.mmvq.is_some() && self.mmvq_pipeline_for(w, 1).is_some())
@@ -17578,9 +20330,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         .and_then(|p| p.wv)
                         .zip(wv_g)
                         .and_then(|(w, g)| bg(w, g)),
+                    input.attn_gate.zip(gate_g).and_then(|(w, g)| bg(w, g)),
                 ]
             }
-            _ => [None, None, None],
+            _ => [None, None, None, None],
         };
         FusedAttnLayerResources {
             producer_q8,
@@ -17607,6 +20360,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         wq_g: &CachedOpResources,
         wk_g: Option<&CachedOpResources>,
         wv_g: Option<&CachedOpResources>,
+        gate_g: Option<&CachedOpResources>,
     ) -> Arc<FusedAttnLayerResources> {
         let (waddr, wlen) = input.wq.cache_key();
         let key: FusedAttnLayerCacheKey = (
@@ -17618,6 +20372,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             input.kv.is_some(),
             input.kv.as_ref().is_some_and(|p| p.wv.is_some()),
             input.batch_slot,
+            input.normed_q8.is_some(),
         );
         {
             let cache = self
@@ -17628,7 +20383,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 return entry.clone();
             }
         }
-        let resources = Arc::new(self.build_fused_attn_layer_resources(input, wq_g, wk_g, wv_g));
+        let resources =
+            Arc::new(self.build_fused_attn_layer_resources(input, wq_g, wk_g, wv_g, gate_g));
         let mut cache = self
             .fused_attn_layer_cache
             .lock()
@@ -18228,8 +20984,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             GpuInput::Cpu(_) => None,
         };
 
-        let layer =
-            self.fused_attn_layer_entry_for(&input, &wq_g, wk_g.as_deref(), wv_g.as_deref());
+        // The attention gate's projection reads the same `normed`, through
+        // the norm's q8 where it has an integer-dot kernel and the norm wrote
+        // one, else through its own copied input — it has no share of the
+        // layer's shared q8 or the shared-input bind groups, which are built
+        // for Q/K/V alone.
+        let gate_entry = input
+            .attn_gate
+            .map(|w| self.op_entry_for(w, input.batch_slot));
+        let gate_g = gate_entry
+            .as_ref()
+            .map(|e| e.lock().expect("op cache entry poisoned"));
+
+        let layer = self.fused_attn_layer_entry_for(
+            &input,
+            &wq_g,
+            wk_g.as_deref(),
+            wv_g.as_deref(),
+            gate_g.as_deref(),
+        );
 
         // Copy `normed` into a projection's own input buffer only when that
         // projection has no shared way to read it: neither an f32 shared-input
@@ -18289,17 +21062,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             );
         }
 
-        // The attention gate's projection reads the same `normed`, through
-        // its own copied input — it has no share of the layer's q8 or the
-        // shared-input bind groups, which are built for Q/K/V alone.
-        let gate_entry = input
-            .attn_gate
-            .map(|w| self.op_entry_for(w, input.batch_slot));
-        let gate_g = gate_entry
-            .as_ref()
-            .map(|e| e.lock().expect("op cache entry poisoned"));
         if let Some(g) = &gate_g
             && !input.projections_ready
+            && !(input.normed_q8.is_some() && layer.producer_q8[3].is_some())
         {
             self.upload_or_copy(
                 cursor.encoder(),
@@ -18827,7 +21592,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
                 self.op_stamp(pass, "attn.wq");
                 if let (Some(w), Some(g)) = (attn_gate, &gate_g) {
-                    self.record_matmul(pass, w, g);
+                    match producer(3) {
+                        Some(bg) => self.record_mmvq_matmul_shared(pass, w, g, bg),
+                        None => self.record_matmul(pass, w, g),
+                    }
                     self.op_stamp(pass, "attn.gate");
                 }
                 if let (Some(proj), Some(wk_guard)) = (&kv, &wk_g) {
@@ -21783,8 +24551,9 @@ struct FusedAttnLayerResources {
     /// The Q/K/V projections' integer-dot bind groups over the attention
     /// norm's own q8 output (`FusedAttnInput::normed_q8`), one per
     /// projection with an i8 kernel — the producer-quantized twin of
-    /// `shared_q8`, which needs no quantize dispatch.
-    producer_q8: [Option<wgpu::BindGroup>; 3],
+    /// `shared_q8`, which needs no quantize dispatch. The fourth is the
+    /// attention gate's, where the layer has one.
+    producer_q8: [Option<wgpu::BindGroup>; 4],
     /// Q-norm and Q-RoPE, fused into one `fused_norm_rope_pipeline`
     /// dispatch — always safe, unlike K's own (see [`KNormRope`]'s own
     /// doc comment): nothing ever needs to read Q's post-norm-but-pre-

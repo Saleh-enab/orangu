@@ -1374,6 +1374,28 @@ pub(crate) fn swiglu_ffn_limited_into(
     down_w: &crate::engine::loader::QuantMatrix,
     limit: SwigluLimit,
 ) {
+    let h = swiglu_gate_up_limited_into(backend, scratch, normed, n_tokens, gate_w, up_w, limit);
+    backend.matmul_into(out, h, n_tokens, down_w);
+}
+
+/// The first half of [`swiglu_ffn_limited_into`] — the batched gate/up
+/// dispatch and the gated product — returning the `[n_tokens, n_ff]`
+/// intermediate the down projection reads, in `scratch`'s own buffer.
+///
+/// Split out for the one caller that has to touch that intermediate before
+/// projecting it down: `qwen_hybrid::DenseFfn` on a Hadamard-folded file
+/// rotates it into `ffn_down`'s basis first. Every other caller goes
+/// through [`swiglu_ffn_limited_into`], which is this plus the projection.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn swiglu_gate_up_limited_into<'s>(
+    backend: &dyn crate::engine::backend::Backend,
+    scratch: &'s mut FfnScratch,
+    normed: &[f32],
+    n_tokens: usize,
+    gate_w: &crate::engine::loader::QuantMatrix,
+    up_w: &crate::engine::loader::QuantMatrix,
+    limit: SwigluLimit,
+) -> &'s mut Vec<f32> {
     use crate::engine::backend::MatmulOp;
     backend.matmul_batch_into(
         &mut scratch.gate_up,
@@ -1395,7 +1417,7 @@ pub(crate) fn swiglu_ffn_limited_into(
     let (gate, up) = scratch.gate_up.split_at_mut(1);
     let gate = &mut gate[0];
     limit.apply_inplace(gate, &up[0]);
-    backend.matmul_into(out, gate, n_tokens, down_w);
+    gate
 }
 
 /// One MoE layer's weights, for [`swiglu_moe_ffn`].
@@ -1490,6 +1512,24 @@ impl SwigluLimit {
     /// caller's scratch.
     fn apply_inplace(self, gate: &mut [f32], up: &[f32]) {
         debug_assert_eq!(gate.len(), up.len());
+        // Fanned out across the pool at prefill widths. Measured on the 27B
+        // `PTQ1_0` at 8 threads: a 64-token prefill's `exp`s are worth it
+        // (ttft 8.2 → 7.5 s), while a decode row of `n_ff` (17,408) is not
+        // — a fork-join per layer for 50 µs of work cost decode 1.88 →
+        // 1.78 tok/s. The threshold is a few tokens' worth of `n_ff`.
+        const PAR_MIN: usize = 65536;
+        const CHUNK: usize = 4096;
+        if gate.len() >= PAR_MIN {
+            use rayon::prelude::*;
+            gate.par_chunks_mut(CHUNK)
+                .zip(up.par_chunks(CHUNK))
+                .for_each(|(g, u)| self.apply_inplace_serial(g, u));
+        } else {
+            self.apply_inplace_serial(gate, up);
+        }
+    }
+
+    fn apply_inplace_serial(self, gate: &mut [f32], up: &[f32]) {
         match self {
             Self::None => {
                 for g in gate.iter_mut() {

@@ -2066,6 +2066,8 @@ gemma 4 checkpoint."
                                     &layer.ffn_gate,
                                     &layer.ffn_up,
                                     &layer.ffn_down,
+                                    crate::engine::backend::vulkan::FfnActivation::Geglu,
+                                    None,
                                 )
                             })
                     };

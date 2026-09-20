@@ -2877,8 +2877,9 @@ impl KvCache {
             push_u32(&mut out, r.num_heads() as u32);
             push_u32(&mut out, r.head_dim as u32);
             push_u32(&mut out, r.state_dim as u32);
-            push_f32s(&mut out, &r.conv_history);
-            push_f32s(&mut out, &r.delta_state);
+            let snapshot = r.host_snapshot();
+            push_f32s(&mut out, &snapshot.conv);
+            push_f32s(&mut out, &snapshot.state);
         }
         // A trailing section rather than a new format version, so a blob
         // written before this field existed still restores: see
@@ -3082,10 +3083,65 @@ impl RecurrentSpec {
     }
 }
 
+/// A device's own copy of a recurrent layer's state matrices, kept by the
+/// backend that steps them there so a token's delta rule neither uploads
+/// nor reads back the state — only the layer's output comes home. The
+/// cache owns the handle and tracks which copy is current
+/// ([`RecurrentLayerState::fresh`]); the backend implements the readback
+/// and recognises its own mirror through `as_any`.
+pub trait DeviceStateMirror: Send + Sync {
+    /// Copies the device's state matrices into `state` (the whole
+    /// `delta_state`) and its conv history into `conv` (the whole
+    /// `conv_history`), blocking until they are there.
+    fn download(&self, state: &mut [f32], conv: &mut [f32]);
+    /// The concrete mirror, for the backend that made it.
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// Which copy of a mirrored state is current — see
+/// [`RecurrentLayerState::device_step`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fresh {
+    /// Host and device agree (or there is no device copy).
+    Both,
+    /// The host wrote last; the device copy, if any, must be uploaded
+    /// before the next device step.
+    Host,
+    /// The device stepped last; the host copy is stale until downloaded.
+    Device,
+}
+
+/// What a backend's device step gets: the host state (to upload when the
+/// host wrote last), the mirror slot to fill on first use, and the
+/// freshness to set to [`Fresh::Device`] once the step is recorded.
+pub struct DeviceStateAccess<'a> {
+    pub host: &'a mut [f32],
+    /// The conv1d rolling history, `[conv_channels, d_conv - 1]` — stepped
+    /// on the device beside the state when the conv runs there.
+    pub conv: &'a mut [f32],
+    pub mirror: &'a mut Option<Box<dyn DeviceStateMirror>>,
+    pub fresh: &'a mut Fresh,
+}
+
+/// The host's view of a mirrored state — [`RecurrentLayerState::
+/// host_snapshot`]: borrowed when the host copy is current, downloaded
+/// when the device's is.
+pub struct HostSnapshot<'a> {
+    pub state: std::borrow::Cow<'a, [f32]>,
+    pub conv: std::borrow::Cow<'a, [f32]>,
+}
+
 /// One recurrent (SSM / gated-delta-net) layer's persistent state: a
 /// causal-conv1d rolling history and a per-head state matrix. Unlike
 /// [`LayerCache`], there's no per-position history to index — linear
 /// attention/SSM layers carry a single evolving state forward.
+///
+/// The state matrices may also live on a device ([`DeviceStateMirror`]):
+/// every host access goes through [`Self::delta_state_mut`],
+/// [`Self::delta_states_mut`] or [`Self::host_snapshot`], which bring the
+/// device's copy home first when it is the current one, and the device
+/// step ([`Self::device_step`]) uploads the host's when that is. The
+/// invariant is one authoritative copy at a time, named by `fresh`.
 pub struct RecurrentLayerState {
     /// `[conv_channels, d_conv - 1]`, channel-major, oldest-first per
     /// channel — the causal conv1d's rolling window of prior inputs.
@@ -3100,6 +3156,12 @@ pub struct RecurrentLayerState {
     /// a delta-net layer, `ssm.state_size` for a selective-SSM one. See
     /// [`RecurrentSpec`].
     state_dim: usize,
+    /// The device's copy of `delta_state`, once a backend has stepped this
+    /// state there. Never duplicated or serialized: a copy of the cache is
+    /// host-only and starts without one.
+    mirror: Option<Box<dyn DeviceStateMirror>>,
+    /// Which of the two copies is current.
+    fresh: Fresh,
 }
 
 impl RecurrentLayerState {
@@ -3111,6 +3173,8 @@ impl RecurrentLayerState {
             delta_state: vec![0.0; spec.num_heads * spec.head_dim * spec.state_dim],
             head_dim: spec.head_dim,
             state_dim: spec.state_dim,
+            mirror: None,
+            fresh: Fresh::Both,
         }
     }
 
@@ -3131,6 +3195,8 @@ impl RecurrentLayerState {
             delta_state,
             head_dim,
             state_dim,
+            mirror: None,
+            fresh: Fresh::Both,
         }
     }
 
@@ -3149,12 +3215,60 @@ impl RecurrentLayerState {
     /// so this is a plain clone, used by [`KvCache::duplicate`].
     fn duplicate(&self) -> Self {
         Self {
-            conv_history: self.conv_history.clone(),
+            conv_history: self.host_snapshot().conv.into_owned(),
             conv_channels: self.conv_channels,
             d_conv: self.d_conv,
-            delta_state: self.delta_state.clone(),
+            delta_state: self.host_snapshot().state.into_owned(),
             head_dim: self.head_dim,
             state_dim: self.state_dim,
+            mirror: None,
+            fresh: Fresh::Both,
+        }
+    }
+
+    /// The current state matrices as the host sees them: borrowed when the
+    /// host copy is current, downloaded into a fresh vector when the device
+    /// stepped last. For readers that hold the state by shared reference
+    /// (a snapshot, a serialization); a writer uses the `_mut` accessors.
+    pub fn host_snapshot(&self) -> HostSnapshot<'_> {
+        use std::borrow::Cow;
+        match (&self.mirror, self.fresh) {
+            (Some(mirror), Fresh::Device) => {
+                let mut state = vec![0.0; self.delta_state.len()];
+                let mut conv = vec![0.0; self.conv_history.len()];
+                mirror.download(&mut state, &mut conv);
+                HostSnapshot {
+                    state: Cow::Owned(state),
+                    conv: Cow::Owned(conv),
+                }
+            }
+            _ => HostSnapshot {
+                state: Cow::Borrowed(&self.delta_state),
+                conv: Cow::Borrowed(&self.conv_history),
+            },
+        }
+    }
+
+    /// Brings the device's copy home when it is the current one, so the
+    /// host copy can be read or written in place.
+    fn ensure_host(&mut self) {
+        if let (Some(mirror), Fresh::Device) = (&self.mirror, self.fresh) {
+            mirror.download(&mut self.delta_state, &mut self.conv_history);
+            self.fresh = Fresh::Both;
+        }
+    }
+
+    /// The state for a backend about to step it on its device — see
+    /// [`DeviceStateAccess`]. The backend uploads `host` when `fresh` is not
+    /// [`Fresh::Device`] (or the mirror is not its own), records its step
+    /// against the mirror, and sets `fresh` to [`Fresh::Device`]; a mirror
+    /// left in place by another backend is simply replaced.
+    pub fn device_step(&mut self) -> DeviceStateAccess<'_> {
+        DeviceStateAccess {
+            host: &mut self.delta_state,
+            conv: &mut self.conv_history,
+            mirror: &mut self.mirror,
+            fresh: &mut self.fresh,
         }
     }
 
@@ -3167,8 +3281,11 @@ impl RecurrentLayerState {
         debug_assert_eq!(self.d_conv, src.d_conv);
         debug_assert_eq!(self.head_dim, src.head_dim);
         debug_assert_eq!(self.state_dim, src.state_dim);
-        self.conv_history.copy_from_slice(&src.conv_history);
-        self.delta_state.copy_from_slice(&src.delta_state);
+        let src = src.host_snapshot();
+        self.conv_history.copy_from_slice(&src.conv);
+        self.delta_state.copy_from_slice(&src.state);
+        // The host wrote; a device copy of ours is stale until re-uploaded.
+        self.fresh = Fresh::Host;
     }
 
     /// One timestep of causal depthwise conv1d: convolves `input`
@@ -3179,6 +3296,8 @@ impl RecurrentLayerState {
     /// token, then slides the window forward. Returns the convolved output
     /// (`[conv_channels]`); the caller applies SiLU itself.
     pub fn conv_step(&mut self, input: &[f32], kernel: &[f32]) -> Vec<f32> {
+        self.ensure_host();
+        self.fresh = Fresh::Host;
         debug_assert_eq!(input.len(), self.conv_channels);
         debug_assert_eq!(kernel.len(), self.conv_channels * self.d_conv);
         let hist_w = self.d_conv - 1;
@@ -3208,6 +3327,8 @@ impl RecurrentLayerState {
     /// fastest-varying, mutable — the recurrence updates it in place every
     /// token).
     pub fn delta_state_mut(&mut self, head: usize) -> &mut [f32] {
+        self.ensure_host();
+        self.fresh = Fresh::Host;
         let size = self.head_dim * self.state_dim;
         let start = head * size;
         &mut self.delta_state[start..start + size]
@@ -3221,6 +3342,8 @@ impl RecurrentLayerState {
     /// independent, so their update is a fan-out, and a fan-out needs every
     /// head's slice disjoint and alive at once rather than one at a time.
     pub fn delta_states_mut(&mut self) -> (&mut [f32], usize) {
+        self.ensure_host();
+        self.fresh = Fresh::Host;
         let size = self.head_dim * self.state_dim;
         (&mut self.delta_state, size)
     }
@@ -4616,6 +4739,76 @@ mod tests {
         // 5*1 + 7*10 + 9*100 = 975.
         let out = state.conv_step(&[9.0], &kernel);
         assert_eq!(out, vec![975.0]);
+    }
+
+    /// The one-authoritative-copy protocol around a device mirror: a step
+    /// on the device leaves the host stale until an accessor downloads;
+    /// a host write leaves the device stale; a snapshot downloads without
+    /// claiming the host copy is current; a duplicate is host-only.
+    #[test]
+    fn a_device_mirror_is_downloaded_before_any_host_access_and_never_copied() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Fake {
+            value: f32,
+            downloads: std::sync::Arc<AtomicUsize>,
+        }
+        impl super::DeviceStateMirror for Fake {
+            fn download(&self, state: &mut [f32], conv: &mut [f32]) {
+                state.fill(self.value);
+                conv.fill(-self.value);
+                self.downloads.fetch_add(1, Ordering::Relaxed);
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let downloads = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut state = RecurrentLayerState::new(RecurrentSpec::delta_net(1, 2, 2, 2));
+        // A backend's step: installs its mirror, claims the device copy.
+        {
+            let access = state.device_step();
+            assert_eq!(*access.fresh, super::Fresh::Both);
+            *access.mirror = Some(Box::new(Fake {
+                value: 7.0,
+                downloads: downloads.clone(),
+            }));
+            *access.fresh = super::Fresh::Device;
+        }
+        // A snapshot reads the device without touching the host copy.
+        let snapshot = state.host_snapshot();
+        assert!(snapshot.state.iter().all(|&v| v == 7.0));
+        assert!(snapshot.conv.iter().all(|&v| v == -7.0));
+        drop(snapshot);
+        assert_eq!(downloads.load(Ordering::Relaxed), 1);
+        assert_eq!(state.fresh, super::Fresh::Device);
+        // A host writer gets the downloaded copy and owns it from then on.
+        state.delta_state_mut(0)[0] = 1.0;
+        assert_eq!(downloads.load(Ordering::Relaxed), 2);
+        assert_eq!(state.fresh, super::Fresh::Host);
+        assert_eq!(state.host_snapshot().state[0], 1.0);
+        assert!(state.host_snapshot().conv.iter().all(|&v| v == -7.0));
+        assert_eq!(downloads.load(Ordering::Relaxed), 2);
+        // The conv step is a host write too.
+        *state.device_step().fresh = super::Fresh::Device;
+        state.conv_step(&[0.0], &[0.0, 0.0]);
+        assert_eq!(downloads.load(Ordering::Relaxed), 3);
+        assert_eq!(state.fresh, super::Fresh::Host);
+        assert_eq!(state.delta_state[0], 7.0);
+        // The next step sees the host copy current and must upload.
+        assert_eq!(*state.device_step().fresh, super::Fresh::Host);
+        // A duplicate is a host-only copy of the current state.
+        *state.device_step().fresh = super::Fresh::Device;
+        let dup = state.duplicate();
+        assert!(dup.mirror.is_none());
+        assert_eq!(dup.fresh, super::Fresh::Both);
+        assert!(dup.delta_state.iter().all(|&v| v == 7.0));
+        assert!(dup.conv_history.iter().all(|&v| v == -7.0));
+        // A copy from another state is a host write.
+        let mut other = RecurrentLayerState::new(RecurrentSpec::delta_net(1, 2, 2, 2));
+        other.copy_from(&state);
+        assert_eq!(other.fresh, super::Fresh::Host);
+        assert!(other.delta_state.iter().all(|&v| v == 7.0));
+        assert!(other.conv_history.iter().all(|&v| v == -7.0));
     }
 
     #[test]

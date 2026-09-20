@@ -492,3 +492,39 @@ pub(super) fn norm_pair_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGr
         ],
     })
 }
+
+/// Bind group layout for `add_rmsnorm_wide_pipeline` — the pre-norm pair
+/// `x_out = x + residual; y = rmsnorm(x_out) · weight` in one dispatch:
+/// `x`, `weight`, `residual` read-only, `x_out` and `y` read-write,
+/// `meta` uniform. See `shader_source_add_rmsnorm_wide`.
+pub(super) fn elem6_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let storage = |read_only: bool| wgpu::BindingType::Buffer {
+        ty: wgpu::BufferBindingType::Storage { read_only },
+        has_dynamic_offset: false,
+        min_binding_size: None,
+    };
+    let entry = |binding: u32, ty: wgpu::BindingType| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty,
+        count: None,
+    };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("orangu-server elem6 bind group layout"),
+        entries: &[
+            entry(0, storage(true)),
+            entry(1, storage(true)),
+            entry(2, storage(true)),
+            entry(3, storage(false)),
+            entry(4, storage(false)),
+            entry(
+                5,
+                wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+            ),
+        ],
+    })
+}

@@ -121,6 +121,28 @@ impl CpuBackend {
             // write straight into the caller's buffer, no transpose and no
             // allocation at all.
             out.resize(out_dim, 0.0);
+            // Two rows per task where the type has a two-row kernel — the
+            // Prism ternary types, whose decode is instruction-bound and
+            // shares its activation loads between the pair.
+            if vecdot::supports_k_row_pair(ggml_type, in_dim) {
+                out.par_chunks_mut(2)
+                    .with_min_len(super::matmul_min_rows().div_ceil(2))
+                    .enumerate()
+                    .for_each(|(pair, dst)| {
+                        let o0 = 2 * pair;
+                        let row = |o: usize| &raw[o * row_bytes..(o + 1) * row_bytes];
+                        if dst.len() == 2 {
+                            let (y0, y1) =
+                                vecdot::dot_k_row_pair(ggml_type, row(o0), row(o0 + 1), &act);
+                            dst[0] = y0;
+                            dst[1] = y1;
+                        } else {
+                            // `out_dim` is odd — the last row alone.
+                            dst[0] = vecdot::dot_k_row(ggml_type, row(o0), &act);
+                        }
+                    });
+                return true;
+            }
             // A floor on how small a task may get, not a chunk size — see
             // `backend::matmul_min_rows`. One row per task is a few hundred
             // nanoseconds of arithmetic inside a job the pool has to create,

@@ -199,6 +199,13 @@ impl Qwen4ExpMtpHead {
             target.config().n_vocab,
         );
 
+        // A draft head of a Hadamard-folded file would need the fold on its
+        // own projections too; none is wired here, so `finish` refuses one.
+        let hadamard = crate::engine::hadamard::from_loaded(loaded)?;
+        let mut fold = crate::engine::hadamard::FoldLedger::new(hadamard.as_ref());
+        let attn = FullAttn::load(&t, 0, &mut fold)?;
+        fold.finish()?;
+
         Ok(Self {
             dims,
             hc,
@@ -209,7 +216,7 @@ impl Qwen4ExpMtpHead {
             hc_attn: HcMixer::load(loaded, &format!("{prefix}.hc_attn"), true)?,
             hc_ffn: HcMixer::load(loaded, &format!("{prefix}.hc_ffn"), true)?,
             // The one attention layer this head has, so cache slot 0.
-            attn: FullAttn::load(&t, 0)?,
+            attn,
             ffn: MoeFfn::load(&t, n_expert_used)?,
             head: HcMixer::load(loaded, &format!("{prefix}.nextn.hc_head"), false)?,
             tok_embeddings,
