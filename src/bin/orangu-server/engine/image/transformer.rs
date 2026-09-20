@@ -845,23 +845,14 @@ pub(crate) fn joint_attention(
     head_dim: usize,
     scale: f32,
 ) -> Vec<f32> {
-    #[cfg(target_arch = "aarch64")]
-    {
-        joint_attention_blocked(q, k, v, n, n_head, head_dim, scale)
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        joint_attention_per_query(q, k, v, n, n_head, head_dim, scale)
-    }
+    joint_attention_blocked(q, k, v, n, n_head, head_dim, scale)
 }
 
 /// Queries per [`joint_attention_blocked`] task: six tiles of four, so a
 /// block's score rows (`24 × n` floats — 400 KiB at 1024 pixels) stay in
 /// L2 through the softmax and the value product.
-#[cfg(target_arch = "aarch64")]
 const ATTN_QUERIES: usize = 24;
 
-#[cfg(target_arch = "aarch64")]
 fn joint_attention_blocked(
     q: &[f32],
     k: &[f32],
@@ -987,18 +978,14 @@ fn joint_attention_blocked(
 
 /// A raw output pointer the attention tasks share — see
 /// [`joint_attention_blocked`]'s safety note.
-#[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
 struct SharedOut(*mut f32);
-#[cfg(target_arch = "aarch64")]
 unsafe impl Send for SharedOut {}
-#[cfg(target_arch = "aarch64")]
 unsafe impl Sync for SharedOut {}
 
 /// The direct form: one query row per task, a dot per key and an `axpy`
-/// per value. Kept as the reference the blocked kernel is tested against,
-/// and as the path on architectures without the tiled `f32` GEMM.
-#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+/// per value. Kept as the reference the blocked kernel is tested against.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn joint_attention_per_query(
     q: &[f32],
     k: &[f32],
@@ -1174,7 +1161,6 @@ mod tests {
     /// The blocked kernel is the per-query form reordered: at a size with
     /// several query blocks, a short last block, and more than one head,
     /// every output agrees to `f32` rounding.
-    #[cfg(target_arch = "aarch64")]
     #[test]
     fn blocked_attention_matches_the_per_query_form() {
         let n = 2 * ATTN_QUERIES + 7;

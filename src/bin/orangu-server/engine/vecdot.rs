@@ -2609,9 +2609,6 @@ pub const MM_TILE: usize = 8;
 ///
 /// A separate type rather than a flag on [`ActQ8K`], so the kernels that
 /// read the other layout cannot be handed this one by mistake.
-// Off `aarch64` the activations are built but never read: the kernel that
-// reads them is `i8mm`, and [`have_i8mm`] keeps the callers away from it.
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub struct ActQ8Mm {
     n_tokens: usize,
     n_block: usize,
@@ -2794,7 +2791,6 @@ fn quantize_8(src: &[f32], inv: f32, dst: &mut [i8; 8]) -> i32 {
 /// exact and identical, the `f32` steps are the same operations in the same
 /// order per (row, token), and `Q4_K`'s min correction is applied first as
 /// there. Only the register shape differs.
-#[cfg(target_arch = "aarch64")]
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn dot_k_rows(w: &[&KRow], a: &ActQ8Mm, out: &mut [&mut [f32]]) {
     dot_k_rows_tiles(w, a, 0..a.n_tile, out)
@@ -2828,16 +2824,94 @@ pub fn dot_k_rows_tiles(
     }
 }
 
-/// Never reached off `aarch64`: [`have_i8mm`] is `false` there and every
-/// caller gates on it. Present so the callers compile on one code path.
+/// [`dot_k_rows_tiles`] off `aarch64`: the same product over the same
+/// [`ActQ8Mm`] layout in plain integer arithmetic — [`dot_k_rows_portable`].
+/// The callers prefer the pair kernels where [`have_i8mm`] is false (their
+/// `AVX2`/`VNNI` forms are the tuned path there), so this is the complete
+/// definition rather than the fast one.
 #[cfg(not(target_arch = "aarch64"))]
 pub fn dot_k_rows_tiles(
-    _w: &[&KRow],
-    _a: &ActQ8Mm,
-    _tiles: std::ops::Range<usize>,
-    _out: &mut [&mut [f32]],
+    w: &[&KRow],
+    a: &ActQ8Mm,
+    tiles: std::ops::Range<usize>,
+    out: &mut [&mut [f32]],
 ) {
-    unreachable!("dot_k_rows_tiles needs i8mm; have_i8mm() gates its callers")
+    dot_k_rows_portable(w, a, tiles, out)
+}
+
+/// The `i8mm` tile product in portable Rust: every row of `w` against
+/// every token of the tiles, `i32` sums per scale group folded by the
+/// group's integer scale, then `acc += ad * (d * isum)` per super-block —
+/// the pair kernel's expression, operation for operation, so the result is
+/// bit-identical to [`dot_k_pair`]'s and to `smmla`'s (the test on an
+/// `i8mm` machine asserts equality). Written once for every architecture:
+/// what a machine without `i8mm` runs when handed this layout, and what
+/// the `smmla` kernel is checked against.
+// On `aarch64` the check is its only caller.
+#[cfg_attr(all(target_arch = "aarch64", not(test)), allow(dead_code))]
+pub fn dot_k_rows_portable(
+    rows: &[&KRow],
+    a: &ActQ8Mm,
+    tiles: std::ops::Range<usize>,
+    out: &mut [&mut [f32]],
+) {
+    debug_assert!(!rows.is_empty());
+    debug_assert_eq!(rows.len(), out.len());
+    debug_assert!(rows.iter().all(|r| r.kind == rows[0].kind));
+    debug_assert!(out.iter().all(|o| o.len() == a.n_tokens));
+    debug_assert!(tiles.end <= a.n_tile);
+    let kind = rows[0].kind;
+    let mins = kind == KKind::Q4K;
+    // A scale group is 32 elements, or 16 for `Q6_K`.
+    let group = if kind == KKind::Q6K { 16 } else { 32 };
+    for tl in tiles {
+        let qtile = &a.q[tl * a.n_block * MM_TILE * 32..][..a.n_block * MM_TILE * 32];
+        let dtile = &a.d[tl * a.n_super * MM_TILE..][..a.n_super * MM_TILE];
+        let btile = &a.bsum[tl * a.n_super * MM_TILE * SUBS..][..a.n_super * MM_TILE * SUBS];
+        for k in 0..MM_TILE {
+            let t = tl * MM_TILE + k;
+            if t >= a.n_tokens {
+                break;
+            }
+            let (tp, half) = (k / 2, k % 2);
+            // Token `k`'s 32 bytes of block `b`, in element order, out of
+            // the pair-interleaved tile.
+            let token_block = |b: usize, e: usize| -> i32 {
+                let c = e / 8;
+                qtile[b * MM_TILE * 32 + ((tp * 4 + c) * 2 + half) * 8 + e % 8] as i32
+            };
+            for (row, o) in rows.iter().zip(out.iter_mut()) {
+                let mut acc = 0f32;
+                if mins {
+                    for s in 0..a.n_super {
+                        let ad = dtile[s * MM_TILE + k];
+                        let mut i = 0i32;
+                        for j in 0..SUBS {
+                            i += row.mins[s * SUBS + j] as i32
+                                * btile[(s * MM_TILE + k) * SUBS + j] as i32;
+                        }
+                        acc -= ad * row.dmin[s] * i as f32;
+                    }
+                }
+                for s in 0..a.n_super {
+                    let mut isum = 0i32;
+                    for j in 0..SUBS {
+                        let b = s * SUBS + j;
+                        let wq = &row.q[b * 32..b * 32 + 32];
+                        for g in 0..(32 / group) {
+                            let dot: i32 = (g * group..(g + 1) * group)
+                                .map(|e| wq[e] as i32 * token_block(b, e))
+                                .sum();
+                            isum += row.sc[b * (32 / group) + g] as i32 * dot;
+                        }
+                    }
+                    let ad = dtile[s * MM_TILE + k];
+                    acc += ad * (row.d[s] * isum as f32);
+                }
+                o[t] = acc;
+            }
+        }
+    }
 }
 
 /// The number of [`MM_TILE`]-token tiles `a` holds — for a caller splitting
@@ -3665,7 +3739,6 @@ fn dot_float<const KIND: u8>(row: &[u8], x: &[f32]) -> f32 {
 
 /// Widens one float row (`F32`/`F16`/`BF16` bytes) to `f32`, for
 /// [`gemm_f32_rows`]'s tile — done once per row per task, not per token.
-#[cfg(target_arch = "aarch64")]
 pub fn widen_float_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut Vec<f32>) {
     out.clear();
     out.reserve(in_dim);
@@ -3678,13 +3751,14 @@ pub fn widen_float_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut Vec<
 }
 
 /// Rows per [`gemm_f32_rows`] tile.
-#[cfg(target_arch = "aarch64")]
 pub const F32_ROWS: usize = 4;
 /// Tokens per [`gemm_f32_rows`] tile: 4 × 6 accumulators plus four weight
 /// vectors and one activation vector is 29 of the 32 NEON registers — the
 /// largest tile that does not spill. (4 × 8 needs 37 and spilled every
-/// accumulator: 79 vector stores per 32 multiply-adds.)
-#[cfg(target_arch = "aarch64")]
+/// accumulator: 79 vector stores per 32 multiply-adds.) The portable tile
+/// keeps the same shape: 24 eight-lane accumulators is within `AVX2`'s
+/// sixteen registers only with spills, but the tile's shape is what the
+/// callers' splits are sized to, and the same shape keeps them one code.
 const F32_TOKENS: usize = 6;
 
 /// Four `f32` rows against every token — the prefill kernel for the float
@@ -3706,7 +3780,6 @@ const F32_TOKENS: usize = 6;
 /// The `f32` result differs from [`dot_row_f32`]'s only in summation order
 /// (four interleaved partial sums against eight), which is `f32` rounding
 /// noise — the same seeded picture came out byte-identical through both.
-#[cfg(target_arch = "aarch64")]
 pub fn gemm_f32_rows(w: [&[f32]; F32_ROWS], x: &[f32], in_dim: usize, out: [&mut [f32]; F32_ROWS]) {
     let n_tokens = out[0].len();
     debug_assert!(w.iter().all(|r| r.len() >= in_dim));
@@ -3718,7 +3791,10 @@ pub fn gemm_f32_rows(w: [&[f32]; F32_ROWS], x: &[f32], in_dim: usize, out: [&mut
         // Safety: the tile reads `in_dim` floats from each of the four rows
         // and from tokens `t0..t0 + F32_TOKENS`, all inside the slices
         // checked above.
+        #[cfg(target_arch = "aarch64")]
         let tile = unsafe { f32_tile(&w, x.as_ptr().add(t0 * in_dim), in_dim) };
+        #[cfg(not(target_arch = "aarch64"))]
+        let tile = f32_tile_portable(&w, &x[t0 * in_dim..], in_dim);
         for (r, row) in tile.iter().enumerate() {
             out[r][t0..t0 + F32_TOKENS].copy_from_slice(row);
         }
@@ -3780,6 +3856,53 @@ unsafe fn f32_tile(
     }
 }
 
+/// The portable 4 × [`F32_TOKENS`] tile: the same 24 accumulators as
+/// [`f32_tile`], each eight lanes wide as plain arrays, which LLVM keeps in
+/// vector registers where the target has them (`AVX2` is the `x86_64`
+/// build's baseline). Every loop bound is a constant for the same reason as
+/// the NEON tile's.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+#[allow(clippy::needless_range_loop)]
+#[inline(always)]
+fn f32_tile_portable(
+    w: &[&[f32]; F32_ROWS],
+    x: &[f32],
+    in_dim: usize,
+) -> [[f32; F32_TOKENS]; F32_ROWS] {
+    const LANES: usize = 8;
+    let k8 = in_dim / LANES * LANES;
+    let mut acc = [[[0f32; LANES]; F32_TOKENS]; F32_ROWS];
+    let mut k = 0;
+    while k < k8 {
+        let wv: [&[f32]; F32_ROWS] = [
+            &w[0][k..k + LANES],
+            &w[1][k..k + LANES],
+            &w[2][k..k + LANES],
+            &w[3][k..k + LANES],
+        ];
+        for t in 0..F32_TOKENS {
+            let xv = &x[t * in_dim + k..t * in_dim + k + LANES];
+            for r in 0..F32_ROWS {
+                for l in 0..LANES {
+                    acc[r][t][l] += wv[r][l] * xv[l];
+                }
+            }
+        }
+        k += LANES;
+    }
+    let mut out = [[0f32; F32_TOKENS]; F32_ROWS];
+    for t in 0..F32_TOKENS {
+        for r in 0..F32_ROWS {
+            let mut sum = acc[r][t].iter().sum::<f32>();
+            for kk in k8..in_dim {
+                sum += w[r][kk] * x[t * in_dim + kk];
+            }
+            out[r][t] = sum;
+        }
+    }
+    out
+}
+
 /// `sum_i w[i] * x[i]` over two `f32` slices of equal length, four lanes at
 /// a time — the short-tile tail of [`gemm_f32_rows`].
 #[cfg(target_arch = "aarch64")]
@@ -3803,6 +3926,26 @@ pub fn dot_f32_slices(w: &[f32], x: &[f32]) -> f32 {
     };
     for kk in k4..w.len() {
         sum += w[kk] * x[kk];
+    }
+    sum
+}
+
+/// [`dot_f32_slices`] off `aarch64`: eight independent lane sums, which
+/// LLVM vectorizes where the target can.
+#[cfg(not(target_arch = "aarch64"))]
+pub fn dot_f32_slices(w: &[f32], x: &[f32]) -> f32 {
+    debug_assert_eq!(w.len(), x.len());
+    let mut acc = [0f32; 8];
+    let (wc, wr) = w.as_chunks::<8>();
+    let (xc, xr) = x.as_chunks::<8>();
+    for (wv, xv) in wc.iter().zip(xc) {
+        for l in 0..8 {
+            acc[l] += wv[l] * xv[l];
+        }
+    }
+    let mut sum = acc.iter().sum::<f32>();
+    for (a, b) in wr.iter().zip(xr) {
+        sum += a * b;
     }
     sum
 }
@@ -5899,7 +6042,6 @@ mod tests {
     /// `in_dim` that is not a multiple of four (a scalar tail), a token
     /// count that is not a multiple of eight (a short last tile), and rows
     /// stored as `F16` and `BF16` as well as `F32`.
-    #[cfg(target_arch = "aarch64")]
     #[test]
     fn tiled_float_gemm_matches_the_per_token_dot() {
         for (ggml_type, stride) in [
@@ -5956,6 +6098,25 @@ mod tests {
                     assert!(
                         (have - want).abs() <= 1e-4 * want.abs().max(1.0),
                         "type {ggml_type} row {o} token {t}: {have} vs {want}"
+                    );
+                }
+            }
+            // The portable tile — what `gemm_f32_rows` runs off `aarch64` —
+            // is the same product in another summation order: checked on
+            // every architecture, against the same per-token dot.
+            let wr: [&[f32]; F32_ROWS] = [&rows[0], &rows[1], &rows[2], &rows[3]];
+            let tile = f32_tile_portable(&wr, &x, in_dim);
+            for o in 0..F32_ROWS {
+                for t in 0..F32_TOKENS {
+                    let want = dot_row_f32(
+                        ggml_type,
+                        &raw[o * row_bytes..(o + 1) * row_bytes],
+                        &x[t * in_dim..(t + 1) * in_dim],
+                    );
+                    assert!(
+                        (tile[o][t] - want).abs() <= 1e-4 * want.abs().max(1.0),
+                        "portable tile, type {ggml_type} row {o} token {t}: {} vs {want}",
+                        tile[o][t]
                     );
                 }
             }
@@ -6034,13 +6195,14 @@ mod tests {
     /// the same order per lane. So it must agree **to the bit** — on every
     /// kind, with a trailing tile of padded tokens, and against rows that
     /// carry negative scales (`IQ4_XS`/`Q6_K`) and a min pass (`Q4_K`).
-    /// Skipped, not failed, on a core without `i8mm`.
-    #[cfg(target_arch = "aarch64")]
+    /// The portable form of the same tile product (`dot_k_rows_portable`,
+    /// what `dot_k_rows_tiles` is off `aarch64`) is held to the same bit —
+    /// on every architecture; the `smmla` form where the core has `i8mm`.
     #[test]
     fn i8mm_quad_kernel_is_bit_identical_to_the_pair_kernel() {
-        if !have_i8mm() {
-            eprintln!("no i8mm on this core; skipped");
-            return;
+        let smmla = have_i8mm();
+        if !smmla {
+            eprintln!("no i8mm on this core; the portable form alone is checked");
         }
         for ggml_type in [GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS] {
             for (in_dim, n_tokens) in [(256usize, 7usize), (2048, 4), (1024, 13)] {
@@ -6062,19 +6224,33 @@ mod tests {
                     let (e0, e1) = dst.split_at_mut(n_tokens);
                     dot_k_pair(&rows[pair * 2], &rows[pair * 2 + 1], &acts, e0, e1);
                 }
-                let mut got = vec![0f32; out_dim * n_tokens];
+                let mm = ActQ8Mm::quantize(&x, in_dim, n_tokens);
+                let refs: Vec<&KRow> = rows.iter().collect();
+                let mut portable = vec![0f32; out_dim * n_tokens];
                 {
-                    let mm = ActQ8Mm::quantize(&x, in_dim, n_tokens);
-                    let refs: Vec<&KRow> = rows.iter().collect();
-                    let mut outs: Vec<&mut [f32]> = got.chunks_mut(n_tokens).collect();
-                    dot_k_rows(&refs, &mm, &mut outs);
+                    let mut outs: Vec<&mut [f32]> = portable.chunks_mut(n_tokens).collect();
+                    dot_k_rows_portable(&refs, &mm, 0..mm.n_tiles(), &mut outs);
                 }
                 assert!(
-                    got.iter()
+                    portable
+                        .iter()
                         .zip(&expect)
                         .all(|(g, e)| g.to_bits() == e.to_bits()),
-                    "type {ggml_type} in_dim {in_dim} tokens {n_tokens}: quad {got:?} != pair {expect:?}"
+                    "type {ggml_type} in_dim {in_dim} tokens {n_tokens}: portable {portable:?} != pair {expect:?}"
                 );
+                if smmla {
+                    let mut got = vec![0f32; out_dim * n_tokens];
+                    {
+                        let mut outs: Vec<&mut [f32]> = got.chunks_mut(n_tokens).collect();
+                        dot_k_rows(&refs, &mm, &mut outs);
+                    }
+                    assert!(
+                        got.iter()
+                            .zip(&expect)
+                            .all(|(g, e)| g.to_bits() == e.to_bits()),
+                        "type {ggml_type} in_dim {in_dim} tokens {n_tokens}: quad {got:?} != pair {expect:?}"
+                    );
+                }
                 // And not trivially: the rows produce something.
                 assert!(expect.iter().any(|v| *v != 0.0));
             }

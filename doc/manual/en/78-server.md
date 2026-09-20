@@ -1249,6 +1249,21 @@ tokens). `ORANGU_EXPERT_I8MM=0` turns it off for an A/B on one binary;
 of 4–64 on that core: more rows reuse each activation tile from L1 across
 more `smmla` tiles, until the unpacked rows crowd it out).
 
+**Every one of these kernels exists on every architecture.** The
+`smmla` tile product has a portable twin (`vecdot::dot_k_rows_portable`,
+the same arithmetic in `i32` and `f32` scalars, bit-identical to the pair
+kernel and to `smmla`, which the same test asserts on every machine), and
+it is what `dot_k_rows_tiles` is off `aarch64` — a complete definition,
+not a stub, though the callers there prefer the pair kernels' `AVX2`/`VNNI`
+forms through `have_i8mm`. The float prefill GEMM (`gemm_f32_rows`,
+`dot_f32_slices`, `widen_float_row`), its two-dimensional split in
+`CpuBackend::matmul_float_into`, and the blocked joint attention of the
+picture transformer (`joint_attention_blocked`) are architecture-
+independent, with a NEON tile on `aarch64` and a portable eight-lane
+tile elsewhere (`f32_tile_portable`, plain arrays LLVM vectorizes under
+the `x86_64` build's `AVX2` baseline); the tests that check them against
+the per-token dot and the per-query attention run everywhere.
+
 **The serial half of a prefill matmul.** After the kernel above, a
 per-thread profile of the 12-thread microbenchmark showed every worker
 busy about half the wall time: the phases that run on one thread while

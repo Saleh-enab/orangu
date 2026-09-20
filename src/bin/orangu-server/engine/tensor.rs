@@ -828,9 +828,6 @@ pub fn softmax_inplace(x: &mut [f32]) {
 /// probability; the scalar [`softmax_inplace`] above keeps `libm`'s `exp`
 /// for the sampler and the language models' attention, whose references
 /// are bit-exact.
-// Its only non-test caller is the blocked image attention, which exists
-// on `aarch64` alone.
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub fn exp_inplace(x: &mut [f32]) {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: NEON is baseline on aarch64; the loop reads and writes only

@@ -51,12 +51,10 @@ pub struct CpuBackend;
 /// The most tokens one `matmul_float_into` task takes: 258 pixels of a VAE
 /// `im2col` band is under a megabyte of activations, read once per row
 /// group. A multiple of the kernel's six-token tile.
-#[cfg(target_arch = "aarch64")]
 const F32_TOKEN_BLOCK: usize = 258;
 /// Rows per `matmul_float_into` task: eight quads, whose widened weights
 /// (32 × `in_dim` floats — 430 KiB at 3×3×384) fit L2 beside the token
 /// block.
-#[cfg(target_arch = "aarch64")]
 const F32_ROW_GROUP: usize = 32;
 
 /// A raw output pointer rayon tasks may share. Sound only under the
@@ -493,7 +491,6 @@ impl CpuBackend {
         // while it sits in L1, and the group's widened weights stay in L2.
         // Each task's outputs are a rectangle of the token-major result no
         // other task touches, written straight in — nothing to transpose.
-        #[cfg(target_arch = "aarch64")]
         if n_tokens > 1 {
             let quad = vecdot::F32_ROWS;
             // `F32` weights are read in place — an `im2col` convolution's
@@ -1118,7 +1115,6 @@ mod tests {
     /// the row quad or the row group, an `in_dim` that is not a multiple of
     /// four, token counts that leave a short last tile and a short last
     /// block, and rows stored as `F32`, `F16` and `BF16`.
-    #[cfg(target_arch = "aarch64")]
     #[test]
     fn float_prefill_matches_the_dequantize_reference_at_awkward_shapes() {
         use crate::engine::quant::{GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32};
