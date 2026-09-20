@@ -44,6 +44,7 @@ pub mod npu_ffn;
 pub mod npu_ort;
 pub mod os;
 pub mod profiling;
+pub mod quantize;
 
 pub mod session;
 pub mod shell;

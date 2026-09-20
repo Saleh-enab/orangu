@@ -92,7 +92,8 @@ impl SamplingParams {
             crate::config::Role::All
             | crate::config::Role::Code
             | crate::config::Role::Review
-            | crate::config::Role::Embedding => Self::default(),
+            | crate::config::Role::Embedding
+            | crate::config::Role::Image => Self::default(),
         }
     }
 }

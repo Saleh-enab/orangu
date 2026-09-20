@@ -71,6 +71,14 @@ pub const INHERIT_FDS_VAR: &str = "ORANGU_INHERIT_FDS";
 /// bounds the retry to one.
 pub const FALLBACK_MODEL_VAR: &str = "ORANGU_FALLBACK_MODEL";
 
+/// The role the fallback model is served in, beside [`FALLBACK_MODEL_VAR`]
+/// — the role of the image that set it, which is the role that model was
+/// working in. Needed because the role is the model's own for a picture
+/// generator (`Role::fixed_by_model`): the flag the failed image was
+/// started with was chosen for the model that failed, and may be exactly
+/// the one the fallback refuses.
+pub const FALLBACK_ROLE_VAR: &str = "ORANGU_FALLBACK_ROLE";
+
 /// Whether this build can hand over at all. `false` on non-Unix, where the
 /// model manager's Load button is disabled for the same reason
 /// `[orangu-server].reexec = no` disables it.
@@ -92,9 +100,10 @@ pub struct InheritedFds {
 
 static INHERITED: OnceLock<InheritedFds> = OnceLock::new();
 static FALLBACK: OnceLock<Option<String>> = OnceLock::new();
+static FALLBACK_ROLE: OnceLock<Option<Role>> = OnceLock::new();
 
-/// Reads [`INHERIT_FDS_VAR`] and [`FALLBACK_MODEL_VAR`] and removes both
-/// from the environment.
+/// Reads [`INHERIT_FDS_VAR`], [`FALLBACK_MODEL_VAR`] and
+/// [`FALLBACK_ROLE_VAR`] and removes all three from the environment.
 ///
 /// **Must be called from the very top of `main`,** on the only thread that
 /// exists yet and before anything else could read the environment — the same
@@ -113,12 +122,17 @@ pub unsafe fn take_inherited() {
     let fallback = std::env::var(FALLBACK_MODEL_VAR)
         .ok()
         .filter(|value| !value.is_empty());
+    let fallback_role = std::env::var(FALLBACK_ROLE_VAR)
+        .ok()
+        .and_then(|value| Role::parse(&value).ok());
     unsafe {
         std::env::remove_var(INHERIT_FDS_VAR);
         std::env::remove_var(FALLBACK_MODEL_VAR);
+        std::env::remove_var(FALLBACK_ROLE_VAR);
     }
     let _ = INHERITED.set(fds);
     let _ = FALLBACK.set(fallback);
+    let _ = FALLBACK_ROLE.set(fallback_role);
 }
 
 pub fn inherited() -> InheritedFds {
@@ -130,6 +144,28 @@ pub fn inherited() -> InheritedFds {
 /// the fallback attempt".
 pub fn fallback_model() -> Option<&'static str> {
     FALLBACK.get().and_then(|f| f.as_deref())
+}
+
+/// The role [`fallback_model`] was serving in, when a handover said.
+pub fn fallback_role() -> Option<Role> {
+    FALLBACK_ROLE.get().copied().flatten()
+}
+
+/// The role a handover starts `path` in: the model's own when it has one
+/// (a `qwen_image` file is always `image`), and otherwise this process's —
+/// unless that is itself a model's own role, which a language model cannot
+/// take, in which case the default. Nobody is at a prompt to ask during a
+/// handover, so the answer has to be derivable.
+pub fn role_for_model(current: Role, path: &Path) -> Role {
+    let required = orangu::gguf::GgufFile::open_summary(path)
+        .ok()
+        .and_then(|gguf| orangu::model_spec::architecture_of(&gguf))
+        .and_then(|architecture| Role::required_by(Some(&architecture)));
+    match required {
+        Some(role) => role,
+        None if current.fixed_by_model() => Role::default(),
+        None => current,
+    }
 }
 
 fn parse_inherit_fds(value: &str) -> InheritedFds {
@@ -204,7 +240,9 @@ pub struct Handover {
     listen: Listen,
     /// `--workspace`, always passed, always absolute.
     workspace: PathBuf,
-    /// `--all`/`--code`/`--review`/`--explorer`/`--embedding`.
+    /// `--all`/`--code`/`--review`/`--explorer`/`--embedding`/`--image`:
+    /// the role this process is in, which is the fallback's role and the
+    /// starting point of [`role_for_model`] for the next one.
     role: Role,
     /// The model this process is serving — what the new image falls back to
     /// if it cannot load the one it is being given.
@@ -251,8 +289,14 @@ impl Handover {
         &self.current_model
     }
 
+    /// The role this process is serving in.
+    pub fn role(&self) -> Role {
+        self.role
+    }
+
+    /// The command line the new image gets: `model`, served in `role`.
     #[cfg_attr(not(unix), allow(dead_code))]
-    fn argv(&self, model: &str) -> Vec<OsString> {
+    fn argv(&self, model: &str, role: Role) -> Vec<OsString> {
         let mut argv: Vec<OsString> = vec![model.into()];
         if let Some(config) = &self.config {
             argv.push("--config".into());
@@ -272,7 +316,7 @@ impl Handover {
         }
         argv.push("--workspace".into());
         argv.push((&self.workspace).into());
-        argv.push(role_flag(self.role).into());
+        argv.push(role_flag(role).into());
         // Deliberately not `--daemon`: this process has already detached, and
         // the exec inherits that. Passing it again would fork a *second*
         // time, orphaning the pid a supervisor is watching.
@@ -291,14 +335,15 @@ impl Handover {
         (!parts.is_empty()).then(|| parts.join(","))
     }
 
-    /// Replaces this process with one serving `model`. Returns only on
-    /// failure — on success there is no "after" to return to.
+    /// Replaces this process with one serving `model` in `role` (see
+    /// [`role_for_model`]). Returns only on failure — on success there is
+    /// no "after" to return to.
     ///
     /// `fallback` is the spec the new image should try if it cannot load
-    /// `model`; `None` on a fallback attempt itself, which is what stops the
-    /// retry from looping.
+    /// `model`, in this process's own role; `None` on a fallback attempt
+    /// itself, which is what stops the retry from looping.
     #[cfg(unix)]
-    pub fn exec(&self, model: &str, fallback: Option<&str>) -> anyhow::Error {
+    pub fn exec(&self, model: &str, role: Role, fallback: Option<&str>) -> anyhow::Error {
         use std::os::unix::process::CommandExt;
 
         // Rust opens every socket with `SOCK_CLOEXEC`, so without this the
@@ -316,14 +361,18 @@ impl Handover {
         }
 
         let mut command = std::process::Command::new(&self.exe);
-        command.args(self.argv(model));
+        command.args(self.argv(model, role));
         match self.inherit_value() {
             Some(value) => command.env(INHERIT_FDS_VAR, value),
             None => command.env_remove(INHERIT_FDS_VAR),
         };
         match fallback {
-            Some(fallback) => command.env(FALLBACK_MODEL_VAR, fallback),
-            None => command.env_remove(FALLBACK_MODEL_VAR),
+            Some(fallback) => command
+                .env(FALLBACK_MODEL_VAR, fallback)
+                .env(FALLBACK_ROLE_VAR, self.role.label()),
+            None => command
+                .env_remove(FALLBACK_MODEL_VAR)
+                .env_remove(FALLBACK_ROLE_VAR),
         };
 
         // `exec` replaces this image; anything it returns is the reason it
@@ -336,7 +385,7 @@ impl Handover {
     }
 
     #[cfg(not(unix))]
-    pub fn exec(&self, model: &str, _fallback: Option<&str>) -> anyhow::Error {
+    pub fn exec(&self, model: &str, _role: Role, _fallback: Option<&str>) -> anyhow::Error {
         // Names both the target and this binary, which is also what keeps
         // `exe` from reading as dead on a platform whose `exec` is a stub.
         anyhow!(
@@ -354,6 +403,7 @@ fn role_flag(role: Role) -> &'static str {
         Role::Review => "--review",
         Role::Explorer => "--explorer",
         Role::Embedding => "--embedding",
+        Role::Image => "--image",
     }
 }
 
@@ -430,7 +480,7 @@ mod tests {
         };
 
         let argv: Vec<String> = handover
-            .argv("user/new:Q4_K_M")
+            .argv("user/new:Q4_K_M", handover.role)
             .into_iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
@@ -474,7 +524,7 @@ mod tests {
         };
 
         let argv: Vec<String> = handover
-            .argv("user/new")
+            .argv("user/new", handover.role)
             .into_iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
@@ -488,5 +538,38 @@ mod tests {
         assert!(!argv.iter().any(|arg| arg == "--web"), "{argv:?}");
         // Web UI disabled — only the API descriptor travels.
         assert_eq!(handover.inherit_value().as_deref(), Some("api:3"));
+    }
+
+    /// The flag on the new image's command line is the role the *next*
+    /// model is served in, not this one's: a handover onto a picture
+    /// generator says `--image` whatever this process is, and one off it
+    /// falls back to `--all`, since a language model cannot take `--image`
+    /// and nobody is at a prompt to choose.
+    #[test]
+    fn a_handover_takes_the_role_the_next_model_needs() {
+        let handover = Handover {
+            exe: PathBuf::from("/usr/bin/orangu-server"),
+            config: None,
+            listen: Listen::default(),
+            workspace: PathBuf::from("/srv"),
+            role: Role::Code,
+            current_model: "user/old".to_string(),
+            fds: InheritedFds::default(),
+        };
+        let argv: Vec<String> = handover
+            .argv("user/pictures", Role::Image)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(argv.last().map(String::as_str), Some("--image"));
+
+        // A file that is not a GGUF at all names no architecture, so it is
+        // treated as a language model: the current role stays, unless the
+        // current role is the picture generator's own.
+        let not_a_model = std::env::temp_dir().join("orangu-reexec-not-a-model.gguf");
+        std::fs::write(&not_a_model, b"nothing").unwrap();
+        assert_eq!(role_for_model(Role::Code, &not_a_model), Role::Code);
+        assert_eq!(role_for_model(Role::Image, &not_a_model), Role::All);
+        let _ = std::fs::remove_file(&not_a_model);
     }
 }

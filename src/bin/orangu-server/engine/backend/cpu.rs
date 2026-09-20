@@ -48,6 +48,26 @@ use super::{Backend, MatmulOp, guarded_matmul_op_into};
 #[derive(Default)]
 pub struct CpuBackend;
 
+/// The most tokens one `matmul_float_into` task takes: 258 pixels of a VAE
+/// `im2col` band is under a megabyte of activations, read once per row
+/// group. A multiple of the kernel's six-token tile.
+#[cfg(target_arch = "aarch64")]
+const F32_TOKEN_BLOCK: usize = 258;
+/// Rows per `matmul_float_into` task: eight quads, whose widened weights
+/// (32 × `in_dim` floats — 430 KiB at 3×3×384) fit L2 beside the token
+/// block.
+#[cfg(target_arch = "aarch64")]
+const F32_ROW_GROUP: usize = 32;
+
+/// A raw output pointer rayon tasks may share. Sound only under the
+/// discipline `matmul_k_gemm_into`'s `i8mm` path keeps: every task writes a
+/// column range no other task touches, inside the loop the pointer was
+/// taken for.
+#[derive(Clone, Copy)]
+struct SharedOut(*mut f32);
+unsafe impl Send for SharedOut {}
+unsafe impl Sync for SharedOut {}
+
 impl CpuBackend {
     /// The fused path: quantize each token's activations to `int8` **once**,
     /// then dot them against the still-quantized weight rows. Returns `None`
@@ -194,6 +214,13 @@ impl CpuBackend {
         in_dim: usize,
         out_dim: usize,
     ) {
+        if vecdot::have_i8mm() {
+            let acts = vecdot::ActQ8Mm::quantize(x, in_dim, n_tokens);
+            Self::matmul_k_mm_into(
+                out, &acts, n_tokens, ggml_type, raw, row_bytes, in_dim, out_dim,
+            );
+            return;
+        }
         let acts = vecdot::ActQ8K::quantize(x, in_dim, n_tokens);
         let mut yt = vec![0f32; out_dim * n_tokens];
         yt.par_chunks_mut(n_tokens * 2).enumerate().for_each_init(
@@ -214,6 +241,101 @@ impl CpuBackend {
         );
 
         Self::finish_into(out, yt, n_tokens, out_dim);
+    }
+
+    /// The K-quant prefill GEMM on the `i8mm` kernel for activations
+    /// already quantized — the entry a caller with its own `ActQ8Mm` uses
+    /// (the VAE gathers its convolution windows straight into one).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn matmul_k_mm_into(
+        out: &mut Vec<f32>,
+        acts: &vecdot::ActQ8Mm,
+        n_tokens: usize,
+        ggml_type: u32,
+        raw: &[u8],
+        row_bytes: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) {
+        {
+            // `k_rows_per_task` rows per task for the `smmla` kernel
+            // (`vecdot::dot_k_rows_tiles`), unpacked once each, over a block
+            // of token tiles — two dimensions, so a matmul of few rows
+            // against many tokens (a VAE convolution: 96 rows, 65,536
+            // pixels) is not six tasks on twelve cores. A short trailing
+            // row group is padded up to a whole quad with the last row
+            // repeated, its extra outputs going to scratch — the kernel's
+            // arithmetic is the pair kernel's to the bit, so nothing else
+            // changes.
+            //
+            // Each task accumulates its rows transposed in a small private
+            // buffer (16 rows x n_tokens: L1-resident at prefill sizes) and
+            // then writes them straight into `out`'s token-major layout —
+            // for every token, its 16 rows are one contiguous 64-byte run,
+            // one cache line. That is the whole transpose, done in parallel
+            // and for free, where `finish_into`'s serial strided pass over
+            // a 3 MiB `yt` was a quarter of a 256-token matmul's wall time.
+            out.resize(n_tokens * out_dim, 0.0);
+            let per_task = vecdot::k_rows_per_task();
+            let quad = vecdot::ROW_QUAD;
+            let n_groups = out_dim.div_ceil(per_task);
+            let n_tiles = acts.n_tiles();
+            // Token blocks only when the rows alone cannot occupy the pool:
+            // the transformer's 3072-row linears are 192 groups already,
+            // and every block re-reads the group's unpacked rows.
+            let wanted = 4 * rayon::current_num_threads();
+            let n_blocks = if n_groups >= wanted {
+                1
+            } else {
+                wanted.div_ceil(n_groups).min(n_tiles).max(1)
+            };
+            let tiles_per_block = n_tiles.div_ceil(n_blocks).max(1);
+            let n_blocks = n_tiles.div_ceil(tiles_per_block);
+            let sink = SharedOut(out.as_mut_ptr());
+            (0..n_groups * n_blocks).into_par_iter().for_each_init(
+                || {
+                    (
+                        (0..per_task)
+                            .map(|_| vecdot::KRow::new())
+                            .collect::<Vec<_>>(),
+                        vec![0f32; n_tokens * per_task],
+                        vec![0f32; n_tokens * (quad - 1)],
+                    )
+                },
+                move |(rows, yt, scratch), task| {
+                    let sink = sink;
+                    let (g, b) = (task / n_blocks, task % n_blocks);
+                    let o0 = g * per_task;
+                    let n_rows = per_task.min(out_dim - o0);
+                    let row = |o: usize| &raw[o * row_bytes..(o + 1) * row_bytes];
+                    for (i, slot) in rows.iter_mut().enumerate().take(n_rows) {
+                        vecdot::unpack_k_row(ggml_type, row(o0 + i), in_dim, slot);
+                    }
+                    let padded = n_rows.div_ceil(quad) * quad;
+                    let refs: Vec<&vecdot::KRow> =
+                        (0..padded).map(|i| &rows[i.min(n_rows - 1)]).collect();
+                    let mut outs: Vec<&mut [f32]> =
+                        yt[..n_tokens * n_rows].chunks_mut(n_tokens).collect();
+                    outs.extend(scratch.chunks_mut(n_tokens).take(padded - n_rows));
+                    let tiles = b * tiles_per_block..((b + 1) * tiles_per_block).min(n_tiles);
+                    let t0 = tiles.start * vecdot::MM_TILE;
+                    let t1 = (tiles.end * vecdot::MM_TILE).min(n_tokens);
+                    vecdot::dot_k_rows_tiles(&refs, acts, tiles, &mut outs);
+                    // Safety: task `task` alone writes columns
+                    // `o0..o0 + n_rows` of token rows `t0..t1` of a buffer
+                    // sized `n_tokens * out_dim` above; the rectangles of
+                    // different tasks are disjoint, and the pointer outlives
+                    // the parallel loop it is used in.
+                    for t in t0..t1 {
+                        for r in 0..n_rows {
+                            unsafe {
+                                *sink.0.add(t * out_dim + o0 + r) = yt[r * n_tokens + t];
+                            }
+                        }
+                    }
+                },
+            );
+        }
     }
 
     /// The `Q8_0`/`Q5_0`/`IQ4_NL` prefill GEMM, over [`vecdot::ActQ8Flat`].
@@ -358,6 +480,121 @@ impl CpuBackend {
         }
         let raw = w.raw_bytes();
         let row_bytes = w.row_bytes();
+
+        // Prefill-sized: the tiled kernel (`vecdot::gemm_f32_rows`) over a
+        // two-dimensional split — blocks of tokens × groups of rows — sized
+        // so there are a few tasks per worker whatever the shape. A VAE
+        // decode has both kinds: 96 rows against tens of thousands of
+        // pixels at full resolution (split by rows alone, every task
+        // streamed the whole activation band from memory for its four
+        // rows), and 384 rows of 3×3×384 against a thousand latents at the
+        // bottom (split by tokens alone, four tasks on twelve cores). Within
+        // a task the token tile is applied to every quad of its row group
+        // while it sits in L1, and the group's widened weights stay in L2.
+        // Each task's outputs are a rectangle of the token-major result no
+        // other task touches, written straight in — nothing to transpose.
+        #[cfg(target_arch = "aarch64")]
+        if n_tokens > 1 {
+            let quad = vecdot::F32_ROWS;
+            // `F32` weights are read in place — an `im2col` convolution's
+            // weights already are `f32`, and copying 5 MiB of them per band
+            // was most of a bad version of this path. The half-width types
+            // are widened once per call, rows in parallel.
+            let widened: Vec<f32>;
+            // Safety: `f32` has no invalid bit patterns, so any aligned
+            // four bytes are one; `align_to` reports the unaligned ends,
+            // and only a fully aligned run is taken.
+            let rows: &[f32] = match unsafe { raw.align_to::<f32>() } {
+                ([], floats, []) if ggml_type == crate::engine::quant::GGML_TYPE_F32 => floats,
+                _ => {
+                    let mut all = vec![0f32; out_dim * in_dim];
+                    all.par_chunks_mut(in_dim).enumerate().for_each(|(o, row)| {
+                        let mut tmp = Vec::new();
+                        vecdot::widen_float_row(
+                            ggml_type,
+                            &raw[o * row_bytes..(o + 1) * row_bytes],
+                            in_dim,
+                            &mut tmp,
+                        );
+                        row.copy_from_slice(&tmp);
+                    });
+                    widened = all;
+                    &widened
+                }
+            };
+            let row = |o: usize| &rows[o * in_dim..(o + 1) * in_dim];
+            out.resize(n_tokens * out_dim, 0.0);
+            let wanted = 4 * rayon::current_num_threads();
+            // Rows per task: 32 unless the shape cannot make enough tasks
+            // of them — a rank-64 LoRA's down projection has 64 rows and a
+            // thousand tokens, which at 32 rows is two groups and, with the
+            // token block floored at six, too few tasks to keep twelve
+            // workers busy (measured: 2.7× one core on twelve). Halving
+            // the group until there are `wanted` tasks fixes the tail.
+            let max_blocks = n_tokens.div_ceil(6).max(1);
+            let group = [F32_ROW_GROUP, 16, 8, 4]
+                .into_iter()
+                .find(|g| out_dim.div_ceil(*g) * max_blocks.min(wanted) >= wanted)
+                .unwrap_or(4);
+            let n_groups = out_dim.div_ceil(group);
+            let blocks_wanted = wanted.div_ceil(n_groups).max(1);
+            let block = n_tokens
+                .div_ceil(blocks_wanted)
+                .div_ceil(6)
+                .saturating_mul(6)
+                .clamp(6, F32_TOKEN_BLOCK);
+            let n_blocks = n_tokens.div_ceil(block);
+            let sink = SharedOut(out.as_mut_ptr());
+            (0..n_blocks * n_groups).into_par_iter().for_each_init(
+                || vec![0f32; block * quad],
+                move |yt, task| {
+                    let sink = sink;
+                    let (b, g) = (task / n_groups, task % n_groups);
+                    let t0 = b * block;
+                    let nt = block.min(n_tokens - t0);
+                    let xs = &x[t0 * in_dim..(t0 + nt) * in_dim];
+                    let g0 = g * group;
+                    let g1 = (g0 + group).min(out_dim);
+                    let mut o0 = g0;
+                    while o0 + quad <= g1 {
+                        let (y0, rest) = yt.split_at_mut(nt);
+                        let (y1, rest) = rest.split_at_mut(nt);
+                        let (y2, rest) = rest.split_at_mut(nt);
+                        let (y3, _) = rest.split_at_mut(nt);
+                        vecdot::gemm_f32_rows(
+                            [row(o0), row(o0 + 1), row(o0 + 2), row(o0 + 3)],
+                            xs,
+                            in_dim,
+                            [y0, y1, y2, y3],
+                        );
+                        // Safety: this task alone writes rows `o0..o0 + 4` of
+                        // tokens `t0..t0 + nt` in a buffer sized above; every
+                        // other task's rectangle is disjoint.
+                        for t in 0..nt {
+                            for r in 0..quad {
+                                unsafe {
+                                    *sink.0.add((t0 + t) * out_dim + o0 + r) = yt[r * nt + t];
+                                }
+                            }
+                        }
+                        o0 += quad;
+                    }
+                    // A group whose end is not a multiple of four: the last
+                    // rows one at a time.
+                    for o in o0..g1 {
+                        for t in 0..nt {
+                            let v =
+                                vecdot::dot_f32_slices(row(o), &xs[t * in_dim..(t + 1) * in_dim]);
+                            // Safety: as above.
+                            unsafe {
+                                *sink.0.add((t0 + t) * out_dim + o) = v;
+                            }
+                        }
+                    }
+                },
+            );
+            return true;
+        }
 
         // Transposed accumulation, as `matmul_fused` does: the rayon split is
         // over output rows, each written exactly once, so no scatter and no
@@ -538,6 +775,10 @@ impl CpuBackend {
 }
 
 impl Backend for CpuBackend {
+    fn is_cpu(&self) -> bool {
+        true
+    }
+
     fn is_host(&self) -> bool {
         true
     }
@@ -809,6 +1050,150 @@ mod tests {
     /// One weight matrix of `ggml_type`. Float scale fields get bounded,
     /// non-degenerate values; every other field is read back as an integer,
     /// so arbitrary bits are fine there.
+    /// A timing loop for the K-quant prefill GEMM at a Qwen-Image linear's
+    /// shape, for tuning the kernel without a model or a server:
+    ///
+    /// ```text
+    /// ORANGU_EXPERT_K_ROWS=16 cargo test --profile release-with-debug \
+    ///     --bin orangu-server k_gemm_throughput -- --ignored --nocapture
+    /// ```
+    ///
+    /// Prints G MAC/s. Ignored because it takes seconds and proves nothing
+    /// about correctness — the bit-identity tests do that.
+    #[test]
+    #[ignore]
+    fn k_gemm_throughput() {
+        // `ORANGU_BENCH_SHAPE=in,out,tokens` picks another shape — e.g.
+        // `1024,96,65536`, a VAE convolution at full resolution; the type
+        // is `Q4_K`, or `Q6_K` with `ORANGU_BENCH_Q6K=1`.
+        let (in_dim, out_dim, n_tokens) = std::env::var("ORANGU_BENCH_SHAPE")
+            .ok()
+            .and_then(|v| {
+                let mut it = v.split(',').map(|p| p.trim().parse::<usize>().ok());
+                Some((it.next()??, it.next()??, it.next()??))
+            })
+            .unwrap_or((3072, 3072, 256));
+        let ggml_type = if std::env::var("ORANGU_BENCH_Q6K").is_ok_and(|v| v == "1") {
+            crate::engine::quant::GGML_TYPE_Q6_K
+        } else {
+            GGML_TYPE_Q4_K
+        };
+        let mut seed = 0x1234_5678_9ABC_DEF0u64;
+        let bytes = if ggml_type == GGML_TYPE_Q4_K {
+            weights(GGML_TYPE_Q4_K, in_dim, out_dim, &mut seed)
+        } else {
+            let values: Vec<f32> = (0..in_dim * out_dim)
+                .map(|i| ((i * 31 % 17) as f32 - 8.0) * 0.01)
+                .collect();
+            orangu::quantize::encode(ggml_type, &values, in_dim)
+        };
+        let w = test_quant_matrix(&bytes, ggml_type, in_dim, out_dim);
+        let x: Vec<f32> = (0..n_tokens * in_dim)
+            .map(|i| ((i % 29) as f32 - 14.0) * 0.037)
+            .collect();
+        let mut out = Vec::new();
+        // Warm the pool and the caches once.
+        CpuBackend.matmul_into(&mut out, &x, n_tokens, &w);
+        let reps = std::env::var("ORANGU_BENCH_REPS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(5);
+        let started = std::time::Instant::now();
+        for _ in 0..reps {
+            CpuBackend.matmul_into(&mut out, &x, n_tokens, &w);
+        }
+        let secs = started.elapsed().as_secs_f64() / reps as f64;
+        let gmac = (in_dim * out_dim * n_tokens) as f64 / secs / 1e9;
+        eprintln!(
+            "k_gemm {in_dim}x{out_dim} x {n_tokens} tokens: {:.1} ms, {gmac:.1} G MAC/s \
+             (i8mm {}, rows/task {})",
+            secs * 1e3,
+            vecdot::have_i8mm(),
+            vecdot::k_rows_per_task()
+        );
+    }
+
+    /// The tiled float path must agree with the dequantize reference at
+    /// every awkward shape at once: an `out_dim` that is not a multiple of
+    /// the row quad or the row group, an `in_dim` that is not a multiple of
+    /// four, token counts that leave a short last tile and a short last
+    /// block, and rows stored as `F32`, `F16` and `BF16`.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn float_prefill_matches_the_dequantize_reference_at_awkward_shapes() {
+        use crate::engine::quant::{GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32};
+        for (ggml_type, out_dim, in_dim) in [
+            (GGML_TYPE_F32, 11usize, 37usize),
+            (GGML_TYPE_F32, 35, 64),
+            (GGML_TYPE_F16, 9, 21),
+            (GGML_TYPE_BF16, 4, 8),
+        ] {
+            let value = |i: usize| ((i * 31 % 17) as f32 - 8.0) * 0.125;
+            let mut bytes = Vec::new();
+            for i in 0..out_dim * in_dim {
+                let v = value(i);
+                match ggml_type {
+                    GGML_TYPE_F32 => bytes.extend_from_slice(&v.to_le_bytes()),
+                    GGML_TYPE_F16 => bytes.extend_from_slice(&half::f16::from_f32(v).to_le_bytes()),
+                    _ => bytes.extend_from_slice(&half::bf16::from_f32(v).to_le_bytes()),
+                }
+            }
+            let w = test_quant_matrix(&bytes, ggml_type, in_dim, out_dim);
+            for n_tokens in [2usize, 5, 6, 7, 259, 1000] {
+                let x: Vec<f32> = (0..n_tokens * in_dim).map(|i| value(i + 3) * 0.5).collect();
+                let want = CpuBackend.matmul_dequant(&x, n_tokens, &w);
+                let got = CpuBackend.matmul(&x, n_tokens, &w);
+                assert_eq!(got.len(), want.len());
+                for (i, (g, e)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - e).abs() <= 1e-4 * e.abs().max(1.0),
+                        "type {ggml_type} {out_dim}x{in_dim} tokens {n_tokens} at {i}: {g} vs {e}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The float sibling of [`k_gemm_throughput`], at a Qwen-Image VAE
+    /// convolution's shape: 96 output channels, a 3×3×96 `im2col` row,
+    /// a band of 65,536 pixels.
+    #[test]
+    #[ignore]
+    fn f32_gemm_throughput() {
+        // `ORANGU_BENCH_SHAPE=in,out,tokens` picks another shape — e.g.
+        // `3072,64,1054` and `64,3072,1054`, a rank-64 LoRA's two products.
+        let (in_dim, out_dim, n_tokens) = std::env::var("ORANGU_BENCH_SHAPE")
+            .ok()
+            .and_then(|v| {
+                let mut it = v.split(',').map(|p| p.trim().parse::<usize>().ok());
+                Some((it.next()??, it.next()??, it.next()??))
+            })
+            .unwrap_or((864, 96, 65_536));
+        let bytes: Vec<u8> = (0..in_dim * out_dim)
+            .flat_map(|i| (((i * 31 % 17) as f32 - 8.0) * 0.01).to_le_bytes())
+            .collect();
+        let w = test_quant_matrix(&bytes, crate::engine::quant::GGML_TYPE_F32, in_dim, out_dim);
+        let x: Vec<f32> = (0..n_tokens * in_dim)
+            .map(|i| ((i % 29) as f32 - 14.0) * 0.037)
+            .collect();
+        let mut out = Vec::new();
+        CpuBackend.matmul_into(&mut out, &x, n_tokens, &w);
+        let reps = std::env::var("ORANGU_BENCH_REPS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(5);
+        let started = std::time::Instant::now();
+        for _ in 0..reps {
+            CpuBackend.matmul_into(&mut out, &x, n_tokens, &w);
+        }
+        let secs = started.elapsed().as_secs_f64() / reps as f64;
+        let gmac = (in_dim * out_dim * n_tokens) as f64 / secs / 1e9;
+        eprintln!(
+            "f32_gemm {in_dim}x{out_dim} x {n_tokens} tokens: {:.1} ms, {gmac:.1} G MAC/s",
+            secs * 1e3
+        );
+    }
+
     fn weights(ggml_type: u32, in_dim: usize, out_dim: usize, seed: &mut u64) -> Vec<u8> {
         let (block_bytes, block_elems) = block_layout(ggml_type);
         let mut bytes = Vec::new();

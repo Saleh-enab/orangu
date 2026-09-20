@@ -120,6 +120,157 @@ pub fn scan_models_dir(dir: &Path) -> Result<Vec<ModelSummary>> {
     Ok(summaries)
 }
 
+/// `general.architecture` of an opened header, when it has one.
+pub fn architecture_of(gguf: &GgufFile) -> Option<String> {
+    gguf.metadata.iter().find_map(|(k, v)| match v {
+        crate::gguf::GgufValue::String(s) if k == "general.architecture" => Some(s.clone()),
+        _ => None,
+    })
+}
+
+/// Whether `path` is the text encoder a `qwen_image` model needs — a
+/// `qwen2vl` GGUF of Qwen2.5-VL-7B's width (3584), which is what tells it
+/// apart from the 3B and 72B — judged from its header alone. Both
+/// `download` (to know whether to fetch one) and the server (to find the
+/// one to load) ask this, so it lives here between them.
+pub fn is_qwen_image_text_encoder(path: &Path) -> bool {
+    let Ok(gguf) = GgufFile::open_summary(path) else {
+        return false;
+    };
+    architecture_of(&gguf).as_deref() == Some("qwen2vl")
+        && gguf
+            .metadata
+            .iter()
+            .find(|(k, _)| k == "qwen2vl.embedding_length")
+            .and_then(|(_, v)| v.as_u64())
+            == Some(3584)
+}
+
+/// Every text encoder under `dir` (see [`is_qwen_image_text_encoder`]),
+/// largest file first — so a directory holding several quantizations
+/// offers the best one, and the choice is the same on every run.
+pub fn find_qwen_image_text_encoder(dir: &Path) -> Option<PathBuf> {
+    let mut candidates: Vec<(u64, PathBuf)> = walkdir::WalkDir::new(dir)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .map(walkdir::DirEntry::into_path)
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        })
+        .filter(|path| is_qwen_image_text_encoder(path))
+        .map(|path| (std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0), path))
+        .collect();
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    candidates.into_iter().next().map(|(_, path)| path)
+}
+
+/// Whether `path` is the Qwen-Image VAE: a `safetensors` whose header
+/// names the Wan decoder's output convolution (`decoder.head.2.weight`,
+/// `[3, 96, 3, 3, 3]`) and the post-quant convolution (`conv2.weight`).
+/// Judged from the header — the first few tens of kilobytes — never the
+/// file name, which a download can change and a copy can lose.
+pub fn is_qwen_image_vae(path: &Path) -> bool {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    use std::io::Read;
+    let mut len = [0u8; 8];
+    if file.read_exact(&mut len).is_err() {
+        return false;
+    }
+    let len = u64::from_le_bytes(len);
+    // A real header is under 100 KiB; anything larger is not this file.
+    if len == 0 || len > 4 << 20 {
+        return false;
+    }
+    let mut header = vec![0u8; len as usize];
+    if file.read_exact(&mut header).is_err() {
+        return false;
+    }
+    let Ok(header) = serde_json::from_slice::<serde_json::Value>(&header) else {
+        return false;
+    };
+    header
+        .get("decoder.head.2.weight")
+        .and_then(|t| t.get("shape"))
+        .and_then(|s| s.as_array())
+        .is_some_and(|shape| {
+            shape.iter().map(|v| v.as_u64()).collect::<Vec<_>>()
+                == [Some(3), Some(96), Some(3), Some(3), Some(3)]
+        })
+        && header.get("conv2.weight").is_some()
+}
+
+/// The first Qwen-Image VAE under `dir`, in path order.
+pub fn find_qwen_image_vae(dir: &Path) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = walkdir::WalkDir::new(dir)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .map(walkdir::DirEntry::into_path)
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"))
+        })
+        .filter(|path| is_qwen_image_vae(path))
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
+/// The step-distilled adapter under `dir` a `qwen_image` model is served
+/// with by default: a `safetensors` whose name says `Lightning` and a step
+/// count (`Qwen-Image-2512-Lightning-8steps-V1.0-bf16.safetensors`). With
+/// several — the 4- and the 8-step file side by side — the most steps
+/// wins: it is the better picture, and the one `download` fetches.
+pub fn find_qwen_image_lightning(dir: &Path) -> Option<PathBuf> {
+    let mut candidates: Vec<(usize, PathBuf)> = walkdir::WalkDir::new(dir)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .map(walkdir::DirEntry::into_path)
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"))
+        })
+        .filter_map(|path| {
+            let name = path.file_name()?.to_str()?;
+            name.contains("Lightning")
+                .then(|| lightning_steps(name))
+                .flatten()
+                .map(|steps| (steps, path.clone()))
+        })
+        .collect();
+    // Most steps first, then by path, so the choice is the same on every
+    // scan of the same directory.
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    candidates.into_iter().next().map(|(_, path)| path)
+}
+
+/// The step count a step-distilled adapter's name carries —
+/// `Qwen-Image-2512-Lightning-8steps-V1.0-bf16.safetensors` → 8, and the
+/// same from a path or a `<user>/<repo>:<file>` reference — or `None` for
+/// any other name. The server serves such an adapter at that many steps
+/// with guidance off unless the config says otherwise; `--init` offers the
+/// same.
+pub fn lightning_steps(spec: &str) -> Option<usize> {
+    let name = spec.rsplit(['/', ':', '\\']).next()?;
+    let (before, _) = name.split_once("steps")?;
+    let digits = before.trim_end_matches(|c: char| c.is_ascii_digit());
+    before[digits.len()..]
+        .parse()
+        .ok()
+        .filter(|steps| *steps > 0)
+}
+
 /// Whether `path` names a multi-token-prediction draft head, by the filename
 /// rule `download` selected it with — and the one the server attaches it by.
 fn is_mtp_head_path(path: &Path) -> bool {
@@ -1132,6 +1283,10 @@ pub struct ModelSupport {
     /// quantization it can't decode, and only the latter is fixed by
     /// downloading a different file of the same model.
     pub unsupported_quant: Option<String>,
+    /// Whether the architecture is a picture generator (`qwen_image`)
+    /// rather than a language model — the rows `orangu-server --image`
+    /// offers, and the ones every other role flag greys out.
+    pub image: bool,
 }
 
 impl ModelSupport {
@@ -1139,6 +1294,17 @@ impl ModelSupport {
     /// architecture *and* no unreadable tensor type.
     pub fn loadable(&self) -> bool {
         self.supported && self.unsupported_quant.is_none()
+    }
+
+    /// Whether a picker in `dim` mode offers this row — loadable, and of
+    /// the kind (picture or language model) that mode is choosing between.
+    pub fn selectable(&self, dim: Dimming) -> bool {
+        self.loadable()
+            && match dim {
+                Dimming::Off | Dimming::Unsupported | Dimming::UpToDate => true,
+                Dimming::ImageModels => self.image,
+                Dimming::TextModels => !self.image,
+            }
     }
 
     /// The `SUPPORTED` cell text, e.g. `Yes (llama)`, `No (glm4moe)`, or
@@ -1166,6 +1332,7 @@ mod support_cell_tests {
             architecture: Some(arch.to_string()),
             supported,
             unsupported_quant: quant.map(str::to_string),
+            image: arch == "qwen_image",
         }
     }
 
@@ -1182,6 +1349,25 @@ mod support_cell_tests {
             "No (llama, TQ1_0)"
         );
         assert_eq!(support("glm4moe", false, None).cell(), "No (glm4moe)");
+    }
+
+    /// A role picker offers a row only when it is both loadable and of the
+    /// kind the role serves: `--image` greys the language models, every
+    /// text role greys the picture generators, and the plain listing greys
+    /// nothing it can load.
+    #[test]
+    fn a_row_is_selectable_by_kind_under_the_role_dimming_modes() {
+        use super::Dimming;
+        let text = support("llama", true, None);
+        let image = support("qwen_image", true, None);
+        let broken = support("qwen_image", true, Some("TQ1_0"));
+        assert!(text.selectable(Dimming::Unsupported));
+        assert!(image.selectable(Dimming::Unsupported));
+        assert!(!text.selectable(Dimming::ImageModels));
+        assert!(image.selectable(Dimming::ImageModels));
+        assert!(text.selectable(Dimming::TextModels));
+        assert!(!image.selectable(Dimming::TextModels));
+        assert!(!broken.selectable(Dimming::ImageModels));
     }
 
     /// `loadable()` is what greys the row and gates the pickers, so it has
@@ -1219,6 +1405,16 @@ pub enum Dimming {
     /// `(Refresh)` - stand out. Needs a non-empty `latest_updates` map to
     /// have any effect.
     UpToDate,
+    /// `orangu-server --image`: grey every row that is not a loadable
+    /// picture generator ([`ModelSupport::image`]), so only the models that
+    /// role can serve stand out. Needs a non-empty `support` slice.
+    ImageModels,
+    /// `orangu-server --all`/`--code`/`--review`/`--explorer`/
+    /// `--embedding`: grey the picture generators along with the unloadable
+    /// rows — an image model is only ever served in the `image` role, so
+    /// under any other flag it is not on offer. Needs a non-empty `support`
+    /// slice.
+    TextModels,
 }
 
 /// The `list` table for every `.gguf` model found, with no Hugging Face
@@ -1417,7 +1613,9 @@ pub fn format_groups_with_last_used_in_order(
         };
         let dimmed = match dim {
             Dimming::Off => false,
-            Dimming::Unsupported => show_support && !support[index].loadable(),
+            Dimming::Unsupported | Dimming::ImageModels | Dimming::TextModels => {
+                show_support && !support[index].selectable(dim)
+            }
             Dimming::UpToDate => !refresh,
         };
         if dimmed {
@@ -1445,6 +1643,68 @@ fn format_last_used(timestamp: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The VAE is recognised by its decoder's output convolution and the
+    /// post-quant convolution in the `safetensors` header — a file with the
+    /// right name and other contents is not it, and a file with any name
+    /// and the right tensors is.
+    #[test]
+    fn the_qwen_image_vae_is_recognised_by_its_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, header: &str| {
+            let path = dir.path().join(name);
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(header.as_bytes());
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let vae = write(
+            "anything.safetensors",
+            r#"{"decoder.head.2.weight":{"dtype":"BF16","shape":[3,96,3,3,3],"data_offsets":[0,0]},
+                "conv2.weight":{"dtype":"BF16","shape":[16,16,1,1,1],"data_offsets":[0,0]}}"#,
+        );
+        assert!(is_qwen_image_vae(&vae));
+        let other = write(
+            "qwen_image_vae.safetensors",
+            r#"{"decoder.head.2.weight":{"dtype":"BF16","shape":[3,128,3,3],"data_offsets":[0,0]}}"#,
+        );
+        assert!(!is_qwen_image_vae(&other));
+        assert_eq!(find_qwen_image_vae(dir.path()), Some(vae));
+        assert!(find_qwen_image_text_encoder(dir.path()).is_none());
+        assert!(find_qwen_image_lightning(dir.path()).is_none());
+    }
+
+    /// The adapter is found by its name, the most steps first when the
+    /// 4- and 8-step files are both there, and the count is read from a
+    /// bare name, a path or a `<user>/<repo>:<file>` reference alike.
+    #[test]
+    fn the_lightning_adapter_is_found_by_name_with_the_most_steps_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir
+            .path()
+            .join("models--lightx2v--Qwen-Image-2512-Lightning/snapshots/abc");
+        std::fs::create_dir_all(&nested).unwrap();
+        let four = nested.join("Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors");
+        std::fs::write(&four, b"").unwrap();
+        std::fs::write(dir.path().join("style.safetensors"), b"").unwrap();
+        assert_eq!(find_qwen_image_lightning(dir.path()), Some(four.clone()));
+        let eight = nested.join("Qwen-Image-2512-Lightning-8steps-V1.0-bf16.safetensors");
+        std::fs::write(&eight, b"").unwrap();
+        assert_eq!(find_qwen_image_lightning(dir.path()), Some(eight));
+
+        assert_eq!(
+            lightning_steps(
+                "lightx2v/Qwen-Image-2512-Lightning:Qwen-Image-2512-Lightning-8steps-V1.0-bf16.safetensors"
+            ),
+            Some(8)
+        );
+        assert_eq!(lightning_steps(four.to_str().unwrap()), Some(4));
+        assert_eq!(
+            lightning_steps("lightx2v/Qwen-Image-2512-Lightning:style.safetensors"),
+            None
+        );
+        assert_eq!(lightning_steps(""), None);
+    }
     use std::io::Write;
 
     /// Writes a minimal GGUF file with one metadata key and, optionally, one
@@ -2129,6 +2389,7 @@ mod tests {
             architecture: Some("llama".to_string()),
             supported: true,
             unsupported_quant: None,
+            image: false,
         }];
         let output = format_groups_with_last_used(
             &groups,

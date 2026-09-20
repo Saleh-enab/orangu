@@ -18,7 +18,7 @@
 
 use crate::engine::backend::DeviceRequest;
 use crate::engine::placement::SplitMode;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use orangu::config::parse_ini_sections;
 use orangu::logging::LogTarget;
 use std::{
@@ -207,6 +207,16 @@ pub fn bundled_configuration(
         // "the server and a model as one file".
         draft_model: None,
         draft_tokens: DEFAULT_DRAFT_TOKENS,
+        // A bundle carries one model and no companions, so it can never be
+        // a qwen_image model; these are never read.
+        text_encoder: None,
+        vae: None,
+        image_lora: ImageLora::Auto,
+        image_lora_merge: true,
+        vae_precision: crate::engine::image::vae::VaePrecision::default(),
+        image: crate::engine::image::ImageDefaults::default(),
+        image_steps_set: false,
+        image_cfg_scale_set: false,
         // A bundle carries no certificate; TLS is a per-deployment decision.
         tls: None,
         // A key baked into a distributed executable is a key everyone who has
@@ -261,6 +271,12 @@ pub enum Role {
     Review,
     Explorer,
     Embedding,
+    /// Picture generation — the role of a `qwen_image` model, and the only
+    /// one such a model is served in. Unlike the other five it is not a
+    /// tuning chosen for a model: it is what the model *is*, so an image
+    /// model comes up in it without being asked (see
+    /// [`Role::fixed_by_model`]) and a text model cannot take it.
+    Image,
 }
 
 impl Role {
@@ -271,8 +287,9 @@ impl Role {
             "review" => Ok(Role::Review),
             "explorer" => Ok(Role::Explorer),
             "embedding" => Ok(Role::Embedding),
+            "image" => Ok(Role::Image),
             other => Err(anyhow!(
-                "invalid role '{other}' (expected all, code, review, explorer, or embedding)"
+                "invalid role '{other}' (expected all, code, review, explorer, embedding, or image)"
             )),
         }
     }
@@ -284,7 +301,24 @@ impl Role {
             Role::Review => "review",
             Role::Explorer => "explorer",
             Role::Embedding => "embedding",
+            Role::Image => "image",
         }
+    }
+
+    /// Whether this is the role a model's architecture decides — [`Role::
+    /// Image`], which a `qwen_image` model always has and nothing else can
+    /// have — as opposed to the five an operator picks between for a
+    /// language model. A fixed role is never prompted for and never
+    /// narrowed by an `x-orangu-role` header.
+    pub fn fixed_by_model(&self) -> bool {
+        matches!(self, Role::Image)
+    }
+
+    /// The role a model must be served in, from its `general.architecture`
+    /// — `Some(Role::Image)` for a picture generator, `None` for a language
+    /// model, whose role is the operator's choice.
+    pub fn required_by(architecture: Option<&str>) -> Option<Role> {
+        (architecture == Some("qwen_image")).then_some(Role::Image)
     }
 
     /// Default request-queue depth per slot before a new request is
@@ -312,7 +346,11 @@ impl Role {
             // on precisely when `slots` is more than one. Still not the
             // default here: it is KV-cache memory spent on concurrency a
             // single user does not have.
-            Role::All | Role::Code | Role::Review | Role::Explorer => 1,
+            //
+            // An image model draws one picture at a time (`engine::image::
+            // Pipeline` holds a single busy lock), so a second slot would
+            // only queue.
+            Role::All | Role::Code | Role::Review | Role::Explorer | Role::Image => 1,
         }
     }
 
@@ -698,6 +736,40 @@ pub struct ServerConfiguration {
     /// vocabulary, which is checked at startup rather than discovered as
     /// nonsense output.
     pub draft_model: Option<String>,
+    /// `[orangu-server].text_encoder`: the `qwen2vl` GGUF a `qwen_image`
+    /// model encodes prompts with — a model spec or path, the same shape as
+    /// [`model`](Self::model). `None` (the default) finds the largest such
+    /// file in the models directory. Ignored for every other architecture.
+    pub text_encoder: Option<String>,
+    /// `[orangu-server].vae`: the Qwen-Image VAE (`.safetensors`) a
+    /// `qwen_image` model decodes pictures with, absolute or relative to
+    /// the models directory. `None` finds it by its tensors.
+    pub vae: Option<String>,
+    /// `[orangu-server].image_lora`: the low-rank adapter (`.safetensors`)
+    /// applied to the picture transformer's linears — see [`ImageLora`].
+    pub image_lora: ImageLora,
+    /// `[orangu-server].image_lora_merge`: whether the adapter is folded
+    /// into the weights at startup (the default — a minute or two once,
+    /// then no cost per pass) or applied in `f32` on every pass (`no`:
+    /// exact, 13–28% of a pass on the CPU).
+    pub image_lora_merge: bool,
+    /// `[orangu-server].vae_precision`: `int8` (the default — the VAE's
+    /// convolutions as `Q6_K` weights against `int8` activations on the
+    /// transformer's kernel, about three times faster on an `i8mm` core) or
+    /// `f32` (as the file has them; exact).
+    pub vae_precision: crate::engine::image::vae::VaePrecision,
+    /// `[orangu-server].image_*`: what a picture request gets when it does
+    /// not say — size, steps, guidance, the negative prompt, and how far
+    /// from an attached picture to start. The web console's chat sends none
+    /// of these, so for it these *are* the settings.
+    pub image: crate::engine::image::ImageDefaults,
+    /// Whether `image_steps` and `image_cfg_scale` were written in the
+    /// config. Under a step-distilled adapter the ones left out follow the
+    /// adapter — its step count, guidance off — rather than Qwen-Image's
+    /// release settings, which the adapter was made to replace; see
+    /// [`ServerConfiguration::image_defaults_under`].
+    pub image_steps_set: bool,
+    pub image_cfg_scale_set: bool,
     /// `[orangu-server].draft_tokens`: how many tokens the draft model
     /// proposes per verification (default 4).
     ///
@@ -1023,6 +1095,36 @@ pub fn load_server_configuration(
         None => DEFAULT_DRAFT_TOKENS,
     };
 
+    let text_encoder = section
+        .get("text_encoder")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let vae = section
+        .get("vae")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let image_lora = match section.get("image_lora").map(|value| value.trim()) {
+        None | Some("") | Some("auto") => ImageLora::Auto,
+        Some("none") => ImageLora::None,
+        Some(spec) => ImageLora::Spec(spec.to_string()),
+    };
+    let image_steps_set = section.contains_key("image_steps");
+    let image_cfg_scale_set = section.contains_key("image_cfg_scale");
+    let image_lora_merge = match section.get("image_lora_merge") {
+        Some(value) => parse_bool(SERVER_SECTION, "image_lora_merge", value)?,
+        None => true,
+    };
+    let vae_precision = match section.get("vae_precision") {
+        Some(value) => crate::engine::image::vae::VaePrecision::parse(value).ok_or_else(|| {
+            anyhow!(
+                "invalid value for [{SERVER_SECTION}].vae_precision: '{}' (expected int8 or f32)",
+                value.trim()
+            )
+        })?,
+        None => crate::engine::image::vae::VaePrecision::default(),
+    };
+    let image = parse_image_defaults(&section)?;
+
     let kv_cache = match section.get("kv_cache") {
         Some(value) => KvCache::parse(value).ok_or_else(|| {
             anyhow!(
@@ -1176,6 +1278,14 @@ pub fn load_server_configuration(
         queue_limit,
         draft_model,
         draft_tokens,
+        text_encoder,
+        vae,
+        image_lora,
+        image_lora_merge,
+        vae_precision,
+        image,
+        image_steps_set,
+        image_cfg_scale_set,
         api_key,
         tls,
         device,
@@ -1186,6 +1296,285 @@ pub fn load_server_configuration(
         log,
         mcp_servers,
     })
+}
+
+/// `[orangu-server].image_lora`. Qwen-Image's own settings — fifty guided
+/// steps — are hours on a CPU, and its publishers' Lightning distillation
+/// (an adapter that makes a picture in eight unguided steps) is fetched
+/// with the model; so absent, or `auto`, the adapter found under the
+/// models directory is served, `none` runs the base model, and anything
+/// else names an adapter: a path, absolute or relative to the models
+/// directory, or the `<user>/<repo>:<file>` reference `download` fetched.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ImageLora {
+    #[default]
+    Auto,
+    None,
+    Spec(String),
+}
+
+impl ServerConfiguration {
+    /// The picture defaults with `adapter` in place: `image_steps` and
+    /// `image_cfg_scale` as configured, or — left out under a Lightning
+    /// adapter — the step count its name carries and guidance off, which is
+    /// what it was trained for (the base model's fifty guided steps under
+    /// it, or eight unguided steps without it, are noise). Any other
+    /// adapter, or none, leaves Qwen-Image's release settings.
+    pub fn image_defaults_under(
+        &self,
+        adapter: Option<&std::path::Path>,
+    ) -> crate::engine::image::ImageDefaults {
+        let mut defaults = self.image.clone();
+        let steps = adapter
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .and_then(orangu::model_spec::lightning_steps);
+        if let Some(steps) = steps {
+            if !self.image_steps_set {
+                defaults.steps = steps;
+            }
+            if !self.image_cfg_scale_set {
+                defaults.cfg_scale = 1.0;
+            }
+        }
+        defaults
+    }
+}
+
+/// `[orangu-server].image_size`, `image_steps`, `image_cfg_scale`,
+/// `image_negative_prompt` and `image_strength` — each optional, each
+/// checked here so a typo is a startup error rather than a picture that
+/// silently came out at the default.
+fn parse_image_defaults(
+    section: &HashMap<String, String>,
+) -> Result<crate::engine::image::ImageDefaults> {
+    let mut image = crate::engine::image::ImageDefaults::default();
+    if let Some(value) = section.get("image_size") {
+        let (width, height) = parse_image_size(value).ok_or_else(|| {
+            anyhow!(
+                "invalid value for [{SERVER_SECTION}].image_size: '{}' (expected WIDTHxHEIGHT, \
+                 both multiples of 16)",
+                value.trim()
+            )
+        })?;
+        image.width = width;
+        image.height = height;
+    }
+    if let Some(value) = section.get("image_steps") {
+        image.steps = value
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|steps| *steps > 0)
+            .ok_or_else(|| {
+                anyhow!(
+                    "invalid value for [{SERVER_SECTION}].image_steps: '{}' (expected a positive \
+                     integer)",
+                    value.trim()
+                )
+            })?;
+    }
+    if let Some(value) = section.get("image_cfg_scale") {
+        image.cfg_scale = value
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|scale| scale.is_finite() && *scale >= 0.0)
+            .ok_or_else(|| {
+                anyhow!(
+                    "invalid value for [{SERVER_SECTION}].image_cfg_scale: '{}' (expected a \
+                     non-negative number; 1 turns guidance off)",
+                    value.trim()
+                )
+            })?;
+    }
+    if let Some(value) = section.get("image_negative_prompt") {
+        image.negative_prompt = value.trim().to_string();
+    }
+    if let Some(value) = section.get("image_strength") {
+        image.strength = value
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|s| (0.0..=1.0).contains(s))
+            .ok_or_else(|| {
+                anyhow!(
+                    "invalid value for [{SERVER_SECTION}].image_strength: '{}' (expected a number \
+                     from 0 to 1)",
+                    value.trim()
+                )
+            })?;
+    }
+    if let Some(value) = section.get("image_format") {
+        image.format = crate::engine::image::ImageFormat::parse(value).ok_or_else(|| {
+            anyhow!(
+                "invalid value for [{SERVER_SECTION}].image_format: '{}' (expected png, jpeg, gif, \
+                 webp or svg)",
+                value.trim()
+            )
+        })?;
+    }
+    Ok(image)
+}
+
+/// `WIDTHxHEIGHT` (or `WIDTH` alone for a square), both multiples of 16 —
+/// the unit a picture is generated in: the VAE's 8 pixels per latent cell
+/// times the transformer's 2x2 patch.
+pub fn parse_image_size(value: &str) -> Option<(usize, usize)> {
+    let value = value.trim().to_ascii_lowercase();
+    let (w, h) = match value.split_once(['x', '*']) {
+        Some((w, h)) => (
+            w.trim().parse::<usize>().ok()?,
+            h.trim().parse::<usize>().ok()?,
+        ),
+        None => {
+            let side = value.parse::<usize>().ok()?;
+            (side, side)
+        }
+    };
+    (w >= 16 && h >= 16 && w.is_multiple_of(16) && h.is_multiple_of(16)).then_some((w, h))
+}
+
+/// The `approval_mode` values an MCP section may carry — orangu's own
+/// `McpApprovalMode` spellings, checked here so the console's editor
+/// refuses what the client would refuse.
+pub const MCP_APPROVAL_MODES: [&str; 4] = ["auto", "prompt", "writes", "deny"];
+
+impl McpConfiguration {
+    /// Refuses what the file could not hold or the client could not read:
+    /// a section name that is empty, is one of the two reserved sections,
+    /// or would not survive the INI line it is written on; an empty
+    /// endpoint; an approval mode orangu does not know.
+    pub fn validate(&self) -> Result<()> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            bail!("an MCP server needs a name");
+        }
+        if name == SERVER_SECTION || name == WEB_SECTION {
+            bail!("'{name}' is the server's own section, not an MCP server");
+        }
+        if name.contains(['[', ']', '\n', '\r', '=', '#', ';']) {
+            bail!("an MCP server's name cannot contain [ ] = # ; or a line break");
+        }
+        let endpoint = self.endpoint.trim();
+        if endpoint.is_empty() {
+            bail!("[{name}].endpoint must be set for an MCP server");
+        }
+        if endpoint.contains(['\n', '\r']) {
+            bail!("[{name}].endpoint cannot contain a line break");
+        }
+        if !MCP_APPROVAL_MODES.contains(&self.approval_mode.as_str()) {
+            bail!(
+                "invalid [{name}].approval_mode '{}'; expected auto, prompt, writes, or deny",
+                self.approval_mode
+            );
+        }
+        Ok(())
+    }
+
+    /// The section as the file holds it: the header, the endpoint, and the
+    /// two other keys only where they differ from their defaults — the
+    /// same rule `--init` writes by.
+    pub fn render_section(&self) -> String {
+        let mut out = format!(
+            "[{}]\nendpoint = {}\n",
+            self.name.trim(),
+            self.endpoint.trim()
+        );
+        if !self.enabled {
+            out.push_str("enabled = no\n");
+        }
+        if self.approval_mode != "writes" {
+            out.push_str(&format!("approval_mode = {}\n", self.approval_mode));
+        }
+        out
+    }
+}
+
+/// Rewrites one MCP section of a configuration file in place — replaced
+/// by `replacement`, or removed when that is `None` — and leaves every
+/// other line as it was, comments included: the file is the operator's,
+/// and the console's editor touches only the section it was asked about.
+/// A section is its header line through the line before the next header
+/// (or the end of the file); a section that is not there is appended.
+/// Written to a temporary file beside the original and renamed over it,
+/// so a crash mid-write leaves the file as it was.
+pub fn rewrite_mcp_section(
+    path: &Path,
+    name: &str,
+    replacement: Option<&McpConfiguration>,
+) -> Result<()> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read configuration {}", path.display()))?;
+    let is_header = |line: &str| {
+        let line = line.trim();
+        line.strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .map(|inner| inner.trim() == name)
+            .unwrap_or(false)
+    };
+    let lines: Vec<&str> = contents.lines().collect();
+    let start = lines.iter().position(|line| is_header(line));
+    let end = start.map(|start| {
+        lines[start + 1..]
+            .iter()
+            .position(|line| line.trim().starts_with('['))
+            .map_or(lines.len(), |offset| start + 1 + offset)
+    });
+    let mut out = String::new();
+    match (start, end) {
+        (Some(start), Some(end)) => {
+            for line in &lines[..start] {
+                out.push_str(line);
+                out.push('\n');
+            }
+            if let Some(mcp) = replacement {
+                out.push_str(&mcp.render_section());
+                // Keep the section's own trailing blank line, if it had one,
+                // so the file keeps its spacing.
+                if end < lines.len() && lines[end - 1].trim().is_empty() {
+                    out.push('\n');
+                }
+            }
+            for line in &lines[end..] {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        _ => {
+            out.push_str(&contents);
+            if let Some(mcp) = replacement {
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                if !out.is_empty() && !out.ends_with("\n\n") {
+                    out.push('\n');
+                }
+                out.push_str(&mcp.render_section());
+            }
+        }
+    }
+    let temp = path.with_extension("conf.tmp");
+    std::fs::write(&temp, &out).with_context(|| format!("failed to write {}", temp.display()))?;
+    std::fs::rename(&temp, path)
+        .with_context(|| format!("failed to replace {}", path.display()))?;
+    Ok(())
+}
+
+/// The MCP sections of a configuration file, as [`load_server_configuration`]
+/// reads them — for the console to show what the file holds after an edit.
+pub fn load_mcp_servers(path: &Path) -> Result<Vec<McpConfiguration>> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read configuration {}", path.display()))?;
+    let mut sections = parse_ini_sections(&contents)?;
+    sections.remove(SERVER_SECTION);
+    sections.remove(WEB_SECTION);
+    let mut mcp_servers = sections
+        .into_iter()
+        .map(|(name, values)| parse_mcp_configuration(name, values))
+        .collect::<Result<Vec<_>>>()?;
+    mcp_servers.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(mcp_servers)
 }
 
 fn parse_mcp_configuration(
@@ -1339,6 +1728,55 @@ mod tests {
         assert_eq!(conf.model, None);
     }
 
+    /// `image_size` is `WIDTHxHEIGHT` or one side for a square, in the
+    /// 16-pixel unit a picture is generated in; anything else is refused
+    /// at startup rather than rounded.
+    #[test]
+    fn image_size_parses_pairs_and_squares_in_sixteens() {
+        assert_eq!(parse_image_size("1024x768"), Some((1024, 768)));
+        assert_eq!(parse_image_size(" 512 X 512 "), Some((512, 512)));
+        assert_eq!(parse_image_size("640*400"), Some((640, 400)));
+        assert_eq!(parse_image_size("768"), Some((768, 768)));
+        assert_eq!(parse_image_size("1000x1000"), None);
+        assert_eq!(parse_image_size("8"), None);
+        assert_eq!(parse_image_size("wide"), None);
+    }
+
+    #[test]
+    fn image_defaults_are_read_and_checked() {
+        let mut section = HashMap::new();
+        section.insert("image_size".to_string(), "512x256".to_string());
+        section.insert("image_steps".to_string(), "20".to_string());
+        section.insert("image_cfg_scale".to_string(), "1".to_string());
+        section.insert("image_negative_prompt".to_string(), "blurry".to_string());
+        section.insert("image_strength".to_string(), "0.8".to_string());
+        section.insert("image_format".to_string(), "webp".to_string());
+        let image = parse_image_defaults(&section).unwrap();
+        assert_eq!((image.width, image.height), (512, 256));
+        assert_eq!(image.steps, 20);
+        assert_eq!(image.cfg_scale, 1.0);
+        assert_eq!(image.negative_prompt, "blurry");
+        assert_eq!(image.strength, 0.8);
+        assert_eq!(image.format, crate::engine::image::ImageFormat::Webp);
+
+        let defaults = parse_image_defaults(&HashMap::new()).unwrap();
+        assert_eq!((defaults.width, defaults.height), (1024, 1024));
+        assert_eq!(defaults.steps, 50);
+
+        for (key, value) in [
+            ("image_steps", "0"),
+            ("image_cfg_scale", "-1"),
+            ("image_strength", "2"),
+            ("image_size", "100x100"),
+            ("image_format", "bmp"),
+        ] {
+            let mut section = HashMap::new();
+            section.insert(key.to_string(), value.to_string());
+            let err = parse_image_defaults(&section).unwrap_err().to_string();
+            assert!(err.contains(key), "{key}: {err}");
+        }
+    }
+
     /// A hand-edited `.ini` gets every spelling of a switch a person might
     /// reasonably write, not only the two Rust's `bool` parser accepts.
     #[test]
@@ -1365,6 +1803,98 @@ mod tests {
             let conf = load_server_configuration(file.path(), None, false).unwrap();
             assert_eq!(conf.reexec, expected, "reexec = {value}");
         }
+    }
+
+    /// The editor rewrites one section and nothing else: comments, spacing
+    /// and the other sections come through untouched; a missing section is
+    /// appended; removal takes the section and its trailing blank line.
+    #[test]
+    fn an_mcp_section_is_rewritten_in_place_and_nothing_else_moves() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            "# my server\n[orangu-server]\nmodels = /srv/models\n\n[docs]\nendpoint = http://a/\n\
+             enabled = no\n\n[web]\nport = 8101 # console\n",
+        )
+        .unwrap();
+        let docs = McpConfiguration {
+            name: "docs".into(),
+            endpoint: "http://b/".into(),
+            enabled: true,
+            approval_mode: "deny".into(),
+        };
+        rewrite_mcp_section(file.path(), "docs", Some(&docs)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(file.path()).unwrap(),
+            "# my server\n[orangu-server]\nmodels = /srv/models\n\n[docs]\nendpoint = http://b/\n\
+             approval_mode = deny\n\n[web]\nport = 8101 # console\n"
+        );
+        let tools = McpConfiguration {
+            name: "tools".into(),
+            endpoint: "http://c/".into(),
+            enabled: false,
+            approval_mode: "writes".into(),
+        };
+        rewrite_mcp_section(file.path(), "tools", Some(&tools)).unwrap();
+        assert!(std::fs::read_to_string(file.path()).unwrap().ends_with(
+            "[web]\nport = 8101 # console\n\n[tools]\nendpoint = http://c/\nenabled = no\n"
+        ));
+        rewrite_mcp_section(file.path(), "docs", None).unwrap();
+        let after = std::fs::read_to_string(file.path()).unwrap();
+        assert!(!after.contains("[docs]"));
+        assert!(after.contains("[orangu-server]\nmodels = /srv/models\n\n[web]\n"));
+        let servers = load_mcp_servers(file.path()).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "tools");
+        assert!(!servers[0].enabled);
+
+        let bad = McpConfiguration {
+            name: "web".into(),
+            ..docs.clone()
+        };
+        assert!(bad.validate().is_err());
+        let bad = McpConfiguration {
+            approval_mode: "maybe".into(),
+            ..docs.clone()
+        };
+        assert!(bad.validate().is_err());
+        assert!(docs.validate().is_ok());
+    }
+
+    /// `image_lora` absent or `auto` serves the adapter found under the
+    /// models directory, `none` the base model, anything else that file;
+    /// and under a Lightning adapter the steps and guidance left unset
+    /// follow it — an explicit key is kept as written.
+    #[test]
+    fn image_lora_defaults_to_auto_and_the_adapter_sets_the_schedule() {
+        let load = |keys: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(file, "[orangu-server]\nmodels = /srv/models\n{keys}").unwrap();
+            load_server_configuration(file.path(), None, false).unwrap()
+        };
+        let eight = Path::new("/srv/models/Qwen-Image-2512-Lightning-8steps-V1.0-bf16.safetensors");
+
+        let conf = load("");
+        assert_eq!(conf.image_lora, ImageLora::Auto);
+        assert!(!conf.image_steps_set && !conf.image_cfg_scale_set);
+        let under = conf.image_defaults_under(Some(eight));
+        assert_eq!((under.steps, under.cfg_scale), (8, 1.0));
+        let base = conf.image_defaults_under(None);
+        assert_eq!((base.steps, base.cfg_scale), (50, 4.0));
+        let other = conf.image_defaults_under(Some(Path::new("/srv/models/style.safetensors")));
+        assert_eq!((other.steps, other.cfg_scale), (50, 4.0));
+
+        assert_eq!(load("image_lora = none").image_lora, ImageLora::None);
+        assert_eq!(load("image_lora = auto").image_lora, ImageLora::Auto);
+        assert_eq!(
+            load("image_lora = lora/style.safetensors").image_lora,
+            ImageLora::Spec("lora/style.safetensors".to_string())
+        );
+
+        let conf = load("image_steps = 4\nimage_cfg_scale = 2");
+        assert!(conf.image_steps_set && conf.image_cfg_scale_set);
+        let under = conf.image_defaults_under(Some(eight));
+        assert_eq!((under.steps, under.cfg_scale), (4, 2.0));
     }
 
     /// NPU precompilation is on unless it is turned off, and a start with
@@ -1967,6 +2497,7 @@ mod tests {
             ("review", Role::Review),
             ("explorer", Role::Explorer),
             ("embedding", Role::Embedding),
+            ("image", Role::Image),
         ] {
             let mut file = tempfile::NamedTempFile::new().unwrap();
             writeln!(
@@ -1978,6 +2509,28 @@ mod tests {
             let conf = load_server_configuration(file.path(), None, true).unwrap();
             assert_eq!(conf.role, expected, "role = {value}");
         }
+    }
+
+    /// `image` is the one role a file's architecture decides: a `qwen_image`
+    /// model requires it, nothing else may take it, and it is never asked
+    /// for.
+    #[test]
+    fn the_image_role_is_fixed_by_a_qwen_image_architecture() {
+        assert_eq!(Role::required_by(Some("qwen_image")), Some(Role::Image));
+        assert_eq!(Role::required_by(Some("llama")), None);
+        assert_eq!(Role::required_by(None), None);
+        assert!(Role::Image.fixed_by_model());
+        for role in [
+            Role::All,
+            Role::Code,
+            Role::Review,
+            Role::Explorer,
+            Role::Embedding,
+        ] {
+            assert!(!role.fixed_by_model(), "{}", role.label());
+        }
+        assert!(Role::Image.allows_generation());
+        assert_eq!(Role::Image.default_slots(), 1);
     }
 
     /// Outside `--daemon` mode, the config file's `role` key isn't even

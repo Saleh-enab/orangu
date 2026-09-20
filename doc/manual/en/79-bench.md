@@ -54,7 +54,8 @@ traffic is growing per token.
 #### Ranges
 
 Anywhere a list of points is accepted — `--depths`, `--pp`, `--pg`,
-`--pp-continue`, `--embed`, `--streams` — an item may be a range instead of a
+`--pp-continue`, `--embed`, `--image`, `--streams` — an item may be a range
+instead of a
 number, in the three forms the wider ecosystem's benchmarks use, so a sweep can
 be copied between them:
 
@@ -486,6 +487,114 @@ attaches a `timings` object to `/v1/embeddings`, so there is nothing to prefer
 over the clock. HTTP and the JSON encoding of an `n_embd`-long float array are
 therefore inside the number — small beside a forward pass, and identical on
 both engines, since the same client sends both.
+
+### Image mode (`--image`) — where a picture's minutes go
+
+A picture is three models in a row — the prompt through the text encoder,
+the latent through the diffusion transformer once per step (twice under
+guidance), and the latent through the VAE — and a user who typed *Create an
+image of a cat* into the console and waited sees one number: the wait.
+`--image` takes the same request through the same endpoint
+(`POST /v1/images/generations`, streamed) and splits the wait three ways
+from the server's own phase timings (the `timings` object on the completed
+event: `encode_ms`, `steps_ms`, `decode_ms`), so a slow picture is a slow
+*phase* — and, with `--flamegraph`, a slow phase is a hot function.
+
+```sh
+orangu-server unsloth/Qwen-Image-2512-GGUF:Q4_K_M &     # comes up in the image role
+orangu-bench --image 256 --reps 1 --flamegraph cat.svg
+orangu-bench --image 256,512 --image-steps 4 --image-cfg 1 --reps 3
+```
+
+```
+    image | tokens | steps | encode_s |   step_s | decode_s |  total_s |     best |   mean ± sd(n-1)
+--------------------------------------------------------------------------------------------------------
+ 256x256  |    256 |   1x2 |      6.3 |     43.7 |      6.6 |     56.6 |     11.7 |     11.7 ±     —
+          | transformer: mlp 57%  qkv 26%  out 8%  attention 6%  modulation 2%  other 1%
+ 512x512  |   1024 |   1x2 |     14.9 |    185.8 |     22.0 |    222.7 |     11.0 |     11.0 ±     —
+          | transformer: mlp 51%  qkv 23%  attention 17%  out 8%  modulation 1%  other 1%
+
+  rate: image-token passes per second over the denoising loop (latent tokens x transformer passes / step_s x steps);
+  encode_s is the prompts through the text encoder, decode_s the VAE and the file
+  profile  cat.svg (795026 samples over 96s — 8.27 cores busy, 8.04 per /proc)
+           0.00 gpu-wait  0.01 pool-idle  8.26 working (cores)
+           top self-time frames:
+            80.4%  orangu_server::engine::vecdot::dot_k_pair
+             6.6%  orangu_server::engine::vecdot::dot_row_f32
+             2.3%  <&orangu_server::engine::image::transformer::joint_attention::{c
+             1.8%  <orangu_server::engine::backend::cpu::CpuBackend>::finish_into
+             1.7%  orangu_server::engine::vecdot::unpack_k_row
+```
+
+That run — the 20-billion-parameter transformer on twelve ARM cores, no
+GPU — is the answer to "why did *Create an image of a cat* never come
+back". The rate is flat at 11–12 token passes a second from 256 to 1024
+tokens, so the transformer is compute-bound in its linears already at the
+smallest size: `mlp` + `qkv` + `out` are nine tenths of every pass, and the
+profile puts 80% of the samples in the Q4_K dot kernel under them, with 8.3
+of twelve cores busy. At the console's defaults — 1024 pixels, fifty steps,
+guidance on — that is 4096 tokens × 100 passes = 409,600 token passes, or
+close to ten hours at this rate; the text encoder and VAE together are
+under a tenth of the wall time and grow slower than the loop. What moves
+the number is the kernel and the cores it runs on (a GPU backend, or the
+four idle cores), not the pipeline around it; what moves the *wait* is
+`image_size`, `image_steps` and `image_cfg_scale = 1`, in that order.
+
+`tokens` is the transformer's sequence: one latent token per 16×16 pixels
+(the VAE's 8× compression times the transformer's 2×2 patch), so a 256-pixel
+square is 256 tokens and a 1024-pixel one is 4096. `steps` says how many
+times the transformer ran over them, `x2` when the server ran guidance (two
+passes per step, one per prompt). `encode_s` is the prompts through the text
+encoder — both of them under guidance — `step_s` one denoising step,
+`decode_s` the VAE and the file format, and `total_s` the request from send
+to `[DONE]`: what the console's user waited.
+
+The recorded rate — `best`/`mean`, what `--history` and the chart keep —
+is **latent-token passes per second over the denoising loop**: `tokens ×
+passes / (step_s × steps)`. It is to a picture what prompt-processing tok/s
+is to a chat turn: how fast the transformer chews through positions,
+independent of how many the request asked for, so a 256-pixel run at two
+steps and a 1024-pixel run at fifty sit on one chart.
+
+**Two steps, not fifty.** Every step is the same work, so two of them say
+what fifty would at a fortieth of the wait — and profiling the fiftieth step
+finds nothing the second did not. The size is what to vary: attention is
+quadratic in the token count and the linears are linear in it, and the two
+regimes trade places somewhere between 256 and 1024 pixels. Guidance is
+left to the server's default (Qwen-Image's own, on) unless `--image-cfg` says
+otherwise, because that is how the console's request arrives; `--image-cfg
+1` halves the passes and is the honest number for a server configured with
+`image_cfg_scale = 1`. The seed is fixed, so every repetition draws the same
+noise; the picture is not the point.
+
+**The warmup is a 16-pixel picture** — one latent token, one step, no
+guidance: the smallest request the endpoint accepts, which still creates
+the pipeline's own threads before `perf` attaches (see *Why `--flamegraph`
+needs the warmup*) and still reads every transformer weight once, so the
+first measured picture pays no page-cache cost. A text completion would not
+do either: it exercises the text encoder, which is the one model of the
+three a picture spends the least time in.
+
+**The line under each row is the transformer by operation class** — the
+server's `timings.stages`, as shares of the passes' own total, largest
+first: `modulation` (the `img_mod`/`txt_mod` linears, `[3072 → 18432]`
+weights read for a *single* token, sixty blocks a pass — pure weight
+traffic), `qkv` (the six attention input projections), `attention` (head
+norms, RoPE and the joint attention itself), `out` (the two output
+projections), `mlp` (the four feed-forward linears and their GELU) and
+`other` (embeddings, norms, modulation arithmetic, residual adds, the final
+projection). This split is the server's own account, not the profile's: the
+matmuls run on rayon's workers, whose stacks bottom out in the pool rather
+than in the layer that asked, so in the flamegraph every linear of every
+block lands on the one `dot_k_pair` frame and the caller is unknowable
+from the stacks alone. The two are read together — the flamegraph says
+*which kernel*, the stage line says *which layer*.
+
+`first_progress_s` (in `--json` output) is the request-to-first-progress
+time seen from this side — the encode phase plus the first step, a
+cross-check on the server's own split that needs no server cooperation. A
+server older than this mode, whose completed event carries no `timings`, is
+refused rather than guessed at.
 
 ### A sweep can contaminate its own later rows
 
@@ -925,6 +1034,10 @@ Options:
       --streams <LIST>                 Concurrency mode: comma-separated stream counts; reports AGGREGATE tok/s
       --pp-continue-base <N>           Prompt length (tokens) to prime the prefix cache with for `--pp-continue` [default: 512]
       --embed <LIST>                   Embedding mode: prompt lengths to sweep against /v1/embeddings
+      --image <LIST>                   Image mode: square picture sizes (pixels, multiples of 16) to sweep against /v1/images/generations
+      --image-steps <N>                Denoising steps per picture for `--image` [default: 2]
+      --image-cfg <SCALE>              Guidance scale for `--image`; 1 runs the prompt alone. Default: the server's
+      --image-prompt <TEXT>            The prompt every `--image` picture is drawn from [default: "Create an image of a cat"]
       --gen <N>                        Number of tokens to generate per timed run [default: 128]
       --curve <N>                      Curve mode: one generation of this many tokens, bucketed by context; 0 disables [default: 0]
       --bucket <N>                     Bucket width (in context tokens) for `--curve` [default: 256]

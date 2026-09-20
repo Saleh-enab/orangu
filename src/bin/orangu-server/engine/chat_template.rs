@@ -32,11 +32,26 @@ use serde::{Deserialize, Serialize};
 /// `follow.get('tool_call_id')`, `follow.get('name')`). Dropping them, as this
 /// struct used to, does not merely lose formatting: a model that called a tool
 /// on turn N sees no record of having done so on turn N+1, and calls it again.
+///
+/// `content` may arrive as OpenAI's *array of parts* rather than a string —
+/// `[{"type": "text", "text": ...}, {"type": "image_url", "image_url":
+/// {"url": "data:image/png;base64,..."}}]`, which is how a client attaches
+/// a picture. The text parts are joined into [`content`](Self::content)
+/// (so every chat template keeps seeing a string) and the pictures land in
+/// [`images`](Self::images), which is never serialized and so never reaches
+/// a template. A language model here has no vision path and ignores them;
+/// a `qwen_image` model starts its picture from the last one. See
+/// [`ChatMessageWire`], which is what is actually deserialized.
 #[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(from = "ChatMessageWire")]
 pub struct ChatMessage {
     pub role: String,
     #[serde(default)]
     pub content: String,
+    /// The `image_url` parts of an array-shaped `content`, as given (data
+    /// URLs or plain URLs). See the struct's own doc.
+    #[serde(skip)]
+    pub images: Vec<String>,
     /// Assistant messages: the calls this turn made. Left as raw JSON rather
     /// than a typed struct because templates reach into it in
     /// model-specific ways (`function['arguments']` as a mapping *or* a
@@ -61,6 +76,72 @@ impl ChatMessage {
             role: role.to_string(),
             content: content.to_string(),
             ..Default::default()
+        }
+    }
+}
+
+/// [`ChatMessage`] as it is read off the wire: `content` still a JSON value,
+/// because it is a string *or* an array of parts, and serde's derive can
+/// only fill one field from one key. The conversion below is where the
+/// parts are split into text and pictures.
+#[derive(Deserialize)]
+struct ChatMessageWire {
+    role: String,
+    #[serde(default)]
+    content: serde_json::Value,
+    #[serde(default)]
+    tool_calls: Option<serde_json::Value>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+impl From<ChatMessageWire> for ChatMessage {
+    /// A string is the text; `null` is empty; an array's `text` parts are
+    /// joined with newlines and its `image_url` parts collected. Any other
+    /// part type is ignored, as OpenAI's own servers ignore what they do not
+    /// know, and any other JSON value is read as its text — a number sent
+    /// as content is a caller's mistake, not a reason to refuse the turn.
+    fn from(wire: ChatMessageWire) -> Self {
+        let mut images = Vec::new();
+        let content = match wire.content {
+            serde_json::Value::Null => String::new(),
+            serde_json::Value::String(s) => s,
+            serde_json::Value::Array(parts) => {
+                let mut text = String::new();
+                for part in parts {
+                    match part.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => {
+                            if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                                if !text.is_empty() {
+                                    text.push('\n');
+                                }
+                                text.push_str(t);
+                            }
+                        }
+                        Some("image_url") => {
+                            let url = part.get("image_url").and_then(|u| {
+                                u.get("url").and_then(|s| s.as_str()).or_else(|| u.as_str())
+                            });
+                            if let Some(url) = url {
+                                images.push(url.to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                text
+            }
+            other => other.to_string(),
+        };
+        Self {
+            role: wire.role,
+            content,
+            images,
+            tool_calls: wire.tool_calls,
+            tool_call_id: wire.tool_call_id,
+            name: wire.name,
         }
     }
 }
@@ -923,6 +1004,36 @@ mod tests {
             .render(&messages, false, "", "", Reasoning::default())
             .unwrap();
         assert_eq!(out, "CALL:get_weather;RESULT[get_weather/call-1]=17C;");
+    }
+
+    /// OpenAI's array-of-parts `content`: the text parts become the string
+    /// every template reads, the pictures are kept aside, and a plain string
+    /// still deserializes as it always did.
+    #[test]
+    fn content_parts_split_into_text_and_images() {
+        let message: ChatMessage = serde_json::from_str(
+            r#"{"role": "user", "content": [
+                {"type": "text", "text": "a cat"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                {"type": "text", "text": "on a mat"},
+                {"type": "input_audio", "input_audio": {}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(message.content, "a cat\non a mat");
+        assert_eq!(message.images, vec!["data:image/png;base64,AAAA"]);
+        // What a template sees: no `images` key at all.
+        let json = serde_json::to_value(&message).unwrap();
+        assert!(json.get("images").is_none());
+        assert_eq!(json["content"], "a cat\non a mat");
+
+        let plain: ChatMessage =
+            serde_json::from_str(r#"{"role": "user", "content": "hi"}"#).unwrap();
+        assert_eq!(plain.content, "hi");
+        assert!(plain.images.is_empty());
+        let none: ChatMessage =
+            serde_json::from_str(r#"{"role": "assistant", "content": null}"#).unwrap();
+        assert_eq!(none.content, "");
     }
 
     #[test]

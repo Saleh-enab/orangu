@@ -318,6 +318,13 @@ pub struct Engine {
     /// line either way; this is the one piece of output that is not a log
     /// record, because it is not a line.
     pub live_stats: bool,
+    /// The Qwen-Image pipeline, when the served model is a `qwen_image`
+    /// diffusion transformer. Then [`Self::model`] and [`Self::tokenizer`]
+    /// are its **text encoder** — a real `qwen2vl` language model, loaded
+    /// through the ordinary path and shared with the pipeline — and the
+    /// generation endpoints answer with pictures rather than tokens. `None`
+    /// for every language model, which is every other architecture.
+    pub image: Option<Arc<super::image::Pipeline>>,
 }
 
 /// What a caught generation panic is reported to the caller as: the panic's
@@ -5124,6 +5131,7 @@ mod tests {
             role: crate::config::Role::default(),
             reasoning_effort: None,
             live_stats: false,
+            image: None,
         };
 
         let mut rx = engine

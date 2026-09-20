@@ -426,6 +426,80 @@ fn detect_power_source() -> (PowerSource, Option<u8>) {
     (PowerSource::Unknown, None)
 }
 
+/// The cores worth running compute on, when the machine has two kinds.
+///
+/// A big.LITTLE part (every recent ARM SoC; Intel's hybrid parts on x86
+/// report the same way) lists a `cpu_capacity` per core under `/sys`: the
+/// scheduler's own relative throughput figure, 1024 for the fastest core.
+/// A `Cortex-A520` beside a `Cortex-A720` reports 279 — under a third —
+/// and a compute-bound kernel handed an equal share of work on such a core
+/// finishes last by that ratio, so every other worker waits for it.
+///
+/// Whether to *use* only the big cores is a measured question with two
+/// answers on the development board (8 A720 + 4 A520). In a matmul
+/// microbenchmark the little cores added nothing: twelve workers matched
+/// eight pinned to the big cluster (346 vs 342 G MAC/s), their whole
+/// contribution spent waiting for their tails. In the server they do help
+/// prefill — a 256-pixel Qwen-Image step went 14.4 → 16.6 s and a 7B
+/// prefill 43.0 → 36.8 tok/s when pinned, because a forward pass is many
+/// short parallel regions with slack the little cores fill — while decode
+/// went the other way, 4.66 → 5.48 tok/s pinned. So the server keeps one
+/// worker per logical core by default and offers the big cluster behind
+/// `ORANGU_EXPERT_BIG_CORES=1`; a decode-only deployment is the case that
+/// wants it, and a decode-specific pool is the open task.
+///
+/// Returns the cores at or above half the largest capacity — the big
+/// cluster, in that ordering — or `None` when the machine is homogeneous
+/// (all capacities equal, or no capacity file: x86 Linux without the
+/// hybrid attribute, and every non-Linux platform).
+pub fn big_cores() -> Option<Vec<usize>> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut caps = Vec::new();
+        for entry in std::fs::read_dir("/sys/devices/system/cpu").ok()?.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(index) = name
+                .strip_prefix("cpu")
+                .and_then(|rest| rest.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            let Ok(text) = std::fs::read_to_string(entry.path().join("cpu_capacity")) else {
+                continue;
+            };
+            let Ok(cap) = text.trim().parse::<u64>() else {
+                continue;
+            };
+            caps.push((index, cap));
+        }
+        big_cores_from(caps)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// [`big_cores`]'s rule over `(core, capacity)` pairs, in core order:
+/// `None` unless the capacities differ, else every core at or above half
+/// the largest.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn big_cores_from(mut caps: Vec<(usize, u64)>) -> Option<Vec<usize>> {
+    let max = caps.iter().map(|(_, c)| *c).max()?;
+    let min = caps.iter().map(|(_, c)| *c).min()?;
+    if min == max {
+        return None;
+    }
+    caps.sort_unstable();
+    let big: Vec<usize> = caps
+        .into_iter()
+        .filter(|(_, c)| *c * 2 >= max)
+        .map(|(i, _)| i)
+        .collect();
+    (!big.is_empty()).then_some(big)
+}
+
 pub fn detect_cpu() -> CpuInfo {
     let mut sys = System::new_with_specifics(
         RefreshKind::nothing()
@@ -1422,6 +1496,39 @@ fn format_gpu_entries(out: &mut String, gpus: &[GpuInfo]) {
 
 #[cfg(test)]
 mod tests {
+    /// The big cluster is what stays after halving the largest capacity:
+    /// the development board's A720s (905–1024) with its A520s (279) left
+    /// out, in core order; a homogeneous machine — or one with no capacity
+    /// figures — is `None`, so the pool keeps one worker per core.
+    #[test]
+    fn big_cores_are_those_at_half_the_largest_capacity_or_more() {
+        let board = vec![
+            (0, 1024),
+            (1, 1024),
+            (2, 279),
+            (3, 279),
+            (4, 279),
+            (5, 279),
+            (6, 905),
+            (7, 905),
+            (8, 866),
+            (9, 866),
+            (10, 984),
+            (11, 984),
+        ];
+        assert_eq!(
+            super::big_cores_from(board),
+            Some(vec![0, 1, 6, 7, 8, 9, 10, 11])
+        );
+        // Unordered input comes back in core order.
+        assert_eq!(
+            super::big_cores_from(vec![(3, 300), (0, 1024), (1, 1024)]),
+            Some(vec![0, 1])
+        );
+        assert_eq!(super::big_cores_from(vec![(0, 1024), (1, 1024)]), None);
+        assert_eq!(super::big_cores_from(Vec::new()), None);
+    }
+
     use super::*;
 
     /// The governor is a banner *value*, so it is capitalized for display

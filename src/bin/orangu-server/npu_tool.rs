@@ -2435,6 +2435,9 @@ fn stopping() -> bool {
 /// Safe to call when there is no NPU, when nothing was started, and twice.
 pub fn stop_preparation() {
     STOPPING.store(true, std::sync::atomic::Ordering::Relaxed);
+    // And the library's own flag: the thread may be inside `NpuFfn::open`,
+    // reading or binding graphs, which checks it between each one.
+    orangu::npu_ffn::request_stop();
     // The child first: the thread is almost certainly blocked waiting for
     // it, and it will not look at the flag until it comes back.
     #[cfg(unix)]
@@ -2708,6 +2711,11 @@ pub fn install_ffn_service(model: &Path, budget_bytes: u64) {
     else {
         return;
     };
+    // Bound while the process was on its way out: dropped here, on this
+    // thread, rather than measured and installed for nobody.
+    if stopping() {
+        return;
+    }
 
     // **Whether this model should use the device is this model's question**,
     // and it is answered by measurement rather than by any property of the
@@ -2715,7 +2723,12 @@ pub fn install_ffn_service(model: &Path, budget_bytes: u64) {
     // were compiled; this asks again of the set that actually bound, which
     // is the one that will serve. Cheap either way: one inference and one
     // host-side reference.
-    match block_error(&gguf, model, &service, &widths) {
+    let error = block_error(&gguf, model, &service, &widths);
+    // Cut short by a shutdown: not a refusal, and nothing to say.
+    if stopping() {
+        return;
+    }
+    match error {
         Some(error) if error <= max_block_error() => {
             // `in use` rather than a bare count, to pair with the startup
             // inventory's `— preparing feed-forward blocks` and with the
@@ -2993,6 +3006,13 @@ fn block_error(
 
     let mut worst: Option<f32> = None;
     for block in sample_over_depth(&blocks, SAMPLED_BLOCKS) {
+        // Each sampled block is one inference and one host-side `f32`
+        // reference of a whole feed-forward block — seconds on a 7B model,
+        // and the measured remainder of an exit once the graphs are bound.
+        // A measurement cut short is `None`, and `None` is a refusal.
+        if stopping() {
+            return None;
+        }
         // The layer index the service knows this block by, from its own
         // name. Position in `blocks` is not it: a file whose blocks are not
         // a complete run from zero would be measured against the wrong

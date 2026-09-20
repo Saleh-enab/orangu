@@ -153,6 +153,13 @@ pub fn download_model_reporting(
     progress: Option<Arc<DownloadProgress>>,
 ) -> Result<PathBuf> {
     let (repo, tag) = split_repo_tag(spec)?;
+    // `<user>/<repo>:<file>.safetensors` names one file rather than a
+    // quantization — a LoRA for the picture pipeline — and fetches it into
+    // the same cache layout, where `[orangu-server].image_lora` finds it.
+    if let Some(file) = tag.as_deref().filter(|t| t.ends_with(".safetensors")) {
+        eprintln!("Fetching {file} from {repo}");
+        return download_repo_file(models_dir, &repo, file, progress);
+    }
     let client = build_client(None)?;
     let token = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty());
 
@@ -247,7 +254,7 @@ pub fn download_model_reporting(
     let needed: u64 = slots.iter().map(|s| s.size - s.downloaded).sum();
     check_space(&blobs_dir, needed, crate::os::available_space(&blobs_dir))?;
 
-    let board = Mutex::new(ProgressBoard::new(slots, progress));
+    let board = Mutex::new(ProgressBoard::new(slots, progress.clone()));
     // Drawn even when there's nothing left to fetch: a repo that's already
     // fully downloaded still says so, file by file.
     board.lock().unwrap().draw();
@@ -275,7 +282,170 @@ pub fn download_model_reporting(
     if let Err(err) = crate::model_registry::record_download(spec, &path) {
         eprintln!("warning: could not update ~/.orangu/models: {err:#}");
     }
+    // A qwen_image model is a third of a model on its own — see
+    // [`download_image_companions`]. Fetched after the model is recorded so
+    // a failed companion (the VAE repository being down) leaves what was
+    // downloaded usable by anything that does not need it.
+    if let Ok(gguf) = GgufFile::open_summary(&path)
+        && crate::model_spec::architecture_of(&gguf).as_deref() == Some(QWEN_IMAGE_ARCHITECTURE)
+    {
+        download_image_companions(models_dir, progress)?;
+    }
     Ok(path)
+}
+
+/// `general.architecture` of a Qwen-Image diffusion transformer.
+pub const QWEN_IMAGE_ARCHITECTURE: &str = "qwen_image";
+/// The text encoder a `qwen_image` model conditions on: Qwen2.5-VL-7B,
+/// whose final hidden states the transformer was trained against. Any
+/// quantization of it serves; this is the one fetched when none is present.
+pub const QWEN_IMAGE_TEXT_ENCODER_REPO: &str = "unsloth/Qwen2.5-VL-7B-Instruct-GGUF";
+pub const QWEN_IMAGE_TEXT_ENCODER_TAG: &str = "Q4_K_M";
+/// The Qwen-Image VAE, as ComfyUI and stable-diffusion.cpp publish it — a
+/// `safetensors`, since nobody converts a VAE to GGUF.
+pub const QWEN_IMAGE_VAE_REPO: &str = "Comfy-Org/Qwen-Image_ComfyUI";
+pub const QWEN_IMAGE_VAE_FILE: &str = "split_files/vae/qwen_image_vae.safetensors";
+/// Qwen-Image-Lightning, the publishers' step distillation of the model as
+/// a low-rank adapter: a picture in 8 unguided steps instead of 50 guided
+/// ones. Served by default when present — the base model's own settings
+/// are hours on a CPU — so it is fetched with the model.
+pub const QWEN_IMAGE_LIGHTNING_REPO: &str = "lightx2v/Qwen-Image-2512-Lightning";
+pub const QWEN_IMAGE_LIGHTNING_FILE: &str =
+    "Qwen-Image-2512-Lightning-8steps-V1.0-bf16.safetensors";
+
+/// Fetches what a `qwen_image` model needs beside it and does not carry:
+/// the Qwen2.5-VL-7B text encoder (a `qwen2vl` GGUF, itself a model
+/// `list` shows and the server can serve on its own), the VAE, and the
+/// Lightning adapter the server uses by default. Each is skipped when the
+/// models directory already holds one — a second quantization of the
+/// encoder is a choice, not a default — so a re-download, or a second
+/// Qwen-Image checkpoint, fetches nothing twice.
+///
+/// Public so `orangu-server` can offer the same fetch to a directory that
+/// has the model and lacks a companion.
+pub fn download_image_companions(
+    models_dir: &Path,
+    progress: Option<Arc<DownloadProgress>>,
+) -> Result<()> {
+    if crate::model_spec::find_qwen_image_text_encoder(models_dir).is_none() {
+        eprintln!(
+            "Fetching the text encoder a qwen_image model needs \
+             ({QWEN_IMAGE_TEXT_ENCODER_REPO}:{QWEN_IMAGE_TEXT_ENCODER_TAG})"
+        );
+        download_model_reporting(
+            models_dir,
+            &format!("{QWEN_IMAGE_TEXT_ENCODER_REPO}:{QWEN_IMAGE_TEXT_ENCODER_TAG}"),
+            progress.clone(),
+        )
+        .context("downloading the qwen_image text encoder")?;
+    }
+    if crate::model_spec::find_qwen_image_vae(models_dir).is_none() {
+        eprintln!("Fetching the VAE a qwen_image model needs ({QWEN_IMAGE_VAE_REPO})");
+        download_repo_file(
+            models_dir,
+            QWEN_IMAGE_VAE_REPO,
+            QWEN_IMAGE_VAE_FILE,
+            progress.clone(),
+        )
+        .context("downloading the qwen_image VAE")?;
+    }
+    if crate::model_spec::find_qwen_image_lightning(models_dir).is_none() {
+        eprintln!(
+            "Fetching the Lightning adapter a qwen_image model is served with \
+             ({QWEN_IMAGE_LIGHTNING_REPO}:{QWEN_IMAGE_LIGHTNING_FILE})"
+        );
+        download_repo_file(
+            models_dir,
+            QWEN_IMAGE_LIGHTNING_REPO,
+            QWEN_IMAGE_LIGHTNING_FILE,
+            progress,
+        )
+        .context("downloading the qwen_image Lightning adapter")?;
+    }
+    Ok(())
+}
+
+/// Fetches one named file from a repository into the same hub-cache layout
+/// [`download_model_reporting`] uses (`models--<owner>--<name>/snapshots/
+/// <commit>/<path>`), for the files that are not GGUF models: the
+/// Qwen-Image VAE. Returns where the file landed.
+pub fn download_repo_file(
+    models_dir: &Path,
+    repo: &str,
+    file_path: &str,
+    progress: Option<Arc<DownloadProgress>>,
+) -> Result<PathBuf> {
+    let client = build_client(None)?;
+    let token = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty());
+    let commit = resolve_commit(&client, repo, token.as_deref())?;
+    let files = list_repo_files(&client, repo, &commit, token.as_deref())?;
+    let file = files
+        .iter()
+        .find(|f| f.path == file_path)
+        .ok_or_else(|| anyhow!("{repo} has no file {file_path}"))?;
+
+    let repo_dir = models_dir.join(repo_folder_name(repo));
+    let blobs_dir = repo_dir.join("blobs");
+    let snapshot_dir = repo_dir.join("snapshots").join(&commit);
+    fs::create_dir_all(&blobs_dir)
+        .with_context(|| format!("failed to create {}", blobs_dir.display()))?;
+    fs::create_dir_all(&snapshot_dir)
+        .with_context(|| format!("failed to create {}", snapshot_dir.display()))?;
+    let refs_dir = repo_dir.join("refs");
+    fs::create_dir_all(&refs_dir)
+        .with_context(|| format!("failed to create {}", refs_dir.display()))?;
+    fs::write(refs_dir.join("main"), &commit)
+        .with_context(|| format!("failed to write {}", refs_dir.join("main").display()))?;
+
+    let blob_path = blobs_dir.join(&file.oid);
+    let already_downloaded = blob_path.is_file() && fs::metadata(&blob_path)?.len() == file.size;
+    let resumed = match fs::metadata(part_path(&blob_path)).map(|m| m.len()) {
+        Ok(len) if len < file.size => len,
+        _ => 0,
+    };
+    let slots = vec![Slot {
+        label: file.path.clone(),
+        size: file.size,
+        downloaded: if already_downloaded {
+            file.size
+        } else {
+            resumed
+        },
+        state: if already_downloaded {
+            SlotState::Skipped
+        } else {
+            SlotState::Queued
+        },
+    }];
+    check_space(
+        &blobs_dir,
+        file.size - slots[0].downloaded,
+        crate::os::available_space(&blobs_dir),
+    )?;
+    let board = Mutex::new(ProgressBoard::new(slots, progress));
+    board.lock().unwrap().draw();
+    if !already_downloaded {
+        let tasks = vec![DownloadTask {
+            label: file.path.clone(),
+            url: format!(
+                "{HUB_ENDPOINT}/{repo}/resolve/{commit}/{}",
+                urlencode_path(&file.path)
+            ),
+            blob_path: blob_path.clone(),
+            size: file.size,
+            slot: 0,
+        }];
+        download_all(&client, &tasks, token.as_deref(), &board)?;
+    }
+    let snapshot_path = snapshot_dir.join(&file.path);
+    if let Some(parent) = snapshot_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    if !snapshot_path.exists() {
+        link_or_copy(&blob_path, &snapshot_path, &file.oid, &file.path)?;
+    }
+    Ok(snapshot_path)
 }
 
 /// How long one shard's header fetch may take before

@@ -744,6 +744,62 @@ button:disabled {
   display: none;
 }
 
+/* A picture in an answer — one a qwen_image model made, or any markdown
+   image — scaled to the message, with the same save control a diagram
+   has hanging under it. Inline-block rather than a figure: markdown puts
+   the image inside a paragraph, and a block there would escape it. */
+.answer-image {
+  display: inline-block;
+  max-width: 100%;
+  vertical-align: top;
+}
+
+.answer-image img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+}
+
+.answer-image .diagram-dl {
+  display: inline-flex;
+  margin-top: 0.3em;
+}
+
+/* A picture being generated: the robot, blinking as a pending answer
+   does, and beside it the step count and a countdown of the time left,
+   kept by `app.js` from the `progress` events. Only the robot blinks —
+   a clock that flashes cannot be read. */
+.image-progress {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.6em;
+}
+
+.image-progress .image-progress-robot {
+  animation: blink 1s step-start infinite;
+}
+
+.image-progress .image-progress-label {
+  font-size: 0.85em;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A picture attached to a message shows as itself rather than a name:
+   a thumbnail chip, the file name under it on hover. */
+.attachment-chip.image-chip {
+  padding: 4px;
+  border-radius: 8px;
+}
+
+.attachment-chip.image-chip img {
+  display: block;
+  max-width: 160px;
+  max-height: 120px;
+  border-radius: 6px;
+}
+
 /* The diagram source, collapsed. Turning a code block into an image
    would otherwise remove the only way to copy the source back out. */
 .mermaid-source,
@@ -989,13 +1045,15 @@ button:disabled {
   outline-offset: 1px;
 }
 
-/* ------------------------------------------------------------- models --
-   The model manager (index.html's #models-overlay, driven by app.js): a
-   modal over the whole app, not a dropdown like #history-panel — it owns
-   irreversible actions and a download that runs for minutes, so it stays
-   put until it is closed deliberately. */
+/* ----------------------------------------------------------- settings --
+   The settings dialog (index.html's #settings-overlay, driven by app.js):
+   a modal over the whole app, not a dropdown like #history-panel — one of
+   its panes owns irreversible actions and a download that runs for
+   minutes, so it stays put until it is closed deliberately. A brand-brown
+   column on the left holds the pane buttons; the chosen pane fills the
+   rest. */
 
-#models-overlay {
+#settings-overlay {
   position: fixed;
   inset: 0;
   z-index: 30;
@@ -1008,60 +1066,413 @@ button:disabled {
 
 /* Same specificity trap as #attach-menu — `display: flex` above would
    otherwise beat the UA `[hidden]` rule and pin the modal open. */
-#models-overlay[hidden] {
+#settings-overlay[hidden] {
   display: none;
 }
 
-#mcps-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 20;
-  display: grid;
-  place-items: center;
-  padding: 1rem;
-  background: color-mix(in srgb, var(--bg) 65%, transparent);
-}
-
-#mcps-overlay[hidden] { display: none; }
-
-#mcps-panel {
-  width: min(720px, 100%);
-  max-height: min(80vh, 640px);
-  overflow: auto;
-  padding: 1rem;
+#settings-panel {
+  display: flex;
+  flex-direction: column;
+  width: min(1080px, 100%);
+  max-height: 100%;
+  overflow: hidden;
+  background: var(--bg-raised);
   border: 1px solid var(--border);
-  border-radius: .75rem;
-  background: var(--surface);
-  box-shadow: 0 1rem 3rem rgba(0, 0, 0, .35);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
 }
 
-#mcps-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
-#mcps-header h2 { margin: 0; }
-.mcps-note { color: var(--muted); font-size: .9rem; }
-#mcps-table table { width: 100%; border-collapse: collapse; }
-#mcps-table th, #mcps-table td { padding: .55rem; border-bottom: 1px solid var(--border); text-align: left; }
-#mcps-table td:last-child { text-align: right; }
-#mcps-details { white-space: pre-wrap; margin: 1rem 0 0; padding: .75rem; background: var(--bg); border-radius: .5rem; }
-
-/* While an action is in flight the panel keeps its layout but stops taking
-   clicks, so a double-click can't fire a delete twice. */
-#models-overlay.busy #models-panel {
-  pointer-events: none;
-  opacity: 0.7;
+/* The column and the pane, side by side above the footer; the row takes
+   whatever height the footer leaves. */
+#settings-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
 }
 
-#models-panel {
+/* The column: the brand brown of the header, the same in both themes,
+   with white buttons lettered in that brown. The pressed one is the pane
+   on show; it stays white — the column is the only brown thing here, so
+   white-on-brown is the button and nothing else is. */
+#settings-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 0 0 168px;
+  padding: 18px 14px;
+  background: var(--brand-bg);
+  border-right: 1px solid var(--brand-border);
+}
+
+#settings-title {
+  margin: 0 0 8px 6px;
+  font-size: 1.1em;
+  color: var(--brand-text);
+}
+
+.settings-tab {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px solid #ffffff;
+  border-radius: 8px;
+  background: #ffffff;
+  color: var(--brand-bg);
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+}
+
+.settings-tab svg {
+  width: 18px;
+  height: 18px;
+  flex: none;
+}
+
+.settings-tab:hover {
+  background: var(--brand-text);
+}
+
+.settings-tab[aria-pressed="true"] {
+  font-weight: 700;
+  box-shadow: inset 4px 0 0 var(--brand-bg);
+}
+
+/* Greyed when the pane has nothing to offer — the picture settings on a
+   language model. */
+.settings-tab.unavailable {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* The footer across the dialog, in the column's brown: Save at the left
+   edge, Cancel at the right, the same white-on-brown buttons. */
+#settings-footer {
+  display: flex;
+  justify-content: space-between;
+  flex: none;
+  padding: 12px 14px;
+  background: var(--brand-bg);
+  border-top: 1px solid var(--brand-border);
+}
+
+#settings-footer .settings-tab {
+  width: auto;
+  min-width: 120px;
+  justify-content: center;
+}
+
+#settings-content {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  padding: 18px 20px;
+}
+
+#settings-close-btn {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+}
+
+.settings-pane {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  width: min(920px, 100%);
-  max-height: 100%;
-  overflow-y: auto;
+  /* Room for the close button in the corner. */
+  padding-right: 40px;
+}
+
+.settings-pane[hidden] {
+  display: none;
+}
+
+/* ----------------------------------------------------------------- mcps --
+   The MCP inventory: the table, a row's Edit and Delete, the header's Add,
+   and the one form (or the one confirmation) open under the table. */
+#mcps-header { display: flex; align-items: center; gap: 10px; }
+#mcps-header h2 { margin: 0; font-size: 1.1em; }
+#mcps-path { flex: 1; min-width: 0; }
+.mcps-note { color: var(--text-dim); font-size: .9rem; margin: 0; min-height: 1.2em; }
+#mcps-table table { width: 100%; border-collapse: collapse; }
+#mcps-table th, #mcps-table td { padding: .55rem; border-bottom: 1px solid var(--border); text-align: left; }
+#mcps-table th { font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-dim); }
+#mcps-table td:last-child { text-align: right; white-space: nowrap; }
+
+.mcps-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  font-size: 0.9em;
+}
+
+.mcps-action svg {
+  width: 15px;
+  height: 15px;
+}
+
+#mcps-table .mcps-action + .mcps-action {
+  margin-left: 6px;
+}
+
+#mcps-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 640px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+#mcps-form[hidden] {
+  display: none;
+}
+
+#mcps-form h3 {
+  margin: 0;
+  font-size: 1em;
+}
+
+#mcps-form-actions,
+#mcps-confirm {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+#mcps-confirm {
+  padding: 12px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+}
+
+#mcps-confirm[hidden] {
+  display: none;
+}
+
+#mcps-confirm-text {
+  flex: 1;
+}
+
+#mcps-form-ok,
+#mcps-confirm-ok {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-color: var(--accent);
+}
+
+/* --------------------------------------------------------------- notice --
+   The one-button pop-up, above the settings dialog. */
+#notice-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.45);
+}
+
+#notice-overlay[hidden] {
+  display: none;
+}
+
+#notice-box {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(480px, 100%);
   padding: 18px 20px;
   background: var(--bg-raised);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+
+#notice-box h2 {
+  margin: 0;
+  font-size: 1.1em;
+}
+
+#notice-box p {
+  margin: 0;
+}
+
+#notice-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+#notice-ok {
+  min-width: 90px;
+  background: var(--accent);
+  color: var(--accent-text);
+  border-color: var(--accent);
+}
+
+/* ---------------------------------------------------------------- image --
+   The picture settings pane: a label column and a control column, the
+   estimate under them, the two actions last. */
+#image-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+#image-header h2 {
+  margin: 0;
+  font-size: 1.1em;
+}
+
+#image-model {
+  flex: 1;
+  min-width: 0;
+}
+
+#image-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 640px;
+}
+
+.image-field {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  align-items: center;
+  gap: 12px;
+}
+
+.image-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.image-controls select,
+.image-controls input[type="text"],
+.image-controls input[type="number"] {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-input);
+  color: var(--text);
+  font: inherit;
+}
+
+.image-controls input[type="text"] {
+  flex: 1;
+}
+
+.image-controls input[type="number"] {
+  width: 6em;
+}
+
+.image-controls input[type="range"] {
+  flex: 1;
+}
+
+#image-strength-value {
+  min-width: 3em;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+}
+
+#image-estimate {
+  min-height: 1.2em;
+}
+
+#image-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+#image-reset-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#image-reset-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* The (i) beside each setting's name: a small ring, and its explanation
+   in a bubble under the pointer on hover or keyboard focus — `data-tip`
+   is the text, so the markup stays one element per hint and the bubble
+   needs no script. */
+.info-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-left: 4px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-dim);
+  vertical-align: middle;
+  cursor: help;
+}
+
+.info-btn svg {
+  width: 15px;
+  height: 15px;
+}
+
+.info-btn:hover,
+.info-btn:focus-visible {
+  color: var(--accent);
+}
+
+.info-btn::after {
+  content: attr(data-tip);
+  position: absolute;
+  left: 0;
+  top: calc(100% + 6px);
+  z-index: 5;
+  width: 320px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-raised);
+  color: var(--text);
+  font-size: 0.82em;
+  font-weight: 400;
+  line-height: 1.4;
+  text-align: left;
+  white-space: normal;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+  /* `display`, not `visibility`: a hidden bubble hanging below the last
+     row would still stretch the pane's scroll area. */
+  display: none;
+  pointer-events: none;
+}
+
+.info-btn:hover::after,
+.info-btn:focus-visible::after {
+  display: block;
+}
+
+/* ------------------------------------------------------------- models --
+   The model manager pane. While an action is in flight it keeps its layout
+   but stops taking clicks, so a double-click can't fire a delete twice. */
+#settings-overlay.busy #models-panel {
+  pointer-events: none;
+  opacity: 0.7;
 }
 
 #models-header {

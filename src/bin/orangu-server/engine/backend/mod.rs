@@ -829,6 +829,12 @@ pub trait Backend: Send + Sync {
         None
     }
 
+    /// Whether this is the CPU backend — for a caller with a CPU-only fast
+    /// path (the VAE's gathered `int8` convolutions).
+    fn is_cpu(&self) -> bool {
+        false
+    }
+
     /// [`Backend::as_wgpu`] for work scoped to **one layer**, on the device
     /// that layer's weights were placed on.
     ///

@@ -205,6 +205,22 @@ pub struct NpuFfn {
     withdrew: std::sync::atomic::AtomicBool,
 }
 
+/// Set once the process is shutting down: an `open` in progress stops
+/// between two cached graphs — reading them off disk, or binding them on
+/// the device — and answers `None`, instead of finishing a load nobody
+/// will use. Measured on a Zhouyi X2 with the cache on a USB disk: 35
+/// graphs were 25 s of exit.
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells any [`NpuFfn::open`] in progress, and any later one, to give up.
+pub fn request_stop() {
+    STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn stop_requested() -> bool {
+    STOP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl NpuFfn {
     /// Loads every cached block for `model` onto the device.
     ///
@@ -248,6 +264,9 @@ impl NpuFfn {
         // and ordering is all it takes.
         for &tokens in widths {
             for (layer, prefix) in blocks {
+                if stop_requested() {
+                    return None;
+                }
                 let key = BlockKey {
                     model: &model_fingerprint,
                     block: prefix,
@@ -268,6 +287,9 @@ impl NpuFfn {
                 // The same layer's attention projections, when they were
                 // compiled. Loaded here so both kinds go to the device
                 // thread together and share its capacity bookkeeping.
+                if stop_requested() {
+                    return None;
+                }
                 let attn = BlockKey {
                     model: &model_fingerprint,
                     block: &format!("attn.{prefix}"),
@@ -283,7 +305,7 @@ impl NpuFfn {
                 }
             }
         }
-        if artifacts.is_empty() {
+        if artifacts.is_empty() || stop_requested() {
             return None;
         }
         // **What this device was able to hold last time.** Binding a graph
@@ -639,6 +661,14 @@ fn device_thread(
     // executables for the same layer.
     let mut bound: HashMap<(Kind, usize, usize), Bound> = HashMap::new();
     for (compiled, layer, tokens) in artifacts {
+        // A shutdown between two binds: what is bound is released here on
+        // the device's own thread, and the caller is told there is nothing
+        // — a partial set would only be offered, then dropped, on exit.
+        if stop_requested() {
+            drop(bound);
+            let _ = ready.send(Vec::new());
+            return;
+        }
         let kind = match &compiled {
             Artifact::Ffn(_) => Kind::Ffn,
             Artifact::Attn(_) => Kind::Attn,

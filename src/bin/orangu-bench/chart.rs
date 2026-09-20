@@ -216,6 +216,15 @@ pub fn render_labelled(
             "Embeddings — forward pass",
             axes.x.as_deref().unwrap_or("prompt length (tokens)"),
         ),
+        // Image generation is the diffusion transformer's rate — latent-token
+        // passes per second over the denoising loop — against the picture's
+        // side. Not tokens of text, and not one of the models above, so it
+        // has a panel of its own.
+        (
+            "image",
+            "Image — transformer, latent-token passes/s",
+            axes.x.as_deref().unwrap_or("picture side (pixels)"),
+        ),
         // The three mixture-of-experts mechanism panels (`super::moe`). Each
         // is a count rather than a rate, and none is in tokens/second, so
         // none can share a panel with the ones above — the whole reason they

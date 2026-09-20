@@ -27,6 +27,7 @@ pub mod expert_store;
 pub mod expert_tier;
 pub mod footprint;
 pub mod generate;
+pub mod image;
 pub mod iq_grids;
 pub mod kv_cache;
 pub mod kv_pool;

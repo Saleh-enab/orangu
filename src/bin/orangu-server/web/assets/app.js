@@ -18,6 +18,7 @@
   const attachmentsEl = document.getElementById("attachments");
   const attachInputs = {
     document: document.getElementById("attach-input-document"),
+    image: document.getElementById("attach-input-image"),
     file: document.getElementById("attach-input-file"),
   };
 
@@ -94,21 +95,44 @@
     return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
   }
 
+  // Whether an attachment is a picture the console shows as itself: a
+  // staged one carries its bytes (`data`, base64) and a sent one the URL
+  // the server kept it at (`image_url`).
+  function imageSrcOf(att) {
+    if (att.image_url) return att.image_url;
+    if (att.data && /^image\/(png|jpeg|jpg|gif|webp|svg\+xml)$/.test(att.mime || "")) {
+      return `data:${att.mime};base64,${att.data}`;
+    }
+    return null;
+  }
+
   // One attachment chip: name + size, and (staged only) a remove button.
+  // A picture is a thumbnail instead, its name and size on hover — the
+  // picture says more than either.
   function makeAttachmentChip(att, onRemove) {
     const chip = document.createElement("span");
     chip.className = "attachment-chip";
 
-    const name = document.createElement("span");
-    name.className = "chip-name";
-    name.textContent = att.name;
-    name.title = att.mime ? `${att.name} (${att.mime})` : att.name;
+    const imageSrc = imageSrcOf(att);
+    if (imageSrc) {
+      chip.classList.add("image-chip");
+      const img = document.createElement("img");
+      img.src = imageSrc;
+      img.alt = att.name;
+      img.title = `${att.name} (${att.mime || "image"}, ${formatSize(att.size)})`;
+      chip.appendChild(img);
+    } else {
+      const name = document.createElement("span");
+      name.className = "chip-name";
+      name.textContent = att.name;
+      name.title = att.mime ? `${att.name} (${att.mime})` : att.name;
 
-    const size = document.createElement("span");
-    size.className = "chip-size";
-    size.textContent = formatSize(att.size);
+      const size = document.createElement("span");
+      size.className = "chip-size";
+      size.textContent = formatSize(att.size);
 
-    chip.append(name, size);
+      chip.append(name, size);
+    }
 
     if (onRemove) {
       const remove = document.createElement("button");
@@ -957,9 +981,73 @@
 
   function showFailure(assistantEl, consoleLabel, detail) {
     console.error(consoleLabel, detail);
+    clearImageProgress(assistantEl);
     assistantEl.className = "message error";
     assistantEl.textContent = FAILURE_MESSAGE;
     addErrorFooter(assistantEl, detail);
+  }
+
+  // The wait for a picture being generated — see the `progress` event in
+  // `sendMessage`. The blinking robot stays, as for any answer still on
+  // its way, and beside it the time left counts down second by second:
+  // the server says once per step how long it expects the rest to take
+  // (`eta_seconds`), and a step can be minutes apart, so the clock runs
+  // locally between events and is set from each new one. Built once per
+  // answer and updated in place.
+  function showImageProgress(assistantEl, payload) {
+    let box = assistantEl.querySelector(":scope > .image-progress");
+    if (!box) {
+      assistantEl.textContent = "";
+      box = document.createElement("span");
+      box.className = "image-progress";
+      const robot = document.createElement("span");
+      robot.className = "image-progress-robot";
+      robot.textContent = "🤖";
+      const label = document.createElement("span");
+      label.className = "image-progress-label";
+      box.append(robot, label);
+      assistantEl.appendChild(box);
+      box.timer = setInterval(() => renderImageProgress(box), 1000);
+    }
+    box.step = Number(payload.step) || 0;
+    box.steps = Number(payload.steps) || 0;
+    const eta = Number(payload.eta_seconds);
+    // Step 0 is the server's announcement before the first step — its
+    // estimate from the last measured rate — so the wait is on screen the
+    // moment the prompt is sent, not after a first step that may itself be
+    // minutes away.
+    box.deadline = Number.isFinite(eta) && eta > 0 ? Date.now() + eta * 1000 : null;
+    renderImageProgress(box);
+  }
+
+  function renderImageProgress(box) {
+    const { step, steps, deadline } = box;
+    let text = steps > 0 && step > 0 ? `Step ${step}/${steps}` : "Starting";
+    if (deadline !== null) {
+      const left = Math.max(0, Math.round((deadline - Date.now()) / 1000));
+      text += left > 0 ? ` · ${formatCountdown(left)}` : " · any moment now";
+    }
+    box.querySelector(".image-progress-label").textContent = text;
+  }
+
+  function clearImageProgress(assistantEl) {
+    const box = assistantEl.querySelector(":scope > .image-progress");
+    if (box) {
+      clearInterval(box.timer);
+      box.remove();
+    }
+  }
+
+  // `4h 21m 03s`, `19m 35s`, `6s` — every field the clock ticks through is
+  // shown, so a countdown never jumps when an hour or a minute rolls over.
+  function formatCountdown(seconds) {
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const rest = seconds % 60;
+    const pad = (n) => String(n).padStart(2, "0");
+    if (hours > 0) return `${hours}h ${pad(minutes)}m ${pad(rest)}s`;
+    if (minutes > 0) return `${minutes}m ${pad(rest)}s`;
+    return `${rest}s`;
   }
 
   async function sendMessage(text, attachments) {
@@ -1039,10 +1127,23 @@
             appendAttachmentChips(userEl, turnAttachments);
             continue;
           }
+          if (payload.type === "progress") {
+            // An image model reports once per denoising step rather than
+            // per token: the step count and a countdown of the estimate
+            // left beside the robot (the bubble's own blink comes off — the
+            // robot inside the box blinks by itself, the clock does not),
+            // until the picture lands in the `done` event like any other
+            // answer.
+            assistantEl.classList.remove("pending");
+            showImageProgress(assistantEl, payload);
+            transcript.scrollTop = transcript.scrollHeight;
+            continue;
+          }
           assistantEl.classList.remove("pending");
           if (payload.type === "reasoning" || payload.type === "token" || payload.type === "done") {
             ensurePanes(assistantEl);
             if (payload.type === "done") {
+              clearImageProgress(assistantEl);
               // The finished documents, whole — see `applyHtmlDelta`.
               reasoningHtml = payload.reasoning_html ?? "";
               answerHtml = payload.html ?? "";
@@ -1115,6 +1216,7 @@
         // failure bubble. If nothing had arrived yet, drop the placeholder.
         const hadContent = !assistantEl.classList.contains("pending");
         assistantEl.classList.remove("pending");
+        clearImageProgress(assistantEl);
         if (hadContent) {
           const notice = document.createElement("p");
           notice.className = "truncated-notice";
@@ -1253,9 +1355,22 @@
   // icon button whose label lives in its `title`/`aria-label`, matching the
   // rest of this UI's chrome.
 
-  const modelsBtn = document.getElementById("models-btn");
-  const modelsOverlay = document.getElementById("models-overlay");
-  const modelsCloseBtn = document.getElementById("models-close-btn");
+  // Settings: one dialog, three panes — MCP servers, the model manager,
+  // the picture settings — picked from the brand-brown column on its left.
+  // The overlay is shared; each pane keeps its own state below, and the
+  // model manager's polling runs only while its pane is the one shown.
+  const settingsBtn = document.getElementById("settings-btn");
+  const settingsOverlay = document.getElementById("settings-overlay");
+  const settingsCloseBtn = document.getElementById("settings-close-btn");
+  const settingsSaveBtn = document.getElementById("settings-save-btn");
+  const settingsCancelBtn = document.getElementById("settings-cancel-btn");
+  const settingsTabs = Array.from(document.querySelectorAll("#settings-nav .settings-tab"));
+  const settingsPanes = {
+    mcps: document.getElementById("mcps-panel"),
+    models: document.getElementById("models-panel"),
+    image: document.getElementById("image-panel"),
+  };
+  const modelsOverlay = settingsOverlay;
   const modelsReloadBtn = document.getElementById("models-reload-btn");
   const modelsDirEl = document.getElementById("models-dir");
   const modelsCurrentEl = document.getElementById("models-current");
@@ -1868,8 +1983,6 @@
 
   function openModels() {
     modelsState.open = true;
-    modelsOverlay.hidden = false;
-    modelsBtn.setAttribute("aria-expanded", "true");
     modelsNotice("");
     refreshModels(true).catch((err) => console.error(err));
     refreshUpdateBadges().catch((err) => console.error(err));
@@ -1883,8 +1996,6 @@
 
   function closeModels() {
     modelsState.open = false;
-    modelsOverlay.hidden = true;
-    modelsBtn.setAttribute("aria-expanded", "false");
     modelsMetadataEl.hidden = true;
     modelsState.metadata.model = null;
     if (modelsState.timer) {
@@ -1893,33 +2004,10 @@
     }
   }
 
-  modelsBtn.addEventListener("click", () => {
-    if (modelsOverlay.hidden) {
-      openModels();
-    } else {
-      closeModels();
-    }
-  });
-  modelsCloseBtn.addEventListener("click", closeModels);
   modelsReloadBtn.addEventListener("click", () => {
     modelsNotice("");
     refreshModels(true).catch((err) => console.error(err));
     refreshUpdateBadges().catch((err) => console.error(err));
-  });
-  // Clicking the backdrop closes; clicking inside the panel does not. Escape
-  // closes the metadata viewer first, if it's open, so one key doesn't throw
-  // away two levels at once.
-  modelsOverlay.addEventListener("click", (event) => {
-    if (event.target === modelsOverlay) closeModels();
-  });
-  document.addEventListener("keydown", (event) => {
-    if (event.key !== "Escape" || modelsOverlay.hidden) return;
-    if (!modelsMetadataEl.hidden) {
-      modelsMetadataEl.hidden = true;
-      modelsState.metadata.model = null;
-    } else {
-      closeModels();
-    }
   });
 
   document.addEventListener("click", (event) => {
@@ -1936,59 +2024,531 @@
     }
   });
 
-  // MCP inventory is deliberately read-only. The server reads its MCP
-  // sections at startup, so changing one belongs in the config plus restart.
-  const mcpsBtn = document.getElementById("mcps-btn");
-  const mcpsOverlay = document.getElementById("mcps-overlay");
-  const mcpsCloseBtn = document.getElementById("mcps-close-btn");
+  // ------------------------------------------------------------ mcps --
+  // The MCP servers the configuration file names. The pane edits a draft
+  // of the list — Add, Edit and Delete each through a small form with its
+  // own OK and Cancel — and the dialog's Save writes the draft to the file
+  // (`PUT /api/mcps`), which the server rewrites one section at a time.
+  // This server never connects to an MCP server itself, so a written
+  // change is complete the moment it is in the file; a server started from
+  // the file afterwards is what reads it, and Save's pop-up says so.
   const mcpsTable = document.getElementById("mcps-table");
-  const mcpsDetails = document.getElementById("mcps-details");
+  const mcpsPath = document.getElementById("mcps-path");
+  const mcpsAddBtn = document.getElementById("mcps-add-btn");
+  const mcpsForm = document.getElementById("mcps-form");
+  const mcpsFormTitle = document.getElementById("mcps-form-title");
+  const mcpsFormName = document.getElementById("mcps-form-name");
+  const mcpsFormEndpoint = document.getElementById("mcps-form-endpoint");
+  const mcpsFormEnabled = document.getElementById("mcps-form-enabled");
+  const mcpsFormApproval = document.getElementById("mcps-form-approval");
+  const mcpsFormCancel = document.getElementById("mcps-form-cancel");
+  const mcpsFormStatus = document.getElementById("mcps-form-status");
+  const mcpsConfirm = document.getElementById("mcps-confirm");
+  const mcpsConfirmText = document.getElementById("mcps-confirm-text");
+  const mcpsConfirmOk = document.getElementById("mcps-confirm-ok");
+  const mcpsConfirmCancel = document.getElementById("mcps-confirm-cancel");
+  const mcpsStatus = document.getElementById("mcps-status");
+  // `saved`: the list as the server last reported it; `draft`: the list
+  // with the pane's edits, what Save sends. `editing`: the name of the row
+  // an open form is for, `""` for a new one, `null` when the form is
+  // closed. `path`: the configuration file, `null` when there is none to
+  // write (a bundled binary), which makes the pane read-only.
+  const mcpsState = { saved: [], draft: [], editing: null, path: null, pendingDelete: null };
 
-  function closeMcps() {
-    mcpsOverlay.hidden = true;
-    mcpsBtn.setAttribute("aria-expanded", "false");
+  function mcpsDirty() {
+    return JSON.stringify(mcpsState.draft) !== JSON.stringify(mcpsState.saved);
   }
 
-  async function showMcp(name) {
-    const res = await fetch(`/api/mcps/${encodeURIComponent(name)}`, { cache: "no-store" });
-    if (!res.ok) throw new Error(await res.text());
-    mcpsDetails.textContent = JSON.stringify(await res.json(), null, 2);
-    mcpsDetails.hidden = false;
-  }
+  const ICON_EDIT = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>`;
+  const ICON_DELETE = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/></svg>`;
 
-  async function openMcps() {
-    mcpsOverlay.hidden = false;
-    mcpsBtn.setAttribute("aria-expanded", "true");
-    mcpsDetails.hidden = true;
-    mcpsTable.textContent = "Loading…";
-    const res = await fetch("/api/mcps", { cache: "no-store" });
-    if (!res.ok) throw new Error(await res.text());
-    const mcps = await res.json();
-    if (!mcps.length) {
+  function renderMcps() {
+    const writable = !!mcpsState.path;
+    mcpsPath.textContent = mcpsState.path || "no configuration file — read-only";
+    mcpsAddBtn.disabled = !writable;
+    if (!mcpsState.draft.length) {
       mcpsTable.textContent = "No MCP servers are configured.";
       return;
     }
     const table = document.createElement("table");
-    table.innerHTML = "<thead><tr><th>Name</th><th>Endpoint</th><th>Status</th><th></th></tr></thead>";
+    table.innerHTML = "<thead><tr><th>Name</th><th>Endpoint</th><th>Status</th><th>Approval</th><th></th></tr></thead>";
     const body = document.createElement("tbody");
-    mcps.forEach((mcp) => {
+    mcpsState.draft.forEach((mcp) => {
       const row = document.createElement("tr");
-      [mcp.name, mcp.endpoint, mcp.enabled ? "Enabled" : "Disabled"].forEach((value) => {
-        const cell = document.createElement("td"); cell.textContent = value; row.appendChild(cell);
+      [mcp.name, mcp.endpoint, mcp.enabled ? "Enabled" : "Disabled", mcp.approval_mode].forEach((value) => {
+        const cell = document.createElement("td");
+        cell.textContent = value;
+        row.appendChild(cell);
       });
       const action = document.createElement("td");
-      const show = document.createElement("button");
-      show.type = "button"; show.className = "icon-btn subtle-btn"; show.textContent = "Show";
-      show.addEventListener("click", () => showMcp(mcp.name).catch((err) => { mcpsDetails.textContent = err.message; mcpsDetails.hidden = false; }));
-      action.appendChild(show); row.appendChild(action); body.appendChild(row);
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.className = "mcps-action";
+      edit.innerHTML = `${ICON_EDIT} Edit`;
+      edit.disabled = !writable;
+      edit.addEventListener("click", () => openMcpForm(mcp.name));
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "mcps-action";
+      del.innerHTML = `${ICON_DELETE} Delete`;
+      del.disabled = !writable;
+      del.addEventListener("click", () => askDeleteMcp(mcp.name));
+      action.append(edit, del);
+      row.appendChild(action);
+      body.appendChild(row);
     });
     table.appendChild(body);
     mcpsTable.replaceChildren(table);
   }
 
-  mcpsBtn.addEventListener("click", () => openMcps().catch((err) => { mcpsTable.textContent = err.message; }));
-  mcpsCloseBtn.addEventListener("click", closeMcps);
-  mcpsOverlay.addEventListener("click", (event) => { if (event.target === mcpsOverlay) closeMcps(); });
+  // The form, for a new server (`name` empty) or the named one's values.
+  function openMcpForm(name) {
+    closeMcpConfirm();
+    mcpsState.editing = name;
+    const mcp = mcpsState.draft.find((m) => m.name === name);
+    mcpsFormTitle.textContent = mcp ? `Edit ${mcp.name}` : "Add an MCP server";
+    mcpsFormName.value = mcp ? mcp.name : "";
+    // The name is the section header, and a renamed section is another
+    // section: to rename, delete and add.
+    mcpsFormName.disabled = !!mcp;
+    mcpsFormEndpoint.value = mcp ? mcp.endpoint : "";
+    mcpsFormEnabled.checked = mcp ? mcp.enabled : true;
+    mcpsFormApproval.value = mcp ? mcp.approval_mode : "writes";
+    mcpsFormStatus.textContent = "";
+    mcpsForm.hidden = false;
+    (mcp ? mcpsFormEndpoint : mcpsFormName).focus();
+  }
+
+  function closeMcpForm() {
+    mcpsState.editing = null;
+    mcpsForm.hidden = true;
+  }
+
+  // OK: into the draft, after the checks the server would make, so a
+  // mistake is said here rather than at Save.
+  mcpsForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const name = mcpsFormName.value.trim();
+    const endpoint = mcpsFormEndpoint.value.trim();
+    if (!name) {
+      mcpsFormStatus.textContent = "A name is needed.";
+      return;
+    }
+    if (/[\[\]=#;]/.test(name) || name === "orangu-server" || name === "web") {
+      mcpsFormStatus.textContent = "The name is the [section] in the file: no [ ] = # ; and not orangu-server or web.";
+      return;
+    }
+    if (!endpoint) {
+      mcpsFormStatus.textContent = "An endpoint is needed.";
+      return;
+    }
+    const entry = { name, endpoint, enabled: mcpsFormEnabled.checked, approval_mode: mcpsFormApproval.value };
+    if (mcpsState.editing === "") {
+      if (mcpsState.draft.some((m) => m.name === name)) {
+        mcpsFormStatus.textContent = `There is already a server named ${name}.`;
+        return;
+      }
+      mcpsState.draft.push(entry);
+      mcpsState.draft.sort((a, b) => a.name.localeCompare(b.name));
+    } else {
+      const index = mcpsState.draft.findIndex((m) => m.name === mcpsState.editing);
+      if (index >= 0) mcpsState.draft[index] = entry;
+    }
+    closeMcpForm();
+    renderMcps();
+    mcpsStatus.textContent = mcpsDirty() ? "Changed — Save writes it to the configuration file." : "";
+  });
+  mcpsFormCancel.addEventListener("click", closeMcpForm);
+  mcpsAddBtn.addEventListener("click", () => openMcpForm(""));
+
+  function askDeleteMcp(name) {
+    closeMcpForm();
+    mcpsState.pendingDelete = name;
+    mcpsConfirmText.textContent = `Delete ${name} from the configuration?`;
+    mcpsConfirm.hidden = false;
+    mcpsConfirmOk.focus();
+  }
+
+  function closeMcpConfirm() {
+    mcpsState.pendingDelete = null;
+    mcpsConfirm.hidden = true;
+  }
+
+  mcpsConfirmOk.addEventListener("click", () => {
+    mcpsState.draft = mcpsState.draft.filter((m) => m.name !== mcpsState.pendingDelete);
+    closeMcpConfirm();
+    renderMcps();
+    mcpsStatus.textContent = mcpsDirty() ? "Changed — Save writes it to the configuration file." : "";
+  });
+  mcpsConfirmCancel.addEventListener("click", closeMcpConfirm);
+
+  async function openMcps() {
+    closeMcpForm();
+    closeMcpConfirm();
+    mcpsStatus.textContent = "";
+    mcpsTable.textContent = "Loading…";
+    const res = await fetch("/api/mcps", { cache: "no-store" });
+    if (!res.ok) throw new Error(await res.text());
+    const inventory = await res.json();
+    mcpsState.saved = inventory.servers;
+    mcpsState.draft = inventory.servers.map((m) => ({ ...m }));
+    mcpsState.path = inventory.path;
+    renderMcps();
+  }
+
+  // Save's share: the draft to the file. The answer is the file's own
+  // list, read back, and where it went.
+  async function saveMcps() {
+    const res = await fetch("/api/mcps", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(mcpsState.draft),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const inventory = await res.json();
+    mcpsState.saved = inventory.servers;
+    mcpsState.draft = inventory.servers.map((m) => ({ ...m }));
+    renderMcps();
+    return inventory;
+  }
+
+  // -------------------------------------------------------- notice --
+  // One pop-up with one button, for the word after a Save that wrote the
+  // configuration file.
+  const noticeOverlay = document.getElementById("notice-overlay");
+  const noticeTitle = document.getElementById("notice-title");
+  const noticeText = document.getElementById("notice-text");
+  const noticeOk = document.getElementById("notice-ok");
+
+  function showNotice(title, text) {
+    noticeTitle.textContent = title;
+    noticeText.textContent = text;
+    noticeOverlay.hidden = false;
+    noticeOk.focus();
+  }
+  noticeOk.addEventListener("click", () => { noticeOverlay.hidden = true; });
+  noticeOverlay.addEventListener("click", (event) => {
+    if (event.target === noticeOverlay) noticeOverlay.hidden = true;
+  });
+
+  // ---------------------------------------------------------- image --
+  // The picture settings: the defaults every chat turn on an image model
+  // gets, which the server holds (`GET`/`POST /api/props`, the API's
+  // `/props`) so a choice made here is what the next prompt draws — a
+  // 256-pixel, 4-step preview, then the full picture. The estimate under
+  // the controls is the server's own rate model applied to what is
+  // selected, before anything is sent. Nothing here reaches the server
+  // until the dialog's Save; Cancel drops the edits, and the pane's own
+  // Reset only puts the form back to the configuration's values.
+  const imageForm = document.getElementById("image-form");
+  const imageNone = document.getElementById("image-none");
+  const imageModelEl = document.getElementById("image-model");
+  const imageSize = document.getElementById("image-size");
+  const imageSizeCustom = document.getElementById("image-size-custom");
+  const imageSteps = document.getElementById("image-steps");
+  const imageStepsCustom = document.getElementById("image-steps-custom");
+  const imageCfg = document.getElementById("image-cfg");
+  const imageCfgCustom = document.getElementById("image-cfg-custom");
+  const imageNegative = document.getElementById("image-negative");
+  const imageStrength = document.getElementById("image-strength");
+  const imageStrengthValue = document.getElementById("image-strength-value");
+  const imageFormat = document.getElementById("image-format");
+  const imageEstimate = document.getElementById("image-estimate");
+  const imageStatus = document.getElementById("image-status");
+  const imageResetBtn = document.getElementById("image-reset-btn");
+  const imageTab = settingsTabs.find((tab) => tab.dataset.pane === "image");
+  // The last `/api/props` answer's `image` object, or `null` for a
+  // language model.
+  let imageProps = null;
+
+  // A select with an "Other…" row: the value is one of the options, or
+  // whatever the input beside it says once "Other…" is chosen.
+  function selectWithCustom(select, custom, value) {
+    const text = String(value);
+    const option = Array.from(select.options).find((o) => o.value === text);
+    if (option) {
+      select.value = text;
+      custom.hidden = true;
+    } else {
+      select.value = "custom";
+      custom.hidden = false;
+      custom.value = text;
+    }
+  }
+  function customValue(select, custom) {
+    return select.value === "custom" ? custom.value.trim() : select.value;
+  }
+  for (const [select, custom] of [
+    [imageSize, imageSizeCustom],
+    [imageSteps, imageStepsCustom],
+    [imageCfg, imageCfgCustom],
+  ]) {
+    select.addEventListener("change", () => {
+      custom.hidden = select.value !== "custom";
+      if (!custom.hidden) custom.focus();
+      renderImageEstimate();
+    });
+    custom.addEventListener("input", renderImageEstimate);
+  }
+  imageStrength.addEventListener("input", () => {
+    imageStrengthValue.textContent = Number(imageStrength.value).toFixed(2);
+  });
+
+  function fillImageForm(d) {
+    selectWithCustom(imageSize, imageSizeCustom, d.size);
+    selectWithCustom(imageSteps, imageStepsCustom, d.steps);
+    selectWithCustom(imageCfg, imageCfgCustom, d.cfg_scale);
+    imageNegative.value = d.negative_prompt.trim();
+    imageStrength.value = d.strength;
+    imageStrengthValue.textContent = Number(d.strength).toFixed(2);
+    imageFormat.value = d.format || "png";
+    renderImageEstimate();
+  }
+
+  // What the form says now, as `POST /api/props`' `image` object.
+  function imageFormSettings() {
+    const cfg = Number(customValue(imageCfg, imageCfgCustom));
+    return {
+      size: customValue(imageSize, imageSizeCustom),
+      steps: Number(customValue(imageSteps, imageStepsCustom)),
+      cfg_scale: Number.isFinite(cfg) ? cfg : 1,
+      negative_prompt: imageNegative.value.trim() || " ",
+      strength: Number(imageStrength.value),
+      format: imageFormat.value,
+    };
+  }
+
+  // The server's rate model (see `/props`' `rate`) over the form's
+  // settings: encode + steps × tokens × passes × (linear + attention
+  // scaled to this size) + decode per pixel.
+  function renderImageEstimate() {
+    if (!imageProps) return;
+    const rate = imageProps.rate;
+    const settings = imageFormSettings();
+    const match = /^(\d+)x(\d+)$/.exec(settings.size);
+    if (!match || !Number.isFinite(settings.steps) || settings.steps < 1) {
+      imageEstimate.textContent = "";
+      return;
+    }
+    if (!rate) {
+      imageEstimate.textContent = "No rate measured yet — the first picture teaches it.";
+      return;
+    }
+    const width = Number(match[1]);
+    const height = Number(match[2]);
+    const tokens = Math.floor(width / 16) * Math.floor(height / 16);
+    const passes = settings.cfg_scale > 1 ? 2 : 1;
+    const attention = rate.attention_per_token_pass * tokens / Math.max(rate.attention_tokens, 1);
+    const step = tokens * passes * (rate.linear_per_token_pass + attention);
+    const seconds = rate.encode + step * settings.steps + rate.decode_per_pixel * width * height;
+    imageEstimate.textContent = `About ${formatCountdown(Math.round(seconds))} a picture at these settings on this server.`;
+  }
+
+  async function loadImageProps() {
+    const res = await fetch("/api/props", { cache: "no-store" });
+    if (!res.ok) throw new Error(await res.text());
+    const props = await res.json();
+    imageProps = props.image;
+    renderImageProps(props);
+  }
+
+  function renderImageProps(props) {
+    const image = props.image;
+    imageTab.classList.toggle("unavailable", !image);
+    imageTab.title = image ? "" : "Not an image model";
+    imageNone.hidden = !!image;
+    imageForm.hidden = !image;
+    if (!image) {
+      imageModelEl.textContent = props.model || "";
+      return;
+    }
+    const lora = image.lora;
+    imageModelEl.textContent = lora
+      ? `${props.model} · ${lora.path.split(/[\\/]/).pop()}${lora.steps ? ` (${lora.steps}-step)` : ""}`
+      : `${props.model} · base model, no adapter`;
+    fillImageForm(image.defaults);
+  }
+
+  // Whether the form differs from what the server holds — what Save has
+  // to send. A language model has no form, and nothing to send.
+  function imageFormDirty() {
+    if (!imageProps) return false;
+    const d = imageProps.defaults;
+    const f = imageFormSettings();
+    return (
+      f.size !== d.size ||
+      f.steps !== d.steps ||
+      Math.abs(f.cfg_scale - d.cfg_scale) > 1e-6 ||
+      f.negative_prompt.trim() !== d.negative_prompt.trim() ||
+      Math.abs(f.strength - d.strength) > 1e-6 ||
+      f.format !== (d.format || "png")
+    );
+  }
+
+  async function postImageProps(settings) {
+    imageStatus.textContent = "Saving…";
+    const res = await fetch("/api/props", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image: settings }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const props = await res.json();
+    imageProps = props.image;
+    renderImageProps(props);
+    const d = props.image.defaults;
+    const eta = props.image.estimated_default_seconds;
+    imageStatus.textContent = `Set: ${d.size}, ${d.steps} steps, guidance ${d.cfg_scale > 1 ? d.cfg_scale : "off"}${
+      Number.isFinite(eta) ? ` — about ${formatCountdown(Math.round(eta))} a picture` : ""
+    }.`;
+  }
+
+  // Enter in a field is Save, the same as the button in the column.
+  imageForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    saveSettings();
+  });
+  // Back to the configuration file's values — in the form only; Save is
+  // what makes them the server's.
+  imageResetBtn.addEventListener("click", () => {
+    if (!imageProps) return;
+    fillImageForm(imageProps.configured);
+    imageStatus.textContent = "Reset to the configuration — Save to apply.";
+  });
+
+  // ------------------------------------------------------- settings --
+  let settingsPane = null;
+
+  // `keepForm`: switch to the pane without refilling its form from the
+  // server — for showing a refused Save beside the value that was refused.
+  function showSettingsPane(name, keepForm = false) {
+    if (settingsPane === "models" && name !== "models") closeModels();
+    settingsPane = name;
+    for (const tab of settingsTabs) {
+      tab.setAttribute("aria-pressed", tab.dataset.pane === name ? "true" : "false");
+    }
+    for (const [key, pane] of Object.entries(settingsPanes)) {
+      pane.hidden = key !== name;
+    }
+    if (name === "models") openModels();
+    // A draft with edits survives a look at another pane; a clean one is
+    // re-read, in case the file changed.
+    if (name === "mcps" && !keepForm && !mcpsDirty()) {
+      openMcps().catch((err) => { mcpsTable.textContent = err.message; });
+    }
+    if (name === "image" && !keepForm) {
+      imageStatus.textContent = "";
+      loadImageProps().catch((err) => { imageStatus.textContent = err.message; });
+    }
+    try {
+      localStorage.setItem("orangu-settings-pane", name);
+    } catch {
+      // A private window; the pane just isn't remembered.
+    }
+  }
+
+  function openSettings() {
+    settingsOverlay.hidden = false;
+    settingsBtn.setAttribute("aria-expanded", "true");
+    let pane = null;
+    try {
+      pane = localStorage.getItem("orangu-settings-pane");
+    } catch {
+      // As above.
+    }
+    if (!settingsPanes[pane]) pane = "models";
+    showSettingsPane(pane);
+    // The Image tab is greyed on a language model; that is learnt from
+    // `/api/props`, asked once the dialog is open so the other panes never
+    // wait on it.
+    loadImageProps().catch((err) => console.error(err));
+  }
+
+  function closeSettings() {
+    if (settingsPane === "models") closeModels();
+    // Whatever the MCP pane still held is dropped: Save has written it by
+    // now, and Cancel means not to.
+    closeMcpForm();
+    closeMcpConfirm();
+    mcpsState.draft = mcpsState.saved.map((m) => ({ ...m }));
+    settingsPane = null;
+    settingsOverlay.hidden = true;
+    settingsBtn.setAttribute("aria-expanded", "false");
+  }
+
+  // Save: every pane's pending edits go to the server, then the dialog
+  // closes. Only the Image pane holds any — the model manager acts as it
+  // goes and the MCP pane is read-only — so this is the picture form when
+  // it differs from what the server holds; a refused value keeps the
+  // dialog open with the reason under the form.
+  async function saveSettings() {
+    if (imageFormDirty()) {
+      try {
+        await postImageProps(imageFormSettings());
+      } catch (err) {
+        showSettingsPane("image", true);
+        imageStatus.textContent = err.message;
+        return;
+      }
+    }
+    let written = null;
+    if (mcpsDirty()) {
+      try {
+        written = await saveMcps();
+      } catch (err) {
+        showSettingsPane("mcps", true);
+        mcpsStatus.textContent = err.message;
+        return;
+      }
+    }
+    closeSettings();
+    if (written) {
+      showNotice(
+        "MCP servers saved",
+        `Written to ${written.path}. orangu-server reads its MCP servers when it starts, so restart it for the change to apply.`,
+      );
+    }
+  }
+
+  // Cancel (and the corner's ×, and Escape): the edits are dropped — the
+  // form is refilled from the server the next time the pane opens.
+  function cancelSettings() {
+    closeSettings();
+  }
+
+  settingsBtn.addEventListener("click", () => {
+    if (settingsOverlay.hidden) {
+      openSettings();
+    } else {
+      cancelSettings();
+    }
+  });
+  settingsCloseBtn.addEventListener("click", cancelSettings);
+  settingsSaveBtn.addEventListener("click", () => {
+    saveSettings().catch((err) => console.error(err));
+  });
+  settingsCancelBtn.addEventListener("click", cancelSettings);
+  for (const tab of settingsTabs) {
+    tab.addEventListener("click", () => {
+      if (tab.classList.contains("unavailable")) return;
+      showSettingsPane(tab.dataset.pane);
+    });
+  }
+  // Clicking the backdrop closes; clicking inside the dialog does not.
+  // Escape closes the model manager's metadata viewer first, if it's open,
+  // so one key doesn't throw away two levels at once.
+  settingsOverlay.addEventListener("click", (event) => {
+    if (event.target === settingsOverlay) cancelSettings();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || settingsOverlay.hidden) return;
+    if (settingsPane === "models" && !modelsMetadataEl.hidden) {
+      modelsMetadataEl.hidden = true;
+      modelsState.metadata.model = null;
+    } else {
+      cancelSettings();
+    }
+  });
 
   (async function init() {
     const savedId = localStorage.getItem("orangu-session-id");

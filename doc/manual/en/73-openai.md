@@ -11,8 +11,9 @@ serve it.
 The model argument resolves the same way `orangu-server show`/`download` do: an
 existing local `.gguf` path, an `NR`/`MODEL` label under the configured `models`
 directory, or a `<user>/<model>[:quant]` Hugging Face repo (fetched on first
-use). The role flag (`--all`/`--code`/`--review`/`--explorer`/`--embedding`,
-mutually exclusive, `--all` by default) selects how the server presents itself;
+use). The role flag (`--all`/`--code`/`--review`/`--explorer`/`--embedding`/
+`--image`, mutually exclusive, `--all` by default; `--image` is fixed by a
+`qwen_image` model rather than chosen) selects how the server presents itself;
 give each running server its own port in `orangu-server.conf` when you run more
 than one at a time.
 

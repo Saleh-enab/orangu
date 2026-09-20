@@ -46,10 +46,11 @@ it isn't already cached there. No separate download step is needed.
 
 Leave it off entirely and `orangu-server` lists every `.gguf` model under
 the configured `models` directory and prompts for one by `NR`, then —
-unless `--all`/`--code`/`--review`/`--explorer`/`--embedding` was passed —
-prompts for a role too (see below), TAB-completing over the five valid
-names (dropdown-style: an empty `TAB` press lists all five) and defaulting
-to `all` on an empty entry:
+unless `--all`/`--code`/`--review`/`--explorer`/`--embedding`/`--image`
+was passed, and unless the model is a picture generator, whose role is
+`image` without asking — prompts for a role too (see below), TAB-completing
+over the five names a language model can take (dropdown-style: an empty
+`TAB` press lists all five) and defaulting to `all` on an empty entry:
 
 ```sh
 orangu-server
@@ -1627,16 +1628,20 @@ reexec = yes
   matmul, the MoE expert loop, and the per-expert fan-out. Unset (the
   default) means one per logical core. `--threads` and `ORANGU_THREADS`
   override it for one run.
-- `role` — `all` (the default), `code`, `review`, `explorer`, or
-  `embedding`. See **Roles** below. Resolved in this order: an explicit CLI
-  flag (`--all`/`--code`/`--review`/`--explorer`/`--embedding`) wins
-  everywhere and skips the prompt entirely; failing that, `--daemon` takes
-  this key directly, having no terminal to prompt on; and an attached run
-  with no flag uses it to **pre-select the interactive `role` prompt** —
-  ghosted on the empty line, TAB-completing over the five names, and
-  overridable by typing another. That prompt only appears when no model was
-  given on the CLI either; an attached run that names a model and no role
-  flag is `all`, as before.
+- `role` — `all` (the default), `code`, `review`, `explorer`,
+  `embedding`, or `image`. See **Roles** below. Resolved in this order: an
+  explicit CLI flag (`--all`/`--code`/`--review`/`--explorer`/`--embedding`/
+  `--image`) wins everywhere and skips the prompt entirely; failing that,
+  `--daemon` takes this key directly, having no terminal to prompt on; and
+  an attached run with no flag uses it to **pre-select the interactive
+  `role` prompt** — ghosted on the empty line, TAB-completing over the
+  five names a language model can take, and overridable by typing another.
+  That prompt only appears when no model was given on the CLI either; an
+  attached run that names a model and no role flag is `all`, as before.
+  `image` is the exception to all of that: it is the role of a `qwen_image`
+  model, which comes up in it whatever this key says is missing, and
+  which refuses any *other* value here (under `--daemon`) or on the CLI —
+  see **Image generation** below.
 - `log_type` / `log_path` — where the server's output goes. `console` (the
   default) is exactly what it has always printed: the startup banner, a
   progress line rewritten once a second while a request runs, each request's
@@ -1687,6 +1692,17 @@ shown.
 | `read_size` | `8192` | widen an explicit read of a model file to this many **KiB** (8 MiB); `4` disables widening |
 | `draft_model` | — | a second, smaller model whose guesses the served model verifies |
 | `draft_tokens` | `4` | tokens the draft proposes per verification |
+| `text_encoder` | largest found | the `qwen2vl` GGUF a `qwen_image` model encodes prompts with |
+| `vae` | first found | the Qwen-Image VAE (`.safetensors`) a `qwen_image` model decodes with |
+| `image_lora` | `auto` | the adapter applied to the picture transformer: `auto` the Lightning file under `models` (fetched with the model; a picture in 8 unguided steps), `none` the base model, or a `.safetensors` (or 4-step variant, rougher) |
+| `vae_precision` | `int8` | the VAE's convolutions as `Q6_K` on the `int8` kernel (3–4× faster decode), or `f32` as stored (exact) |
+| `image_lora_merge` | `yes` | fold the adapter into the weights at startup (a few minutes once, then no cost per pass); `no` applies it in `f32` every pass |
+| `image_size` | `1024x1024` | a picture's size when the request does not say; multiples of 16 |
+| `image_steps` | `50`; the adapter's under one | denoising steps |
+| `image_cfg_scale` | `4`; `1` under an adapter | classifier-free guidance; `1` turns it off |
+| `image_negative_prompt` | a space | what a picture is pushed away from |
+| `image_strength` | `0.6` | how much of the schedule an attached picture goes through |
+| `image_format` | `png` | the format a picture comes back in: `png`, `jpeg`, `gif`, `webp` or `svg` |
 | `backend` | `auto` | `cpu`, `vulkan`, `metal`, `dx12`, `cuda`, `opencl`, `rocm`, `npu` |
 | `device` | `auto` | which card: an index, part of a name, or `auto` |
 | `device_split` | `off` | spread one model across several devices |
@@ -1706,11 +1722,17 @@ shown.
 
 Every section that is none of the above — not `[orangu-server]` and not
 `[web]` — is read as an **MCP server**, named after the section. These are an
-inventory for the web console's MCP panel, which lists them and
-shows one on request; the server itself neither connects to them nor calls
-them, so an entry here changes nothing about inference. A section with no
-`endpoint` is rejected at startup, which is also what a misspelled section
-name looks like.
+inventory for the web console's **Settings › MCP** pane, which lists them
+and edits them — **Add**, and each row's **Edit** and **Delete**, each
+through a small form with its own **OK** and **Cancel**; the dialog's
+**Save** then writes the list to this file, one section at a time and
+nothing else touched (comments and spacing included), and says in a
+pop-up where it wrote and that a restart is what reads it. The server
+itself neither connects to them nor calls them, so an entry here changes
+nothing about inference. A section with no `endpoint` is rejected at
+startup, which is also what a misspelled section name looks like; the
+pane refuses the same things before writing. A name is the section
+header, so a renamed server is a deleted one and an added one.
 
 | `[<mcp-name>]` | default | what it does |
 | :-- | :-- | :-- |
@@ -1899,9 +1921,11 @@ takes precedence over it wherever both appear.
 then `~/.orangu/orangu-server.conf` are tried, in that order — the same
 order every subcommand above resolves it in too, not just serving.
 `-i`/`--init` writes `~/.orangu/orangu-server.conf` interactively — it also
-prompts for `role` (TAB-completing over the five valid names, defaulting to
-`all`), right after `model`, and only writes the `role =` line when a
-non-default value was chosen. **Answering `host` with anything but a loopback
+prompts for `role` (TAB-completing over the five names a language model
+can take, defaulting to `all`), right after `model`, and only writes the
+`role =` line when a non-default value was chosen; an image model answers
+`image` on its own and is then asked the picture pipeline's keys, each
+written only when it differs from the default (see **Image generation**). **Answering `host` with anything but a loopback
 address then prompts for an `api_key`** — that is the question the wizard just
 created by widening the address, and asking it here is the difference between
 walking someone into an exposed server and letting them decide. Leaving it
@@ -1959,9 +1983,12 @@ and the features built on top of it later will do the same.
 
 ## Roles
 
-`--all`/`--code`/`--review`/`--explorer`/`--embedding` (mutually exclusive;
-`--all` is the default) hint at which of `orangu-server`'s own features
-matter for a given deployment. These mirror `orangu`'s conventional
+`--all`/`--code`/`--review`/`--explorer`/`--embedding`/`--image`
+(mutually exclusive; `--all` is the default) hint at which of
+`orangu-server`'s own features matter for a given deployment. Five of them
+are a choice made for a language model; `--image` is not a choice at all —
+it is the role of a `qwen_image` picture generator, which takes it on its
+own and cannot take another (see **Image generation**). These mirror `orangu`'s conventional
 deployment roles (`all`/`code`/`review`/`explorer`/`embeddings`), but a
 single `orangu-server` process serves whatever model it's given rather than
 picking one — so unlike a real `orangu-server` process per role, this only
@@ -2097,11 +2124,19 @@ differently.
 `code` behaves identically to `all` today — no `orangu-server` feature is
 `code`-specific yet beyond what `all` already provides.
 
-The role in effect is, in order: whichever CLI flag was passed; or, if none
-was and this is an attached run with no model given on the command line
-either, whatever's typed at the interactive `role [all]: ` prompt; or, in
-`--daemon` mode only (no attached terminal to prompt on), the config
-file's own `role` key; or, failing all three, `all`.
+`image` is what a `qwen_image` model is served as: every chat turn and
+`/v1/images/generations` draw a picture, one at a time (a single slot),
+with the engine's default sampling and no reasoning to suppress. An
+`x-orangu-role` header cannot move a request off it, or onto it.
+
+The role in effect is, in order: the model's own, when it has one (a
+`qwen_image` file is always `image`, and an explicit flag or `--daemon`
+config key saying otherwise is an error rather than overridden); or
+whichever CLI flag was passed; or, if none was and this is an attached run
+with no model given on the command line either, whatever's typed at the
+interactive `role [all]: ` prompt; or, in `--daemon` mode only (no attached
+terminal to prompt on), the config file's own `role` key; or, failing all
+three, `all`.
 
 ## GPU backend
 
@@ -2193,7 +2228,18 @@ orangu-server: [cpu] AMD Ryzen 7 4800H [8 cores / 16 threads, AVX2, 62.19 GiB RA
 The CPU line is printed even when a GPU is doing the work: the tokenizer,
 the sampler and — on a split model — attention all run there, so its core
 count, instruction set and worker-thread count are part of what a
-throughput number means. `threads` sizes that worker pool.
+throughput number means. `threads` sizes that worker pool. The instruction
+set named is the `int8` matmul kernel the engine will actually run — on
+ARM `i8mm (smmla)`, `dotprod (sdot)` or `NEON`; on x86-64 `AVX-512 VNNI`,
+`AVX2`, `SSE4.1` or `scalar` — after the instruction has passed a
+self-test on this machine, not merely what the CPU advertises. On a
+machine with big and little cores (Linux reports a `cpu_capacity` per
+core) the worker count is qualified — `12 worker threads (default: 8 big
++ 4 little cores)` — because the little cores run the same tasks at a
+third of the speed, which is part of what a number from that machine
+means. `ORANGU_EXPERT_BIG_CORES=1` keeps the workers on the big cluster
+instead, one per big core: measured faster for decode alone and slower
+for prefill and pictures, so it is not the default.
 
 The number at the start of each line is the device's *enumeration* index —
 the thing `device = <n>` names — which is why the lines are not in
@@ -2882,10 +2928,301 @@ a chat session is the console's own scratch data. Deleting the chat
 currently on screen starts a fresh empty one in its place; the dropdown
 stays open, so several can be cleared in a row.
 
+## Image generation
+
+This section is the reference; the *Image generation* chapter that
+follows *Building a model* is the walk-through — what to download, how
+to start, what the console's settings do.
+
+`orangu-server` also serves **Qwen-Image**, a text-to-image model, from the
+same GGUF inventory: a file whose `general.architecture` is `qwen_image`
+(e.g. `unsloth/Qwen-Image-2512-GGUF`, `list`'s `Yes (qwen_image)`). Point
+the server at it exactly as at a language model — `orangu-server 16`, or
+`model = unsloth/Qwen-Image-2512-GGUF:Q4_K_M` — and every chat turn is
+answered with a picture instead of text.
+
+A `qwen_image` file is one third of the model, and the other two thirds
+are found beside it in the models directory:
+
+- **The text encoder** — Qwen2.5-VL-7B-Instruct, a `qwen2vl` GGUF (any
+  quantization; `unsloth/Qwen2.5-VL-7B-Instruct-GGUF`). The picture is
+  conditioned on this model's hidden states, so it is loaded as the
+  server's language model through the ordinary path: `/v1/embeddings`
+  still works, and `list` shows it as a model of its own that can be
+  served alone.
+- **The VAE** — `qwen_image_vae.safetensors` from
+  `Comfy-Org/Qwen-Image_ComfyUI`, the same file ComfyUI and
+  stable-diffusion.cpp use. Nobody publishes it as GGUF, so the server
+  reads the `safetensors` as published. It is recognised by its tensors,
+  not its name.
+- **The Lightning adapter** — `Qwen-Image-2512-Lightning-8steps-V1.0-bf16.
+  safetensors` from `lightx2v/Qwen-Image-2512-Lightning`, the publishers'
+  step distillation of the model. Not strictly a third of it — the base
+  model draws without it — but what the server serves by default, since
+  the base model's own fifty guided steps are hours on a CPU; see *Eight
+  steps instead of fifty* below.
+
+`orangu-server download unsloth/Qwen-Image-2512-GGUF:Q4_K_M` fetches all
+four, skipping a companion the directory already holds — a second
+quantization of the encoder is a choice, not a default. The web console's
+model manager downloads the same way. Two keys name a companion explicitly
+when the directory holds several, or when they live elsewhere:
+
+```ini
+[orangu-server]
+model = unsloth/Qwen-Image-2512-GGUF:Q4_K_M
+text_encoder = unsloth/Qwen2.5-VL-7B-Instruct-GGUF:Q8_0
+vae = /srv/models/qwen_image_vae.safetensors
+```
+
+`text_encoder` takes the same kind of spec as `model`; `vae` a path,
+absolute or relative to `models`. Left out, the largest text encoder under
+`models` is used, and the first VAE found. The two are reported at
+startup and on `/props` under `image`.
+
+**The VAE runs in `int8` too.** Its convolutions are stored as `f32`; by
+default the server encodes them as six-bit `Q6_K` at load (rows zero-padded
+to the kernel's 256-wide blocks) and runs them against eight-bit
+activations on the same kernel as the transformer, each pixel's window
+gathered straight into the quantizer rather than laid out as a table
+first — a decode three to four times faster on an `i8mm` core (512 px:
+10.6 → 2.7 s; 1024 px: 35 → 16 s), the picture within a level or two of a
+pixel of the exact one. `vae_precision = f32` keeps the exact path.
+
+### Eight steps instead of fifty: `image_lora`
+
+Qwen-Image needs fifty guided steps — a hundred transformer passes — for
+a picture. Its publishers distil that into **Qwen-Image-Lightning**: a
+low-rank adapter (a LoRA, 850 MB of `safetensors`) which, applied to the
+same weights, makes a picture in 4 or 8 steps with guidance off. That is
+twelve times fewer passes than the release settings, and the picture is,
+if anything, cleaner. So it is the default: `download` of the model
+fetches the 8-step file beside it, and a server with no `image_lora` key
+serves the Lightning adapter it finds under `models` — the most steps
+when there are several — at that many steps with guidance off:
+
+```
+[image] LoRA …/Qwen-Image-2512-Lightning-8steps-V1.0-bf16.safetensors (720 linears adapted; found under models — image_lora = none runs the base model)
+[image] a picture at the defaults (1024x1024, 8 steps, guidance off) takes about 23 min here; image_size = 512x512 would be about 4 min
+```
+
+A models directory without the file gets the base model and a warning
+naming the `download` that fetches the adapter. `image_lora = none` runs
+the base model at its fifty guided steps by choice; `image_lora = <file>`
+names another adapter — a path (absolute or relative to `models`) or the
+`<user>/<repo>:<file>` reference `download` fetched — with the same
+rule for the steps: a Lightning file's count and guidance off, anything
+else Qwen-Image's settings, and `image_steps` / `image_cfg_scale` in the
+file over either.
+
+```sh
+orangu-server download lightx2v/Qwen-Image-2512-Lightning:Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors
+```
+
+```ini
+[orangu-server]
+model = unsloth/Qwen-Image-2512-GGUF:Q4_K_M
+image_lora = lightx2v/Qwen-Image-2512-Lightning:Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors
+```
+
+The adapter is read once at startup (`[image] LoRA … (720 linears
+adapted)`) and, by default,
+**merged into the weights** — each adapted linear dequantized, the
+low-rank product added, and encoded again in its own type (`[image] LoRA
+merged into the transformer's weights in 165 s` on the development
+board) — so every pass then runs at the base model's speed. The merged
+tensors are kept under `<models>/orangu-merged/`, keyed by both files'
+identities, so the merge is paid once: the next start maps them in
+seconds (`[image] LoRA merge read from …`). Delete the directory to
+reclaim the space (8.6 GiB for this model); it is rebuilt on demand. The merge rounds the weights a second time; the picture is a
+different, equally good one, not the same one nudged. `image_lora_merge =
+no` applies the adapter in `f32` on every pass instead — exact, at a tenth
+to a quarter of each pass on the CPU. `image_steps` and
+`image_cfg_scale` are what the adapter was trained for: the base model at
+eight unguided steps produces noise, the adapted one a picture. Any LoRA
+in the usual `safetensors` layout (`<linear>.lora_down.weight` /
+`lora_up.weight` / `alpha`, or `lora_A`/`lora_B`) works the same way; one
+naming linears this transformer lacks is applied where it matches and
+warns about the rest.
+
+Measured on the development board (twelve ARM cores, no GPU): a 512-pixel
+picture in 3½ minutes, a 1024-pixel one in 19 min 35 s (145 s a step — the
+rate falls with size as attention grows) — where the base model's
+release settings were about three hours.
+
+The same repository holds a **4-step** file (the config above). It halves
+the wait — 512 px in 2 minutes, 1024 px in 10 — and the picture shows it:
+a faint grain over fur and skin, softer detail, a flatter background, more
+so the larger the picture. Take it when a fast draft is the point; the
+8-step file is the one fetched and served by default. (With both under
+`models` and no key, the 8-step one is served: the most steps wins.)
+
+### The `image` role
+
+An image model is not served in a role you pick: it is always `image`, and
+`--image` is the flag that says so.
+
+- `orangu-server 16` (or a config `model =`) with no role flag comes up in
+  it, printing `Role: image` where the role prompt would otherwise have
+  been, and the banner's `Mode` line says `image`.
+- `orangu-server` with no model prompts from the table as usual; picking
+  an image model settles the role, so the role prompt is skipped.
+- `orangu-server --image` greys every row of the table that is not an
+  image model, so only the models the role serves stand out; picking a
+  greyed row is refused. The `Model:` prompt pre-selects the config's
+  `model =` only when the flag serves it; under `--image` beside the
+  usual language-model config it offers the first image model in the
+  table instead, so Enter is a picture generator. The other five flags do
+  the reverse — `--all`, `--code`, `--review`, `--explorer` and
+  `--embedding` grey the image models, since a picture generator cannot
+  come up in a language model's role: `orangu-server --code 16` is an
+  error that says so, and so is `--image` on a language model (and their
+  prompt pre-selects the first language model when the config names a
+  picture one).
+- Under `--daemon`, the config's `role` key stands in for the flag, with
+  the same rules: `role = code` beside an image `model` is refused, and a
+  missing key is `image`.
+- `bundle` refuses an image model (three files do not fit one bundle) and
+  refuses `--image`.
+
+`--init` follows the same rule. Picking an image model at its `model`
+prompt answers `role: image` on its own, and then asks for every key of
+the picture pipeline — `text_encoder`, `vae`, `image_lora` (and, with an
+adapter, `image_lora_merge`), `vae_precision`, `image_size`,
+`image_steps`, `image_cfg_scale`, `image_negative_prompt`,
+`image_strength`, `image_format` — each defaulting to what the server does
+without it;
+Enter on all of them writes none of them, like every other default the
+wizard leaves out. `image_lora` offers `auto` and says which Lightning
+file that is under `models` (or that there is none yet), and the two
+prompts after it offer what the server takes under that adapter — the
+step count its name carries (`image_steps [8]`) and `image_cfg_scale
+[1]` — or, after `none`, Qwen-Image's own `50` and `4`. A language model
+is asked none of these.
+
+### What a request gets
+
+Six keys set what a picture request gets when it does not say. The
+defaults are Qwen-Image's own release settings, except that under a
+Lightning adapter — the default, when one is under `models` — `image_steps`
+and `image_cfg_scale` follow the adapter (its step count, guidance off)
+unless the file sets them:
+
+| `[orangu-server]` | default | |
+| :-- | :-- | :-- |
+| `image_size` | `1024x1024` | `WIDTHxHEIGHT`, both multiples of 16 — the VAE's 8 pixels per latent cell times the transformer's 2x2 patch |
+| `image_steps` | `50`; the adapter's (`8`) under one | denoising steps; the time a picture takes is close to linear in this |
+| `image_cfg_scale` | `4`; `1` under an adapter | classifier-free guidance: how far the picture is pushed towards the prompt and away from the negative one. `1` turns guidance off, which halves the work per step |
+| `image_negative_prompt` | a single space | what the picture is pushed away from; only read when guidance is on |
+| `image_strength` | `0.6` | for a picture started from an attached one: how much of the schedule to run — `1` ignores the attachment's content, `0` returns it unchanged |
+| `image_format` | `png` | the container a picture comes back in when the request names none: `png`, `jpeg`, `gif` (one frame, 256 colours), `webp` (lossless) or `svg` (a document of the picture's size with the pixels inside as PNG — there is no pixels-to-vector) — an attached picture's own format wins |
+
+The web console sends none of these, so for it they *are* the settings.
+`/v1/images/generations` takes every one of them per request.
+
+**Time.** The transformer is 20 billion parameters and every step is a full
+pass over them for every image token — 4096 tokens at 1024x1024 — twice
+when guidance is on. That is minutes per picture on a GPU and hours on a
+CPU at the defaults; the console shows a step counter and an estimate as
+it goes, and **Stop** cancels at the next step. For a quick look, reduce
+`image_size` (512x512 is a quarter of the tokens) and `image_steps`, or set
+`image_cfg_scale = 1`. The transformer runs on the same backend as the
+encoder — unless the two together exceed an automatically chosen device,
+in which case the transformer and VAE run on the CPU and the startup log
+says so (`--device` overrides that) — and the whole file is read through
+`mmap` like every other model: the Q4_K_M is 12.3 GiB on disk and needs
+about that much memory, plus the encoder's.
+
+**`backend = auto` measures before it commits a picture to a GPU.** A
+picture is prefill-shaped work — hundreds of tokens through every linear
+— and whether a GPU beats the CPU at that is a fact about the two chips,
+not about the GPU existing: an integrated GPU sharing the CPU's memory,
+beside a CPU with an `int8` matrix unit, can be several times *slower*.
+So with `auto`, the server times one of the transformer's own linears on
+the device and on the CPU at startup (`[image] calibration 3072x12288 x
+256 tokens: device 352 ms, cpu 39 ms — the CPU: the whole pipeline runs
+there`) and, when the CPU wins, runs the encoder, transformer and VAE all
+on the CPU — the banner's backend then reads `CPU (calibrated: faster
+than the device for pictures)`. An explicit `backend = vulkan` (or
+`--device`) is honoured as given, calibration or not.
+
+**The wait is said up front.** The same calibration seeds an estimate of
+the pipeline's rate, and the startup log says what the configured defaults
+cost at it — `[image] a picture at the defaults (1024x1024, 50 steps,
+guidance on) takes about 3 h 32 min here; image_size = 512x512, image_steps
+= 20, image_cfg_scale = 1 would be about 11 min` — with the cheaper
+settings spelled out whenever the default is over a quarter of an hour.
+Every picture then refines the rate from its own steps, and every request
+is announced with it: the console shows *Starting · 6s* beside the
+blinking robot the moment the prompt is sent (a `step` 0 progress event,
+see the HTTP reference), the time counting down second by second and
+reset by each step's own estimate (*Step 3/8 · 2m 05s*).
+
+### In the web console
+
+Type a prompt and send it: the reply is the picture, at `image_size`,
+with a save control under it that downloads the full-size file, and a
+caption with the size, steps and seed. It is kept beside the session at
+`~/.orangu/server/sessions/<uuid>/files/` and comes back on a later visit
+through **History**. While it is drawn the robot blinks beside a
+countdown — *Starting · 22s*, then *Step 2/4 · 11s* — the server's own
+estimate, corrected at every step.
+
+**Settings › Image** (the gear in the topbar) is where the picture's
+settings live: the size (256 × 256 up to 1280 × 720, or any `WIDTHxHEIGHT`
+in multiples of 16), the steps (4, 8, 20, 50, or a number), the guidance
+(off, Qwen-Image's 4, or a value), the negative prompt, the strength an
+attached picture is followed at, and the format the picture comes back
+in (PNG, JPEG, GIF, WebP or SVG) — each with an (i) that explains it on
+hover, under a line that says what a picture at those settings costs on
+this server, from its measured rate, before any is sent. The dialog's
+footer — **Save** at its left, **Cancel** at its right — is shared by
+every pane: Save makes what the panes hold the server's (here, the
+defaults every turn from then on draws at, from any browser) and closes;
+Cancel (or ×, or Escape) drops the edits. The pane's **Reset** puts
+the form back to the configuration file's values, for Save to apply. The
+usual rhythm on a slow machine: 512 × 512 and 4 steps for a preview of
+the prompt in two minutes (256 × 256 is faster still, but the model
+wanders off the prompt at that size — a cat asked for, a man drawn), then
+1024 × 1024 for the picture. The pane's
+header names the adapter the server carries (`…-8steps-…`); on a
+language model the pane is greyed. The same settings are `GET`/`POST
+/props` in the *HTTP endpoints* chapter.
+
+**Attach** a picture — the menu's **Image** item, or **File**; PNG, JPEG,
+GIF, WebP and SVG are read — and the model starts from it instead of from
+noise, at the attachment's own size (snapped to 16 pixels, and scaled down
+to `image_size`'s longer side when it is larger), running `image_strength`
+of the schedule. The reply comes back in the same format the picture
+arrived in: a JPEG stays a JPEG, a PNG a PNG, a GIF a GIF (one frame, 256
+colours), a WebP a lossless WebP, an SVG an SVG — drawn first, and the
+picture comes back as an SVG document carrying it as PNG, there being no
+pixels-to-vector. An animated GIF or WebP is read as its first frame. The attachment itself shows as a thumbnail under
+your message.
+
+Attaching a picture to a *language* model's chat does not send it to the
+model, which has no vision path; the model is told a picture was attached
+and not shown to it, so it does not guess at the contents.
+
+### Through the API
+
+`POST /v1/images/generations` is OpenAI's Images API — `prompt`, `n`,
+`size`, `output_format` (`png`, `jpeg`, `gif` or `webp`), `response_format: "b64_json"`
+— plus the knobs above per request (`steps`, `cfg_scale`,
+`negative_prompt`, `seed`) and, in place of OpenAI's multipart
+`/v1/images/edits`, an `image` (a `data:` URL or bare base64 of a PNG,
+JPEG, GIF, WebP or SVG) with a `strength` to start from. `stream: true` reports a
+step at a time. `POST /v1/chat/completions` on an image server answers the
+last user message with the picture as a markdown image over a `data:` URL
+— which any chat client that renders markdown shows inline — and takes a
+picture from an `image_url` content part. Both are documented field by
+field in the *HTTP endpoints* chapter.
+
 ## Model management
 
-The topbar's **Models** button opens a panel showing the models directory from
-the same scan as `orangu-server list`, with its core numbered inventory fields:
+**Settings › Models** (the gear in the topbar) is a panel showing the
+models directory from the same scan as `orangu-server list`, with its core
+numbered inventory fields:
 
 | | |
 | :-- | :-- |
@@ -3039,7 +3376,14 @@ it. `-y`/`--yes` skips the confirmation prompt, the same flag `delete` uses.
 Three equivalent ways: `Ctrl+C`, `SIGINT` (`kill -INT <pid>`), or
 `POST /v1/shutdown` (loopback-only — refused from a non-localhost peer, the
 same safety rule `orangu-coordinator`'s own shutdown endpoint uses). Both
-the API and (if enabled) the web UI listener stop together.
+the API and (if enabled) the web UI listener stop together, and the
+process is gone within a few seconds whatever it was doing: a picture in
+flight stops at its next transformer block or VAE layer rather than at its
+next step (minutes, at 1024 px), and NPU preparation stops between two
+graphs or two measured blocks rather than after the set. Measured on the
+development board: idle 0.2 s; a 1024-pixel picture in flight 1.2 s; the
+same with the NPU compiling and binding in the background 2.5 s (it was
+107 s and 26 s).
 
 ## What a request cost
 
@@ -3061,10 +3405,11 @@ that apply to all of them.
 
 ## Scope
 
-Text-in/text-out GGUF chat, completion, and embedding models, for sixteen
+Text-in/text-out GGUF chat, completion, and embedding models — and one
+text-to-image model — for seventeen
 servable architecture families: Llama-style (`general.architecture` one of `llama`,
-`qwen2`, `qwen3`, `mistral`, and `qwen3vl` — Qwen3-VL's text backbone,
-*text-only* input), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
+`qwen2`, `qwen3`, `mistral`, `qwen3vl` — Qwen3-VL's text backbone,
+*text-only* input — and `qwen2vl`, Qwen2.5-VL's, the same way), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
 the `gemma-4-26B-A4B` routed-expert MoE — a dense shared MLP plus softmax
 top-k experts per MoE layer — plus the bidirectional-attention,
 embeddings-only `gemma-embedding`), Qwen3.5/3.6-MoE (`qwen35moe`, e.g.
@@ -3124,7 +3469,11 @@ attention, or a squared-ReLU mixture-of-experts FFN), and Ling 3.0
 Delta Attention layers alternating with gated, *rotated* absorbed latent
 attention, over sigmoid-routed experts whose selection is group-limited:
 the experts form `expert_group_count` groups and only the best
-`expert_group_used_count` of them may serve a token) — using
+`expert_group_used_count` of them may serve a token), and Qwen-Image
+(`qwen_image`, e.g. `unsloth/Qwen-Image-2512-GGUF` — not a language model:
+a dual-stream diffusion transformer that denoises a latent picture under a
+prompt's hidden states, served with a `qwen2vl` text encoder and the
+Qwen-Image VAE beside it; see **Image generation**) — using
 `F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`MXFP4`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
 `IQ1_S`/`IQ1_M`/`IQ1_XS`/`IQ1_XXS`/`IQ1_XXXS`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_NL`/`IQ4_XS` tensors. Weight matrices and embedding tables are read lazily from the
 memory-mapped file (dequantized one row at a time, on demand) rather than

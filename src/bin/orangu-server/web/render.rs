@@ -568,11 +568,7 @@ impl Renderer<'_> {
                 self.render_inline_nodes(&link.children)
             ),
             Node::LinkReference(link) => self.render_inline_nodes(&link.children),
-            Node::Image(image) => format!(
-                "<img src=\"{}\" alt=\"{}\">",
-                escape_attr(&image.url),
-                escape_attr(&image.alt)
-            ),
+            Node::Image(image) => render_image(&image.url, &image.alt),
             Node::ImageReference(image) => format!("[image: {}]", escape_html(&image.alt)),
             Node::FootnoteReference(reference) => {
                 format!("[^{}]", escape_html(&reference.identifier))
@@ -787,6 +783,49 @@ impl Renderer<'_> {
         }
         html.push_str("</table>");
         html
+    }
+}
+
+/// An image in an answer — a picture a `qwen_image` model made, kept
+/// beside the session (`/api/sessions/{id}/files/...`) or carried inline
+/// as a `data:` URL — with the same save control a diagram gets, since the
+/// transcript scales it down and the full-size original is the point.
+///
+/// A `<span>`, not a `<figure>`: the image is inline content inside the
+/// paragraph markdown put it in, and a block element there would be
+/// closed early by the browser's parser and land outside its paragraph.
+fn render_image(url: &str, alt: &str) -> String {
+    let extension = image_extension(url);
+    format!(
+        "<span class=\"answer-image\"><img src=\"{url}\" alt=\"{alt}\" loading=\"lazy\">\
+         <a class=\"diagram-dl\" href=\"{url}\" download=\"orangu-image.{extension}\" \
+         title=\"Download {upper}\" aria-label=\"Download image as {upper}\">{SAVE_ICON}</a></span>",
+        url = escape_attr(url),
+        alt = escape_attr(alt),
+        upper = extension.to_ascii_uppercase(),
+    )
+}
+
+/// The file extension a saved copy of `url` should get: from the MIME type
+/// of a `data:` URL, else the URL's own extension, else `png`.
+fn image_extension(url: &str) -> String {
+    if let Some(rest) = url.strip_prefix("data:") {
+        let mime = rest.split([';', ',']).next().unwrap_or("");
+        return match mime {
+            "image/jpeg" | "image/jpg" => "jpg",
+            "image/svg+xml" => "svg",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            _ => "png",
+        }
+        .to_string();
+    }
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    match path.rsplit('.').next() {
+        Some(ext) if ext.len() <= 4 && ext.chars().all(|c| c.is_ascii_alphanumeric()) => {
+            ext.to_ascii_lowercase()
+        }
+        _ => "png".to_string(),
     }
 }
 
@@ -1617,6 +1656,23 @@ mod tests {
         let html = render_markdown_to_html_t("![alt\"](http://x/\"y)");
         assert!(!html.contains("\"y\""));
         assert!(html.contains("&quot;"));
+    }
+
+    /// A picture in an answer renders as an image with a save control whose
+    /// file name follows the picture's own format — a JPEG from the session
+    /// store saves as `.jpg`, a PNG data URL as `.png`.
+    #[test]
+    fn images_get_a_save_control_in_their_own_format() {
+        let html = render_markdown_to_html_t("![a cat](/api/sessions/x/files/1-0.jpg)");
+        assert!(html.contains(
+            "<span class=\"answer-image\"><img src=\"/api/sessions/x/files/1-0.jpg\" alt=\"a cat\""
+        ));
+        assert!(html.contains("download=\"orangu-image.jpg\""));
+        let html = render_markdown_to_html_t("![x](data:image/png;base64,AAAA)");
+        assert!(html.contains("download=\"orangu-image.png\""));
+        assert_eq!(image_extension("data:image/jpeg;base64,AA"), "jpg");
+        assert_eq!(image_extension("https://x/y.svg?v=1"), "svg");
+        assert_eq!(image_extension("https://x/y"), "png");
     }
 
     #[test]

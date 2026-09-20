@@ -69,6 +69,28 @@ pub fn extract(incoming: &IncomingAttachment) -> Result<Attachment> {
         incoming.mime.clone()
     };
 
+    // A picture (PNG, JPEG, GIF, WebP, SVG) is kept as a picture: no text is
+    // pulled out of an SVG's markup, which would put its source in front of
+    // a model that was shown a drawing.
+    if crate::engine::image::codec::is_readable_image(&incoming.name, &mime) {
+        let mime = if mime.is_empty() || mime == "application/octet-stream" {
+            crate::engine::image::ImageFormat::from_extension(&incoming.name)
+                .map(|f| f.mime())
+                .unwrap_or("image/svg+xml")
+                .to_string()
+        } else {
+            mime
+        };
+        return Ok(Attachment {
+            name: incoming.name.clone(),
+            mime,
+            size,
+            text: None,
+            image: None,
+            image_bytes: Some(bytes),
+        });
+    }
+
     let text = extract_text(&incoming.name, &mime, &bytes).map(cap_text);
 
     Ok(Attachment {
@@ -76,6 +98,8 @@ pub fn extract(incoming: &IncomingAttachment) -> Result<Attachment> {
         mime,
         size,
         text,
+        image: None,
+        image_bytes: None,
     })
 }
 
@@ -104,6 +128,14 @@ pub fn compose_content(text: &str, attachments: &[Attachment]) -> String {
                     att.name, att.mime, body
                 ));
             }
+            // A language model here has no vision path, and saying so beats
+            // letting it guess at what the file held.
+            None if att.image.is_some() || att.image_bytes.is_some() => out.push_str(&format!(
+                "[Attached image \"{}\" ({}, {}) — a picture this model cannot see]",
+                att.name,
+                att.mime,
+                human_size(att.size)
+            )),
             None => out.push_str(&format!(
                 "[Attached file \"{}\" ({}, {}) — binary content, not included]",
                 att.name,
@@ -457,19 +489,34 @@ mod tests {
                 mime: "text/plain".into(),
                 size: 4,
                 text: Some("BODY".into()),
+                image: None,
+                image_bytes: None,
+            },
+            Attachment {
+                name: "blob.bin".into(),
+                mime: "application/octet-stream".into(),
+                size: 2048,
+                text: None,
+                image: None,
+                image_bytes: None,
             },
             Attachment {
                 name: "img.png".into(),
                 mime: "image/png".into(),
                 size: 2048,
                 text: None,
+                image: Some("1-0.png".into()),
+                image_bytes: None,
             },
         ];
         let out = compose_content("look at these", &atts);
         assert!(out.starts_with("look at these"));
         assert!(out.contains("Attached document \"spec.txt\""));
         assert!(out.contains("BODY"));
-        assert!(out.contains("[Attached file \"img.png\" (image/png, 2.0 KB)"));
+        assert!(out.contains("[Attached file \"blob.bin\" (application/octet-stream, 2.0 KB)"));
+        assert!(out.contains(
+            "[Attached image \"img.png\" (image/png, 2.0 KB) — a picture this model cannot see]"
+        ));
     }
 
     #[test]
@@ -496,6 +543,8 @@ mod tests {
             mime: "text/markdown".into(),
             size: 0,
             text: Some("# Entities\n\n```mermaid\nerDiagram\n    A ||--o{ B : has\n```\n".into()),
+            image: None,
+            image_bytes: None,
         }];
         let out = compose_content("Please, render this", &atts);
 

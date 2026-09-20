@@ -574,6 +574,26 @@ pub fn run(request: Request) -> Result<()> {
     // catching now, not after a multi-gigabyte copy.
     crate::reexec::precheck(&model_path)
         .with_context(|| format!("{} cannot be served by this build", model_path.display()))?;
+    // A picture generator is three files (transformer, text encoder, VAE)
+    // and a bundle carries one, so neither the model nor its role can be
+    // bundled — said here, before the copy, rather than at the bundle's
+    // first start.
+    let architecture = orangu::model_spec::architecture_of(&gguf);
+    if let Some(required) = Role::required_by(architecture.as_deref()) {
+        bail!(
+            "{label} cannot be bundled: a {} model needs its text encoder and VAE beside it, so \
+             the {} role is only ever served from a models directory",
+            architecture.as_deref().unwrap_or("qwen_image"),
+            required.label()
+        );
+    }
+    if role.fixed_by_model() {
+        bail!(
+            "--{} serves picture generators (qwen_image) only, and {label} is a {} model",
+            role.label(),
+            architecture.as_deref().unwrap_or("language")
+        );
+    }
     let shards = crate::engine::loader::shard_paths(&model_path, &gguf)?;
     let quantization = (!crate::label_carries_tag(&label))
         .then(|| orangu::model_spec::quantization_for_file(&model_path, &gguf))

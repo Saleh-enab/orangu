@@ -1,7 +1,9 @@
 # The inference engine: a contributor's map
 
-`orangu-server` carries seventeen architecture modules across sixteen servable
-architecture families, and six device backends.
+`orangu-server` carries seventeen architecture modules across seventeen servable
+architecture families — sixteen language models and one diffusion
+transformer, which has a module of its own outside `engine::arch` — and six
+device backends.
 Each one documents itself well; what has been missing is the thing you need
 *first* — where they sit, which of them you have to touch, and which rules are
 not visible from the module you happen to be reading.
@@ -222,12 +224,30 @@ Architectures, by what they are rather than by name:
 
 Twenty-one modules above, seventeen architecture modules: `qwen_hybrid`, `kda`,
 `hyper` and `indexer` are shared parts, not architectures of their own.
-Seventeen `ArchFamily` variants, sixteen *servable* families: `dflash` is a
+Eighteen `ArchFamily` variants, seventeen *servable* families: `dflash` is a
 module and a variant but resolves to the model it drafts for rather than
-serving itself. Those are the two
+serving itself, and `QwenImage` is a variant whose module lives outside
+`engine::arch` altogether (below). Those are the two
 conventions every count in the documentation uses — check them against this
 table and `ArchFamily` rather than against another prose count, which is how
 they drifted apart before.
+
+One family is not in the table because it is not a `ModelForward`:
+`qwen_image`, Qwen-Image's diffusion transformer, lives in `engine::image`.
+It has no tokens, no vocabulary and no KV cache; what it computes is a
+velocity for a latent picture, conditioned on a prompt's hidden states. The
+pipeline around it (`engine::image::Pipeline`) reuses the language-model
+engine for exactly the part that *is* a language model — the Qwen2.5-VL text
+encoder is an ordinary `qwen2vl` load through `arch::llama`, read through
+`ModelForward::forward_hidden_states` — and adds what has no counterpart: the
+dual-stream transformer (`image::transformer`), the Wan VAE read from
+`safetensors` (`image::vae`), the flow-matching schedule
+(`image::scheduler`) and PNG/JPEG/GIF/WebP/SVG in and out (`image::codec`). Every
+matmul in all of that still goes through `Backend::matmul`, so a new device
+backend serves pictures without knowing they exist. `main.rs`'s `prepare`
+builds the served `Engine` from the encoder and hangs the pipeline on
+`Engine::image`; `build_model` refuses the family, since nothing else may
+reach it.
 
 Backends, and they are not six of a kind:
 

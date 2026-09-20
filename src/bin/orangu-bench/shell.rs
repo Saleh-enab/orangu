@@ -56,7 +56,7 @@ _orangu_bench() {
             COMPREPLY=( $(compgen -W "all 0.0.0.0 127.0.0.1" -- "$cur") )
             return 0
             ;;
-        --url|--depths|--pp|--pp-continue|--pg|--streams|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--cap|--chart-scale|--chart-y-label|--chart-x-label|--chart-panels|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--sweep|--sweep-cmd|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature)
+        --url|--depths|--pp|--pp-continue|--pg|--streams|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--image|--image-steps|--image-cfg|--image-prompt|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--cap|--chart-scale|--chart-y-label|--chart-x-label|--chart-panels|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--sweep|--sweep-cmd|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature)
             return 0
             ;;
     esac
@@ -64,7 +64,7 @@ _orangu_bench() {
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
             "--url --depths --pp --pp-continue --pg --decode-cpu --streams --shared-prefix --shared-prefix-tokens \
-             --prefix-scan --pp-continue-base --embed --gen --curve --bucket --reps --drop-model-cache --no-warmup \
+             --prefix-scan --pp-continue-base --embed --image --image-steps --image-cfg --image-prompt --gen --curve --bucket --reps --drop-model-cache --no-warmup \
              --timeout --model --json --history --label --chart --chart-only --table --storage-probe --storage-file \
              --storage-span --storage-ramp --cap --chart-png --chart-scale --chart-y-label --chart-x-label --chart-panels \
              --flamegraph --flamegraph-pid --flamegraph-freq --flamegraph-call-graph --flamegraph-png \
@@ -102,6 +102,10 @@ _orangu_bench() {
         '--prefix-scan[Scan-resistance mode: unique prompts to push through between two uses of one hot prefix]:list:' \
         '--pp-continue-base[Prompt length (tokens) to prime the prefix cache with for --pp-continue]:n:' \
         '--embed[Embedding mode: prompt lengths to sweep against /v1/embeddings]:list:' \
+        '--image[Image mode: square picture sizes to sweep against /v1/images/generations]:list:' \
+        '--image-steps[Denoising steps per picture for --image]:n:' \
+        '--image-cfg[Guidance scale for --image; 1 runs the prompt alone]:scale:' \
+        '--image-prompt[The prompt every --image picture is drawn from]:text:' \
         '--gen[Number of tokens to generate per timed run]:n:' \
         '--curve[Curve mode: one generation of this many tokens, bucketed by context; 0 disables]:n:' \
         '--bucket[Bucket width (in context tokens) for --curve]:n:' \
@@ -176,6 +180,10 @@ complete -c orangu-bench -l shared-prefix-tokens   -x -d 'Length in tokens of th
 complete -c orangu-bench -l prefix-scan            -x -d 'Scan-resistance mode: unique prompts to push through between two uses of one hot prefix'
 complete -c orangu-bench -l pp-continue-base       -x -d 'Prompt length (tokens) to prime the prefix cache with for --pp-continue'
 complete -c orangu-bench -l embed                  -x -d 'Embedding mode: prompt lengths to sweep against /v1/embeddings'
+complete -c orangu-bench -l image                  -x -d 'Image mode: square picture sizes to sweep against /v1/images/generations'
+complete -c orangu-bench -l image-steps            -x -d 'Denoising steps per picture for --image'
+complete -c orangu-bench -l image-cfg              -x -d 'Guidance scale for --image; 1 runs the prompt alone'
+complete -c orangu-bench -l image-prompt           -x -d 'The prompt every --image picture is drawn from'
 complete -c orangu-bench -l gen                    -x -d 'Number of tokens to generate per timed run'
 complete -c orangu-bench -l curve                  -x -d 'Curve mode: one generation of this many tokens, bucketed by context; 0 disables'
 complete -c orangu-bench -l bucket                 -x -d 'Bucket width (in context tokens) for --curve'
@@ -259,6 +267,10 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--prefix-scan', 'Scan-resistance mode: unique prompts to push through between two uses of one hot prefix'),
         @('--pp-continue-base', 'Prompt length (tokens) to prime the prefix cache with for --pp-continue'),
         @('--embed', 'Embedding mode: prompt lengths to sweep against /v1/embeddings'),
+        @('--image', 'Image mode: square picture sizes to sweep against /v1/images/generations'),
+        @('--image-steps', 'Denoising steps per picture for --image'),
+        @('--image-cfg', 'Guidance scale for --image; 1 runs the prompt alone'),
+        @('--image-prompt', 'The prompt every --image picture is drawn from'),
         @('--gen', 'Number of tokens to generate per timed run'),
         @('--curve', 'Curve mode: one generation of this many tokens, bucketed by context; 0 disables'),
         @('--bucket', 'Bucket width (in context tokens) for --curve'),

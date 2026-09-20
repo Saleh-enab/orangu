@@ -189,6 +189,15 @@ pub enum ArchFamily {
     /// file's own per-layer `feed_forward_length` and
     /// `attention.head_count_kv`. See `engine::arch::nemotron`.
     NemotronHMoe,
+    /// Qwen-Image (`qwen_image`, e.g. `unsloth/Qwen-Image-2512-GGUF`) — not
+    /// a language model at all: the dual-stream diffusion transformer that
+    /// turns a prompt into a picture. It is served through
+    /// `engine::image` rather than `ModelForward`, and needs two companion
+    /// files beside it — a `qwen2vl` text encoder (an ordinary
+    /// [`ArchFamily::LlamaStyle`] load, whose hidden states condition the
+    /// picture) and the Qwen-Image VAE (`safetensors`) that turns latents
+    /// into pixels. See `engine::image::transformer` for the graph.
+    QwenImage,
 }
 
 /// GGUF `general.architecture` values that map to [`ArchFamily::LlamaStyle`]
@@ -212,7 +221,17 @@ pub enum ArchFamily {
 /// this layer's DeepStack slice" add is adding zero. Multimodal (image/
 /// video) input itself is out of scope, per this project's existing
 /// deferred-multimodal decision.
-const LLAMA_STYLE_ARCHITECTURES: &[&str] = &["llama", "qwen2", "qwen3", "mistral", "qwen3vl"];
+///
+/// `qwen2vl` (e.g. `unsloth/Qwen2.5-VL-7B-Instruct-GGUF`) is Qwen2.5-VL's
+/// text backbone and is here for the same reason `qwen3vl` is: plain
+/// `qwen2` (Q/K/V biases, NEOX rotation) whose M-RoPE sections
+/// (`rope.dimension_sections = [16, 24, 24, 0]`) collapse to ordinary
+/// single-position RoPE on text-only input. It is what the Qwen-Image
+/// pipeline (`engine::image`) encodes prompts with — the picture is
+/// conditioned on this model's final hidden states, read through the same
+/// `ModelForward::forward_hidden_states` an embeddings request uses.
+const LLAMA_STYLE_ARCHITECTURES: &[&str] =
+    &["llama", "qwen2", "qwen3", "mistral", "qwen3vl", "qwen2vl"];
 /// `mistral3` (e.g. `unsloth/Ministral-3-3B-Instruct-2512-GGUF`) — see
 /// [`ArchFamily::Mistral3`] and `engine::arch::mistral`.
 const MISTRAL_ARCHITECTURES: &[&str] = &["mistral3"];
@@ -297,6 +316,10 @@ const NEMOTRON_ARCHITECTURES: &[&str] = &["nemotron_h_moe", "nemotron_h"];
 /// GQA+RoPE transformers with routed experts, sharing none of this
 /// module's delta-net or latent-attention machinery.
 const BAILINGMOE3_ARCHITECTURES: &[&str] = &["bailingmoe3"];
+/// `qwen_image` (e.g. `unsloth/Qwen-Image-2512-GGUF`,
+/// `unsloth/Qwen-Image-Edit-2511-GGUF`) — see [`ArchFamily::QwenImage`] and
+/// `engine::image`. The only family here that is not a language model.
+const QWEN_IMAGE_ARCHITECTURES: &[&str] = &["qwen_image"];
 
 /// Architectures this engine recognises by name and deliberately does **not**
 /// serve, with the reason.
@@ -409,6 +432,9 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if BAILINGMOE3_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::BailingMoe3);
     }
+    if QWEN_IMAGE_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::QwenImage);
+    }
     // A recognised near miss gets its own reason. The alternative — dropping
     // the reader into the whole accepted-name list, which looks like it
     // *should* contain theirs — is what makes an out-of-tree alias mechanism
@@ -463,6 +489,7 @@ fn supported_architecture_names() -> Vec<&'static str> {
         .chain(INKLING_ARCHITECTURES)
         .chain(NEMOTRON_ARCHITECTURES)
         .chain(BAILINGMOE3_ARCHITECTURES)
+        .chain(QWEN_IMAGE_ARCHITECTURES)
         .cloned()
         .collect()
 }
@@ -829,6 +856,106 @@ pub(crate) fn probe_quant_matrix(
         out_dim,
         device: 0,
         layer: NO_LAYER,
+    }
+}
+
+impl QuantMatrix {
+    /// An `F32` matrix over an owned buffer — `rows` is `[out_dim, in_dim]`,
+    /// row-major — for weights that do not come from a GGUF file at all.
+    ///
+    /// The Qwen-Image VAE (`engine::image::vae`) is read from a `safetensors`
+    /// file and its convolutions are run as matmuls over unrolled patches,
+    /// so its kernels have to become the one thing `Backend::matmul` reads.
+    ///
+    /// The same identity caveat as [`probe_quant_matrix`] applies: a GPU
+    /// backend caches uploads by the buffer's address, so the matrix must
+    /// live as long as the backend does. The VAE is built once and held by
+    /// the pipeline for the process's lifetime, which is exactly that.
+    pub(crate) fn from_f32_rows(rows: Vec<f32>, in_dim: usize, out_dim: usize) -> Self {
+        assert_eq!(
+            rows.len(),
+            in_dim * out_dim,
+            "rows do not fill [{out_dim}, {in_dim}]"
+        );
+        let bytes: Vec<u8> = bytemuck::cast_slice::<f32, u8>(&rows).to_vec();
+        Self {
+            bytes: Arc::new(bytes),
+            ggml_type: quant::GGML_TYPE_F32,
+            start: 0,
+            row_bytes: in_dim * std::mem::size_of::<f32>(),
+            in_dim,
+            out_dim,
+            device: 0,
+            layer: NO_LAYER,
+        }
+    }
+
+    /// A matrix of `ggml_type` over owned, already-encoded bytes — `bytes`
+    /// is `out_dim` rows of `row_bytes(ggml_type, in_dim)` each — for a
+    /// tensor rebuilt in memory rather than read from the file: the picture
+    /// transformer's linears with an adapter merged in
+    /// (`engine::image::lora`). Same identity caveat as
+    /// [`Self::from_f32_rows`]. `device` and `layer` are taken from
+    /// `like`, the matrix it replaces, so placement and residency see it
+    /// as the same tensor.
+    /// A matrix over `len` bytes at `start` of a shared mapping — a cached
+    /// merged tensor (`engine::image::lora::MergedCache`), page cache rather
+    /// than heap. `like` supplies device and layer as in
+    /// [`Self::from_encoded_rows`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_shared_bytes(
+        bytes: TensorBytes,
+        start: usize,
+        len: usize,
+        ggml_type: u32,
+        in_dim: usize,
+        out_dim: usize,
+        like: &QuantMatrix,
+    ) -> Self {
+        assert!(out_dim > 0 && len.is_multiple_of(out_dim));
+        assert!(start + len <= bytes.len());
+        Self {
+            bytes,
+            ggml_type,
+            start,
+            row_bytes: len / out_dim,
+            in_dim,
+            out_dim,
+            device: like.device,
+            layer: like.layer,
+        }
+    }
+
+    /// The whole backing store this matrix reads from — for writing a
+    /// merged tensor out; [`Self::raw_bytes`] is the matrix's own range of
+    /// it, which is what a caller usually wants.
+    pub(crate) fn shared_bytes(&self) -> TensorBytes {
+        self.bytes.clone()
+    }
+
+    pub(crate) fn from_encoded_rows(
+        bytes: Vec<u8>,
+        ggml_type: u32,
+        in_dim: usize,
+        out_dim: usize,
+        like: Option<&QuantMatrix>,
+    ) -> Self {
+        assert!(
+            out_dim > 0 && bytes.len().is_multiple_of(out_dim),
+            "{} bytes do not divide into {out_dim} rows",
+            bytes.len()
+        );
+        let row_bytes = bytes.len() / out_dim;
+        Self {
+            bytes: Arc::new(bytes),
+            ggml_type,
+            start: 0,
+            row_bytes,
+            in_dim,
+            out_dim,
+            device: like.map_or(0, |l| l.device),
+            layer: like.map_or(NO_LAYER, |l| l.layer),
+        }
     }
 }
 
@@ -1265,6 +1392,20 @@ pub(crate) fn block_index(name: &str) -> Option<usize> {
 }
 
 impl LoadedModel {
+    /// A tensor's `ggml_type` and declared shape (ggml order, fastest-varying
+    /// dimension first) without touching its data.
+    ///
+    /// The `qwen_image` diffusion transformer sizes itself from this: its
+    /// GGUF carries no hyperparameter keys at all, so the stream width, head
+    /// width and text width are read off `img_in.weight`, `attn.norm_q.weight`
+    /// and `txt_in.weight` — see `engine::image::transformer`.
+    pub fn tensor_dims(&self, name: &str) -> Result<(u32, Vec<u64>)> {
+        self.tensors
+            .get(name)
+            .map(|loc| (loc.ggml_type, loc.dims.clone()))
+            .ok_or_else(|| anyhow!("model is missing tensor '{name}'"))
+    }
+
     /// Every tensor's `(name, ggml_type)`, across **every** shard — unlike
     /// walking a single [`GgufFile`]'s directory, which for a split model
     /// only sees shard 1. Used by `engine::backend::unsupported_tensor_types`
@@ -1549,7 +1690,11 @@ impl LoadedModel {
             .ok_or_else(|| anyhow!("GGUF file is missing general.architecture"))?;
         resolve_arch_family(&architecture)?;
 
-        let config = read_model_config(&gguf, &architecture)?;
+        let config = if resolve_arch_family(&architecture)? == ArchFamily::QwenImage {
+            read_image_model_config(&gguf, &architecture)?
+        } else {
+            read_model_config(&gguf, &architecture)?
+        };
 
         // Every shard's tensor directory, merged. A single-file model is
         // just the one-shard case of this.
@@ -1985,6 +2130,64 @@ fn read_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelConfig>
     })
 }
 
+/// [`ModelConfig`] for a `qwen_image` file, whose metadata is three keys and
+/// no hyperparameters: everything is read off tensor shapes.
+///
+/// The diffusion transformer has no vocabulary, context length or KV heads.
+/// The fields that mean nothing for it are set to what keeps every generic
+/// consumer of a `ModelConfig` (the footprint report, the KV probe, the
+/// banner) well-defined — a zero vocabulary and a single-head attention
+/// shape — and `engine::image::transformer` reads its own real dimensions
+/// directly, so nothing downstream computes with these.
+fn read_image_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelConfig> {
+    let dims = |name: &str| -> Result<&[u64]> {
+        gguf.tensors
+            .iter()
+            .find(|t| t.name == name)
+            .map(|t| t.dims.as_slice())
+            .ok_or_else(|| anyhow!("{architecture}: model is missing tensor '{name}'"))
+    };
+    let img_in = dims("img_in.weight")?;
+    let norm_q = dims("transformer_blocks.0.attn.norm_q.weight")?;
+    anyhow::ensure!(
+        img_in.len() == 2 && norm_q.len() == 1,
+        "{architecture}: img_in.weight / attn.norm_q.weight have unexpected shapes"
+    );
+    let n_embd = img_in[1] as usize;
+    let head_dim = norm_q[0] as usize;
+    if head_dim == 0 || !n_embd.is_multiple_of(head_dim) {
+        bail!("{architecture}: stream width {n_embd} is not a multiple of head width {head_dim}");
+    }
+    let n_layer = gguf
+        .tensors
+        .iter()
+        .filter_map(|t| {
+            t.name
+                .strip_prefix("transformer_blocks.")?
+                .split('.')
+                .next()?
+                .parse::<usize>()
+                .ok()
+        })
+        .max()
+        .map(|last| last + 1)
+        .ok_or_else(|| anyhow!("{architecture}: no transformer_blocks.N tensors"))?;
+    Ok(ModelConfig {
+        architecture: architecture.to_string(),
+        n_vocab: 0,
+        n_embd,
+        n_layer,
+        n_head: n_embd / head_dim,
+        n_head_kv: n_embd / head_dim,
+        head_dim,
+        n_ctx_train: 0,
+        rope_dim: head_dim,
+        rope_freq_base: 10000.0,
+        rms_eps: 1e-6,
+        pooling_type: PoolingType::Mean,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2222,6 +2425,7 @@ mod tests {
             (ArchFamily::Inkling, "inkling"),
             (ArchFamily::NemotronHMoe, "nemotron_h_moe"),
             (ArchFamily::BailingMoe3, "bailingmoe3"),
+            (ArchFamily::QwenImage, "qwen_image"),
         ];
         for &(family, name) in representatives {
             // The exhaustiveness guard: this match has no wildcard, so a new
@@ -2245,6 +2449,7 @@ mod tests {
                 ArchFamily::Inkling => "Inkling",
                 ArchFamily::NemotronHMoe => "NemotronHMoe",
                 ArchFamily::BailingMoe3 => "BailingMoe3",
+                ArchFamily::QwenImage => "QwenImage",
             };
             assert!(
                 listing.contains(&name),

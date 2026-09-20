@@ -146,10 +146,10 @@ impl Drop for TerminalTitleGuard {
     }
 }
 
-/// The five mutually exclusive role flags, as one reusable block.
+/// The six mutually exclusive role flags, as one reusable block.
 ///
 /// Shared rather than written twice because `bundle` needs exactly the same
-/// five: the role a bundle is built with is the role its server comes up in,
+/// set: the role a bundle is built with is the role its server comes up in,
 /// so it is chosen the same way and spelled the same way. Flattening keeps
 /// them a set clap enforces the exclusivity of, in both places at once.
 #[derive(clap::Args, Debug, Default)]
@@ -170,6 +170,10 @@ struct RoleFlags {
     /// Embedding only.
     #[arg(long)]
     embedding: bool,
+    /// Picture generation — a qwen_image model, the only kind this role
+    /// serves and the only role such a model is served in.
+    #[arg(long)]
+    image: bool,
 }
 
 impl RoleFlags {
@@ -187,6 +191,8 @@ impl RoleFlags {
             Some(config::Role::Explorer)
         } else if self.embedding {
             Some(config::Role::Embedding)
+        } else if self.image {
+            Some(config::Role::Image)
         } else {
             None
         }
@@ -691,17 +697,21 @@ fn main() -> ExitCode {
             // its port still bound.
             if let Some(fallback) = reexec::fallback_model() {
                 eprintln!("falling back to '{fallback}'");
+                // In the role the fallback was working in, when the handover
+                // said — this image's own flag was chosen for the model that
+                // just failed, and may be the one the fallback refuses.
+                let role = reexec::fallback_role().unwrap_or(role_arg);
                 match reexec::Handover::new(
                     config_arg,
                     listen_arg,
                     workspace_arg.unwrap_or_else(|| PathBuf::from(".")),
-                    role_arg,
+                    role,
                     fallback.to_string(),
                     reexec::inherited(),
                 ) {
                     // `None` as the fallback of the fallback: one retry, so a
                     // pair of models that both fail can't loop forever.
-                    Ok(handover) => eprintln!("error: {:#}", handover.exec(fallback, None)),
+                    Ok(handover) => eprintln!("error: {:#}", handover.exec(fallback, role, None)),
                     Err(err) => eprintln!("error: {err:#}"),
                 }
             }
@@ -955,6 +965,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     let device_flag = args.device.clone();
     let split_flag = args.device_split.clone();
     let threads_flag = args.threads.clone();
+    let daemon = args.daemon;
     let conf = load_config(args.config, cli_role, args.daemon)?;
     // The logger, as soon as there is a config to say where it goes and
     // before anything worth logging happens. A `--daemon` with the console
@@ -1003,19 +1014,24 @@ fn prepare(args: Args) -> Result<Prepared> {
                 (ModelSource::Embedded(bundle), bundle.model.clone())
             }
             None => {
-                let selected = select_model_interactively(&conf.models, conf.model.as_deref())?;
+                let selected =
+                    select_model_interactively(&conf.models, conf.model.as_deref(), cli_role)?;
                 // Only when no `--all`/`--code`/`--review`/`--explorer`/
-                // `--embedding` flag was given — an explicit flag already
-                // settled `role`, and shouldn't be second-guessed by a
-                // prompt. `conf.slots` was already resolved against
-                // `Role::default()` by `load_config` above (role isn't
-                // known interactively until now), so a role picked here
-                // that has a different `default_slots()` than `all`'s
+                // `--embedding`/`--image` flag was given — an explicit flag
+                // already settled `role`, and shouldn't be second-guessed
+                // by a prompt — and only for a language model: a picture
+                // generator's role is `image`, decided by the file rather
+                // than asked (`Role::fixed_by_model`), which the check on
+                // the header further down settles for every way of naming
+                // a model at once. `conf.slots` was already resolved
+                // against `Role::default()` by `load_config` above (role
+                // isn't known interactively until now), so a role picked
+                // here that has a different `default_slots()` than `all`'s
                 // won't retroactively change `slots` unless `slots` is
                 // also set explicitly in the config — the same scoping
                 // `--code`/`--review`/etc. already have when combined with
                 // an interactively-prompted model.
-                if cli_role.is_none() {
+                if cli_role.is_none() && !selected.image {
                     // Pre-selected from `[orangu-server].role` when the
                     // config names one, so a configuration that already says
                     // how this server is meant to run is one Enter away
@@ -1028,8 +1044,7 @@ fn prepare(args: Args) -> Result<Prepared> {
                     role = init::prompt_role("Role: ", default)?;
                     init::echo_answer("Role: ", role.label());
                 }
-                let (path, label) = selected;
-                (ModelSource::File(path), label)
+                (ModelSource::File(selected.path), selected.label)
             }
         }
     };
@@ -1062,8 +1077,65 @@ fn prepare(args: Args) -> Result<Prepared> {
             .then(|| orangu::model_spec::quantization_for_file(path, &gguf))
             .flatten(),
     };
-    let tokenizer = Arc::new(Tokenizer::from_gguf(&gguf).context("building tokenizer")?);
-    let chat_template_source = metadata_string(&gguf, "tokenizer.chat_template");
+    // A `qwen_image` file is a diffusion transformer, not a language model:
+    // the *served* `ModelForward` and tokenizer are its **text encoder**, a
+    // `qwen2vl` GGUF found beside it, and the file itself is loaded further
+    // down into `engine::image::Pipeline`. Everything between here and there
+    // — backend selection, placement, the footprint report — runs on the
+    // encoder, which is the part of the pipeline that is a language model.
+    // See `engine::image` for the whole shape.
+    let architecture_key = metadata_string(&gguf, "general.architecture");
+    role = fix_role_for_model(
+        role,
+        cli_role,
+        daemon.then_some(conf.role_key).flatten(),
+        &model_label,
+        architecture_key.as_deref(),
+    )?;
+    if role.fixed_by_model() && cli_role.is_none() && !daemon {
+        // The prompt this run would otherwise have answered, in its shape,
+        // so the transcript still says which role the server came up in.
+        println!("Role: {}", role.label());
+    }
+    let image_companions = match architecture_key.as_deref() {
+        Some("qwen_image") => {
+            if let ModelSource::Embedded(_) = &source {
+                bail!(
+                    "a qwen_image model cannot be bundled: it needs its text encoder and VAE \
+                     beside it, and a bundle carries one file"
+                );
+            }
+            let companions = engine::image::Companions::locate(
+                &conf.models,
+                conf.text_encoder.as_deref(),
+                conf.vae.as_deref(),
+            )?;
+            log::info!(
+                "orangu-server: qwen_image text encoder {}",
+                companions.text_encoder.display()
+            );
+            log::info!(
+                "orangu-server: qwen_image VAE {} ({})",
+                companions.vae.display(),
+                conf.vae_precision.label()
+            );
+            Some(companions)
+        }
+        _ => None,
+    };
+    // What the language-model engine loads: the text encoder for an image
+    // model, the model itself otherwise.
+    let weights_source = match (&source, &image_companions) {
+        (_, Some(companions)) => ModelSource::File(companions.text_encoder.clone()),
+        (ModelSource::Embedded(bundle), None) => ModelSource::Embedded(bundle),
+        (ModelSource::File(path), None) => ModelSource::File(path.clone()),
+    };
+    let weights_gguf = match &image_companions {
+        Some(_) => weights_source.gguf()?,
+        None => gguf,
+    };
+    let tokenizer = Arc::new(Tokenizer::from_gguf(&weights_gguf).context("building tokenizer")?);
+    let chat_template_source = metadata_string(&weights_gguf, "tokenizer.chat_template");
 
     // Before the weights are mapped, so the compile step's child process
     // does not run alongside this one holding several gigabytes. It is a
@@ -1087,7 +1159,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     // decode width is worth compiling at all — see `npu_tool::decode_enabled`.
     npu_tool::set_slots(conf.slots);
     npu_tool::prepare_in_background(
-        source.path(),
+        weights_source.path(),
         conf.npu_precompile,
         (conf.npu_cache_gb * (1u64 << 30) as f64) as u64,
     );
@@ -1098,7 +1170,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     // Before the model is opened, because the loader is the first thing that
     // can read a weight through an explicit route.
     engine::expert_read::set_read_size(conf.read_size);
-    let mut loaded = source.load().context("loading model weights")?;
+    let mut loaded = weights_source.load().context("loading model weights")?;
     // Before the first device comes up, because bringing one up compiles the
     // attention shaders against whichever storage this names — the choice
     // cannot be revisited afterwards without rebuilding them.
@@ -1107,10 +1179,60 @@ fn prepare(args: Args) -> Result<Prepared> {
     // kernels get *built*. Unset leaves the choice to the startup
     // cross-check against the CPU.
     engine::backend::vulkan::set_mlp_unroll_override(conf.mlp_unroll);
-    let (backend, backend_label): (Arc<dyn Backend>, String) = select_backend(
+    let (mut backend, mut backend_label): (Arc<dyn Backend>, String) = select_backend(
         conf.backend,
         &requested_device(device_flag.as_deref(), &conf.device),
     )?;
+    // A picture pipeline under `backend = auto` is committed to a GPU only
+    // when the GPU actually beats the CPU at prefill-shaped work — measured
+    // on one of the transformer's own linears, now, before the encoder is
+    // uploaded. An explicit `backend =` is honoured as given. See
+    // `engine::image::calibrate` for the board that made this necessary.
+    let mut transformer_opened = None;
+    let mut image_rate = None;
+    if image_companions.is_some() {
+        let transformer = LoadedModel::open(&path).context("loading the qwen_image weights")?;
+        // The device half only under `auto` with a device in hand; the CPU
+        // half always, since it also seeds the wait estimate.
+        let candidate = match conf.backend {
+            config::BackendPreference::Auto => backend.as_wgpu().map(|w| w as &dyn Backend),
+            _ => None,
+        };
+        let cal = engine::image::calibrate(&transformer, candidate)?;
+        match cal.device {
+            Some(device) => {
+                let verdict = if cal.cpu_wins() {
+                    "the CPU: the whole pipeline runs there"
+                } else {
+                    "the device"
+                };
+                log::info!(
+                    "orangu-server: [image] calibration {}x{} x {} tokens: device {:.0} ms, cpu {:.0} ms — {verdict}",
+                    cal.in_dim,
+                    cal.out_dim,
+                    cal.n_tokens,
+                    device.as_secs_f64() * 1e3,
+                    cal.cpu.as_secs_f64() * 1e3,
+                );
+                if cal.cpu_wins() {
+                    backend = Arc::new(engine::backend::CpuBackend);
+                    backend_label =
+                        "CPU (calibrated: faster than the device for pictures)".to_string();
+                }
+            }
+            None => log::info!(
+                "orangu-server: [image] calibration {}x{} x {} tokens: cpu {:.0} ms",
+                cal.in_dim,
+                cal.out_dim,
+                cal.n_tokens,
+                cal.cpu.as_secs_f64() * 1e3,
+            ),
+        }
+        image_rate = Some(engine::image::RateModel::from_calibration(
+            cal.token_passes_per_second(),
+        ));
+        transformer_opened = Some(transformer);
+    }
     // Before any prompt is prefilled: the chunker's sizer aims at a driver
     // timeout, and on a backend that has none it reads the clock as a
     // per-token rate that a streamed model does not have.
@@ -1354,7 +1476,10 @@ fn prepare(args: Args) -> Result<Prepared> {
             unsupported.join(", ")
         );
     }
-    let architecture = loaded.config.architecture.clone();
+    let architecture = match &image_companions {
+        Some(_) => "qwen_image".to_string(),
+        None => loaded.config.architecture.clone(),
+    };
     // The device's weight arena cuts its chunks to what is coming.
     if let Some(wgpu) = backend.as_wgpu() {
         let largest = loaded
@@ -1366,6 +1491,172 @@ fn prepare(args: Args) -> Result<Prepared> {
         wgpu.plan_weight_bytes(weights_device_bytes, largest);
     }
     let model = build_model(&loaded, &backend)?;
+
+    // The diffusion transformer and the VAE, on the same backend as the
+    // text encoder. The transformer's tensor types are checked against the
+    // backend exactly as the encoder's were above: a device with no kernel
+    // for one of its quantizations must fail here, not on the first step of
+    // the first picture.
+    let image = match &image_companions {
+        Some(companions) => {
+            let transformer = match transformer_opened.take() {
+                Some(transformer) => transformer,
+                None => LoadedModel::open(&path).context("loading the qwen_image weights")?,
+            };
+            let unsupported =
+                engine::backend::unsupported_tensor_types(transformer.tensor_types(), &*backend);
+            if !unsupported.is_empty() {
+                bail!(
+                    "backend {backend_label} has no kernel for the qwen_image model's tensor \
+                     type(s) {}; only backend = cpu reads every type this build supports",
+                    unsupported.join(", ")
+                );
+            }
+            // The transformer is 12–40 GiB of weights on top of the encoder,
+            // and a device that cannot hold both would be lost mid-picture
+            // rather than refuse. The footprint machinery above sized the
+            // device for the encoder alone, so the sum is checked here, and
+            // a transformer that does not fit runs on the CPU — slowly, but
+            // to completion — while the encoder keeps the device. Only an
+            // automatic device choice is second-guessed.
+            let (transformer_device_bytes, _) =
+                engine::backend::device_resident_split(transformer.resident_tensor_sizes());
+            let too_large_for_device = backend
+                .as_wgpu()
+                .and_then(|wgpu| wgpu.device_in_use().vram_total_bytes)
+                .is_some_and(|total| weights_device_bytes + transformer_device_bytes > total)
+                && matches!(
+                    requested_device(device_flag.as_deref(), &conf.device),
+                    engine::backend::device::DeviceRequest::Auto
+                );
+            let image_backend: Arc<dyn Backend> = if too_large_for_device {
+                log::warn!(
+                    "orangu-server: the qwen_image transformer ({}) and its text encoder ({}) \
+                     together exceed the selected device — the transformer and VAE run on the \
+                     CPU. Choose a device explicitly with `--device` to override.",
+                    orangu::format::format_bytes(transformer_device_bytes),
+                    orangu::format::format_bytes(weights_device_bytes),
+                );
+                Arc::new(engine::backend::CpuBackend)
+            } else {
+                backend.clone()
+            };
+            // The adapter: named, or the Lightning file found under the
+            // models directory (fetched with the model — the base model's
+            // own fifty guided steps are hours on a CPU), or none. With one,
+            // the steps and guidance the config leaves unset are the
+            // adapter's, so the picture is the one it was made to draw.
+            let lora_path = match &conf.image_lora {
+                config::ImageLora::Spec(spec) => {
+                    Some(engine::image::resolve_lora(&conf.models, spec)?)
+                }
+                config::ImageLora::Auto => {
+                    let found = orangu::model_spec::find_qwen_image_lightning(&conf.models);
+                    if found.is_none() {
+                        log::warn!(
+                            "orangu-server: [image] no Lightning adapter under {} — the base \
+                             model's {} guided steps per picture; `orangu-server download {}:{}` \
+                             fetches the adapter, which is then served by default",
+                            conf.models.display(),
+                            conf.image.steps,
+                            orangu::model_download::QWEN_IMAGE_LIGHTNING_REPO,
+                            orangu::model_download::QWEN_IMAGE_LIGHTNING_FILE,
+                        );
+                    }
+                    found
+                }
+                config::ImageLora::None => None,
+            };
+            let (lora, merged_cache) = match &lora_path {
+                Some(lora_path) => {
+                    let lora = engine::image::lora::Lora::open(lora_path)?;
+                    log::info!(
+                        "orangu-server: [image] LoRA {} ({} linears adapted{})",
+                        lora_path.display(),
+                        lora.len(),
+                        if conf.image_lora == config::ImageLora::Auto {
+                            "; found under models — image_lora = none runs the base model"
+                        } else {
+                            ""
+                        }
+                    );
+                    let cache = conf.image_lora_merge.then(|| {
+                        engine::image::lora::MergedCache::open(&conf.models, &path, lora_path)
+                    });
+                    (Some(lora), cache)
+                }
+                None => (None, None),
+            };
+            let image_defaults = conf.image_defaults_under(lora_path.as_deref());
+            let mut pipeline = engine::image::Pipeline::load(
+                &transformer,
+                companions.clone(),
+                model.clone(),
+                tokenizer.clone(),
+                image_backend,
+                image_defaults.clone(),
+                image_rate,
+                lora,
+                conf.image_lora_merge,
+                merged_cache,
+                conf.vae_precision,
+            )?;
+            pipeline.adapter = lora_path.clone();
+            // What the defaults cost on this machine, said once, up front —
+            // with the knobs that bring it down, when it is long enough
+            // that somebody would otherwise conclude the server hung.
+            if let Some(seconds) = pipeline.estimated_default_seconds() {
+                let d = pipeline.defaults();
+                let mut line = format!(
+                    "orangu-server: [image] a picture at the defaults ({}x{}, {} steps, guidance {}) \
+                     takes about {} here",
+                    d.width,
+                    d.height,
+                    d.steps,
+                    if d.cfg_scale > 1.0 { "on" } else { "off" },
+                    orangu::format::format_duration_rough(seconds),
+                );
+                if seconds > 15.0 * 60.0 {
+                    // Under an adapter the schedule is already the short one
+                    // and the size is the knob left; without one, all three.
+                    let (steps, passes, knobs) = if lora_path.is_some() {
+                        let passes = if d.cfg_scale > 1.0 { 2.0 } else { 1.0 };
+                        (d.steps, passes, "image_size = 512x512")
+                    } else {
+                        (
+                            20,
+                            1.0,
+                            "image_size = 512x512, image_steps = 20, image_cfg_scale = 1",
+                        )
+                    };
+                    let quick = pipeline
+                        .rate_model()
+                        .map(|m| m.seconds_for(512, 512, steps, passes))
+                        .unwrap_or(0.0);
+                    line.push_str(&format!(
+                        "; {knobs} would be about {}",
+                        orangu::format::format_duration_rough(quick)
+                    ));
+                }
+                log::info!("{line}");
+            }
+            let tc = pipeline.transformer_config();
+            log::info!(
+                "orangu-server: qwen_image transformer: {} blocks, {} heads of {}, {} wide; \
+                 defaults {}x{}, {} steps, cfg {}",
+                tc.n_layer,
+                tc.n_head,
+                tc.head_dim,
+                tc.dim,
+                image_defaults.width,
+                image_defaults.height,
+                image_defaults.steps,
+                image_defaults.cfg_scale,
+            );
+            Some(Arc::new(pipeline))
+        }
+        None => None,
+    };
 
     // What this model puts on the chosen device, against what that device
     // has — reported here, where both are finally known, and before the
@@ -1747,7 +2038,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     // the only reason it is not simply always on is that most models have
     // none. `ORANGU_NO_MTP` turns it off — the control arm an A/B of drafting
     // needs, and the way out if a head ever costs more than it saves.
-    let mtp = match mtp_head_path(&source) {
+    let mtp = match mtp_head_path(&weights_source) {
         Some(path) if !crate::engine::env::flag_on("ORANGU_NO_MTP") => {
             let attach = || -> Result<engine::generate::MtpDraft> {
                 let head = load_mtp_head(
@@ -1834,6 +2125,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         // request's completed line and nothing in between, and a daemon on
         // the console has `/dev/null` for a stdout.
         live_stats: conf.log.is_console() && !args.daemon,
+        image,
     });
 
     // `all` (the default) and its `*` alias become `0.0.0.0` here — see
@@ -2330,6 +2622,14 @@ fn build_model(
             BailingMoeModel::load_with_backend(loaded, backend.clone())
                 .context("building model")?,
         ),
+        // Not a language model: `prepare` builds the served `ModelForward`
+        // from its text encoder and the transformer through
+        // `engine::image::Pipeline`, and never reaches here with one. A
+        // draft-model spec naming one is the only way in.
+        ArchFamily::QwenImage => bail!(
+            "{architecture} is a diffusion transformer, not a language model; it is served as \
+             the model, with its text encoder and VAE beside it, and cannot stand in as a draft"
+        ),
     };
     Ok(model)
 }
@@ -2409,6 +2709,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
         engine: engine.clone(),
         api_key,
         model_label: model_label.clone(),
+        architecture: architecture.clone(),
         backend_label: backend_label.clone(),
         gpu_tuning,
         wgpu_backend: wgpu_backend.clone(),
@@ -2542,6 +2843,13 @@ async fn serve(prepared: Prepared) -> Result<()> {
         // `None` when the config turned it off, or on a platform with no
         // `execve`; the model manager reads that and disables its Load
         // button rather than offering something that would only refuse.
+        // The file the MCP pane writes: `--config`, else the default search's
+        // — the same resolution `load_config` made, minus a bundle's
+        // built-in answers, which are no file to write.
+        let config_file = config_path
+            .clone()
+            .or_else(default_server_config_path)
+            .filter(|path| path.is_file());
         let handover = (reexec_allowed && reexec::supported())
             .then(|| {
                 reexec::Handover::new(
@@ -2595,7 +2903,8 @@ async fn serve(prepared: Prepared) -> Result<()> {
             can_delete: delete_allowed,
             bundled: bundle.is_some(),
             loading: Default::default(),
-            mcp_servers,
+            mcp_servers: std::sync::Mutex::new(mcp_servers),
+            config_file,
         });
         let web_app = web::build_router(web_state);
         // Not joined: when `serve` returns (any shutdown path below), the
@@ -2641,6 +2950,11 @@ async fn serve(prepared: Prepared) -> Result<()> {
             log::info!("shutting down");
         }
     }
+
+    // A picture in flight runs on a blocking thread the runtime joins on the
+    // way out; told now, it stops at its next transformer block or VAE
+    // layer — seconds — instead of its next step, minutes at 1024 px.
+    engine::image::request_shutdown();
 
     // **Before anything else on the way out**, and in this order.
     //
@@ -2776,10 +3090,12 @@ pub(crate) fn model_support(
             let supported = architecture
                 .as_deref()
                 .is_some_and(|arch| engine::loader::resolve_arch_family(arch).is_ok());
+            let image = config::Role::required_by(architecture.as_deref()).is_some();
             orangu::model_spec::ModelSupport {
                 architecture,
                 supported,
                 unsupported_quant,
+                image,
             }
         })
         .collect()
@@ -3414,10 +3730,72 @@ pub(crate) fn format_show(gguf: &GgufFile, full: bool, tensors: bool) -> String 
 /// A directory holding exactly one model ([`init::sole_model`], shared with
 /// the `--init` wizard's own `model` prompt) skips the `NR` prompt entirely
 /// and goes straight on to the caller's role prompt.
+/// What the startup picker settled on: the file to serve, the label to
+/// call it by, and whether it is a picture generator — known from the
+/// table's own `SUPPORTED` column, so the caller can skip the role prompt
+/// for a model whose role is not a choice (`Role::fixed_by_model`).
+struct SelectedModel {
+    path: PathBuf,
+    label: String,
+    image: bool,
+}
+
+/// The role a model has to be served in, reconciled with the one asked
+/// for.
+///
+/// `image` is the model's own role rather than the operator's choice: a
+/// `qwen_image` file (`Role::required_by`) comes up in it whatever `role`
+/// was resolved to so far, and refuses any *explicit* other role — the
+/// CLI flag (`cli_role`), or under `--daemon` the config file's `role` key
+/// (`config_role`), which is the flag's stand-in when there is no terminal
+/// to pass one on. The other way round, `--image` (or `role = image`) on a
+/// language model is refused too: there is no picture pipeline to run it
+/// in. A language model with no explicit role keeps whatever `role` the
+/// prompt or the default gave it.
+fn fix_role_for_model(
+    role: config::Role,
+    cli_role: Option<config::Role>,
+    config_role: Option<config::Role>,
+    model_label: &str,
+    architecture: Option<&str>,
+) -> Result<config::Role> {
+    let required = config::Role::required_by(architecture);
+    let explicit = cli_role.or(config_role);
+    match (required, explicit) {
+        (Some(required), Some(asked)) if asked != required => {
+            let how = match cli_role {
+                Some(_) => format!("--{}", asked.label()),
+                None => format!("[{}].role = {}", config::SERVER_SECTION, asked.label()),
+            };
+            bail!(
+                "{model_label} is a {} model, which is only served in the {} role; \
+                 drop {how} or pass --{}",
+                architecture.unwrap_or("picture"),
+                required.label(),
+                required.label()
+            )
+        }
+        (Some(required), _) => Ok(required),
+        (None, _) if role.fixed_by_model() => {
+            let how = match cli_role {
+                Some(_) => format!("--{}", role.label()),
+                None => format!("[{}].role = {}", config::SERVER_SECTION, role.label()),
+            };
+            bail!(
+                "{how} serves picture generators (qwen_image) only, and {model_label} is a {} \
+                 model; pick an image model or another role",
+                architecture.unwrap_or("language")
+            )
+        }
+        (None, _) => Ok(role),
+    }
+}
+
 fn select_model_interactively(
     models_dir: &Path,
     configured: Option<&str>,
-) -> Result<(PathBuf, String)> {
+    role: Option<config::Role>,
+) -> Result<SelectedModel> {
     let models = orangu::model_spec::scan_models_dir(models_dir)
         .with_context(|| format!("scanning {}", models_dir.display()))?;
     let groups = orangu::model_spec::group_models(&models);
@@ -3428,6 +3806,16 @@ fn select_model_interactively(
         );
     }
 
+    // Which rows the flag that was given can serve: `--image` the picture
+    // generators, any other flag the language models, and no flag at all
+    // everything this build loads — the role is settled by the pick then,
+    // fixed for an image model and prompted for otherwise.
+    let mode = match role {
+        Some(config::Role::Image) => orangu::model_spec::Dimming::ImageModels,
+        Some(_) => orangu::model_spec::Dimming::TextModels,
+        None => orangu::model_spec::Dimming::Unsupported,
+    };
+    let support = model_support(&groups);
     let last_used =
         orangu::model_registry::last_used_for(groups.iter().map(|group| group.paths.as_slice()));
     print!(
@@ -3436,11 +3824,34 @@ fn select_model_interactively(
             &groups,
             models_dir,
             &Default::default(),
-            &model_support(&groups),
-            dimming(orangu::model_spec::Dimming::Unsupported),
+            &support,
+            dimming(mode),
             Some(&last_used),
         )
     );
+    // A greyed row is not on offer: the table said so, and the message
+    // says why in the same words the role flag's own help does.
+    let check = |index: usize, group: &orangu::model_spec::ModelGroup| -> Result<bool> {
+        let support = &support[index];
+        if support.loadable() && !support.selectable(mode) {
+            bail!(
+                "{} is {} model, which --{} does not serve; {}",
+                group.label,
+                if support.image {
+                    "an image"
+                } else {
+                    "a language"
+                },
+                role.unwrap_or_default().label(),
+                if support.image {
+                    "an image model is only served in the image role (--image, or no role flag)"
+                } else {
+                    "--image serves image models only"
+                }
+            );
+        }
+        Ok(support.image)
+    };
 
     // A single listed model is not a choice — take it and move straight on
     // to the role prompt, rather than asking for the only NR on offer. The
@@ -3449,18 +3860,39 @@ fn select_model_interactively(
     // `key: value` shape as the `role [all]: ` prompt that follows, matching
     // how `--init` echoes the same decision.
     if let Some(only) = init::sole_model(&groups) {
+        let image = check(0, only)?;
         println!("\nmodel: {}", only.label);
-        return Ok((only.representative_path.clone(), only.label.clone()));
+        return Ok(SelectedModel {
+            path: only.representative_path.clone(),
+            label: only.label.clone(),
+            image,
+        });
     }
 
     // `[orangu-server].model`, as the `NR` of the row it names — the prompt
     // asks for a number, so that is the form to pre-select it in. A config
     // naming a model that isn't installed has no row to point at; its spec
     // is offered as written instead, and Enter fetches it exactly as
-    // `orangu-server <spec>` would.
-    let default = configured.map(|spec| match init::nr_of(&groups, spec) {
-        Some(nr) => nr.to_string(),
-        None => spec.to_string(),
+    // `orangu-server <spec>` would. Unless the flag rules that model out:
+    // `--image` with a language model configured (the usual config, and
+    // the usual way to ask for a picture) pre-selects the first picture
+    // model instead, and a language-model flag with a picture model
+    // configured the first language model — Enter on a greyed row would
+    // only be refused by `check` below.
+    let default = configured.and_then(|spec| match init::nr_of(&groups, spec) {
+        Some(nr) if support[nr - 1].selectable(mode) => Some(nr.to_string()),
+        Some(_) => None,
+        None => Some(spec.to_string()),
+    });
+    let default = default.or_else(|| {
+        (mode != orangu::model_spec::Dimming::Unsupported)
+            .then(|| {
+                support
+                    .iter()
+                    .position(|support| support.selectable(mode))
+                    .map(|index| (index + 1).to_string())
+            })
+            .flatten()
     });
     let answer = init::prompt_model_nr(&groups, default.as_deref())?;
     // Enter on the ghost leaves the line blank; put the value that was
@@ -3472,14 +3904,28 @@ fn select_model_interactively(
     // resolution the positional argument uses, so the prompt accepts
     // everything that does.
     if let Ok(nr) = answer.parse::<usize>() {
-        let group = nr
+        let index = nr
             .checked_sub(1)
-            .and_then(|index| groups.get(index))
+            .filter(|index| *index < groups.len())
             .ok_or_else(|| anyhow!("no model with NR {nr} ({} model(s) listed)", groups.len()))?;
-        return Ok((group.representative_path.clone(), group.label.clone()));
+        let group = &groups[index];
+        let image = check(index, group)?;
+        return Ok(SelectedModel {
+            path: group.representative_path.clone(),
+            label: group.label.clone(),
+            image,
+        });
     }
-    orangu::model_spec::resolve_load_target(models_dir, &answer)
-        .with_context(|| format!("resolving model '{answer}'"))
+    let (path, label) = orangu::model_spec::resolve_load_target(models_dir, &answer)
+        .with_context(|| format!("resolving model '{answer}'"))?;
+    // Not a row, so not in `support`: judged from its own header, the same
+    // way `prepare` judges a model named on the command line.
+    let image = GgufFile::open_summary(&path)
+        .ok()
+        .and_then(|gguf| orangu::model_spec::architecture_of(&gguf))
+        .and_then(|arch| config::Role::required_by(Some(&arch)))
+        .is_some();
+    Ok(SelectedModel { path, label, image })
 }
 
 /// Ctrl+C (`tokio::signal::ctrl_c`) already covers `SIGINT` on Unix in
@@ -3548,35 +3994,41 @@ fn cpu_label() -> String {
 /// line too: on a machine whose GPU is doing the work, the CPU's core count
 /// and instruction set are still what the tokenizer, the sampler and (on a
 /// split model) attention run on.
-fn cpu_inventory(role: &str, threads: Option<usize>) -> String {
+fn cpu_inventory(role: &str, pool: WorkerPool) -> String {
     let cpu = orangu::hardware::detect_cpu();
     let mut detail = Vec::new();
     match cpu.physical_cores {
         Some(cores) => detail.push(format!("{cores} cores / {} threads", cpu.logical_cores)),
         None => detail.push(format!("{} threads", cpu.logical_cores)),
     }
-    // The widest instruction set `engine::vecdot` will actually dispatch to,
+    // The widest `int8` kernel `engine::vecdot` will actually dispatch to,
     // which is what decides the CPU matmul's speed — not the full feature
-    // list, which belongs in the `system` report.
-    detail.push(
-        if cpu.features.avx512f {
-            "AVX-512"
-        } else if cpu.features.avx2 {
-            "AVX2"
-        } else if cpu.features.sse4_2 {
-            "SSE4.2"
-        } else {
-            "scalar"
-        }
-        .to_string(),
-    );
+    // list, which belongs in the `system` report. Asked of the module that
+    // does the dispatching, so the line cannot say `i8mm` on a core whose
+    // `smmla` failed its self-test and runs `sdot`.
+    detail.push(engine::vecdot::int8_kernel_label().to_string());
     detail.push(format!(
         "{} RAM",
         orangu::format::format_bytes(cpu.total_memory_bytes)
     ));
-    detail.push(match threads {
-        Some(threads) => format!("{threads} worker threads"),
-        None => format!("{} worker threads (default)", cpu.logical_cores),
+    detail.push(match pool {
+        WorkerPool::BigCores(threads) => format!(
+            "{threads} worker threads on the big cores ({} little left to the OS)",
+            cpu.logical_cores.saturating_sub(threads)
+        ),
+        WorkerPool::Sized(threads) => format!("{threads} worker threads"),
+        WorkerPool::Default => match orangu::hardware::big_cores() {
+            // Said, because it is part of what a number from this machine
+            // means: the little cores run the same tasks at a third of the
+            // speed, and a tail on one of them is a wait on all the others.
+            Some(big) => format!(
+                "{} worker threads (default: {} big + {} little cores)",
+                cpu.logical_cores,
+                big.len(),
+                cpu.logical_cores.saturating_sub(big.len())
+            ),
+            None => format!("{} worker threads (default)", cpu.logical_cores),
+        },
     });
     format!(
         "orangu-server: [cpu] {} [{}] {role}",
@@ -3661,7 +4113,7 @@ fn npu_inventory(role: &str) -> Option<String> {
 /// core) untouched, so a config that says nothing about threads keeps
 /// exactly the behaviour it had. Returns what was applied, for the
 /// inventory line.
-fn configure_cpu_threads(flag: Option<&str>, configured: Option<usize>) -> Result<Option<usize>> {
+fn configure_cpu_threads(flag: Option<&str>, configured: Option<usize>) -> Result<WorkerPool> {
     let requested = match flag {
         Some(raw) => Some(
             raw.trim()
@@ -3678,7 +4130,23 @@ fn configure_cpu_threads(flag: Option<&str>, configured: Option<usize>) -> Resul
         },
     };
     let Some(threads) = requested else {
-        return Ok(None);
+        // Nothing asked for: rayon's one worker per logical core — also on
+        // a machine with big and little cores, where the measured answer
+        // is not what the microbenchmark suggested. `ORANGU_EXPERT_BIG_CORES=1`
+        // opts into one worker per big core, kept on the big cluster; see
+        // `hardware::big_cores` for what that gains and costs.
+        let pinned = orangu::hardware::big_cores()
+            .filter(|_| std::env::var("ORANGU_EXPERT_BIG_CORES").is_ok_and(|v| v.trim() == "1"));
+        let Some(cores) = pinned else {
+            return Ok(WorkerPool::Default);
+        };
+        let threads = cores.len();
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .start_handler(move |_| pin_to_cores(&cores))
+            .build_global()
+            .map_err(|err| anyhow!("could not size the worker pool to {threads} threads: {err}"))?;
+        return Ok(WorkerPool::BigCores(threads));
     };
     if threads == 0 {
         bail!("threads must be at least 1 (leave it unset for one worker per logical core)");
@@ -3687,8 +4155,45 @@ fn configure_cpu_threads(flag: Option<&str>, configured: Option<usize>) -> Resul
         .num_threads(threads)
         .build_global()
         .map_err(|err| anyhow!("could not size the worker pool to {threads} threads: {err}"))?;
-    Ok(Some(threads))
+    Ok(WorkerPool::Sized(threads))
 }
+
+/// How [`configure_cpu_threads`] sized the pool, for the inventory line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerPool {
+    /// Nothing asked, nothing detected: rayon's one worker per logical core.
+    Default,
+    /// `--threads`/`ORANGU_THREADS`/`[orangu-server].threads`, as given.
+    Sized(usize),
+    /// `ORANGU_EXPERT_BIG_CORES=1` on a machine with big and little cores:
+    /// one worker per big core, kept on the big cluster.
+    BigCores(usize),
+}
+
+/// Restricts the calling thread to `cores` — the big cluster, so a rayon
+/// worker never lands on a little core and becomes the tail every other
+/// worker waits for. The set, not one core each: within the cluster the OS
+/// still balances. A failure is ignored: the worker then runs wherever the
+/// OS puts it, which is exactly the situation without this call.
+#[cfg(target_os = "linux")]
+fn pin_to_cores(cores: &[usize]) {
+    // Safety: `cpu_set_t` is plain data that `CPU_ZERO`/`CPU_SET` initialise
+    // before it is read, and `sched_setaffinity(0, ...)` acts on the calling
+    // thread only.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        for &core in cores {
+            if core < libc::CPU_SETSIZE as usize {
+                libc::CPU_SET(core, &mut set);
+            }
+        }
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_to_cores(_cores: &[usize]) {}
 
 /// Chooses which routed experts a device holds, and records it on the model
 /// so `LoadedModel::expert_matrix` can stamp each tensor.

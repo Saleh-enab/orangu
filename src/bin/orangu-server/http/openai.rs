@@ -31,9 +31,11 @@ use super::AppState;
 use super::native::finish_reason_str;
 use crate::engine::chat_template::{ChatMessage, ChatTemplate};
 use crate::engine::generate::{GenerateRequest, GenerateStats, StreamEvent};
+use crate::engine::image::ImageEvent;
 use crate::engine::loader::PoolingType;
 use crate::engine::sampling::SamplingParams;
 use crate::engine::tool_calls;
+use base64::Engine as _;
 
 /// How long an answer may get when the request does not say — the
 /// `max_tokens` default for `/v1/chat/completions`, clamped afterwards to
@@ -354,14 +356,17 @@ pub(crate) const ROLE_HEADER: &str = "x-orangu-role";
 /// being reported — a request must not fail because a proxy in front of it
 /// labelled it in a spelling this build does not know.
 pub(crate) fn request_role(state: &AppState, headers: &HeaderMap) -> crate::config::Role {
-    if !state.engine.role.allows_generation() {
+    // An embedding server has no generation to tune, and an image server's
+    // role is the model's own (`Role::fixed_by_model`): neither is a choice
+    // a header can make.
+    if !state.engine.role.allows_generation() || state.engine.role.fixed_by_model() {
         return state.engine.role;
     }
     headers
         .get(ROLE_HEADER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| crate::config::Role::parse(value).ok())
-        .filter(|role| role.allows_generation())
+        .filter(|role| role.allows_generation() && !role.fixed_by_model())
         .unwrap_or(state.engine.role)
 }
 
@@ -380,6 +385,10 @@ pub async fn chat_completions(
             ),
         )
             .into_response();
+    }
+    // An image model answers a chat turn with a picture — see `image_chat`.
+    if state.engine.image.is_some() {
+        return image_chat(state, req).await;
     }
     let Some(template_source) = &state.engine.chat_template_source else {
         return (
@@ -659,6 +668,146 @@ pub async fn chat_completions(
                     break;
                 }
                 StreamEvent::Error(err) => {
+                    yield Ok(axum::response::sse::Event::default().data(json!({"error": err}).to_string()));
+                    break;
+                }
+            }
+        }
+    };
+    axum::response::sse::Sse::new(stream).into_response()
+}
+
+/// `/v1/chat/completions` on a `qwen_image` model: the last user message is
+/// the prompt, its last attached picture (an `image_url` content part) is
+/// what the picture starts from, and the assistant's answer is the picture
+/// as a markdown image over a `data:` URL — which any chat client that
+/// renders markdown shows inline, and which is also handed back raw under
+/// `message.images` for one that wants the bytes.
+///
+/// Every other knob (size, steps, guidance, format) is the server's
+/// `[orangu-server].image_*` default; `seed` is honoured. A client that
+/// wants to choose those per request has `/v1/images/generations`.
+///
+/// Streamed, the chunks carry `image_progress` (`step`, `steps`,
+/// `eta_seconds`) with an empty delta until the picture is done, so a
+/// client that shows nothing but content still ends up with the picture and
+/// one that reads progress can draw a bar.
+async fn image_chat(state: Arc<AppState>, req: ChatCompletionRequest) -> axum::response::Response {
+    let pipeline = match super::images::pipeline_or_reject(&state) {
+        Ok(pipeline) => pipeline,
+        Err(response) => return *response,
+    };
+    let Some(turn) = req.messages.iter().rev().find(|m| m.role == "user") else {
+        return (StatusCode::BAD_REQUEST, "no user message to draw from").into_response();
+    };
+    let init = match turn.images.last() {
+        Some(payload) => match super::images::decode_image_payload(payload) {
+            Ok(init) => Some(init),
+            Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
+        },
+        None => None,
+    };
+    let request = match super::images::build_request(
+        &pipeline.defaults(),
+        super::images::ImageParams {
+            prompt: &turn.content,
+            negative_prompt: None,
+            size: None,
+            output_format: None,
+            seed: req.seed,
+            steps: None,
+            cfg_scale: None,
+            init,
+            strength: None,
+        },
+    ) {
+        Ok(request) => request,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
+    };
+    let prompt = request.prompt.clone();
+    let created = unix_now();
+    let model = state.model_label.clone();
+    let (mut rx, cancel) = pipeline.spawn(request);
+    let image_json = |image: &crate::engine::image::GeneratedImage| {
+        json!({
+            "b64_json": base64::engine::general_purpose::STANDARD.encode(&image.bytes),
+            "output_format": image.format.extension(),
+            "mime": image.format.mime(),
+            "size": format!("{}x{}", image.width, image.height),
+            "seed": image.seed,
+            "steps": image.steps,
+            "generation_ms": image.elapsed.as_millis() as u64,
+        })
+    };
+    let zero_usage = json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
+
+    if !req.stream {
+        let _cancel = cancel;
+        let image = loop {
+            match rx.recv().await {
+                Some(ImageEvent::Progress(_)) => {}
+                Some(ImageEvent::Done(image)) => break image,
+                Some(ImageEvent::Error(err)) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
+                }
+                None => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "generation ended early")
+                        .into_response();
+                }
+            }
+        };
+        return Json(json!({
+            "id": format!("chatcmpl-{created}"),
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": super::images::markdown_image(&image, &prompt),
+                    "images": [image_json(&image)],
+                },
+                "finish_reason": "stop",
+            }],
+            "usage": zero_usage,
+        }))
+        .into_response();
+    }
+
+    let stream = async_stream::stream! {
+        let _cancel = cancel;
+        let id = format!("chatcmpl-{created}");
+        loop {
+            let Some(event) = rx.recv().await else { break };
+            match event {
+                ImageEvent::Progress(p) => {
+                    let chunk = json!({
+                        "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": null}],
+                        "image_progress": {
+                            "step": p.step, "steps": p.steps,
+                            "seconds_per_step": p.seconds_per_step,
+                            "eta_seconds": p.seconds_per_step * (p.steps.saturating_sub(p.step)) as f64,
+                        },
+                    });
+                    yield Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(chunk.to_string()));
+                }
+                ImageEvent::Done(image) => {
+                    let chunk = json!({
+                        "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": {
+                            "role": "assistant",
+                            "content": super::images::markdown_image(&image, &prompt),
+                            "images": [image_json(&image)],
+                        }, "finish_reason": "stop"}],
+                        "usage": zero_usage,
+                    });
+                    yield Ok(axum::response::sse::Event::default().data(chunk.to_string()));
+                    yield Ok(axum::response::sse::Event::default().data("[DONE]"));
+                    break;
+                }
+                ImageEvent::Error(err) => {
                     yield Ok(axum::response::sse::Event::default().data(json!({"error": err}).to_string()));
                     break;
                 }

@@ -34,11 +34,8 @@
       <button id="history-btn" class="icon-btn" type="button" aria-expanded="false" aria-controls="history-panel" aria-label="History" title="History">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 16 14"/></svg>
       </button>
-      <button id="models-btn" class="icon-btn" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="models-panel" aria-label="Models" title="Models">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="12 2 22 8 12 14 2 8 12 2"/><polyline points="2 16 12 22 22 16"/><polyline points="2 12 12 18 22 12"/></svg>
-      </button>
-      <button id="mcps-btn" class="icon-btn" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="mcps-panel" aria-label="MCP servers" title="MCP servers">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+      <button id="settings-btn" class="icon-btn" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="settings-panel" aria-label="Settings" title="Settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
       </button>
       <button id="theme-toggle-btn" class="icon-btn" type="button" aria-label="Switch to light mode" title="Switch to light mode"></button>
     </div>
@@ -55,23 +52,46 @@
     </div>
   </nav>
 
-  <!-- The model manager. A modal dialog rather than a dropdown like
-       #history-panel: it owns an irreversible action (delete) and a
+  <!-- Settings. A modal dialog rather than a dropdown like #history-panel:
+       one of its panes owns an irreversible action (delete) and a
        long-running one (download), so it deliberately takes over the screen
-       instead of closing on the next outside click. The table is built by
-       app.js from /api/models — `orangu-server list`, column for column;
-       the markup here is only the frame and the two fixed controls (the
-       download form and the metadata viewer). -->
-  <div id="models-overlay" hidden>
-    <section id="models-panel" role="dialog" aria-modal="true" aria-labelledby="models-title">
+       instead of closing on the next outside click. The brand-brown column
+       on the left picks the pane — MCP servers, the model manager, the
+       picture settings — and the panes are the sections beside it, one
+       shown at a time (app.js, `openSettings`). -->
+  <div id="settings-overlay" hidden>
+    <section id="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <div id="settings-body">
+      <nav id="settings-nav" aria-label="Settings sections">
+        <h2 id="settings-title">Settings</h2>
+        <button class="settings-tab" type="button" data-pane="mcps" aria-controls="mcps-panel" aria-pressed="false">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+          <span>MCP</span>
+        </button>
+        <button class="settings-tab" type="button" data-pane="models" aria-controls="models-panel" aria-pressed="false">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="12 2 22 8 12 14 2 8 12 2"/><polyline points="2 16 12 22 22 16"/><polyline points="2 12 12 18 22 12"/></svg>
+          <span>Models</span>
+        </button>
+        <button class="settings-tab" type="button" data-pane="image" aria-controls="image-panel" aria-pressed="false">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+          <span>Image</span>
+        </button>
+      </nav>
+      <div id="settings-content">
+        <button id="settings-close-btn" class="icon-btn subtle-btn" type="button" aria-label="Close settings" title="Close settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+
+    <!-- The model manager. The table is built by app.js from /api/models —
+         `orangu-server list`, column for column; the markup here is only
+         the frame and the two fixed controls (the download form and the
+         metadata viewer). -->
+    <section id="models-panel" class="settings-pane" aria-labelledby="models-title" hidden>
       <header id="models-header">
         <h2 id="models-title">Models</h2>
         <span id="models-dir" class="models-subtle"></span>
         <button id="models-reload-btn" class="icon-btn subtle-btn" type="button" aria-label="Rescan models directory" title="Rescan models directory">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-        </button>
-        <button id="models-close-btn" class="icon-btn subtle-btn" type="button" aria-label="Close" title="Close">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
       </header>
 
@@ -109,15 +129,164 @@
         <pre id="models-metadata-body"></pre>
       </div>
     </section>
+
+    <!-- MCP servers: the configuration file's inventory. Add, Edit and
+         Delete change the list held here; the dialog's Save writes it to
+         the file (PUT /api/mcps) and says so in a pop-up — a server started
+         from the file afterwards is what reads it. -->
+    <section id="mcps-panel" class="settings-pane" aria-labelledby="mcps-title" hidden>
+      <header id="mcps-header">
+        <h2 id="mcps-title">MCP servers</h2>
+        <span id="mcps-path" class="models-subtle"></span>
+        <button id="mcps-add-btn" type="button" class="mcps-action">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          Add
+        </button>
+      </header>
+      <div id="mcps-table"></div>
+      <form id="mcps-form" hidden>
+        <h3 id="mcps-form-title">Add an MCP server</h3>
+        <label class="image-field">
+          <span>Name</span>
+          <span class="image-controls"><input id="mcps-form-name" type="text" spellcheck="false" autocomplete="off" placeholder="the [section] name in orangu-server.conf" required></span>
+        </label>
+        <label class="image-field">
+          <span>Endpoint</span>
+          <span class="image-controls"><input id="mcps-form-endpoint" type="text" spellcheck="false" autocomplete="off" placeholder="http://host:port/mcp" required></span>
+        </label>
+        <label class="image-field">
+          <span>Enabled</span>
+          <span class="image-controls"><input id="mcps-form-enabled" type="checkbox" checked></span>
+        </label>
+        <label class="image-field">
+          <span>Approval mode</span>
+          <span class="image-controls">
+            <select id="mcps-form-approval">
+              <option value="auto">auto — every call</option>
+              <option value="prompt">prompt — ask for every call</option>
+              <option value="writes" selected>writes — ask before a call that changes something</option>
+              <option value="deny">deny — no calls</option>
+            </select>
+          </span>
+        </label>
+        <div id="mcps-form-actions">
+          <button id="mcps-form-ok" type="submit">OK</button>
+          <button id="mcps-form-cancel" type="button">Cancel</button>
+          <span id="mcps-form-status" class="models-subtle"></span>
+        </div>
+      </form>
+      <div id="mcps-confirm" hidden>
+        <span id="mcps-confirm-text"></span>
+        <button id="mcps-confirm-ok" type="button">OK</button>
+        <button id="mcps-confirm-cancel" type="button">Cancel</button>
+      </div>
+      <p id="mcps-status" class="mcps-note"></p>
+    </section>
+
+    <!-- The picture settings: the defaults every chat turn on an image
+         model gets, read from and written to /api/props (the API's /props).
+         Filled in by app.js from the server's answer — the size presets and
+         step counts are here, the adapter, the rate and the current values
+         are the server's. -->
+    <section id="image-panel" class="settings-pane" aria-labelledby="image-title" hidden>
+      <header id="image-header"><h2 id="image-title">Image</h2><span id="image-model" class="models-subtle"></span></header>
+      <p id="image-none" class="mcps-note" hidden>The served model is a language model; picture settings apply to a <code>qwen_image</code> model.</p>
+      <form id="image-form" hidden>
+        <label class="image-field">
+          <span>Size <button type="button" class="info-btn" aria-label="What this setting does" data-tip="The picture's width × height in pixels, both multiples of 16. The time grows a little faster than the pixel count. 1024 × 1024 is the model's native size; 512 × 512 is the smallest that still follows the prompt reliably — a preview in a couple of minutes; at 256 × 256 the model wanders (a cat asked for, a man drawn)."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></span>
+          <span class="image-controls">
+            <select id="image-size">
+              <option value="256x256">256 × 256 — smallest</option>
+              <option value="512x512">512 × 512 — preview</option>
+              <option value="768x768">768 × 768</option>
+              <option value="1024x1024">1024 × 1024</option>
+              <option value="1024x768">1024 × 768 — landscape</option>
+              <option value="768x1024">768 × 1024 — portrait</option>
+              <option value="1280x720">1280 × 720 — wide</option>
+              <option value="custom">Other…</option>
+            </select>
+            <input id="image-size-custom" type="text" inputmode="numeric" placeholder="WIDTHxHEIGHT" spellcheck="false" hidden>
+          </span>
+        </label>
+        <label class="image-field">
+          <span>Steps <button type="button" class="info-btn" aria-label="What this setting does" data-tip="Denoising steps — the time is linear in them. A Lightning adapter is made for its own count (the 8-step file for 8, the 4-step file for 4); the base model without an adapter needs 50."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></span>
+          <span class="image-controls">
+            <select id="image-steps">
+              <option value="4">4 — quick</option>
+              <option value="8">8</option>
+              <option value="20">20</option>
+              <option value="50">50</option>
+              <option value="custom">Other…</option>
+            </select>
+            <input id="image-steps-custom" type="number" min="1" step="1" hidden>
+          </span>
+        </label>
+        <label class="image-field">
+          <span>Guidance <button type="button" class="info-btn" aria-label="What this setting does" data-tip="Classifier-free guidance: how hard the picture is pushed towards the prompt and away from the negative prompt. Off under a Lightning adapter, which was trained without it; Qwen-Image's own setting is 4. Guidance doubles the work of every step."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></span>
+          <span class="image-controls">
+            <select id="image-cfg">
+              <option value="1">Off</option>
+              <option value="4">4 — Qwen-Image's</option>
+              <option value="custom">Other…</option>
+            </select>
+            <input id="image-cfg-custom" type="number" min="0" step="0.5" hidden>
+          </span>
+        </label>
+        <label class="image-field">
+          <span>Negative prompt <button type="button" class="info-btn" aria-label="What this setting does" data-tip="What the picture is pushed away from — blurry, text, extra limbs. Read only when guidance is on."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></span>
+          <span class="image-controls"><input id="image-negative" type="text" placeholder="what the picture is pushed away from (guidance on)"></span>
+        </label>
+        <label class="image-field">
+          <span>Strength <button type="button" class="info-btn" aria-label="What this setting does" data-tip="For a picture started from an attached one: how much of the schedule to run over it. 1 ignores the attachment's content and keeps only its size, 0 returns it unchanged; 0.6 keeps the composition and redraws the rest."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></span>
+          <span class="image-controls"><input id="image-strength" type="range" min="0" max="1" step="0.05"><output id="image-strength-value"></output></span>
+        </label>
+        <label class="image-field">
+          <span>Format <button type="button" class="info-btn" aria-label="What this setting does" data-tip="The file the picture comes back as. PNG is lossless; JPEG smaller; GIF one frame on 256 colours; WebP lossless; SVG a document of the picture's size carrying it as PNG, there being no pixels-to-vector. A picture started from an attachment comes back in the attachment's own format."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></span>
+          <span class="image-controls">
+            <select id="image-format">
+              <option value="png">PNG</option>
+              <option value="jpeg">JPEG</option>
+              <option value="gif">GIF</option>
+              <option value="webp">WebP</option>
+              <option value="svg">SVG</option>
+            </select>
+          </span>
+        </label>
+        <p id="image-estimate" class="mcps-note"></p>
+        <div id="image-actions">
+          <button id="image-reset-btn" type="button" title="Put every setting back to the server's configuration; Save makes it so">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+            Reset
+          </button>
+          <span id="image-status" class="models-subtle"></span>
+        </div>
+      </form>
+    </section>
+      </div>
+      </div>
+      <!-- The bar every pane shares: Save on the left applies what the panes
+           hold and closes; Cancel on the right drops it. -->
+      <footer id="settings-footer">
+        <button id="settings-save-btn" class="settings-tab" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>
+          <span>Save</span>
+        </button>
+        <button id="settings-cancel-btn" class="settings-tab" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          <span>Cancel</span>
+        </button>
+      </footer>
+    </section>
   </div>
 
-  <div id="mcps-overlay" hidden>
-    <section id="mcps-panel" role="dialog" aria-modal="true" aria-labelledby="mcps-title">
-      <header id="mcps-header"><h2 id="mcps-title">MCP servers</h2><button id="mcps-close-btn" class="icon-btn subtle-btn" type="button" aria-label="Close" title="Close">×</button></header>
-      <p class="mcps-note">Configured servers are read-only here. Change the server configuration and restart to apply it.</p>
-      <div id="mcps-table"></div>
-      <pre id="mcps-details" hidden></pre>
-    </section>
+  <!-- The word after a Save that wrote the configuration file: what was
+       written, where, and that a restart is what applies it. -->
+  <div id="notice-overlay" hidden>
+    <div id="notice-box" role="dialog" aria-modal="true" aria-labelledby="notice-title">
+      <h2 id="notice-title">Saved</h2>
+      <p id="notice-text"></p>
+      <div id="notice-actions"><button id="notice-ok" type="button">OK</button></div>
+    </div>
   </div>
 
   <main id="transcript" aria-live="polite"></main>
@@ -128,8 +297,10 @@
     </button>
     <div id="attach-menu" role="menu" hidden>
       <button type="button" role="menuitem" data-attach="document">Document</button>
+      <button type="button" role="menuitem" data-attach="image">Image</button>
       <button type="button" role="menuitem" data-attach="file">File</button>
     </div>
+    <input id="attach-input-image" class="attach-input" type="file" multiple hidden accept=".png,.jpg,.jpeg,.gif,.webp,.svg,image/png,image/jpeg,image/gif,image/webp,image/svg+xml">
     <input id="attach-input-document" class="attach-input" type="file" multiple hidden accept=".pdf,.txt,.md,.markdown,.rtf,.csv,.tsv,.json,.xml,.log,.doc,.docx,.xls,.xlsx,.xlsm,.ppt,.pptx,.odt,.ods,.odp,application/pdf,text/*,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.openxmlformats-officedocument.presentationml.presentation,application/vnd.oasis.opendocument.text,application/vnd.oasis.opendocument.spreadsheet,application/vnd.oasis.opendocument.presentation">
     <input id="attach-input-file" class="attach-input" type="file" multiple hidden>
     <div id="composer-main">

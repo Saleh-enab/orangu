@@ -52,6 +52,7 @@ use clap::Parser;
 mod bundle;
 mod chart;
 mod history;
+mod image;
 mod moe;
 mod points;
 use orangu::profiling::profile;
@@ -157,6 +158,26 @@ struct Args {
     /// [`Args::embed_spec`] expanded — see [`Args::expand_lists`].
     #[arg(skip)]
     embed: Vec<u32>,
+
+    /// Image mode: square picture sizes (pixels, multiples of 16) to sweep against /v1/images/generations.
+    #[arg(long = "image", value_delimiter = ',', value_name = "LIST")]
+    image_spec: Vec<String>,
+
+    /// [`Args::image_spec`] expanded — see [`Args::expand_lists`].
+    #[arg(skip)]
+    image: Vec<u32>,
+
+    /// Denoising steps per picture for `--image`.
+    #[arg(long, default_value_t = 2, value_name = "N")]
+    image_steps: u32,
+
+    /// Guidance scale for `--image`; 1 runs the prompt alone. Default: the server's.
+    #[arg(long, value_name = "SCALE")]
+    image_cfg: Option<f64>,
+
+    /// The prompt every `--image` picture is drawn from.
+    #[arg(long, default_value = image::DEFAULT_PROMPT, value_name = "TEXT")]
+    image_prompt: String,
 
     /// Number of tokens to generate per timed run.
     #[arg(long = "gen", default_value_t = 128, value_name = "N")]
@@ -377,6 +398,7 @@ impl Args {
                 &mut self.pp_continue,
             ),
             ("--embed", &self.embed_spec, &mut self.embed),
+            ("--image", &self.image_spec, &mut self.image),
             ("--streams", &self.streams_spec, &mut self.streams),
             (
                 "--shared-prefix",
@@ -1222,7 +1244,11 @@ fn run(args: &Args) -> anyhow::Result<()> {
         // embedding-only server answers `/v1/completions` with HTTP 501, so
         // warming up with a completion would fail the run before it started —
         // which is exactly what kept `--embed`'s models unmeasurable.
-        if args.embed.is_empty() {
+        if !args.image.is_empty() {
+            // The picture pipeline has threads of its own, which a text
+            // completion would not create — see `image::warmup`.
+            image::warmup(&client, &args.url, &args.model)?;
+        } else if args.embed.is_empty() {
             run_once(&client, &args.url, &p, 8, &args.model, args.temperature)?;
         } else {
             run_embed_once(&client, &args.url, &p, &args.model)?;
@@ -1390,6 +1416,9 @@ fn write_bundle(
         "pg": args.pg,
         "pp_continue": args.pp_continue,
         "embed": args.embed,
+        "image": args.image,
+        "image_steps": args.image_steps,
+        "image_cfg": args.image_cfg,
         "streams": args.streams,
         "n_gen": args.n_gen,
         "reps": args.reps,
@@ -1732,6 +1761,7 @@ fn measurement_name(mode: &str) -> &str {
         "curve" => "decode @ context",
         "cpu" => "decode CPU",
         "embed" => "embedding",
+        "image" => "image generation",
         other => other,
     }
 }
@@ -1757,6 +1787,16 @@ fn workload_detail(args: &Args) -> String {
         )
     } else if !args.embed.is_empty() {
         format!("prompt lengths {}", list(&args.embed))
+    } else if !args.image.is_empty() {
+        format!(
+            "square pictures of {} pixels, {} step(s){}",
+            list(&args.image),
+            args.image_steps,
+            match args.image_cfg {
+                Some(cfg) => format!(", guidance {cfg}"),
+                None => ", the server's guidance".to_string(),
+            }
+        )
     } else if !args.streams.is_empty() {
         format!("streams {}", list(&args.streams))
     } else if !args.shared_prefix.is_empty() {
@@ -2609,6 +2649,12 @@ fn measure(
     // unrelated tables under one header.
     if !args.embed.is_empty() {
         return run_embed(client, args, label);
+    }
+
+    // Same exclusivity, same reason: a picture server's text endpoints
+    // measure its text encoder, which is not the model anyone asked about.
+    if !args.image.is_empty() {
+        return image::run_image(client, args, label);
     }
 
     if !args.pg.is_empty() {
@@ -3583,7 +3629,17 @@ fn url_port(url: &str) -> Option<u16> {
 /// carries its own workload rather than depending on its filename.
 fn workload_name(args: &Args) -> String {
     let list = |v: &[u32]| v.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-    if !args.pg.is_empty() {
+    if !args.image.is_empty() {
+        format!(
+            "image {} steps {}{}",
+            list(&args.image),
+            args.image_steps,
+            match args.image_cfg {
+                Some(cfg) => format!(" cfg {cfg}"),
+                None => String::new(),
+            }
+        )
+    } else if !args.pg.is_empty() {
         format!("prefill+decode pg {} gen {}", list(&args.pg), args.n_gen)
     } else if !args.pp.is_empty() {
         format!("prefill pp {}", list(&args.pp))

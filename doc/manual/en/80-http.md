@@ -152,6 +152,7 @@ answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 | `POST /v1/chat/completions` | streaming (SSE) and non-streaming; `tools`/`tool_calls` and `response_format`; `cache_prompt`/`id_slot`/`timings_per_token`/`return_progress`; needs a chat template; disabled under `--embedding` |
 | `POST /v1/completions` | legacy completion, no chat template needed; `cache_prompt`/`id_slot`/`response_format`/`ignore_eos`; disabled under `--embedding` |
 | `POST /v1/embeddings` | pooled and L2-normalized; carries OpenAI's `usage` |
+| `POST /v1/images/generations` | OpenAI's Images API, on a `qwen_image` model; `501` on a language model |
 | `GET /health` | liveness: is this process up. Stays `200` while the server is merely busy |
 | `GET /ready` | readiness: would a request sent now be served |
 | `GET /props` | model and server metadata: backend, devices, build, slot count, workspace |
@@ -468,6 +469,70 @@ another tool to learn what it just paid for.
 This is the endpoint `/search` embeds code through, and the one a server
 tagged `role = embeddings` exists to serve.
 
+#### `POST /v1/images/generations`
+
+Only on a server whose model is a `qwen_image` diffusion transformer (see
+the *Image generation* section of the server chapter); a language model
+answers `501`.
+
+```sh
+curl -s localhost:8100/v1/images/generations -H 'Content-Type: application/json' \
+  -d '{"prompt": "a lighthouse at dusk, oil painting", "size": "768x512", "steps": 20}' \
+  | jq -r '.data[0].b64_json' | base64 -d > lighthouse.png
+```
+
+| field | default | |
+| :-- | :-- | :-- |
+| `prompt` | *required* | what to draw |
+| `negative_prompt` | `image_negative_prompt` | what to draw away from; read only when `cfg_scale > 1` |
+| `size` | `image_size` | `WIDTHxHEIGHT`, both multiples of 16; `auto` is the default, or the attached `image`'s own proportions when there is one |
+| `n` | `1` | pictures to make, `1` to `10`, in turn; a `seed` seeds the set, each one `seed + i` |
+| `output_format` | `image_format` (`png`) | `png`, `jpeg`, `gif`, `webp` (lossless) or `svg` (an SVG document carrying the picture as PNG); an attached picture defaults to its own format |
+| `response_format` | `b64_json` | the only value — there are no files to return a `url` to |
+| `seed` | drawn | reproduces a picture on the same build; the reply reports the one used |
+| `steps` | `image_steps` | denoising steps |
+| `cfg_scale` | `image_cfg_scale` | classifier-free guidance; `1` runs the prompt alone, half the work |
+| `image` | — | a picture to start from — a `data:image/…;base64,…` URL or bare base64 of a PNG, JPEG, GIF, WebP or SVG. Resized to `size` |
+| `strength` | `image_strength` | with `image`: how much of the schedule to run, `0` (unchanged) to `1` (the picture's content is ignored) |
+| `stream` | `false` | server-sent events instead of one body |
+
+The reply is OpenAI's: `{"created", "model", "data": [{"b64_json", …}]}`,
+with each picture also carrying `output_format`, `size`, `seed`, `steps`,
+`generation_ms` and `timings` — `{"encode_ms", "steps_ms", "decode_ms"}`,
+where the picture's time went: the prompts through the text encoder, the
+denoising loop, and the VAE plus the file format — and `timings.stages`,
+the loop's transformer passes by operation class in milliseconds
+(`passes`, `modulation_ms`, `qkv_ms`, `attention_ms`, `out_ms`, `mlp_ms`,
+`other_ms`). It is what `orangu-bench --image` reads; the server logs the
+same split per picture. Streamed, the
+events are `image_generation.progress` —
+`step`, `steps`, `seconds_per_step`, `eta_seconds` — once per step, then one
+`image_generation.completed` with the same fields the body form has, then
+`[DONE]`. The first progress event has `step` **0**: it is the server's
+announcement before any work, its `seconds_per_step` and `eta_seconds`
+the estimate from a rate model — the linears' cost per token and
+attention's, which grows with the token count, learned from each finished
+picture's own stage timings and seeded at startup by a calibration
+matmul; within about 20% across a fourfold change of size, closer at the
+size last measured. A client can show the wait the moment it
+sends; the real steps follow from `1`. Closing the stream cancels the
+work at the next step. `GET /props` carries the same figures under `image`
+as `token_passes_per_second` (at the defaults' size) and
+`estimated_default_seconds` (the whole picture: encode, steps, decode),
+and the rate model itself — see **`GET /props`** below.
+
+`POST /v1/chat/completions` on the same server draws from the last user
+message: its text is the prompt, and the last `image_url` part of an
+array-shaped `content` (`{"type": "image_url", "image_url": {"url":
+"data:image/png;base64,…"}}`) is the picture to start from. Every knob is
+the server's `image_*` default except `seed`. The assistant's `content` is
+the picture as a markdown image over a `data:` URL, which a markdown-rendering
+chat client shows inline; `message.images` carries the same picture as
+`b64_json` with `mime`, `size`, `seed`, `steps` and `generation_ms` for a
+client that wants the bytes. Streamed, the chunks carry an empty `delta` and
+an `image_progress` object (`step`, `steps`, `eta_seconds`) until the final
+chunk delivers the content with `finish_reason: "stop"`.
+
 ### What a request cost
 
 Every generation endpoint reports what the request cost, so a client never has
@@ -555,6 +620,7 @@ Model and server metadata — the closest thing the server exposes over HTTP to
 | `chat_template` | the template source, or `null` when the model carries none |
 | `workspace` | the root the file-lifecycle endpoints resolve against |
 | `uptime_seconds`, `pid` | which process answered, and for how long it has been up |
+| `image` | `null` for a language model; on a `qwen_image` model, the picture pipeline — see below |
 
 `version` dates the release; `commit` is the only field that tells two builds
 of one version apart, which during performance work is every pair of builds
@@ -565,6 +631,42 @@ left over from a previous run.
 Hardware-only startup flags — thread count, GPU layer count, batch size — are
 not exposed here or anywhere else over HTTP; they appear only in the server's
 own startup log.
+
+On a `qwen_image` model, `image` is what a client needs to know how a
+picture will come out, and how long it will take, before asking for one:
+
+| `image.` | |
+| :-- | :-- |
+| `text_encoder`, `vae` | the companion files the pipeline was loaded with |
+| `lora` | the adapter in the weights — `path`, and `steps`, the count a Lightning file's name says it was distilled for — or `null` for the base model |
+| `n_layer`, `n_head`, `head_dim`, `dim` | the transformer's shape |
+| `defaults` | what a request gets when it does not say: `size`, `steps`, `cfg_scale`, `negative_prompt`, `strength`, `format` — as they stand now |
+| `configured` | the same six as the server came up, from the configuration |
+| `token_passes_per_second`, `estimated_default_seconds` | the last measured rate at the defaults' size, and what a picture at the defaults costs at it — `null` before anything was measured |
+| `rate` | the model behind both: `encode` (seconds per picture), `linear_per_token_pass` and `attention_per_token_pass` (seconds per latent-token pass, attention's measured at `attention_tokens` tokens and growing with the count), `decode_per_pixel`. Seconds for any settings = `encode + steps × n × passes × (linear + attention × n / attention_tokens) + decode_per_pixel × pixels`, `n` the latent tokens (`width/16 × height/16`) and `passes` 2 under guidance, 1 without. `null` before anything was measured |
+
+#### `POST /props`
+
+Changes the picture defaults — the ones every request that does not say
+otherwise gets, and so what a chat turn draws. The body is `{"image":
+{…}}` with any of `size` (`WIDTHxHEIGHT`, multiples of 16), `steps`,
+`cfg_scale` (`1` turns guidance off), `negative_prompt`, `strength`
+(0–1), `format` (`png`, `jpeg`, `gif`, `webp`, `svg`); keys left out keep
+their value, and `"reset": true` puts every one
+back to the configuration first. The answer is `GET /props`' document, so
+the caller sees what it set and what it now costs:
+
+```sh
+curl -s -X POST localhost:8100/props -H 'Content-Type: application/json' \
+  -d '{"image": {"size": "512x512", "steps": 4}}'
+```
+
+`400` names the value the config loader would have refused too (a size
+not in multiples of 16, zero steps, a guidance below 0, a strength outside
+0–1) and changes nothing; `501` on a language model. The web console's
+**Settings › Image** pane is this endpoint, on the console's own port as
+`/api/props`; the change holds until the server restarts, when the
+configuration's values are back.
 
 #### `GET /slots`
 
@@ -1295,6 +1397,7 @@ Chat sessions:
 | `GET /api/sessions` | lists every non-empty session, newest-updated first |
 | `GET /api/sessions/{id}` | one session's full message history, each assistant reply already rendered to HTML |
 | `POST /api/sessions/{id}/messages` | sends one chat turn against that session; SSE reply |
+| `GET /api/sessions/{id}/files/{name}` | a picture kept beside the session: one attached to a message (PNG, JPEG, GIF, WebP, SVG), or one a `qwen_image` model made |
 | `DELETE /api/sessions/{id}` | deletes one chat session, directory and all — History's per-row cross |
 | `DELETE /api/sessions` | deletes every chat session — History's **Clear all** footer |
 
@@ -1309,6 +1412,15 @@ re-rendered to HTML, then one `done` event with the final HTML, the raw
 `content`, `truncated`, and `generation_ms`. Errors arrive as an `error`
 event. An empty message with no attachments is a `400`, and a model with no
 chat template makes the whole endpoint a `501`.
+
+A PNG, JPEG, GIF, WebP or SVG attachment is kept as a picture rather than read as text:
+it is stored beside the session and comes back in the `attachments` event
+with an `image_url` the page shows as a thumbnail. On a `qwen_image` server
+the turn is a picture request — the text is the prompt, the last attached
+picture is what it starts from — and the events are `progress` (`step`,
+`steps`, `eta_seconds`) once per step, then the same `done` event as a text
+reply, whose `html` holds the picture and whose `content` is a markdown
+image over the session file's URL.
 
 The model manager, on the same port:
 
@@ -1355,13 +1467,14 @@ finishing while a confirmation dialog is open re-sorts the listing underneath
 it. `select` is a `403` when `[web].reexec` is `no`, and `DELETE /api/models`
 a `403` when `[web].delete` is `no`.
 
-Finally, a read-only MCP inventory, since configuration belongs to the server
-process and edits only take effect on restart:
+Finally, the MCP inventory — the configuration file's MCP sections, which
+orangu clients read and this server only keeps:
 
 | Endpoint | |
 | :-- | :-- |
-| `GET /api/mcps` | every configured MCP section: `name`, `endpoint`, `enabled`, `approval_mode` |
+| `GET /api/mcps` | `servers` — every configured MCP section: `name`, `endpoint`, `enabled`, `approval_mode` — and `path`, the configuration file (`null` for a bundled binary with no file, when the list is read-only) |
 | `GET /api/mcps/{name}` | one of them, or `404` |
+| `PUT /api/mcps` | the whole list, as an array of the same objects (`enabled` defaults to `true`, `approval_mode` to `writes`): every entry is checked first (`400` names the fault — a name that is empty, `orangu-server`, `web` or holds `[ ] = # ;`, an empty endpoint, an approval mode other than `auto`/`prompt`/`writes`/`deny`, a duplicate), then sections the list no longer names are removed and new or changed ones rewritten in place, the rest of the file untouched; the answer is `GET`'s document read back from the file with `restart_required: true` — a server started from the file is what reads it. `501` without a file |
 
 ### Coordinator
 

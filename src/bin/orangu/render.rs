@@ -534,7 +534,11 @@ pub fn render_inline_node(node: &Node) -> String {
         }
         Node::Link(link) => render_link(&render_inline_nodes(&link.children), &link.url),
         Node::LinkReference(link) => render_inline_nodes(&link.children),
-        Node::Image(image) => format!("[image: {}] ({})", image.alt, image.url),
+        Node::Image(image) => format!(
+            "[image: {}] ({})",
+            image.alt,
+            describe_image_url(&image.url)
+        ),
         Node::ImageReference(image) => format!("[image: {}]", image.alt),
         Node::FootnoteReference(reference) => format!("[^{}]", reference.identifier),
         Node::Break(_) => "\n".to_string(),
@@ -571,6 +575,21 @@ pub fn render_heading(depth: u8, children: &[Node]) -> String {
         ),
         _ => format!("{ANSI_BOLD_ON}{content}{ANSI_BOLD_OFF}"),
     }
+}
+
+/// A `data:` URL is a whole picture — an image server answers a chat turn
+/// with one — and printing its base64 would be a screenful of noise per
+/// image, so it is described by type and size instead. Any other URL is
+/// printed as it is.
+fn describe_image_url(url: &str) -> String {
+    let Some(rest) = url.strip_prefix("data:") else {
+        return url.to_string();
+    };
+    let mime = rest.split([';', ',']).next().unwrap_or("data");
+    let payload = rest.split_once(',').map(|(_, p)| p).unwrap_or("");
+    // Base64 carries three bytes per four characters.
+    let bytes = payload.len() / 4 * 3;
+    format!("{mime}, {}", orangu::format::format_bytes(bytes as u64))
 }
 
 /// Render `label` as an OSC 8 terminal hyperlink to `url`: a supporting
@@ -824,6 +843,17 @@ mod tests {
     use super::*;
     use crate::process_env_lock;
     use tempfile::tempdir;
+
+    /// A picture embedded as a data URL is described, not dumped: the
+    /// terminal has no way to show it and its base64 is kilobytes per line.
+    #[test]
+    fn a_data_url_image_is_described_by_type_and_size() {
+        assert_eq!(
+            describe_image_url("data:image/png;base64,AAAAAAAAAAAAAAAA"),
+            "image/png, 12 B"
+        );
+        assert_eq!(describe_image_url("https://x/y.png"), "https://x/y.png");
+    }
 
     struct EnvVarGuard {
         key: &'static str,

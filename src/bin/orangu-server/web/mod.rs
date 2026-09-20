@@ -51,6 +51,7 @@ use std::{
 
 use crate::engine::chat_template::{ChatMessage, ChatTemplate};
 use crate::engine::generate::{Engine, FinishReason, GenerateRequest, StreamEvent};
+use crate::engine::image::ImageEvent;
 use crate::engine::sampling::SamplingParams;
 use sessions::{Attachment, Session, SessionMessage};
 
@@ -233,9 +234,15 @@ pub struct WebState {
     /// `models::select`. Only ever goes from empty to set: this process is
     /// about to be replaced, so there is nothing to reset it back to.
     pub loading: std::sync::Mutex<Option<String>>,
-    /// Configured MCP profiles are displayed read-only; applying config edits
-    /// requires a server restart.
-    pub mcp_servers: Vec<crate::config::McpConfiguration>,
+    /// The MCP servers the configuration names, as this process came up
+    /// with them and as the console's Settings › MCP pane has since written
+    /// them (`web::mcp`) — the file's inventory, which orangu clients read;
+    /// this server never connects to one.
+    pub mcp_servers: std::sync::Mutex<Vec<crate::config::McpConfiguration>>,
+    /// The configuration file this server was started from — `--config`,
+    /// or the one the default search found — which the MCP pane writes.
+    /// `None` for a bundled binary running on its built-in answers.
+    pub config_file: Option<PathBuf>,
 }
 
 impl WebState {
@@ -268,6 +275,10 @@ pub fn build_router(state: Arc<WebState>) -> Router {
         .route("/api/diagrams/{key}/{name}", get(diagram_asset))
         .route("/api/asset-version", get(asset_version_handler))
         .route("/api/system-report", get(system_report))
+        // The picture settings — the API's `/props`, on this port for the
+        // console's Settings › Image pane: `GET` reads the defaults, the
+        // adapter and the measured rate, `POST` sets the defaults.
+        .route("/api/props", get(props).post(set_props))
         // `delete` on both: one row's cross, and History's **Clear all**
         // footer. Unconditional — unlike the model manager's own Delete
         // (`[web].delete`), which owns files on disk that nothing else put
@@ -285,6 +296,7 @@ pub fn build_router(state: Arc<WebState>) -> Router {
             get(get_session).delete(delete_session),
         )
         .route("/api/sessions/{id}/messages", post(send_message))
+        .route("/api/sessions/{id}/files/{name}", get(session_file))
         .merge(mcp::router())
         // The model manager: list, metadata, download, delete — on the same
         // port as the chat UI.
@@ -347,6 +359,53 @@ async fn asset_version_handler() -> impl IntoResponse {
         [("Cache-Control", "no-cache")],
         Json(json!({ "version": asset_version() })),
     )
+}
+
+/// What the console's Settings needs of `/props`: the model, its
+/// architecture, and the picture section (`null` for a language model) —
+/// see `http::images::props_json`.
+async fn props(State(state): State<Arc<WebState>>) -> impl IntoResponse {
+    Json(props_view(&state))
+}
+
+/// `POST /api/props` — the picture defaults every chat turn on this
+/// server then gets; the same body and checks as the API's `POST /props`.
+async fn set_props(
+    State(state): State<Arc<WebState>>,
+    Json(update): Json<serde_json::Value>,
+) -> axum::response::Response {
+    let settings: Option<crate::http::images::ImageSettings> = match update.get("image") {
+        Some(image) => match serde_json::from_value(image.clone()) {
+            Ok(settings) => Some(settings),
+            Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+        },
+        None => None,
+    };
+    if let Some(settings) = &settings {
+        let Some(pipeline) = state.engine.image.as_deref() else {
+            return (StatusCode::NOT_IMPLEMENTED, "not an image model").into_response();
+        };
+        if let Err(err) = crate::http::images::apply_settings(pipeline, settings) {
+            return (StatusCode::BAD_REQUEST, err).into_response();
+        }
+        let d = pipeline.defaults();
+        log::info!(
+            "orangu-server: [image] defaults set to {}x{}, {} steps, cfg {} (web console)",
+            d.width,
+            d.height,
+            d.steps,
+            d.cfg_scale,
+        );
+    }
+    Json(props_view(&state)).into_response()
+}
+
+fn props_view(state: &WebState) -> serde_json::Value {
+    json!({
+        "model": state.model_display,
+        "architecture": state.architecture,
+        "image": state.engine.image.as_deref().map(crate::http::images::props_json),
+    })
 }
 
 /// The model/backend identity plus a fresh hardware snapshot (`orangu-
@@ -527,6 +586,11 @@ struct AttachmentView {
     /// so the UI can say so rather than quietly showing a prefix.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     diagrams_capped: bool,
+    /// For a picture: where the console loads it from
+    /// (`/api/sessions/{id}/files/{name}`), so the chip shows the picture
+    /// itself rather than a name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image_url: Option<String>,
 }
 
 /// One drawn diagram as the browser needs it: the two theme variants (see
@@ -552,7 +616,11 @@ struct DiagramView {
 ///
 /// Called on session load and once per send, never per token — attachment
 /// text doesn't change while a reply streams.
-fn attachment_view(attachment: sessions::Attachment) -> AttachmentView {
+fn attachment_view(session_id: &str, attachment: sessions::Attachment) -> AttachmentView {
+    let image_url = attachment
+        .image
+        .as_deref()
+        .map(|name| sessions::file_url(session_id, name));
     let mut diagrams = Vec::new();
     let mut diagrams_found = 0;
     if let Some(text) = attachment.text.as_deref() {
@@ -602,6 +670,7 @@ fn attachment_view(attachment: sessions::Attachment) -> AttachmentView {
         text: attachment.text,
         diagrams_capped: diagrams_found > mermaid::MAX_PER_ATTACHMENT,
         diagrams: diagrams.into_iter().map(|(_, diagram)| diagram).collect(),
+        image_url,
     }
 }
 
@@ -639,7 +708,7 @@ async fn get_session(
 ) -> impl IntoResponse {
     match sessions::load_session(&id) {
         Ok(session) => Json(SessionView {
-            id: session.id,
+            id: session.id.clone(),
             created_at: session.created_at,
             updated_at: session.updated_at,
             title: session.title,
@@ -657,7 +726,11 @@ async fn get_session(
                         content: m.content,
                         html,
                         generation_ms: m.generation_ms,
-                        attachments: m.attachments.into_iter().map(attachment_view).collect(),
+                        attachments: m
+                            .attachments
+                            .into_iter()
+                            .map(|a| attachment_view(&session.id, a))
+                            .collect(),
                         reasoning_html,
                     }
                 })
@@ -684,13 +757,6 @@ async fn send_message(
         Ok(session) => session,
         Err(err) => return (StatusCode::NOT_FOUND, err.to_string()).into_response(),
     };
-    let Some(template_source) = state.engine.chat_template_source.clone() else {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "model has no tokenizer.chat_template; the web UI needs one",
-        )
-            .into_response();
-    };
 
     // Decode + extract text from every attachment up front, so the prompt
     // and the persisted turn share exactly the same view of them.
@@ -705,6 +771,40 @@ async fn send_message(
     if req.content.trim().is_empty() && extracted.is_empty() {
         return (StatusCode::BAD_REQUEST, "message is empty").into_response();
     }
+
+    // Pictures go to disk beside the transcript now, so the turn persisted
+    // below — and every later visit — can show them; the bytes of the last
+    // one are also what an image model starts from.
+    let mut init_picture: Option<(String, Vec<u8>)> = None;
+    for att in extracted.iter_mut() {
+        if let Some(bytes) = att.image_bytes.take() {
+            let extension = match att.mime.as_str() {
+                "image/svg+xml" => "svg",
+                mime => crate::engine::image::ImageFormat::from_mime(mime)
+                    .unwrap_or(crate::engine::image::ImageFormat::Png)
+                    .extension(),
+            };
+            match sessions::store_file(&id, extension, &bytes) {
+                Ok(name) => att.image = Some(name),
+                Err(err) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")).into_response();
+                }
+            }
+            init_picture = Some((att.mime.clone(), bytes));
+        }
+    }
+
+    if state.engine.image.is_some() {
+        return send_image_message(state, session, req.content, extracted, init_picture).await;
+    }
+
+    let Some(template_source) = state.engine.chat_template_source.clone() else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "model has no tokenizer.chat_template; the web UI needs one",
+        )
+            .into_response();
+    };
 
     let prompt = match render_prompt(&state, &template_source, &session, &req.content, &extracted) {
         Ok(prompt) => prompt,
@@ -748,7 +848,7 @@ async fn send_message(
     let attachment_views: Vec<AttachmentView> = user_attachments
         .iter()
         .cloned()
-        .map(attachment_view)
+        .map(|a| attachment_view(&session.id, a))
         .collect();
 
     let stream = async_stream::stream! {
@@ -823,6 +923,134 @@ async fn send_message(
         }
     };
     axum::response::sse::Sse::new(stream).into_response()
+}
+
+/// A chat turn on a `qwen_image` server: the message is the prompt, an
+/// attached picture is what the picture starts from, and the answer is the
+/// picture — kept as a file beside the transcript and written into the
+/// assistant's message as a markdown image, so a reload renders it the same
+/// way the live turn did.
+///
+/// The picture comes back in the format it was sent in (a JPEG stays a
+/// JPEG; an SVG an SVG document carrying the picture as PNG) and at its own
+/// proportions, bounded by the configured size; without one, it is the
+/// server's `image_size`. Progress goes out once per step, since a picture
+/// is minutes rather than tokens.
+async fn send_image_message(
+    state: Arc<WebState>,
+    mut session: Session,
+    user_message: String,
+    user_attachments: Vec<Attachment>,
+    init_picture: Option<(String, Vec<u8>)>,
+) -> axum::response::Response {
+    let Some(pipeline) = state.engine.image.clone() else {
+        return (StatusCode::NOT_IMPLEMENTED, "not an image model").into_response();
+    };
+    let request = match crate::http::images::build_request(
+        &pipeline.defaults(),
+        crate::http::images::ImageParams {
+            prompt: &user_message,
+            negative_prompt: None,
+            size: None,
+            output_format: None,
+            seed: None,
+            steps: None,
+            cfg_scale: None,
+            init: init_picture,
+            strength: None,
+        },
+    ) {
+        Ok(request) => request,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
+    };
+    let attachment_views: Vec<AttachmentView> = user_attachments
+        .iter()
+        .cloned()
+        .map(|a| attachment_view(&session.id, a))
+        .collect();
+    let (mut rx, cancel) = pipeline.spawn(request);
+    let stream = async_stream::stream! {
+        // Held for the stream's life: the browser's Stop button closes the
+        // connection, and that must stop the steps still to run.
+        let _cancel = cancel;
+        if !attachment_views.is_empty() {
+            yield Ok::<_, Infallible>(
+                axum::response::sse::Event::default()
+                    .data(json!({"type": "attachments", "attachments": attachment_views}).to_string()),
+            );
+        }
+        loop {
+            let Some(event) = rx.recv().await else { break };
+            match event {
+                ImageEvent::Progress(p) => {
+                    let eta = p.seconds_per_step * (p.steps.saturating_sub(p.step)) as f64;
+                    yield Ok(axum::response::sse::Event::default().data(
+                        json!({"type": "progress", "step": p.step, "steps": p.steps, "eta_seconds": eta}).to_string(),
+                    ));
+                }
+                ImageEvent::Done(image) => {
+                    let name = match sessions::store_file(&session.id, image.format.extension(), &image.bytes) {
+                        Ok(name) => name,
+                        Err(err) => {
+                            yield Ok(axum::response::sse::Event::default()
+                                .data(json!({"type": "error", "message": format!("{err:#}")}).to_string()));
+                            break;
+                        }
+                    };
+                    let alt = user_message.replace(['[', ']', '\n'], " ");
+                    let content = format!(
+                        "![{alt}]({})\n\n*{}x{}, {} steps, seed {}*",
+                        sessions::file_url(&session.id, &name),
+                        image.width, image.height, image.steps, image.seed
+                    );
+                    let html = render::render_markdown_to_html(&content, state.project_licence.as_ref());
+                    let generation_ms = image.elapsed.as_millis() as u64;
+                    if let Err(err) = sessions::append_turn(&mut session, &user_message, user_attachments, &content, "", Some(generation_ms)) {
+                        yield Ok(axum::response::sse::Event::default()
+                            .data(json!({"type": "error", "message": err.to_string()}).to_string()));
+                        break;
+                    }
+                    yield Ok(axum::response::sse::Event::default()
+                        .data(json!({"type": "done", "html": html, "reasoning_html": "", "content": content, "reasoning": "", "truncated": false, "generation_ms": generation_ms, "image": true}).to_string()));
+                    break;
+                }
+                ImageEvent::Error(err) => {
+                    yield Ok(axum::response::sse::Event::default()
+                        .data(json!({"type": "error", "message": err}).to_string()));
+                    break;
+                }
+            }
+        }
+    };
+    axum::response::sse::Sse::new(stream).into_response()
+}
+
+/// Serves a file kept beside a session's transcript — an attached or a
+/// generated picture. The name is checked by [`sessions::file_path`], which
+/// only ever produces a path inside that session's own `files/` directory.
+async fn session_file(Path((id, name)): Path<(String, String)>) -> impl IntoResponse {
+    let path = match sessions::file_path(&id, &name) {
+        Ok(path) => path,
+        Err(err) => return (StatusCode::NOT_FOUND, err.to_string()).into_response(),
+    };
+    let Ok(bytes) = tokio::fs::read(&path).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let content_type = match path.extension().and_then(|e| e.to_str()) {
+        Some("svg") => "image/svg+xml",
+        Some(ext) => crate::engine::image::ImageFormat::from_extension(ext)
+            .map(|f| f.mime())
+            .unwrap_or("application/octet-stream"),
+        None => "application/octet-stream",
+    };
+    (
+        [
+            ("content-type", content_type),
+            ("cache-control", "private, max-age=31536000, immutable"),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 /// What changed between the last HTML sent for a pane and the current one:
@@ -936,7 +1164,10 @@ mod tests {
             mime: mime.to_string(),
             data: base64::engine::general_purpose::STANDARD.encode(body.as_bytes()),
         };
-        attachment_view(attachments::extract(&incoming).expect("extracts"))
+        attachment_view(
+            "00000000-0000-4000-8000-000000000000",
+            attachments::extract(&incoming).expect("extracts"),
+        )
     }
 
     #[test]
@@ -1022,7 +1253,10 @@ mod tests {
             mime: "application/octet-stream".into(),
             data: base64::engine::general_purpose::STANDARD.encode([0u8, 1, 2, 255]),
         };
-        let view = attachment_view(attachments::extract(&incoming).unwrap());
+        let view = attachment_view(
+            "00000000-0000-4000-8000-000000000000",
+            attachments::extract(&incoming).unwrap(),
+        );
         assert!(view.text.is_none());
         assert!(view.diagrams.is_empty());
     }

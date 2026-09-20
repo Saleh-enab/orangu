@@ -31,9 +31,39 @@ pub fn format_bytes(bytes: u64) -> String {
     format!("{value:.2} {}", UNITS[unit])
 }
 
+/// A duration as a person would say it — `40 s`, `6 min`, `1 h 20 min` —
+/// for a wait that is an estimate, so no more digits than the estimate
+/// deserves.
+pub fn format_duration_rough(seconds: f64) -> String {
+    let seconds = seconds.max(0.0).round() as u64;
+    if seconds < 60 {
+        return format!("{seconds} s");
+    }
+    let minutes = seconds.div_ceil(60);
+    if minutes < 60 {
+        return format!("{minutes} min");
+    }
+    let (hours, minutes) = (minutes / 60, minutes % 60);
+    if minutes == 0 {
+        format!("{hours} h")
+    } else {
+        format!("{hours} h {minutes} min")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rough_durations_read_like_speech() {
+        assert_eq!(format_duration_rough(0.0), "0 s");
+        assert_eq!(format_duration_rough(41.6), "42 s");
+        assert_eq!(format_duration_rough(61.0), "2 min");
+        assert_eq!(format_duration_rough(6.0 * 60.0), "6 min");
+        assert_eq!(format_duration_rough(3600.0), "1 h");
+        assert_eq!(format_duration_rough(4800.0), "1 h 20 min");
+    }
 
     #[test]
     fn formats_byte_sizes() {

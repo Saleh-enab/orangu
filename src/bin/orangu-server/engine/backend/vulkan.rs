@@ -3786,16 +3786,26 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         let info = adapter.get_info();
         let adapter_name = format!("{} ({:?})", info.name, info.backend);
         let wgpu_backend = info.backend;
-        // See `UploadStaging`: a half must not fit the host-visible device
-        // heap, so it is sized to one more MiB than that heap holds.
-        let upload_staging_min = vulkan_replay::adapter_host_visible_device_local_bytes(&adapter)
-            .map(|bar| bar + (1 << 20));
-
         // Request the adapter's own limits rather than wgpu's conservative
         // portable defaults (128MiB storage buffers) — a model's larger
         // weight matrices (embedding tables, the output projection) are
         // routinely bigger than that.
         let limits = adapter.limits();
+        // See `UploadStaging`: a half must not fit the host-visible device
+        // heap, so it is sized to one more MiB than that heap holds. That
+        // is a discrete card's BAR window. On unified memory (an integrated
+        // GPU: the host-visible device-local heap is the device's whole
+        // memory) there is no window to stay out of and no half that
+        // could — 31 GiB on a Mali, past any buffer the device creates —
+        // so the pair is not used and uploads take the belt, as they do
+        // where the heap's size is unknown.
+        let upload_staging_min = vulkan_replay::adapter_host_visible_device_local_bytes(&adapter)
+            .map(|bar| bar + (1 << 20))
+            .filter(|min| {
+                let device_local = vulkan_replay::adapter_device_local_bytes(&adapter);
+                let unified = device_local.is_some_and(|total| *min > total);
+                !unified && *min <= limits.max_buffer_size
+            });
         // An `f16`-stored KV
         // mirror (see `Self::kv_storage`'s own doc comment for what else
         // that idea does and does not cover). **On by default whenever the
@@ -3999,7 +4009,23 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         // attention — **on by default** when subgroups are supported (opt out with
         // `ORANGU_NO_ATTN_COOP`). Falls back to the classic split kernel per-layer
         // when `head_dim % 32 != 0`. The large long-context decode win.
+        // The cooperative kernels put 32 lanes on one KV position and
+        // reduce the dot with one `subgroupAdd`, which is the whole dot only
+        // when those 32 lanes are one subgroup. A device whose subgroups can
+        // be narrower — Mali, 16 wide — reduces half of it and the kernel is
+        // wrong by construction, not by miscompilation; the classic kernels
+        // reduce through workgroup memory and do not care.
+        let subgroup_wide_enough = info.subgroup_min_size >= 32;
+        if supports_subgroup && !subgroup_wide_enough {
+            log::info!(
+                "orangu-server: [vulkan] {} subgroups are {} lanes wide; the cooperative \
+                 attention kernels need 32 and are not built",
+                info.name,
+                info.subgroup_min_size
+            );
+        }
         let attn_coop = supports_subgroup
+            && subgroup_wide_enough
             && !crate::engine::env::flag_on("ORANGU_NO_ATTN_COOP")
             && !ATTN_COOP_MISCOMPILED.load(std::sync::atomic::Ordering::Relaxed);
         // Effective decode-attention split-k. An explicit `ORANGU_ATTN_SPLIT_K`
@@ -5162,7 +5188,12 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                 "ORANGU_PREFILL_FUSED_ATTN",
             ),
             prefill_gqa: attn_coop && (!crate::engine::env::flag_on("ORANGU_NO_PREFILL_GQA")),
+            // The tiled kernel folds its column phases with
+            // `subgroupShuffleXor` across 32 lanes (only the 64-lane step is
+            // guarded), so it needs the same width the cooperative kernels
+            // do — see `subgroup_wide_enough`.
             prefill_tiled_attn: supports_subgroup
+                && subgroup_wide_enough
                 && crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_TILED_ATTN"),
             attn_prefill_pipelines: Mutex::new(HashMap::new()),
             attn_split_pipelines: Mutex::new(HashMap::new()),
@@ -5665,21 +5696,45 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         // is `NaN` or `Inf` about half the time, which compares equal to
         // nothing and reports every type broken.
         let mut seed = 0x51ed_1234u64;
-        let bytes: Vec<u8> = (0..IN_DIM * OUT_DIM / block_elems)
-            .flat_map(|_| super::probe_blocks::build_block(ggml_type, &mut seed))
-            .collect();
-        let weights = crate::engine::loader::probe_quant_matrix(bytes, ggml_type, IN_DIM, OUT_DIM);
-        Some(
-            [1usize, KERNEL_PROBE_PREFILL]
-                .into_iter()
-                .map(|n_tokens| {
-                    let x: Vec<f32> = (0..IN_DIM * n_tokens)
-                        .map(|i| ((i % 13) as f32 - 6.0) * 0.05)
-                        .collect();
-                    (x, n_tokens, weights.clone())
+        let mut matrix = |out_dim: usize| {
+            let bytes: Vec<u8> = (0..IN_DIM * out_dim / block_elems)
+                .flat_map(|_| super::probe_blocks::build_block(ggml_type, &mut seed))
+                .collect();
+            crate::engine::loader::probe_quant_matrix(bytes, ggml_type, IN_DIM, out_dim)
+        };
+        let weights = matrix(OUT_DIM);
+        // A matrix wide enough for the four-row integer-dot kernel
+        // (`BLOCK_HOISTED_WIDE_MIN_OUT`), which a 256-row one never selects
+        // — so that kernel was never probed at all; and an odd row count,
+        // so the clamped last row group is exercised.
+        let wide = matrix(BLOCK_HOISTED_WIDE_MIN_OUT + 7);
+        // **Every 32-block at its own scale, and a few-token case.** The
+        // activation used to be `(i % 13 - 6) * 0.05` everywhere, so every
+        // block of every token quantized at the same `int8` scale, and an
+        // integer-dot kernel that read another block's scale would have
+        // computed the right answer anyway; and at one and sixteen tokens
+        // the few-token decode the integer-dot kernels exist for — with a
+        // token index past the first — was never dispatched. A per-block
+        // factor and a three-token case close both gaps.
+        let activation = |n_tokens: usize| -> Vec<f32> {
+            (0..IN_DIM * n_tokens)
+                .map(|i| {
+                    let block = i / 32;
+                    let scale = 1.0 + ((block * 7 + n_tokens) % 5) as f32 * 0.4;
+                    ((i % 13) as f32 - 6.0) * 0.05 * scale
                 })
-                .collect(),
-        )
+                .collect()
+        };
+        Some(vec![
+            (activation(1), 1, weights.clone()),
+            (activation(3), 3, weights),
+            (activation(3), 3, wide),
+            (
+                activation(KERNEL_PROBE_PREFILL),
+                KERNEL_PROBE_PREFILL,
+                matrix(OUT_DIM),
+            ),
+        ])
     }
 
     /// The worst relative disagreement [`Self::decode_kernel_agrees`] sees,

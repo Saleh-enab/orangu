@@ -1937,7 +1937,15 @@ fn cross_check_n_tokens(ggml_type: u32, in_dim: usize, out_dim: usize, n_tokens:
     let mut x = vec![0f32; n_tokens * in_dim];
     for v in x.iter_mut() {
         let b = next_byte(&mut seed);
-        *v = (b as f32 - 128.0) / 64.0;
+        // Not a plain `byte / 64`: those are dyadic, and an element that is
+        // exactly half its block's absmax quantizes to an exact `.5` tie
+        // that the device and the CPU reference may round apart by a level
+        // (Mali-G720: `-63.5` to `-64`, the CPU's `-63.499996` to `-63`) —
+        // one level of a large `Q2_K` weight was 35% of a small output. A
+        // second byte's worth of jitter, far below the quantization step,
+        // keeps the values off the ties.
+        let jitter = next_byte(&mut seed) as f32 / 256.0 * 1e-3;
+        *v = (b as f32 - 128.0) / 64.0 + jitter;
     }
 
     let cpu_out = CpuBackend.matmul_dequant(&x, n_tokens, &w);

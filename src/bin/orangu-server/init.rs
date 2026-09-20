@@ -50,11 +50,38 @@ pub fn run_init() -> Result<()> {
     println!("============================\n");
 
     let models = prompt_dir("models", huggingface_cache_dir().as_deref())?;
-    let model = prompt_model(Path::new(&models))?;
-    let role = prompt_role(
-        &format!("role [{}]: ", Role::default().label()),
-        Role::default(),
-    )?;
+    let groups = orangu::model_spec::scan_models_dir(Path::new(&models))
+        .map(|models| orangu::model_spec::group_models(&models))
+        .unwrap_or_default();
+    let model = prompt_model(&groups)?;
+    // A picture generator's role is not a choice (`Role::fixed_by_model`):
+    // the file decides it, so the prompt is answered rather than asked —
+    // echoed in the `key: value` shape the answered prompt would have had.
+    // Whether it is one is read off the same `SUPPORTED` column the
+    // server's own picker shows, so a spec that isn't installed yet (no
+    // row) is asked for a role like any language model.
+    let image_model = nr_of(&groups, &model)
+        .and_then(|nr| crate::model_support(&groups).into_iter().nth(nr - 1))
+        .is_some_and(|support| support.image);
+    let role = if image_model {
+        println!("role: {}", Role::Image.label());
+        Role::Image
+    } else {
+        prompt_role(
+            &format!("role [{}]: ", Role::default().label()),
+            Role::default(),
+        )?
+    };
+    // The picture pipeline's own keys, asked only when there is a picture
+    // pipeline to configure — for a language model they would be seven
+    // questions with no effect. Each answered by Enter unless the operator
+    // wants something other than Qwen-Image's release settings, and written
+    // only then, like every other default below.
+    let image = if role == Role::Image {
+        Some(prompt_image_keys(Path::new(&models))?)
+    } else {
+        None
+    };
     let host = prompt_host(&default_host())?;
     let port = prompt_line("port", &default_port().to_string())?;
     // Asked only when the answer above made it matter. On loopback the server
@@ -106,6 +133,9 @@ pub fn run_init() -> Result<()> {
     }
     if role != Role::default() {
         contents.push_str(&format!("role = {}\n", role.label()));
+    }
+    if let Some(image) = &image {
+        contents.push_str(&image.render());
     }
     contents.push_str(&format!("host = {host}\nport = {port}\n"));
     if !api_key.trim().is_empty() {
@@ -450,12 +480,8 @@ impl Helper for OptionCompleter {}
 /// one model (see [`sole_model`]) — there's nothing to choose between, so
 /// it's taken and echoed as a plain `model: <label>` line rather than
 /// typed out.
-fn prompt_model(models_dir: &Path) -> Result<String> {
-    let groups = orangu::model_spec::scan_models_dir(models_dir)
-        .map(|models| orangu::model_spec::group_models(&models))
-        .unwrap_or_default();
-
-    if let Some(only) = sole_model(&groups) {
+fn prompt_model(groups: &[orangu::model_spec::ModelGroup]) -> Result<String> {
+    if let Some(only) = sole_model(groups) {
         // Echoed in the same `key: value` shape as the prompts around it,
         // so the transcript reads as if it had been answered.
         println!("model: {}", only.label);
@@ -467,8 +493,8 @@ fn prompt_model(models_dir: &Path) -> Result<String> {
         .build();
     let mut editor: Editor<ModelCompleter, DefaultHistory> = Editor::with_config(config)?;
     editor.set_helper(Some(ModelCompleter {
-        options: model_completion_options(&groups),
-        labels: model_hint_options(&groups),
+        options: model_completion_options(groups),
+        labels: model_hint_options(groups),
     }));
 
     match editor.readline("model []: ") {
@@ -733,7 +759,11 @@ pub(crate) fn nr_of(groups: &[orangu::model_spec::ModelGroup], spec: &str) -> Op
         .map(|index| index + 1)
 }
 
-/// Prompts for a [`Role`], TAB-completing over the five valid role names
+/// Prompts for a [`Role`], TAB-completing over the five role names a
+/// language model can take — `image` is not offered, because it is never
+/// chosen: it is the role of a `qwen_image` model, fixed by the file
+/// ([`Role::fixed_by_model`]), and every caller of this prompt has already
+/// established the model is not one —
 /// (dropdown-style: an empty `TAB` press lists every option, matching
 /// `rustyline`'s `CompletionType::List`) and defaulting to [`Role::All`] on
 /// an empty entry. `prompt` is the exact readline prompt text to show —
@@ -745,7 +775,8 @@ pub(crate) fn nr_of(groups: &[orangu::model_spec::ModelGroup], spec: &str) -> Op
 /// values, so (unlike [`prompt_dir`], which just creates a path that isn't
 /// there yet) an unrecognized entry here just re-prompts:
 /// there's no sensible way to "use" a role that isn't one of the five
-/// [`Role`] actually implements.
+/// on offer — and `image`, typed here, is refused for the same reason it
+/// is not listed.
 pub(crate) fn prompt_role(prompt: &str, default: Role) -> Result<Role> {
     let options: Vec<String> = [
         Role::All,
@@ -779,6 +810,14 @@ pub(crate) fn prompt_role(prompt: &str, default: Role) -> Result<Role> {
             return Ok(default);
         }
         match Role::parse(&value) {
+            Ok(role) if role.fixed_by_model() => {
+                println!(
+                    "the {} role is not chosen: it is the role of a qwen_image model, which \
+                     takes it on its own (expected all, code, review, explorer, or embedding)",
+                    role.label()
+                );
+                continue;
+            }
             Ok(role) => return Ok(role),
             Err(err) => {
                 println!("{err}");
@@ -965,6 +1004,238 @@ fn prompt_host(default: &str) -> Result<String> {
     } else {
         value
     })
+}
+
+/// The `[orangu-server]` keys a picture generator reads, as the wizard
+/// collected them — `None` where Enter took the default, so [`render`]
+/// (`ImageKeys::render`) can leave that line out of the file.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct ImageKeys {
+    /// `text_encoder`: the `qwen2vl` GGUF, when not the one found under
+    /// `models`.
+    pub text_encoder: Option<String>,
+    /// `vae`: the `.safetensors`, when not the one found under `models`.
+    pub vae: Option<String>,
+    /// `image_lora`: `none`, or an adapter named instead of the one found
+    /// under `models` (`auto`, the default, is left out).
+    pub image_lora: Option<String>,
+    /// `image_lora_merge`, when `no` (the default folds the adapter in).
+    pub image_lora_merge: Option<bool>,
+    /// `vae_precision`, when `f32` (the default is `int8`).
+    pub vae_precision: Option<String>,
+    /// `image_size`, as typed (`WIDTHxHEIGHT` or one side).
+    pub size: Option<String>,
+    pub steps: Option<usize>,
+    pub cfg_scale: Option<f32>,
+    pub negative_prompt: Option<String>,
+    pub strength: Option<f32>,
+    /// `image_format`, when not `png`.
+    pub format: Option<String>,
+}
+
+impl ImageKeys {
+    /// The lines for the config file — one per key that was answered with
+    /// something other than its default, in the order the wizard asked
+    /// them; nothing at all when every prompt was Enter.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        if let Some(path) = &self.text_encoder {
+            out.push_str(&format!("text_encoder = {path}\n"));
+        }
+        if let Some(path) = &self.vae {
+            out.push_str(&format!("vae = {path}\n"));
+        }
+        if let Some(spec) = &self.image_lora {
+            out.push_str(&format!("image_lora = {spec}\n"));
+        }
+        if let Some(merge) = self.image_lora_merge {
+            out.push_str(&format!(
+                "image_lora_merge = {}\n",
+                if merge { "yes" } else { "no" }
+            ));
+        }
+        if let Some(precision) = &self.vae_precision {
+            out.push_str(&format!("vae_precision = {precision}\n"));
+        }
+        if let Some(size) = &self.size {
+            out.push_str(&format!("image_size = {size}\n"));
+        }
+        if let Some(steps) = self.steps {
+            out.push_str(&format!("image_steps = {steps}\n"));
+        }
+        if let Some(cfg_scale) = self.cfg_scale {
+            out.push_str(&format!("image_cfg_scale = {cfg_scale}\n"));
+        }
+        if let Some(prompt) = &self.negative_prompt {
+            out.push_str(&format!("image_negative_prompt = {prompt}\n"));
+        }
+        if let Some(strength) = self.strength {
+            out.push_str(&format!("image_strength = {strength}\n"));
+        }
+        if let Some(format) = &self.format {
+            out.push_str(&format!("image_format = {format}\n"));
+        }
+        out
+    }
+}
+
+/// Asks for every `[orangu-server]` key the picture pipeline reads, each
+/// defaulting to what the server uses when the key is absent
+/// (`engine::image::ImageDefaults`, and auto-detection under `models` for
+/// the two companion files). A value that would not load is re-asked, with
+/// the same wording the config loader would have rejected it with.
+fn prompt_image_keys(models_dir: &Path) -> Result<ImageKeys> {
+    let defaults = crate::engine::image::ImageDefaults::default();
+    let text_encoder = prompt_line(
+        "text_encoder (blank = the qwen2vl GGUF found under models)",
+        "",
+    )?;
+    let vae = prompt_line("vae (blank = the .safetensors VAE found under models)", "")?;
+    // `auto` is the Lightning adapter under `models` — fetched with the
+    // model, and what the server serves when the key is absent — so the
+    // prompt says which file that is, or that there is none to find.
+    let found = orangu::model_spec::find_qwen_image_lightning(models_dir);
+    let image_lora = prompt_line(
+        &match &found {
+            Some(path) => format!(
+                "image_lora (auto = {}; none = the base model, 50 guided steps)",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("the adapter")
+            ),
+            None => "image_lora (auto = the Lightning adapter under models — none there yet, \
+                     `orangu-server download` of the model fetches it; none = the base model)"
+                .to_string(),
+        },
+        "auto",
+    )?;
+    let image_lora = if image_lora == "auto" {
+        String::new()
+    } else {
+        image_lora
+    };
+    let adapter_name = if image_lora.is_empty() {
+        found
+            .as_deref()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .map(str::to_string)
+    } else if image_lora == "none" {
+        None
+    } else {
+        Some(image_lora.clone())
+    };
+    // The merge question only means something once there is an adapter.
+    let image_lora_merge = if adapter_name.is_none() {
+        true
+    } else {
+        prompt_bool(
+            "image_lora_merge (fold the adapter into the weights at startup)",
+            true,
+        )?
+    };
+    let vae_precision = prompt_checked("vae_precision (int8 or f32)", "int8", |value| {
+        crate::engine::image::vae::VaePrecision::parse(value)
+            .map(|_| ())
+            .ok_or_else(|| anyhow!("expected int8 or f32"))
+    })?;
+    let default_size = format!("{}x{}", defaults.width, defaults.height);
+    let size = prompt_checked("image_size", &default_size, |value| {
+        crate::config::parse_image_size(value)
+            .map(|_| ())
+            .ok_or_else(|| anyhow!("expected WIDTHxHEIGHT or one side, multiples of 16"))
+    })?;
+    // A step-distilled adapter is made for a step count and no guidance,
+    // and says the count in its file name (`…-8steps-…`): the server takes
+    // those under it when the keys are absent, and the prompts offer the
+    // same, so Enter is what the server would do anyway and writes nothing.
+    let (suggested_steps, suggested_cfg) = match adapter_name
+        .as_deref()
+        .and_then(orangu::model_spec::lightning_steps)
+    {
+        Some(steps) => (steps, 1.0),
+        None => (defaults.steps, defaults.cfg_scale),
+    };
+    let steps = prompt_checked(
+        "image_steps",
+        &suggested_steps.to_string(),
+        |value| match value.parse::<usize>() {
+            Ok(steps) if steps > 0 => Ok(()),
+            _ => Err(anyhow!("expected a positive whole number")),
+        },
+    )?;
+    let cfg_scale =
+        prompt_checked(
+            "image_cfg_scale",
+            &suggested_cfg.to_string(),
+            |value| match value.parse::<f32>() {
+                Ok(scale) if scale.is_finite() && scale >= 0.0 => Ok(()),
+                _ => Err(anyhow!("expected a number of 0 or more")),
+            },
+        )?;
+    // The default is a single blank, which a prompt can neither show nor
+    // distinguish from Enter — so the prompt shows nothing, and only a
+    // real negative prompt is written.
+    let negative_prompt = prompt_line("image_negative_prompt", "")?;
+    let strength =
+        prompt_checked(
+            "image_strength",
+            &defaults.strength.to_string(),
+            |value| match value.parse::<f32>() {
+                Ok(strength) if (0.0..=1.0).contains(&strength) => Ok(()),
+                _ => Err(anyhow!("expected a number between 0 and 1")),
+            },
+        )?;
+    let format = prompt_checked(
+        "image_format (png, jpeg, gif, webp or svg)",
+        defaults.format.name(),
+        |value| {
+            crate::engine::image::ImageFormat::parse(value)
+                .map(|_| ())
+                .ok_or_else(|| anyhow!("expected png, jpeg, gif, webp or svg"))
+        },
+    )?;
+    Ok(ImageKeys {
+        text_encoder: Some(text_encoder).filter(|value| !value.is_empty()),
+        vae: Some(vae).filter(|value| !value.is_empty()),
+        image_lora: Some(image_lora).filter(|value| !value.is_empty()),
+        image_lora_merge: Some(image_lora_merge).filter(|merge| !merge),
+        vae_precision: Some(vae_precision).filter(|value| {
+            crate::engine::image::vae::VaePrecision::parse(value)
+                != Some(crate::engine::image::vae::VaePrecision::default())
+        }),
+        size: Some(size).filter(|value| {
+            crate::config::parse_image_size(value) != Some((defaults.width, defaults.height))
+        }),
+        steps: Some(steps.parse::<usize>().expect("checked"))
+            .filter(|steps| *steps != suggested_steps),
+        cfg_scale: Some(cfg_scale.parse::<f32>().expect("checked"))
+            .filter(|scale| *scale != suggested_cfg),
+        negative_prompt: Some(negative_prompt)
+            .filter(|prompt| !prompt.is_empty() && prompt != defaults.negative_prompt.trim()),
+        strength: Some(strength.parse::<f32>().expect("checked"))
+            .filter(|strength| *strength != defaults.strength),
+        format: crate::engine::image::ImageFormat::parse(&format)
+            .filter(|format| *format != defaults.format)
+            .map(|format| format.name().to_string()),
+    })
+}
+
+/// [`prompt_line`] that keeps asking until `check` accepts the answer —
+/// for the keys the config loader would refuse at startup, where a wizard
+/// that wrote them anyway would only move the error to a worse time.
+fn prompt_checked(
+    label: &str,
+    default: &str,
+    check: impl Fn(&str) -> Result<()>,
+) -> Result<String> {
+    loop {
+        let value = prompt_line(label, default)?;
+        match check(&value) {
+            Ok(()) => return Ok(value),
+            Err(err) => println!("invalid {label} '{value}': {err}"),
+        }
+    }
 }
 
 /// Prompts for a plain value (no filesystem completion), reusing `default`
@@ -1379,6 +1650,46 @@ mod tests {
         assert_eq!(
             sole_model(&groups).map(|group| group.label.as_str()),
             Some("unsloth/gemma-4-E2B-it-GGUF:Q4_K_M")
+        );
+    }
+
+    /// The picture keys land in the file only where something other than
+    /// the default was typed — Enter through all seven writes nothing, the
+    /// same rule `role` and the `[web]` booleans follow — and in the order
+    /// they were asked.
+    #[test]
+    fn image_keys_are_written_only_when_they_differ_from_the_defaults() {
+        assert_eq!(ImageKeys::default().render(), "");
+        let keys = ImageKeys {
+            text_encoder: None,
+            vae: Some("/srv/vae/qwen_image_vae.safetensors".to_string()),
+            image_lora: None,
+            image_lora_merge: None,
+            vae_precision: Some("f32".to_string()),
+            size: Some("512x512".to_string()),
+            steps: Some(20),
+            cfg_scale: None,
+            negative_prompt: Some("blurry".to_string()),
+            strength: Some(0.8),
+            format: Some("webp".to_string()),
+        };
+        assert_eq!(
+            keys.render(),
+            "vae = /srv/vae/qwen_image_vae.safetensors\nvae_precision = f32\nimage_size = 512x512\n\
+             image_steps = 20\nimage_negative_prompt = blurry\nimage_strength = 0.8\n\
+             image_format = webp\n"
+        );
+        let keys = ImageKeys {
+            image_lora: Some("lightx2v/Qwen-Image-2512-Lightning:x-8steps.safetensors".to_string()),
+            image_lora_merge: Some(false),
+            steps: Some(8),
+            cfg_scale: Some(1.0),
+            ..ImageKeys::default()
+        };
+        assert_eq!(
+            keys.render(),
+            "image_lora = lightx2v/Qwen-Image-2512-Lightning:x-8steps.safetensors\n\
+             image_lora_merge = no\nimage_steps = 8\nimage_cfg_scale = 1\n"
         );
     }
 

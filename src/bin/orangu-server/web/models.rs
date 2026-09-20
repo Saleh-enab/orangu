@@ -570,6 +570,7 @@ async fn select(
 
     let models_dir = state.models_dir.clone();
     let loaded_path = state.model_path.clone();
+    let current_role = handover.role();
     let resolved = tokio::task::spawn_blocking(move || {
         // `resolve_load_target`, not `resolve_or_fetch_model`: the label it
         // returns is what goes into `argv`, so an `NR` must not survive as
@@ -592,11 +593,16 @@ async fn select(
         // The header check the `SUPPORTED` column already reports, run again
         // here against the file actually about to be loaded.
         crate::reexec::precheck(&path)?;
-        anyhow::Ok((path, label))
+        // The role the new image comes up in: the model's own for a picture
+        // generator, this process's otherwise — decided here, because a
+        // `--code` server handed an image model would only refuse it and
+        // fall back.
+        let role = crate::reexec::role_for_model(current_role, &path);
+        anyhow::Ok((path, label, role))
     })
     .await;
 
-    let (path, label) = match resolved {
+    let (path, label, role) = match resolved {
         Ok(Ok(resolved)) => resolved,
         Ok(Err(err)) => return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
         Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
@@ -630,7 +636,7 @@ async fn select(
         // the client has long since been told the handover was accepted.
         log::error!(
             "error: {:#}",
-            handover.exec(&label, Some(previous.as_str()))
+            handover.exec(&label, role, Some(previous.as_str()))
         );
     });
 

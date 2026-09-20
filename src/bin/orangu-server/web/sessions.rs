@@ -82,6 +82,16 @@ pub struct Attachment {
     pub size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// For a picture (PNG, JPEG, SVG): the file it was kept as under the
+    /// session's `files/` directory, so the transcript can show it again
+    /// and a `qwen_image` model can start from it on this turn. The bytes
+    /// themselves stay out of `chat.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// The picture's bytes between upload and being stored — never
+    /// serialized; [`store_file`] moves them to disk and fills `image`.
+    #[serde(skip)]
+    pub image_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -232,6 +242,60 @@ pub fn is_active(id: &str) -> bool {
 /// Loads a session by id. `id` is parsed as a UUID before touching the
 /// filesystem — an invalid id (including anything path-traversal-shaped)
 /// is rejected here, never reaching `session_chat_path`/`fs::read_to_string`.
+/// Keeps a file beside a session's transcript — a picture the user
+/// attached, or one the model made — and returns the name it was stored
+/// under, for [`file_path`] and the `/api/sessions/{id}/files/{name}`
+/// route. The name is minted here (a counter and the extension), never
+/// taken from the upload, so it is always a plain file name.
+pub fn store_file(session_id: &str, extension: &str, bytes: &[u8]) -> Result<String> {
+    let uuid = Uuid::parse_str(session_id)
+        .map_err(|_| anyhow!("'{session_id}' is not a valid session id"))?;
+    let dir = session_dir(&uuid)?.join("files");
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let extension: String = extension
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(8)
+        .collect();
+    let count = fs::read_dir(&dir)
+        .map(|entries| entries.filter_map(|e| e.ok()).count())
+        .unwrap_or(0);
+    // Counter plus a time stamp: two files stored in one second after a
+    // deletion cannot collide, and the name still sorts in order.
+    let name = format!("{}-{count}.{extension}", unix_now());
+    let path = dir.join(&name);
+    fs::write(&path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(name)
+}
+
+/// The on-disk path of a file [`store_file`] kept, or an error for a name
+/// that is not one it could have minted — the only names this accepts are
+/// `<digits>-<digits>.<alphanumerics>`, so a path segment from a URL can
+/// never reach outside the session's `files/` directory.
+pub fn file_path(session_id: &str, name: &str) -> Result<PathBuf> {
+    let uuid = Uuid::parse_str(session_id)
+        .map_err(|_| anyhow!("'{session_id}' is not a valid session id"))?;
+    let valid = name.split_once('.').is_some_and(|(stem, ext)| {
+        !ext.is_empty()
+            && ext.chars().all(|c| c.is_ascii_alphanumeric())
+            && stem.split_once('-').is_some_and(|(a, b)| {
+                !a.is_empty()
+                    && !b.is_empty()
+                    && a.chars().all(|c| c.is_ascii_digit())
+                    && b.chars().all(|c| c.is_ascii_digit())
+            })
+    });
+    if !valid {
+        anyhow::bail!("'{name}' is not a session file name");
+    }
+    Ok(session_dir(&uuid)?.join("files").join(name))
+}
+
+/// The URL the web console loads a stored file from.
+pub fn file_url(session_id: &str, name: &str) -> String {
+    format!("/api/sessions/{session_id}/files/{name}")
+}
+
 pub fn load_session(id: &str) -> Result<Session> {
     let uuid = Uuid::parse_str(id).map_err(|_| anyhow!("'{id}' is not a valid session id"))?;
     let path = session_chat_path(&uuid)?;

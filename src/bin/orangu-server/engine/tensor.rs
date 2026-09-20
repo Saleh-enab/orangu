@@ -820,6 +820,64 @@ pub fn softmax_inplace(x: &mut [f32]) {
     }
 }
 
+/// Elementwise `e^x` in place, four or eight lanes at a time where the
+/// hardware has it — the same [`exp_neon`]/[`exp_avx2`] approximation
+/// `gelu_inplace` runs on, so a softmax over a large attention block pays
+/// for its exponentials what the GELU does rather than a library call per
+/// element. Accurate to a few parts in a million, which is noise for a
+/// probability; the scalar [`softmax_inplace`] above keeps `libm`'s `exp`
+/// for the sampler and the language models' attention, whose references
+/// are bit-exact.
+// Its only non-test caller is the blocked image attention, which exists
+// on `aarch64` alone.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub fn exp_inplace(x: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is baseline on aarch64; the loop reads and writes only
+    // within `x`.
+    unsafe {
+        use std::arch::aarch64::*;
+        let n = x.len();
+        let mut i = 0;
+        while i + 4 <= n {
+            let v = vld1q_f32(x.as_ptr().add(i));
+            vst1q_f32(x.as_mut_ptr().add(i), exp_neon(v));
+            i += 4;
+        }
+        for v in x[i..].iter_mut() {
+            *v = v.exp();
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: guarded by the checks above; reads and writes only
+            // within `x`.
+            unsafe {
+                use std::arch::x86_64::*;
+                let n = x.len();
+                let mut i = 0;
+                while i + 8 <= n {
+                    let v = _mm256_loadu_ps(x.as_ptr().add(i));
+                    _mm256_storeu_ps(x.as_mut_ptr().add(i), exp_avx2(v));
+                    i += 8;
+                }
+                for v in x[i..].iter_mut() {
+                    *v = v.exp();
+                }
+            }
+            return;
+        }
+        for v in x.iter_mut() {
+            *v = v.exp();
+        }
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    for v in x.iter_mut() {
+        *v = v.exp();
+    }
+}
+
 /// SiLU (`x * sigmoid(x)`), a.k.a. swish — the activation SwiGLU's gate
 /// projection uses.
 pub fn silu(x: f32) -> f32 {
@@ -1936,6 +1994,22 @@ mod tests {
             assert!(
                 got.iter().all(|v| *v == 0.0),
                 "len {len}: a previous call's values survived"
+            );
+        }
+    }
+
+    /// The vector exponential agrees with `libm` to `1e-5` relative over the
+    /// range a softmax or a GELU sees, including a short tail past the last
+    /// whole vector.
+    #[test]
+    fn exp_inplace_matches_libm_to_rounding() {
+        let mut x: Vec<f32> = (0..1003).map(|i| (i as f32) * 0.05 - 30.0).collect();
+        let want: Vec<f32> = x.iter().map(|v| v.exp()).collect();
+        exp_inplace(&mut x);
+        for (i, (g, e)) in x.iter().zip(&want).enumerate() {
+            assert!(
+                (g - e).abs() <= 1e-5 * e.abs().max(1e-30),
+                "at {i}: {g} vs {e}"
             );
         }
     }

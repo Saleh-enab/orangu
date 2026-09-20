@@ -49,6 +49,7 @@ use super::quant::{
     GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
     GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, get_scale_min_k4, read_f16, unpack_q3_k_scales,
 };
+use rayon::prelude::*;
 
 /// Elements per activation-quantization block — one shared `f32` scale per
 /// 32 activations, matching `Q8_0`/`Q5_0`/`Q4_K`'s own 32-element sub-block
@@ -232,7 +233,7 @@ fn quantize_block<const SUMS: bool>(chunk: &[f32], out: &mut [i8], sums: &mut Ve
         *slot = (v * inv).round().clamp(-127.0, 127.0) as i8;
     }
     if SUMS {
-        for group in out.chunks_exact(GROUP) {
+        for group in out.as_chunks::<GROUP>().0 {
             sums.push(group.iter().map(|&v| v as i32).sum());
         }
     }
@@ -2422,6 +2423,616 @@ pub fn dot_k_multi(w: &KRow, a: &ActQ8K, out: &mut [f32], scratch: &mut Vec<f32>
     dot_k_pair(w, w, a, out, scratch);
 }
 
+// =====================================================================
+// The `i8mm` prefill GEMM: four rows x four tokens per tile, `smmla`.
+//
+// `dot_k_pair` above is the right shape for a machine without `i8mm` and the
+// wrong one for a machine with it. Its unit of work is a 32-element dot of
+// one row against one token: two `sdot` and then a **horizontal reduction**
+// (`addv`) to get a scalar out, followed by a scalar multiply by the
+// sub-block's scale. Per (row, token, 32 elements) that is two useful
+// instructions and three or four that only move data sideways, and the
+// reduction serialises on every core. Profiled on a Qwen-Image transformer
+// pass (256 tokens, `Q4_K`): 80% of all samples in that kernel, at about
+// 80 G MAC/s across twelve cores — a tenth of what the cores can do.
+//
+// `smmla` (ARMv8.6 `i8mm`) multiplies a 2x8 `int8` matrix by an 8x2 one and
+// accumulates the 2x2 result into four `i32` lanes — 32 multiply-adds per
+// instruction, twice `sdot`'s, and it never leaves the vector unit: the
+// per-sub-block scale becomes one vector multiply-accumulate (`mla`) into a
+// running super-block sum, and the super-block's `f32` step is three vector
+// ops. Nothing is reduced horizontally until the tile is stored.
+//
+// Tile: 4 weight rows x 4 tokens = two row pairs x two token pairs, four
+// `smmla` accumulators. Per 8-element chunk that is 4 `smmla` against 8
+// 64-bit loads (each vector is two rows' or two tokens' 8 bytes side by
+// side). The activations stay in `ActQ8K`'s existing layout — a token's 32
+// bytes contiguous — and the weights in `KRow`'s, so every other kernel is
+// untouched; the pairing is done by the loads (`ld1 {v.d}[1]`), which costs
+// nothing the loads were not already paying.
+//
+// **Bit-identical to `dot_k_pair`.** The integer sums are exact and the
+// same; the `f32` steps are the same operations in the same order per lane
+// (`acc += ad * (d * isum)`, multiply, multiply, add — Rust never contracts
+// to an FMA), and the `Q4_K` min correction runs the same scalar code first.
+// The test asserts equality, not tolerance.
+// =====================================================================
+
+/// Rows per [`dot_k_rows`] quad — the `smmla` tile height.
+pub const ROW_QUAD: usize = 4;
+
+/// Whether [`dot_k_rows`] may be used: the CPU has `i8mm`, `smmla` agrees
+/// with a scalar 2x2 product on known inputs (the same trust-but-verify
+/// contract as [`have_dotprod`] — the instruction is inline assembly and
+/// was written on a machine that has it, but a constraint mistake must
+/// degrade to `sdot`, not corrupt a picture), and `ORANGU_EXPERT_I8MM` is
+/// not set to `0`/`off` — the switch that lets a before/after be measured on
+/// one binary.
+#[cfg(target_arch = "aarch64")]
+pub fn have_i8mm() -> bool {
+    use std::sync::OnceLock;
+    static USABLE: OnceLock<bool> = OnceLock::new();
+    *USABLE.get_or_init(|| {
+        if !std::arch::is_aarch64_feature_detected!("i8mm") {
+            return false;
+        }
+        if !crate::engine::env::flag_on_unless_disabled("ORANGU_EXPERT_I8MM") {
+            return false;
+        }
+        // Two 2x8 matrices with signs, extremes and a mix, checked against
+        // the scalar definition of the 2x2 product.
+        const A: [i8; 16] = [
+            3, -5, 7, -11, 13, -17, 19, -23, 127, -128, 1, -1, 0, 64, -64, 32,
+        ];
+        const B: [i8; 16] = [
+            2, 4, -6, 8, -10, 12, 14, -16, -128, 127, 29, -31, 37, -41, 43, -47,
+        ];
+        let mut expect = [0i32; 4];
+        for (i, row) in A.as_chunks::<8>().0.iter().enumerate() {
+            for (j, col) in B.as_chunks::<8>().0.iter().enumerate() {
+                expect[i * 2 + j] = row
+                    .iter()
+                    .zip(col)
+                    .map(|(&a, &b)| a as i32 * b as i32)
+                    .sum();
+            }
+        }
+        // Safety: `i8mm` was just detected; both arrays are 16 bytes.
+        let got = unsafe {
+            use std::arch::aarch64::*;
+            let acc = mmla_2x8(vdupq_n_s32(0), vld1q_s8(A.as_ptr()), vld1q_s8(B.as_ptr()));
+            let mut out = [0i32; 4];
+            vst1q_s32(out.as_mut_ptr(), acc);
+            out
+        };
+        got == expect
+    })
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn have_i8mm() -> bool {
+    false
+}
+
+/// `smmla`: `acc += a (2x8, rows in each 8-byte half) . b^T (2x8, rows in
+/// each half)`, lanes `[a0.b0, a0.b1, a1.b0, a1.b1]`.
+///
+/// Inline assembly for the same reason as [`dot16_sdot`]: the intrinsic is
+/// unstable, the encoding is fixed, and `asm!` inlines where a
+/// `#[target_feature]` function would not. [`have_i8mm`] verifies the
+/// operand order at startup.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn mmla_2x8(
+    acc: std::arch::aarch64::int32x4_t,
+    a: std::arch::aarch64::int8x16_t,
+    b: std::arch::aarch64::int8x16_t,
+) -> std::arch::aarch64::int32x4_t {
+    let mut acc = acc;
+    unsafe {
+        std::arch::asm!(
+            ".arch_extension i8mm",
+            "smmla {acc:v}.4s, {a:v}.16b, {b:v}.16b",
+            acc = inout(vreg) acc,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(pure, nomem, nostack)
+        );
+    }
+    acc
+}
+
+/// How many rows [`dot_k_rows`] is handed per rayon task — a multiple of
+/// [`ROW_QUAD`]. More rows per task means each activation tile is read from
+/// L2 once and reused across more row quads while it sits in L1; fewer
+/// means less unpacked weight per task competing for that same L1.
+/// `ORANGU_EXPERT_K_ROWS` overrides the default for a measurement; it is
+/// rounded down to a multiple of four and floored at four.
+pub fn k_rows_per_task() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        let rows = std::env::var("ORANGU_EXPERT_K_ROWS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(K_ROWS_PER_TASK_DEFAULT);
+        (rows / ROW_QUAD * ROW_QUAD).max(ROW_QUAD)
+    })
+}
+
+/// The default for [`k_rows_per_task`]: measured on the board this was
+/// written on (see `doc/PERF-IMAGE.md`).
+const K_ROWS_PER_TASK_DEFAULT: usize = 16;
+
+/// The widest `int8` matmul kernel this process will actually dispatch to,
+/// for the startup `[cpu]` line — the answer to "what can this machine
+/// use", as opposed to what it advertises: each name here is behind the
+/// same runtime check and self-test that gates the kernel itself, so a
+/// core that claims a feature whose instruction misbehaves is reported as
+/// the level it really runs at.
+pub fn int8_kernel_label() -> &'static str {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if have_i8mm() {
+            return "i8mm (smmla)";
+        }
+        if have_dotprod() {
+            return "dotprod (sdot)";
+        }
+        return "NEON";
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if have_vnni() {
+            return "AVX-512 VNNI";
+        }
+        if is_x86_feature_detected!("avx2") {
+            return "AVX2";
+        }
+        if is_x86_feature_detected!("sse4.1") {
+            return "SSE4.1";
+        }
+        return "scalar";
+    }
+    #[allow(unreachable_code)]
+    "scalar"
+}
+
+/// Tokens per [`ActQ8Mm`] tile: four token pairs, so one weight vector is
+/// reused across eight tokens — 6 loads per 8 `smmla` in the inner loop.
+pub const MM_TILE: usize = 8;
+
+/// Activations quantized like [`ActQ8K`] — `int8`, one `f32` scale per 256,
+/// per-32 sums for `Q4_K`'s min term — but laid out for `smmla`: in tiles of
+/// [`MM_TILE`] tokens, and within each 32-element block as
+/// `[token pair][8-element chunk][the pair's two tokens][8]`, so the 16 bytes
+/// an `smmla` wants (two tokens' same 8 elements) are one aligned load.
+///
+/// A separate type rather than a flag on [`ActQ8K`], so the kernels that
+/// read the other layout cannot be handed this one by mistake.
+// Off `aarch64` the activations are built but never read: the kernel that
+// reads them is `i8mm`, and [`have_i8mm`] keeps the callers away from it.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub struct ActQ8Mm {
+    n_tokens: usize,
+    n_block: usize,
+    n_super: usize,
+    /// `n_tokens.div_ceil(MM_TILE)`
+    n_tile: usize,
+    /// `[tile][block][pair][chunk][2][8]`
+    q: Vec<i8>,
+    /// `[tile][super][token]`
+    d: Vec<f32>,
+    /// `[tile][super][token][8]` — `sum(q)` per 32-element sub-block.
+    bsum: Vec<i16>,
+}
+
+impl ActQ8Mm {
+    /// `x` is `[n_tokens][in_dim]`, token-major; `in_dim` a multiple of
+    /// [`SUPER_BLOCK`]. The padding tokens of the last tile stay zero and
+    /// contribute nothing; their outputs are never read.
+    pub fn quantize(x: &[f32], in_dim: usize, n_tokens: usize) -> Self {
+        debug_assert_eq!(x.len(), n_tokens * in_dim);
+        Self::build(
+            in_dim,
+            n_tokens,
+            |t| &x[t * in_dim..(t + 1) * in_dim],
+            |_, _| {},
+        )
+    }
+
+    /// [`Self::quantize`] over rows produced on demand: `fill(t, row)`
+    /// writes token `t`'s `in_dim` values into a scratch row that is
+    /// quantized straight away. What lets a convolution's `im2col` be
+    /// gathered into a 4 KiB buffer per token and never exist as a whole
+    /// — the full-resolution band of a VAE decode was 268 MiB of `f32`
+    /// written and read back for every convolution.
+    pub fn quantize_with(
+        in_dim: usize,
+        n_tokens: usize,
+        fill: impl Fn(usize, &mut [f32]) + Sync,
+    ) -> Self {
+        Self::build(in_dim, n_tokens, |_| &[], fill)
+    }
+
+    /// The tile loop behind both: `direct(t)` is token `t`'s row when it
+    /// already exists (empty otherwise), `fill(t, scratch)` produces it
+    /// when it does not.
+    fn build<'a>(
+        in_dim: usize,
+        n_tokens: usize,
+        direct: impl Fn(usize) -> &'a [f32] + Sync,
+        fill: impl Fn(usize, &mut [f32]) + Sync,
+    ) -> Self {
+        debug_assert_eq!(in_dim % SUPER_BLOCK, 0);
+        let n_block = in_dim / 32;
+        let n_super = in_dim / SUPER_BLOCK;
+        let n_tile = n_tokens.div_ceil(MM_TILE);
+        let mut q = vec![0i8; n_tile * n_block * MM_TILE * 32];
+        let mut d = vec![0f32; n_tile * n_super * MM_TILE];
+        let mut bsum = vec![0i16; n_tile * n_super * MM_TILE * SUBS];
+        // One rayon task per tile: a tile's eight tokens own a contiguous
+        // slice of each of the three arrays, so the tiles quantize in
+        // parallel with no sharing. Serial, this was a quarter of a
+        // 256-token matmul's wall time while eleven threads slept.
+        q.par_chunks_mut(n_block * MM_TILE * 32)
+            .zip(d.par_chunks_mut(n_super * MM_TILE))
+            .zip(bsum.par_chunks_mut(n_super * MM_TILE * SUBS))
+            .enumerate()
+            .for_each_init(Vec::new, |scratch: &mut Vec<f32>, (tl, ((q, d), bsum))| {
+                for k in 0..MM_TILE {
+                    let t = tl * MM_TILE + k;
+                    if t >= n_tokens {
+                        break;
+                    }
+                    let (tp, half) = (k / 2, k % 2);
+                    let existing = direct(t);
+                    let row: &[f32] = if existing.is_empty() {
+                        scratch.resize(in_dim, 0.0);
+                        fill(t, scratch);
+                        scratch
+                    } else {
+                        existing
+                    };
+                    for s in 0..n_super {
+                        let chunk = &row[s * SUPER_BLOCK..(s + 1) * SUPER_BLOCK];
+                        let amax = abs_max(chunk);
+                        let scale = amax / 127.0;
+                        let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+                        d[s * MM_TILE + k] = scale;
+                        for j in 0..SUBS {
+                            let b = s * SUBS + j;
+                            let src = &chunk[j * 32..(j + 1) * 32];
+                            let block = &mut q[b * MM_TILE * 32..][..MM_TILE * 32];
+                            let mut sum = 0i32;
+                            for c in 0..4 {
+                                let dst: &mut [i8; 8] = (&mut block
+                                    [((tp * 4 + c) * 2 + half) * 8..][..8])
+                                    .try_into()
+                                    .unwrap();
+                                sum += quantize_8(&src[c * 8..c * 8 + 8], inv, dst);
+                            }
+                            bsum[(s * MM_TILE + k) * SUBS + j] = sum as i16;
+                        }
+                    }
+                }
+            });
+        Self {
+            n_tokens,
+            n_block,
+            n_super,
+            n_tile,
+            q,
+            d,
+            bsum,
+        }
+    }
+}
+
+/// The largest magnitude in `x`, four lanes at a time on NEON.
+#[inline]
+fn abs_max(x: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    // Safety: NEON is baseline on aarch64; the loop stays within `x`.
+    unsafe {
+        use std::arch::aarch64::*;
+        let mut m = vdupq_n_f32(0.0);
+        let mut i = 0;
+        while i + 4 <= x.len() {
+            m = vmaxq_f32(m, vabsq_f32(vld1q_f32(x.as_ptr().add(i))));
+            i += 4;
+        }
+        let mut max = vmaxvq_f32(m);
+        for v in &x[i..] {
+            max = max.max(v.abs());
+        }
+        max
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    x.iter().fold(0f32, |m, v| m.max(v.abs()))
+}
+
+/// Eight values times `inv`, rounded half away from zero and clamped to
+/// `±127`, into `dst`; returns their sum. The same rounding as
+/// `f32::round` — `vcvtaq_s32_f32` is "round to nearest, ties away" — so
+/// the vector and scalar forms produce identical bytes. The quantizer was
+/// a tenth of a VAE decode's samples as a scalar loop with a computed
+/// scatter per element.
+#[inline]
+fn quantize_8(src: &[f32], inv: f32, dst: &mut [i8; 8]) -> i32 {
+    debug_assert_eq!(src.len(), 8);
+    #[cfg(target_arch = "aarch64")]
+    // Safety: NEON is baseline on aarch64; `src` is eight floats.
+    unsafe {
+        use std::arch::aarch64::*;
+        let invv = vdupq_n_f32(inv);
+        let lo = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(src.as_ptr()), invv));
+        let hi = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(src.as_ptr().add(4)), invv));
+        let limit = vdupq_n_s32(127);
+        let lo = vmaxq_s32(vminq_s32(lo, limit), vnegq_s32(limit));
+        let hi = vmaxq_s32(vminq_s32(hi, limit), vnegq_s32(limit));
+        let narrow = vmovn_s16(vcombine_s16(vmovn_s32(lo), vmovn_s32(hi)));
+        vst1_s8(dst.as_mut_ptr(), narrow);
+        vaddvq_s32(vaddq_s32(lo, hi))
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut sum = 0i32;
+        for (slot, &v) in dst.iter_mut().zip(src) {
+            let qi = (v * inv).round().clamp(-127.0, 127.0) as i8;
+            *slot = qi;
+            sum += qi as i32;
+        }
+        sum
+    }
+}
+
+/// `w.len()` rows — a multiple of [`ROW_QUAD`] — against every token: the
+/// `i8mm` prefill kernel. `out[i]` is row `i`'s `n_tokens`-long output.
+/// Only callable when [`have_i8mm`] is true.
+///
+/// Same arithmetic as [`dot_k_pair`], to the bit: the integer sums are
+/// exact and identical, the `f32` steps are the same operations in the same
+/// order per (row, token), and `Q4_K`'s min correction is applied first as
+/// there. Only the register shape differs.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn dot_k_rows(w: &[&KRow], a: &ActQ8Mm, out: &mut [&mut [f32]]) {
+    dot_k_rows_tiles(w, a, 0..a.n_tile, out)
+}
+
+/// [`dot_k_rows`] over the token tiles `tiles` only — `out[i]` is still
+/// row `i`'s full `n_tokens`-long output, of which the tiles' tokens are
+/// written. What lets a wide, short matmul (a VAE convolution: 96 rows
+/// against 65,536 pixels) be split over tokens as well as rows.
+#[cfg(target_arch = "aarch64")]
+pub fn dot_k_rows_tiles(
+    w: &[&KRow],
+    a: &ActQ8Mm,
+    tiles: std::ops::Range<usize>,
+    out: &mut [&mut [f32]],
+) {
+    debug_assert!(!w.is_empty() && w.len().is_multiple_of(ROW_QUAD));
+    debug_assert_eq!(w.len(), out.len());
+    debug_assert!(w.iter().all(|r| r.kind == w[0].kind));
+    debug_assert!(out.iter().all(|o| o.len() == a.n_tokens));
+    debug_assert!(tiles.end <= a.n_tile);
+    debug_assert!(have_i8mm());
+    // Safety: `have_i8mm` verified the instruction and the caller's
+    // contract requires it.
+    unsafe {
+        match w[0].kind {
+            KKind::Q4K => gemm_k_rows_mmla::<true, false>(w, a, tiles, out),
+            KKind::Iq4Xs => gemm_k_rows_mmla::<false, false>(w, a, tiles, out),
+            KKind::Q6K => gemm_k_rows_mmla::<false, true>(w, a, tiles, out),
+        }
+    }
+}
+
+/// Never reached off `aarch64`: [`have_i8mm`] is `false` there and every
+/// caller gates on it. Present so the callers compile on one code path.
+#[cfg(not(target_arch = "aarch64"))]
+pub fn dot_k_rows_tiles(
+    _w: &[&KRow],
+    _a: &ActQ8Mm,
+    _tiles: std::ops::Range<usize>,
+    _out: &mut [&mut [f32]],
+) {
+    unreachable!("dot_k_rows_tiles needs i8mm; have_i8mm() gates its callers")
+}
+
+/// The number of [`MM_TILE`]-token tiles `a` holds — for a caller splitting
+/// [`dot_k_rows_tiles`] over tokens.
+impl ActQ8Mm {
+    pub fn n_tiles(&self) -> usize {
+        self.n_tile
+    }
+}
+
+/// The rows' weights re-laid for the inner loop, built once per call:
+/// per row pair, per 32-element block, four 16-byte vectors of the two
+/// rows' same 8 elements — one load per `smmla` operand — and the scale
+/// vectors `[sc0, sc0, sc1, sc1]` per scale group, ready to `mla`.
+#[cfg(target_arch = "aarch64")]
+struct PairedRows {
+    /// `[pair][block][chunk][2][8]`
+    q: Vec<i8>,
+    /// `[pair][group]` — a group is 32 elements, or 16 for `Q6_K`.
+    sc: Vec<[i32; 4]>,
+    /// `[pair][super]` — `[d0, d0, d1, d1]`.
+    d: Vec<[f32; 4]>,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl PairedRows {
+    fn build(rows: &[&KRow], n_block: usize, n_super: usize, sc16: bool) -> Self {
+        let n_pair = rows.len() / 2;
+        let groups = if sc16 { n_block * 2 } else { n_block };
+        let mut q = vec![0i8; n_pair * n_block * 64];
+        let mut sc = vec![[0i32; 4]; n_pair * groups];
+        let mut d = vec![[0f32; 4]; n_pair * n_super];
+        for (p, [r0, r1]) in rows.as_chunks::<2>().0.iter().enumerate() {
+            for b in 0..n_block {
+                let dst = &mut q[(p * n_block + b) * 64..][..64];
+                for c in 0..4 {
+                    dst[c * 16..c * 16 + 8].copy_from_slice(&r0.q[b * 32 + c * 8..][..8]);
+                    dst[c * 16 + 8..c * 16 + 16].copy_from_slice(&r1.q[b * 32 + c * 8..][..8]);
+                }
+            }
+            for g in 0..groups {
+                let (s0, s1) = (r0.sc[g] as i32, r1.sc[g] as i32);
+                sc[p * groups + g] = [s0, s0, s1, s1];
+            }
+            for s in 0..n_super {
+                d[p * n_super + s] = [r0.d[s], r0.d[s], r1.d[s], r1.d[s]];
+            }
+        }
+        Self { q, sc, d }
+    }
+}
+
+/// The tile loop. `MINS` runs `Q4_K`'s asymmetric correction first;
+/// `SC16` reads a scale per 16 elements (`Q6_K`) rather than per 32.
+///
+/// Per 8-element chunk: two weight vectors (a row pair each), four
+/// activation vectors (a token pair each), eight `smmla` into eight 2x2
+/// accumulators. Per scale group the accumulators fold into the super-block
+/// sums with one `mla` each; per super-block, three vector ops take them to
+/// `f32`. Everything stays in lanes until the tile is stored.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+unsafe fn gemm_k_rows_mmla<const MINS: bool, const SC16: bool>(
+    rows: &[&KRow],
+    a: &ActQ8Mm,
+    tiles: std::ops::Range<usize>,
+    out: &mut [&mut [f32]],
+) {
+    use std::arch::aarch64::*;
+    let paired = PairedRows::build(rows, a.n_block, a.n_super, SC16);
+    let groups_per_block = if SC16 { 2 } else { 1 };
+    let n_groups = a.n_block * groups_per_block;
+    let n_quad = rows.len() / ROW_QUAD;
+    unsafe {
+        for tl in tiles {
+            let qtile = a.q.as_ptr().add(tl * a.n_block * MM_TILE * 32);
+            let dtile = &a.d[tl * a.n_super * MM_TILE..][..a.n_super * MM_TILE];
+            for quad in 0..n_quad {
+                // Pass 1: `Q4_K`'s `-dmin*m` correction per (row, token),
+                // `sum_j m[j]*bsum[j]` over the eight sub-blocks of each
+                // super-block. Integer and exact, so the wider multiply
+                // changes nothing; the `f32` step is the scalar kernel's.
+                let mut acc = [[0f32; MM_TILE]; ROW_QUAD];
+                if MINS {
+                    let btile = &a.bsum[tl * a.n_super * MM_TILE * SUBS..];
+                    for s in 0..a.n_super {
+                        let ad = &dtile[s * MM_TILE..];
+                        for (r, row) in rows[quad * ROW_QUAD..][..ROW_QUAD].iter().enumerate() {
+                            let m = vld1q_s16(row.mins.as_ptr().add(s * SUBS));
+                            let dm = row.dmin[s];
+                            for k in 0..MM_TILE {
+                                let bs = vld1q_s16(btile.as_ptr().add((s * MM_TILE + k) * SUBS));
+                                let prod = vaddq_s32(
+                                    vmull_s16(vget_low_s16(m), vget_low_s16(bs)),
+                                    vmull_high_s16(m, bs),
+                                );
+                                let i = vaddvq_s32(prod);
+                                acc[r][k] -= ad[k] * dm * i as f32;
+                            }
+                        }
+                    }
+                }
+                // `[row pair][token pair]`, lanes `[r0t0, r0t1, r1t0, r1t1]`.
+                let mut facc = [[vdupq_n_f32(0.0); 4]; 2];
+                for (rp, facc_rp) in facc.iter_mut().enumerate() {
+                    for (tp, f) in facc_rp.iter_mut().enumerate() {
+                        let lanes = [
+                            acc[rp * 2][tp * 2],
+                            acc[rp * 2][tp * 2 + 1],
+                            acc[rp * 2 + 1][tp * 2],
+                            acc[rp * 2 + 1][tp * 2 + 1],
+                        ];
+                        *f = vld1q_f32(lanes.as_ptr());
+                    }
+                }
+
+                let pair0 = quad * 2;
+                let wq0 = paired.q.as_ptr().add(pair0 * a.n_block * 64);
+                let wq1 = paired.q.as_ptr().add((pair0 + 1) * a.n_block * 64);
+                let sc0 = paired.sc.as_ptr().add(pair0 * n_groups);
+                let sc1 = paired.sc.as_ptr().add((pair0 + 1) * n_groups);
+
+                // Pass 2: the symmetric dot.
+                for s in 0..a.n_super {
+                    let mut isum = [[vdupq_n_s32(0); 4]; 2];
+                    for j in 0..SUBS {
+                        let b = s * SUBS + j;
+                        let x = qtile.add(b * MM_TILE * 32);
+                        let w0 = wq0.add(b * 64);
+                        let w1 = wq1.add(b * 64);
+                        let mut part = [[vdupq_n_s32(0); 4]; 2];
+                        for h in 0..2 {
+                            for c in (h * 2)..(h * 2 + 2) {
+                                let wv0 = vld1q_s8(w0.add(c * 16));
+                                let wv1 = vld1q_s8(w1.add(c * 16));
+                                let [p0, p1] = &mut part;
+                                for (tp, (a0, a1)) in p0.iter_mut().zip(p1.iter_mut()).enumerate() {
+                                    let xv = vld1q_s8(x.add(tp * 64 + c * 16));
+                                    *a0 = mmla_2x8(*a0, wv0, xv);
+                                    *a1 = mmla_2x8(*a1, wv1, xv);
+                                }
+                            }
+                            if SC16 || h == 1 {
+                                let g = if SC16 { b * 2 + h } else { b };
+                                let scv = [
+                                    vld1q_s32((*sc0.add(g)).as_ptr()),
+                                    vld1q_s32((*sc1.add(g)).as_ptr()),
+                                ];
+                                for rp in 0..2 {
+                                    for tp in 0..4 {
+                                        isum[rp][tp] =
+                                            vmlaq_s32(isum[rp][tp], part[rp][tp], scv[rp]);
+                                        part[rp][tp] = vdupq_n_s32(0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // `acc += ad * (d * isum)`, per lane — the scalar
+                    // kernel's expression, operation for operation.
+                    let ad = &dtile[s * MM_TILE..];
+                    for rp in 0..2 {
+                        let dv = vld1q_f32(paired.d[(pair0 + rp) * a.n_super + s].as_ptr());
+                        for tp in 0..4 {
+                            let adl = [ad[tp * 2], ad[tp * 2 + 1], ad[tp * 2], ad[tp * 2 + 1]];
+                            let adv = vld1q_f32(adl.as_ptr());
+                            let f = vcvtq_f32_s32(isum[rp][tp]);
+                            facc[rp][tp] =
+                                vaddq_f32(facc[rp][tp], vmulq_f32(adv, vmulq_f32(dv, f)));
+                        }
+                    }
+                }
+
+                // Back to `[row][token]` and out, dropping the padded tail.
+                for rp in 0..2 {
+                    for tp in 0..4 {
+                        let mut lanes = [0f32; 4];
+                        vst1q_f32(lanes.as_mut_ptr(), facc[rp][tp]);
+                        acc[rp * 2][tp * 2] = lanes[0];
+                        acc[rp * 2][tp * 2 + 1] = lanes[1];
+                        acc[rp * 2 + 1][tp * 2] = lanes[2];
+                        acc[rp * 2 + 1][tp * 2 + 1] = lanes[3];
+                    }
+                }
+                for (r, row_acc) in acc.iter().enumerate() {
+                    let dst = &mut out[quad * ROW_QUAD + r];
+                    let base = tl * MM_TILE;
+                    let n = MM_TILE.min(dst.len().saturating_sub(base));
+                    dst[base..base + n].copy_from_slice(&row_acc[..n]);
+                }
+            }
+        }
+    }
+}
+
 fn gemm_k_q4_k<const ISA: u8>(
     w0: &KRow,
     w1: &KRow,
@@ -3050,6 +3661,150 @@ fn dot_float<const KIND: u8>(row: &[u8], x: &[f32]) -> f32 {
         total += widen_float::<KIND>(rb, j) * xv;
     }
     total
+}
+
+/// Widens one float row (`F32`/`F16`/`BF16` bytes) to `f32`, for
+/// [`gemm_f32_rows`]'s tile — done once per row per task, not per token.
+#[cfg(target_arch = "aarch64")]
+pub fn widen_float_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut Vec<f32>) {
+    out.clear();
+    out.reserve(in_dim);
+    match ggml_type {
+        GGML_TYPE_F32 => out.extend((0..in_dim).map(|i| widen_float::<FKIND_F32>(row, i))),
+        GGML_TYPE_F16 => out.extend((0..in_dim).map(|i| widen_float::<FKIND_F16>(row, i))),
+        GGML_TYPE_BF16 => out.extend((0..in_dim).map(|i| widen_float::<FKIND_BF16>(row, i))),
+        other => panic!("vecdot::widen_float_row called for unsupported ggml_type {other}"),
+    }
+}
+
+/// Rows per [`gemm_f32_rows`] tile.
+#[cfg(target_arch = "aarch64")]
+pub const F32_ROWS: usize = 4;
+/// Tokens per [`gemm_f32_rows`] tile: 4 × 6 accumulators plus four weight
+/// vectors and one activation vector is 29 of the 32 NEON registers — the
+/// largest tile that does not spill. (4 × 8 needs 37 and spilled every
+/// accumulator: 79 vector stores per 32 multiply-adds.)
+#[cfg(target_arch = "aarch64")]
+const F32_TOKENS: usize = 6;
+
+/// Four `f32` rows against every token — the prefill kernel for the float
+/// types, which have no `int8` form. `x` is `[n_tokens][in_dim]`
+/// token-major; `out[r]` is row `r`'s `n_tokens`-long output.
+///
+/// [`dot_row_f32`] takes one row against one token and is load-bound: two
+/// loads per multiply-add, and the row re-read from cache for every token.
+/// A Qwen-Image VAE decode — 3×3 convolutions as `im2col` matmuls of 96 to
+/// 384 output rows against tens of thousands of pixels — ran it at under
+/// 2 G MAC/s per core. This holds a 4-row × 6-token tile of accumulators in
+/// registers and walks `in_dim` four lanes at a time: 10 loads per 96
+/// multiply-adds, each `vfmaq_f32` independent of the others, the lane sums
+/// reduced once at the end. The tile is a separate function with every
+/// loop bound a constant, which is what keeps the accumulators in registers
+/// — a tile whose token count is a runtime value indexes them through
+/// memory.
+///
+/// The `f32` result differs from [`dot_row_f32`]'s only in summation order
+/// (four interleaved partial sums against eight), which is `f32` rounding
+/// noise — the same seeded picture came out byte-identical through both.
+#[cfg(target_arch = "aarch64")]
+pub fn gemm_f32_rows(w: [&[f32]; F32_ROWS], x: &[f32], in_dim: usize, out: [&mut [f32]; F32_ROWS]) {
+    let n_tokens = out[0].len();
+    debug_assert!(w.iter().all(|r| r.len() >= in_dim));
+    debug_assert!(x.len() >= n_tokens * in_dim);
+    debug_assert!(out.iter().all(|o| o.len() == n_tokens));
+    let full = n_tokens / F32_TOKENS * F32_TOKENS;
+    let mut t0 = 0;
+    while t0 < full {
+        // Safety: the tile reads `in_dim` floats from each of the four rows
+        // and from tokens `t0..t0 + F32_TOKENS`, all inside the slices
+        // checked above.
+        let tile = unsafe { f32_tile(&w, x.as_ptr().add(t0 * in_dim), in_dim) };
+        for (r, row) in tile.iter().enumerate() {
+            out[r][t0..t0 + F32_TOKENS].copy_from_slice(row);
+        }
+        t0 += F32_TOKENS;
+    }
+    // The last, short tile: one token at a time, four rows.
+    for t in full..n_tokens {
+        let xt = &x[t * in_dim..(t + 1) * in_dim];
+        for r in 0..F32_ROWS {
+            out[r][t] = dot_f32_slices(&w[r][..in_dim], xt);
+        }
+    }
+}
+
+/// One 4 × [`F32_TOKENS`] tile of [`gemm_f32_rows`]. `x` points at the
+/// first of the tile's tokens, each `in_dim` floats long.
+// Index loops rather than iterators, deliberately: with every bound a
+// constant, LLVM unrolls them and keeps all 24 accumulators in registers
+// (checked in the disassembly: 24 `fmla` per 10 loads and no spill); the
+// iterator forms clippy prefers were not tested to do the same.
+#[allow(clippy::needless_range_loop)]
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn f32_tile(
+    w: &[&[f32]; F32_ROWS],
+    x: *const f32,
+    in_dim: usize,
+) -> [[f32; F32_TOKENS]; F32_ROWS] {
+    use std::arch::aarch64::*;
+    unsafe {
+        let k4 = in_dim / 4 * 4;
+        let mut acc = [[vdupq_n_f32(0.0); F32_TOKENS]; F32_ROWS];
+        let mut k = 0;
+        while k < k4 {
+            let w0 = vld1q_f32(w[0].as_ptr().add(k));
+            let w1 = vld1q_f32(w[1].as_ptr().add(k));
+            let w2 = vld1q_f32(w[2].as_ptr().add(k));
+            let w3 = vld1q_f32(w[3].as_ptr().add(k));
+            for t in 0..F32_TOKENS {
+                let xv = vld1q_f32(x.add(t * in_dim + k));
+                acc[0][t] = vfmaq_f32(acc[0][t], w0, xv);
+                acc[1][t] = vfmaq_f32(acc[1][t], w1, xv);
+                acc[2][t] = vfmaq_f32(acc[2][t], w2, xv);
+                acc[3][t] = vfmaq_f32(acc[3][t], w3, xv);
+            }
+            k += 4;
+        }
+        let mut out = [[0f32; F32_TOKENS]; F32_ROWS];
+        for t in 0..F32_TOKENS {
+            for r in 0..F32_ROWS {
+                let mut sum = vaddvq_f32(acc[r][t]);
+                for kk in k4..in_dim {
+                    sum += w[r][kk] * *x.add(t * in_dim + kk);
+                }
+                out[r][t] = sum;
+            }
+        }
+        out
+    }
+}
+
+/// `sum_i w[i] * x[i]` over two `f32` slices of equal length, four lanes at
+/// a time — the short-tile tail of [`gemm_f32_rows`].
+#[cfg(target_arch = "aarch64")]
+pub fn dot_f32_slices(w: &[f32], x: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    debug_assert_eq!(w.len(), x.len());
+    let k4 = w.len() / 4 * 4;
+    // Safety: NEON is baseline on aarch64; `k` stays below `k4 <= len`.
+    let mut sum = unsafe {
+        let mut acc = vdupq_n_f32(0.0);
+        let mut k = 0;
+        while k < k4 {
+            acc = vfmaq_f32(
+                acc,
+                vld1q_f32(w.as_ptr().add(k)),
+                vld1q_f32(x.as_ptr().add(k)),
+            );
+            k += 4;
+        }
+        vaddvq_f32(acc)
+    };
+    for kk in k4..w.len() {
+        sum += w[kk] * x[kk];
+    }
+    sum
 }
 
 /// `block_q8_0`: `{ d: f16, qs: [i8; 32] }` — already `int8`, no unpack at all.
@@ -5139,6 +5894,74 @@ mod tests {
         assert_eq!(a.q[4], -2, "-1.5 must round away from zero");
     }
 
+    /// The tiled float kernel is `dot_row_f32` in a different summation
+    /// order: every output within `f32` rounding of the per-token dot, at an
+    /// `in_dim` that is not a multiple of four (a scalar tail), a token
+    /// count that is not a multiple of eight (a short last tile), and rows
+    /// stored as `F16` and `BF16` as well as `F32`.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn tiled_float_gemm_matches_the_per_token_dot() {
+        for (ggml_type, stride) in [
+            (GGML_TYPE_F32, 4usize),
+            (GGML_TYPE_F16, 2),
+            (GGML_TYPE_BF16, 2),
+        ] {
+            let (in_dim, n_tokens) = (867usize, 21usize);
+            let value = |i: usize| ((i * 31 % 17) as f32 - 8.0) * 0.125;
+            let mut raw = Vec::new();
+            for o in 0..F32_ROWS {
+                for i in 0..in_dim {
+                    let v = value(o * in_dim + i);
+                    match ggml_type {
+                        GGML_TYPE_F32 => raw.extend_from_slice(&v.to_le_bytes()),
+                        GGML_TYPE_F16 => {
+                            raw.extend_from_slice(&half::f16::from_f32(v).to_le_bytes())
+                        }
+                        _ => raw.extend_from_slice(&half::bf16::from_f32(v).to_le_bytes()),
+                    }
+                }
+            }
+            let row_bytes = in_dim * stride;
+            let x: Vec<f32> = (0..n_tokens * in_dim).map(|i| value(i + 5) * 0.5).collect();
+            let mut rows: Vec<Vec<f32>> = vec![Vec::new(); F32_ROWS];
+            for (o, row) in rows.iter_mut().enumerate() {
+                widen_float_row(
+                    ggml_type,
+                    &raw[o * row_bytes..(o + 1) * row_bytes],
+                    in_dim,
+                    row,
+                );
+            }
+            let mut got = vec![0f32; F32_ROWS * n_tokens];
+            {
+                let (g0, rest) = got.split_at_mut(n_tokens);
+                let (g1, rest) = rest.split_at_mut(n_tokens);
+                let (g2, g3) = rest.split_at_mut(n_tokens);
+                gemm_f32_rows(
+                    [&rows[0], &rows[1], &rows[2], &rows[3]],
+                    &x,
+                    in_dim,
+                    [g0, g1, g2, g3],
+                );
+            }
+            for o in 0..F32_ROWS {
+                for t in 0..n_tokens {
+                    let want = dot_row_f32(
+                        ggml_type,
+                        &raw[o * row_bytes..(o + 1) * row_bytes],
+                        &x[t * in_dim..(t + 1) * in_dim],
+                    );
+                    let have = got[o * n_tokens + t];
+                    assert!(
+                        (have - want).abs() <= 1e-4 * want.abs().max(1.0),
+                        "type {ggml_type} row {o} token {t}: {have} vs {want}"
+                    );
+                }
+            }
+        }
+    }
+
     // ------------------------------------------- K-quant prefill GEMM
 
     /// A weight matrix of `out_dim` K-quant rows with finite `f16` scales,
@@ -5204,6 +6027,58 @@ mod tests {
             }
         }
         yt
+    }
+
+    /// The `i8mm` four-row kernel is the pair kernel's arithmetic in a
+    /// different register shape: same integer sums, same `f32` operations in
+    /// the same order per lane. So it must agree **to the bit** — on every
+    /// kind, with a trailing tile of padded tokens, and against rows that
+    /// carry negative scales (`IQ4_XS`/`Q6_K`) and a min pass (`Q4_K`).
+    /// Skipped, not failed, on a core without `i8mm`.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn i8mm_quad_kernel_is_bit_identical_to_the_pair_kernel() {
+        if !have_i8mm() {
+            eprintln!("no i8mm on this core; skipped");
+            return;
+        }
+        for ggml_type in [GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS] {
+            for (in_dim, n_tokens) in [(256usize, 7usize), (2048, 4), (1024, 13)] {
+                // Two quads, so the per-task row loop runs more than once.
+                let out_dim = 2 * ROW_QUAD;
+                let (raw, x, row_bytes) = k_fixture(ggml_type, in_dim, out_dim, n_tokens, 777);
+                let acts = ActQ8K::quantize(&x, in_dim, n_tokens);
+                let mut rows: Vec<KRow> = (0..out_dim).map(|_| KRow::new()).collect();
+                for (o, row) in rows.iter_mut().enumerate() {
+                    unpack_k_row(
+                        ggml_type,
+                        &raw[o * row_bytes..(o + 1) * row_bytes],
+                        in_dim,
+                        row,
+                    );
+                }
+                let mut expect = vec![0f32; out_dim * n_tokens];
+                for (pair, dst) in expect.chunks_mut(2 * n_tokens).enumerate() {
+                    let (e0, e1) = dst.split_at_mut(n_tokens);
+                    dot_k_pair(&rows[pair * 2], &rows[pair * 2 + 1], &acts, e0, e1);
+                }
+                let mut got = vec![0f32; out_dim * n_tokens];
+                {
+                    let mm = ActQ8Mm::quantize(&x, in_dim, n_tokens);
+                    let refs: Vec<&KRow> = rows.iter().collect();
+                    let mut outs: Vec<&mut [f32]> = got.chunks_mut(n_tokens).collect();
+                    dot_k_rows(&refs, &mm, &mut outs);
+                }
+                assert!(
+                    got.iter()
+                        .zip(&expect)
+                        .all(|(g, e)| g.to_bits() == e.to_bits()),
+                    "type {ggml_type} in_dim {in_dim} tokens {n_tokens}: quad {got:?} != pair {expect:?}"
+                );
+                // And not trivially: the rows produce something.
+                assert!(expect.iter().any(|v| *v != 0.0));
+            }
+        }
     }
 
     /// The K-quant GEMM must land inside the same `int8`-activation error

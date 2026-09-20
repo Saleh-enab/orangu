@@ -108,8 +108,53 @@ fn readiness(device_lost: bool, queued: usize, limit: usize) -> (StatusCode, &'s
 }
 
 pub async fn props(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(props_json(&state))
+}
+
+/// `POST /props`: `{"image": {...}}` changes the picture defaults a request
+/// gets when it does not say — see `images::ImageSettings` — and answers
+/// with the same document `GET` does, so a client sees what it set and
+/// what it now costs. Refused whole on a value the config loader would
+/// refuse, and with 501 on a language model, which has no such defaults.
+#[derive(Deserialize, Default)]
+pub struct PropsUpdate {
+    #[serde(default)]
+    image: Option<super::images::ImageSettings>,
+}
+
+pub async fn set_props(
+    State(state): State<Arc<AppState>>,
+    Json(update): Json<PropsUpdate>,
+) -> impl IntoResponse {
+    if let Some(settings) = &update.image {
+        let Some(pipeline) = state.engine.image.as_deref() else {
+            return (StatusCode::NOT_IMPLEMENTED, "not an image model").into_response();
+        };
+        if let Err(err) = super::images::apply_settings(pipeline, settings) {
+            return (StatusCode::BAD_REQUEST, err).into_response();
+        }
+        let d = pipeline.defaults();
+        log::info!(
+            "orangu-server: [image] defaults set to {}x{}, {} steps, cfg {}{}",
+            d.width,
+            d.height,
+            d.steps,
+            d.cfg_scale,
+            pipeline
+                .estimated_default_seconds()
+                .map(|s| format!(
+                    " — about {} a picture",
+                    orangu::format::format_duration_rough(s)
+                ))
+                .unwrap_or_default()
+        );
+    }
+    Json(props_json(&state)).into_response()
+}
+
+fn props_json(state: &AppState) -> serde_json::Value {
     let cfg = state.engine.model.config();
-    Json(serde_json::json!({
+    serde_json::json!({
         "model": state.model_label,
         "backend": state.backend_label,
         // Which build answered. `version` dates the release; `commit` is the
@@ -125,7 +170,15 @@ pub async fn props(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "gpu": state.gpu_tuning,
         // `null` on a machine with no NPU — see `npu_tool::npu_props`.
         "npu": crate::npu_tool::npu_props(),
-        "architecture": cfg.architecture,
+        // The served file's architecture. On a `qwen_image` server the
+        // engine's `ModelForward` is the text encoder, so `cfg` describes
+        // that; `architecture` names what was asked for.
+        "architecture": state.architecture,
+        // `null` for a language model. For a `qwen_image` model: the
+        // companion files it was loaded with, the transformer's shape, the
+        // request defaults a chat turn gets and the measured rate — see
+        // `images::props_json`; `POST /props` changes the defaults.
+        "image": state.engine.image.as_deref().map(super::images::props_json),
         // Which of `--all`/`--code`/`--review`/`--explorer`/`--embedding`
         // this process came up as — the same thing the startup banner's
         // `Mode` row reports, where a client can read it. A coordinator uses
@@ -144,7 +197,7 @@ pub async fn props(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         // the build it just launched rather than one left over from a previous
         // run — see `orangu-bench`'s `report_environment`.
         "pid": std::process::id(),
-    }))
+    })
 }
 
 /// `GET /gpu-timings` — the accumulated GPU timestamp breakdown since the last

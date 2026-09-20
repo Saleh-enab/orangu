@@ -17,6 +17,7 @@
 //! `http::openai` (OpenAI-compatible) and `http::native`
 //! (llama.cpp-native); shutdown is handled here since it's neither.
 
+pub mod images;
 pub mod native;
 pub mod openai;
 
@@ -47,6 +48,11 @@ pub struct AppState {
     /// "id" in `/v1/models` and `/props` — not necessarily a real file path,
     /// so a client can display it directly.
     pub model_label: String,
+    /// The served file's `general.architecture`, as the banner prints it.
+    /// Not always `engine.model.config().architecture`: on a `qwen_image`
+    /// server the engine's model is the text encoder (`qwen2vl`), and this
+    /// is what says so.
+    pub architecture: String,
     /// Backend and device this model is running on, exactly as the startup
     /// banner prints it (e.g. `Vulkan/AMD Radeon RX 5500M (RADV NAVI14)`).
     /// Reported by `/props` so a benchmark can record *what* it measured
@@ -228,7 +234,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(native::health))
         .route("/ready", get(native::ready))
-        .route("/props", get(native::props))
+        .route("/props", get(native::props).post(native::set_props))
         .route("/gpu-timings", get(native::gpu_timings))
         .route("/moe-stats", get(native::moe_stats))
         .route("/decode-stages", get(native::decode_stages))
@@ -246,6 +252,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/chat/completions", post(openai::chat_completions))
         .route("/v1/completions", post(openai::completions))
         .route("/v1/embeddings", post(openai::embeddings))
+        .route("/v1/images/generations", post(images::generations))
         .route("/v1/shutdown", post(shutdown))
         // The file-lifecycle API, mounted from the shared router
         // `orangu-coordinator` mounts too, so both front doors serve the

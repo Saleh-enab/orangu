@@ -1228,6 +1228,69 @@ the per-row allocation, and replaces scalar `f32` multiplies with 16- or
 32-wide `int8` ones (NEON `vmull_s8`/`sdot` on aarch64; AVX-512 VNNI, AVX2
 or SSE4.1 on x86-64, all chosen by runtime feature detection).
 
+**Prefill on `i8mm` cores takes a different shape.** A dot kernel — one
+row against one token, reduced to a scalar every 32 elements — is the
+right unit for decode and the wrong one for a prompt or a picture, where
+the same weights meet hundreds of tokens. On an ARMv8.6 core with `i8mm`,
+`vecdot::dot_k_rows` runs the K-quant GEMM as `smmla` tiles instead: four
+weight rows against eight tokens, each instruction a 2×8·8×2 `int8`
+product accumulated into a 2×2 of `i32` lanes, the per-sub-block scale
+folded in with one vector `mla`, and nothing reduced horizontally until
+the tile is stored. Its activations (`ActQ8Mm`) are the `q8_K` layout
+re-ordered so each `smmla` operand is one aligned load, and its rows are
+re-paired the same way once per task (`PairedRows`). It is the pair
+kernel's arithmetic **to the bit** — the integer sums are identical and the
+`f32` steps are the same operations in the same order — which the test
+`i8mm_quad_kernel_is_bit_identical_to_the_pair_kernel` asserts as
+equality rather than tolerance. Measured on a Cortex-A720: 2.3× per core
+over the `sdot` kernel at a Qwen-Image linear's shape (3072×3072, 256
+tokens). `ORANGU_EXPERT_I8MM=0` turns it off for an A/B on one binary;
+`ORANGU_EXPERT_K_ROWS` sets the rows per rayon task (default 16, the best
+of 4–64 on that core: more rows reuse each activation tile from L1 across
+more `smmla` tiles, until the unpacked rows crowd it out).
+
+**The serial half of a prefill matmul.** After the kernel above, a
+per-thread profile of the 12-thread microbenchmark showed every worker
+busy about half the wall time: the phases that run on one thread while
+eleven sleep were 36% of it — `finish_into`'s transpose of the
+`[out_dim][n_tokens]` accumulator into the token-major output a quarter
+on its own, the activation quantizer a tenth. On the `i8mm` path both are
+gone: `ActQ8Mm::quantize` is one rayon task per tile, and
+`matmul_k_gemm_into` gives each task a private L1-resident block for its
+16 rows and has it write, per token, one contiguous 64-byte run straight
+into the output (`SharedOut`, a raw pointer whose column ranges no two
+tasks share) — the transpose done in parallel and for free. Measured:
+a 256-token 3072×3072 matmul 205 → 346 G MAC/s, a Qwen-Image step
+18.3 → 14.4 s, 7B prefill 35 → 43 tok/s, decode unchanged.
+
+**Big and little cores.** `hardware::big_cores` reads Linux's
+`cpu_capacity` per core and the `[cpu]` line reports the mix. Pinning
+the pool to the big cluster (`ORANGU_EXPERT_BIG_CORES=1`) was measured
+both ways on the development board — it matched the microbenchmark,
+lost prefill and pictures in the server (the little cores fill the slack
+of a forward pass's many short parallel regions) and won decode by 18% —
+so it is opt-in, and a decode-specific pool is the open task
+(`doc/PERF-IMAGE.md`).
+
+**The float weight types get a tiled kernel too.** `F32`/`F16`/`BF16`
+weights have no `int8` form, and their per-token dot (`dot_row_f32`) was
+load-bound. `vecdot::gemm_f32_rows` is a 4-row × 6-token NEON tile — the
+largest that does not spill — and `matmul_float_into` splits the work over
+token blocks × row groups so a VAE convolution (96 rows against 65,536
+pixels) and a bottom-of-the-decoder one (384 rows against 1,024) both get
+a few tasks per worker; `F32` weights are read in place. It halved a
+Qwen-Image VAE decode and raised gemma-4-E2B's prefill by a quarter, whose
+`per_layer_model_proj` is the one float matmul in that model.
+
+**What the machine can use, not what it advertises.** `have_dotprod`,
+`have_i8mm` and `have_vnni` each require the CPU to report the feature
+*and* the instruction to reproduce a scalar reference on known inputs
+before the kernel is dispatched — the assembly was written on one machine
+and runs on many. The startup `[cpu]` line names the level that passed
+(`vecdot::int8_kernel_label`: `i8mm (smmla)`, `dotprod (sdot)`, `NEON`;
+`AVX-512 VNNI`, `AVX2`, `SSE4.1`, `scalar`), so a benchmark's header says
+which kernel produced its number.
+
 Five types have a fused kernel — `Q8_0`, `Q5_0`, `IQ4_NL`, `Q4_K`, `Q6_K`.
 Anything else returns `false` from `vecdot::supports` and the caller keeps
 the ordinary dequantize path, so the module is strictly additive.
@@ -1765,6 +1828,210 @@ mod`), so adding a family is additive rather than a rewrite:
   a server started with `-c 0`; note the common CLI default of `-c 4096` selects
   the short ones instead, so a logit-level comparison has to pass a
   matching `-c`.
+
+- `llama.rs` also serves `qwen2vl` (Qwen2.5-VL's text backbone, e.g.
+  `unsloth/Qwen2.5-VL-7B-Instruct-GGUF`), added for the same reason
+  `qwen3vl` is there: plain `qwen2` tensors and NEOX rotation, with an M-RoPE
+  whose sections (`rope.dimension_sections = [16, 24, 24, 0]`) all see the
+  same 1-D position on text-only input — upstream's `llm_graph_input_pos`
+  converts a text token's position to four identical values, so every
+  rotated pair uses the one position whichever section it belongs to. It is
+  what a `qwen_image` model encodes prompts with.
+
+### Image generation (`engine::image`)
+
+A `qwen_image` GGUF (Qwen-Image; `unsloth/Qwen-Image-2512-GGUF`) is not a
+`ModelForward` and does not go through `engine::arch` at all. It holds a
+**diffusion transformer** — diffusers' `QwenImageTransformer2DModel`, read
+from the file the ComfyUI-GGUF tooling writes, whose tensor names are
+diffusers' own and whose metadata is three keys and no hyperparameters, so
+the loader (`read_image_model_config`) sizes it from tensor shapes:
+`img_in.weight` gives the stream width, `attn.norm_q.weight` the head width,
+and the `transformer_blocks.N` prefixes the depth.
+
+Its role is `config::Role::Image`, and unlike the other five that is a
+fact about the file rather than a choice: `Role::required_by(architecture)`
+names it for `qwen_image` and nothing else, `Role::fixed_by_model` marks
+it as never prompted for and never narrowed by an `x-orangu-role` header,
+and `main::fix_role_for_model` reconciles it at every start with whatever
+was asked — the CLI flag, or under `--daemon` the config's `role` key —
+refusing a conflict in either direction. The startup picker
+(`select_model_interactively`) draws the table in one of three
+`model_spec::Dimming` modes — `ImageModels` under `--image`, `TextModels`
+under any other flag, `Unsupported` with none — from `ModelSupport::image`,
+and refuses a greyed row; `--init` reads the same column to answer its own
+`role` prompt and to ask the `image_*` keys plus `vae_precision` and
+`image_lora_merge` (`init::ImageKeys`, written only where an answer
+differs from what the server would take: `image_lora [auto]` names the
+adapter `find_qwen_image_lightning` finds, and the step and guidance
+prompts after it offer `lightning_steps` of that adapter and 1, the
+server's own rule). The `Model:` prompt itself
+pre-selects the config's `model =` only if `ModelSupport::selectable`
+says the flag serves it, else the first row that is.
+
+Which backend runs it is measured, not assumed. Under `backend = auto`,
+`main::prepare` opens the transformer before the encoder is uploaded and
+calls `engine::image::calibrate`: the first block's `img_mlp` input
+projection (3072×12288, the widest linear and over half of every pass)
+through the selected device and through `CpuBackend`, 256 tokens of
+synthetic activations, each run twice and the second timed — the first
+pays pipeline compilation and the weight upload, a per-picture cost, not
+the per-step one being compared. If the CPU is faster the whole pipeline
+(encoder included) is rebuilt on `CpuBackend`. On the development board
+the Mali-G720 measured 352 ms against the CPU's 39 ms, and a real
+256-pixel step 111.7 s against 14.4 s: the GPU would have made the
+picture eight times slower, and `auto` used to pick it. An explicit
+`backend` is never overridden.
+
+Its attention (`transformer::joint_attention`) is blocked: 24 queries per
+(head, task), the scores and the value product each a `vecdot::
+gemm_f32_rows` tile — the values gathered transposed so the second product
+is a GEMM over the keys — and the softmax per row in between. The
+per-query form (`joint_attention_per_query`) is the reference it is
+tested against and the path on non-ARM targets. Measured at 512 pixels,
+attention went from 36% of a step to 17% and the step from 35.9 to 27.7 s;
+the 24-query block keeps a block's score rows in L2 through the softmax.
+
+The timestep-only vectors — every block's modulation and the output
+norm's — are cached on the transformer keyed by sigma, so guidance's
+second pass at the same sigma skips sixty weight-bound one-token linears.
+The MLP's GELU and the attention softmax's exponentials go through
+`tensor::gelu_inplace` and `tensor::exp_inplace`, the engine's vector
+polynomial `exp`; the scalar `tensor::softmax_inplace` the sampler and the
+language models use is untouched.
+
+`engine::image::lora` reads a low-rank adapter — `<linear>.lora_down/
+lora_up/alpha` in `safetensors`, keyed by the linear's diffusers name and
+shape-checked against it at load — and by default **merges** it
+(`LoraPair::merge_into`): every adapted row dequantized (`engine::quant`),
+`scale · B·A` added, and re-encoded by the encoder that wrote the file —
+`orangu::quantize`, the GGUF encoders moved out of `orangu-gguf` into the
+library for exactly this — into a `QuantMatrix::from_encoded_rows` the
+linear then runs at full speed; 165 s on the development board for 720
+linears — once, because `lora::MergedCache` writes the merged tensors to
+`<models>/orangu-merged/<hash>.bin` (a magic, a JSON header of identities
+and tensor ranges, the rows) and the next start maps them
+(`QuantMatrix::from_shared_bytes`) in seconds, keyed by both files' path,
+size and mtime. `image_lora_merge = no` applies it instead, `y += scale ·
+(x · Aᵀ) · Bᵀ` after each linear: on the CPU a token-blocked down product
+through `vecdot::gemm_f32_rows` and the backend's two-dimensional float
+matmul for the up product, the two-matmul form kept for other backends and
+as the test reference, `Stages::lora` accounting its time apart. What it
+is for is Qwen-Image-Lightning — see the server manual's *Eight steps
+instead of fifty* — and that is the default: `config::ImageLora::Auto`
+(the key absent) has `prepare` serve
+`model_spec::find_qwen_image_lightning`'s file (a `Lightning…<N>steps`
+name under `models`, the most steps first), which
+`model_download::download_image_companions` fetches with the model as a
+fourth companion; `ImageLora::None` is the base model. The picture
+defaults the pipeline is given are `ServerConfiguration::
+image_defaults_under(adapter)`: `image_steps` and `image_cfg_scale` as
+written, else a Lightning adapter's step count (`model_spec::
+lightning_steps`) and 1.
+
+The VAE's convolutions (`engine::image::vae::conv_matrix`) are encoded
+as `Q6_K` at load under the default `VaePrecision::Int8`, each `im2col`
+row zero-padded to a multiple of 256 so the K-quant kernel takes it, and
+`matmul_k_gemm_into` splits such a matmul over token tiles as well as row
+groups (`vecdot::dot_k_rows_tiles`) — 96 rows against 65,536 pixels was six
+tasks on twelve cores before. `ActQ8Mm::quantize` is NEON (`vcvtaq`, the
+same ties-away rounding as `f32::round`, so the bit-identity test still
+holds); it was a tenth of a decode's samples as a scalar loop. And the
+`im2col` band no longer exists on this path: `ActQ8Mm::quantize_with`
+takes a closure that fills one token's row into a scratch buffer, `vae::
+gather_window` is that closure for a pixel's 3×3 window, and
+`CpuBackend::matmul_k_mm_into` runs the kernel on the result — a
+full-resolution band was 268 MiB of `f32` written and read back per
+convolution. Decode at 512 px went 10.6 → 2.7 s over the two steps.
+
+`engine::image::Pipeline` is diffusers' `QwenImagePipeline`, step for step,
+over four parts that each map onto a piece of the reference:
+
+- **The text encoder** is the served language model. `main.rs`'s `prepare`
+  notices the architecture, finds the `qwen2vl` companion
+  (`orangu::model_spec::find_qwen_image_text_encoder`, or
+  `[orangu-server].text_encoder`) and loads *that* as the `Engine`'s
+  `ModelForward` and tokenizer through the ordinary path — backend
+  selection, placement and the footprint report all run on the encoder,
+  which is the part of the pipeline that is a language model. The prompt is
+  wrapped in Qwen-Image's own chat framing (`prompt_template_encode`),
+  encoded, and the framing's own hidden states dropped
+  (`prompt_template_encode_start_idx` — measured by tokenizing the prefix,
+  never hardcoded); what is left, `[n, 3584]` from
+  `ModelForward::forward_hidden_states`, conditions the picture. The
+  encoder stays a full model: `/v1/embeddings` on an image server answers
+  from it.
+- **The transformer** (`image::transformer`) is a dual-stream MMDiT: an
+  image stream and a text stream through their own projections and
+  GELU-tanh feed-forwards per block, joined only in an unmasked attention
+  over `[text | image]`, each stream modulated by the timestep (`x * (1 +
+  scale) + shift` after a weightless LayerNorm, a gate on each residual —
+  six vectors per stream per block from one linear over `SiLU(temb)`) and
+  positioned by a three-axis rotary embedding on adjacent pairs of the
+  128-wide head: 8 pairs for the frame (always zero for a still), 28 for
+  the row and 28 for the column, rows and columns centred on the picture
+  (`scale_rope`), and text tokens placed past the picture's half-extent
+  on all three axes at once. Every projection is a `Backend::matmul`; the
+  attention, norms and rotation are host `f32` code, parallel over rows.
+- **The VAE** (`image::vae`) is Wan 2.1's video autoencoder, read from
+  `qwen_image_vae.safetensors` by a reader of the container written for it
+  (`image::safetensors`). On a single frame its causal 3-D convolutions act
+  through their last temporal slice alone and its temporal resamplers are
+  skipped (diffusers' `feat_cache` bookkeeping does exactly that), so what
+  is built is a 2-D network: each `[out, in, 3, 3, 3]` kernel is read as
+  `[.., .., 2, :, :]`, and activations are kept channel-last so a 3x3
+  convolution is a matmul over unrolled neighbourhoods, run in row bands so
+  a 1024x1024 picture never holds its whole neighbourhood table at once.
+  Encoding (for a picture to start from) and decoding both exist; the
+  latent is the `(mean, logvar)` posterior, sampled as diffusers samples it.
+- **The schedule** (`image::scheduler`) is `FlowMatchEulerDiscreteScheduler`
+  with the checkpoint's config: `linspace(1, 1/steps)` shifted towards the
+  noisy end by an amount that grows with the token count (`mu` from
+  `calculate_shift`), stretched to end at `shift_terminal = 0.02`, one
+  Euler step per level. Classifier-free guidance combines the positive and
+  negative passes and rescales the result, per token, to the positive
+  prediction's length — Qwen-Image's own `cond_norm / noise_norm`. The
+  initial noise is a seeded xoshiro256** through Box–Muller, so a `seed`
+  reproduces a picture on the same build.
+
+Latents travel between the parts in diffusers' packed layout: `[h/16 *
+w/16, 64]` tokens, each a 2x2 patch of the 16-channel latent with features
+ordered `(channel, dy, dx)`, normalised by the VAE's `latents_mean` /
+`latents_std`. The pipeline runs one picture at a time (its `Mutex`): a
+step is a full pass over 20 billion parameters per image token, and two
+interleaved would be slower than two in turn. It runs on a blocking thread
+and reports `ImageEvent`s — progress per step, then the picture — over a
+channel whose reader holds a `CancelOnDrop`, so a client that disconnects
+stops the work at the next step.
+
+`image::codec` is the edge: PNG and JPEG through the `image` crate the tree
+already carried (via `printpdf`), GIF and lossless WebP through the same
+crate's two further codecs, SVG drawn with `resvg` and then read as the
+raster it became; a picture starts from the attachment's own format,
+so a JPEG comes back as JPEG. `http::images` is `/v1/images/generations`,
+and `http::openai::image_chat` turns a chat turn into the same request; the
+web console's `send_image_message` does the same for its own SSE shape and
+keeps every picture as a file under the session's `files/`. All three
+build the request against `Pipeline::defaults()` — a `RwLock<ImageDefaults>`
+behind a clone, so one request is built from one consistent set — which
+`http::images::apply_settings` replaces for `POST /props` (and the
+console's `POST /api/props`), checked as `config::parse_image_defaults`
+checks the same keys; `Pipeline::configured` is what `reset` restores.
+`http::images::props_json` is the `image` object both `/props` and
+`/api/props` answer with, the rate model included so a client can cost
+settings before sending them.
+
+**What is verified, and what is not.** The unit tests pin each piece to the
+reference's arithmetic — the rotary layout, the modulation split order, the
+LayerNorm, the timestep embedding, the schedule's values at 1024x1024, the
+convolution tap order and padding, the latent packing — the way every other
+architecture's tests do, and the real-checkpoint test
+(`ORANGU_TEST_QWEN_IMAGE_*`) generates a small picture end to end. What
+does not yet exist is a captured-tensor fixture from diffusers itself (the
+convention in `doc/DEVELOPERS.md`): the machine this was written on cannot
+run PyTorch, so the transformer's output has been checked structurally and
+visually rather than to the fifth significant figure. It is the first thing
+to add.
 
 ### Constrained decoding (`engine::constraint`, `engine::sampling::Constraint`)
 
@@ -2975,7 +3242,7 @@ or parsed, and are noted as such where they appear.
 | `ORANGU_PREFILL_STREAM_DENSE` | on (`0` turns it off) | Whether a dense gemma layer **without** a per-layer-embedding stage keeps the residual stream on the device: its post-attention chain writes the layer's result — output scale included, folded into the FFN post-norm's kernel — straight into the other stream buffer, as the per-layer-embedding chain does for a layer that has one. Before, the stream only held a layer with that stage; every other layer (the embedding model's, the 31B's) landed its rows on the host and took its chains one waited-for call at a time. Measured 2× on `embeddinggemma` at 64–128 tokens; a bidirectional batch above the stripe width still takes the host path (the fused attention chain declines it), so 256 tokens and up are unchanged. `0` restores the per-layer-embedding requirement, the control arm. |
 | `ORANGU_HOST_STREAM_TOKENS` | `32` (integer; `0` turns it off) | On a model split with the CPU as a device, the narrowest batch at which a **host layer's** projection is sent to the first card rather than run on the CPU. A host layer's weights are already in RAM, and at one token the card would spend longer fetching them than multiplying — but a prefill batch multiplies the same weights by every token, so above this width the layer's Q/K/V, gate/up and down projections upload their weights into the card's bounded streaming region (the same region routed experts stream through, `ORANGU_EXPERT_STREAM_BYTES`), run the integer-dot GEMM there, and read the rows back to the host exactly as the CPU's product would arrive. Nothing else about the layer moves: its attention and its KV cache stay on the host, and the card's residency plan is untouched since the region recycles. A batch wider than one submission's stripe (`ORANGU_MAX_TOKENS_PER_SUBMISSION`) streams stripe by stripe with the weights uploaded once. Decode never takes it, whatever the width — a decode step's numerics must not depend on how many sequences share it. Output differs from the CPU kernel's by the activation rounding, and is closer to the float product: on real weights and activations of the 12B model's first host layer, the card's error against the dequantized product is 0.4–0.6 % where the CPU kernel's is 0.9–1.5 %. Measured on gemma-4-12B split 18:30 over a 4 GiB card and the host, a 512-token chunk's host layer went from 1045 ms (gate/up 586, down 258, Q/K/V 182, attention 19) to 187 ms (83, 56, 29, 19) against 115 for a resident layer's whole fused chain; the prompt went from 12.5 to 49 tok/s at 574 tokens, the 31B from 3.7 to 16. `0` keeps every host layer on the host, the control arm. |
 | `ORANGU_EXPERT_GEMM_TOKENS` | `256` (integer; `0` turns it off) | The narrowest prefill batch at which a mixture-of-experts layer's **routed experts run on the card**, as one submission per layer: the layer's whole expert stack (every expert's gate/up rows as one tensor, ~270 MiB on a 128-expert model) crosses the bus into the streaming region, every expert is multiplied by the rows routed to it in a single *indexed* integer-dot GEMM dispatch per projection (a table names, per token tile, which expert's rows and which activation rows; the activations are quantized once for the layer and never gathered per expert), the activation and multiply run on the card, the product is quantized there, the down stack is copied over the gate/up one inside the same submission and multiplied the same way, and the rows are weighted by their routing weights and summed per token on the card — the host reads back the layer's `[n_tokens, n_embd]` result and nothing else. Per-expert output scales (a QAT file's) are applied by the GEMM as it stores. Uploads go through a persistently mapped staging pair filled by every core and copied by the DMA engine (2.3 → 4.8 GB/s against `write_buffer`'s one-thread copy), and the next layer's stacks are staged while this layer's submission runs. Below the width the host's per-expert GEMM is faster: the stack crosses the bus whatever the batch, the host's cost is per token; measured on a 26B-A4B file the two are level near 220 tokens (host 0.55 ms per token per layer; card ~120 ms per layer fixed plus ~10 ms per 128 tokens), the card 9% behind at 158 tokens and 29% ahead at 574 (49 → 63 tok/s, the reference engine at 66). The region is reserved at model load so it lands in the card's own memory: created later, once the weights had filled a 4 GiB card, it landed in host memory and every expert dispatch read its weights across the bus at a fixed 40 ms (6 ms resident). `ORANGU_EXPERT_GEMM_TOKS` (16/32/64/128, default 32) is the indexed kernel's token tile — one expert's routed tokens are a few dozen, and the dense kernels' 128-token tile would be three quarters padding. Output differs from the host path's by the activation roundings, both 8-bit; a wrong tile or table is off by whole rows. `0` keeps the experts on the host at every width, the control arm. |
-| `ORANGU_EXPERT_PACK` | on (`0` turns it off) | Whether a layer's routed experts reach the card **packed**: only the experts the batch routed to, copied from the staged stack into the streaming region in stripes the region's size, each stripe multiplied before the next is copied over it, all inside the one submission — rather than the whole stack uploaded and the region sized to hold it. A 512-token chunk routes to 70–95 of a 128-expert layer, so it moves 60–75% of the bytes, and the region is `ORANGU_EXPERT_REGION_MIB` instead of the largest stack; the staging pair becomes a trio so the next layer's stack can be filled while the stripes' copies are still in flight. Measured on a 26B-A4B file: 100 → 112 tok/s at 512 tokens, the region 333 → 128 MiB, and the card's KV pool 1408 → 1600 tokens. Needs the mapped staging (a card whose host-visible heap is known); otherwise, or with `0`, the stack goes whole. |
+| `ORANGU_EXPERT_PACK` | on (`0` turns it off) | Whether a layer's routed experts reach the card **packed**: only the experts the batch routed to, copied from the staged stack into the streaming region in stripes the region's size, each stripe multiplied before the next is copied over it, all inside the one submission — rather than the whole stack uploaded and the region sized to hold it. A 512-token chunk routes to 70–95 of a 128-expert layer, so it moves 60–75% of the bytes, and the region is `ORANGU_EXPERT_REGION_MIB` instead of the largest stack; the staging pair becomes a trio so the next layer's stack can be filled while the stripes' copies are still in flight. Measured on a 26B-A4B file: 100 → 112 tok/s at 512 tokens, the region 333 → 128 MiB, and the card's KV pool 1408 → 1600 tokens. Needs the mapped staging (a discrete card whose host-visible heap is known and is a window smaller than the card's memory — on unified memory, an integrated GPU, there is no window for a half to be sized past, so the pair is not used and uploads take the belt); otherwise, or with `0`, the stack goes whole. |
 | `ORANGU_EXPERT_REGION_MIB` | `128` (integer, MiB) | The streaming region's size when the experts are packed (`ORANGU_EXPERT_PACK`): one stripe of routed experts, and what the card holds for the region between prompts. Larger means fewer stripes per layer (a stripe is a copy and a dispatch per projection) and less room for the KV pool; smaller than one expert's rows falls back to the whole stack. |
 | `ORANGU_HOST_PRELOAD` | on (`0` turns it off) | On a model whose host-resident weights (a mixture-of-experts model's routed experts) fit in memory, reads them into the page cache at start — through the file in 8 MiB reads, in file order, twice — before the first request would otherwise bring them in by demand faults (measured at 30 MB/s on a drive that reads sequentially at 400: eleven minutes of a first prompt on a 20 GiB file). Twice because a page read once sits on the kernel's inactive list and is the first evicted under the server's own allocations when other files hold the cache; the second read keeps it. Logged with the bytes and the time (57 s cold for 24 GiB, 17 s mostly cached). A model larger than memory is the streaming regime and takes `ORANGU_EXPERT_WILLNEED` instead; the per-selection read-ahead also applies to the first pass of a resident model. `0` leaves the first request to do it. |
 | `ORANGU_EXPERT_STREAM_EARLY` | unset (integer, MiB) | Creates the expert streaming region at start-up at this size, ahead of the weights — what `ORANGU_EXPERT_GEMM_TOKENS` does by itself for a model whose stacks it can size at load; for a sweep of the region's placement on a card the model fills. |
@@ -2998,7 +3265,7 @@ or parsed, and are noted as such where they appear.
 | `ORANGU_GPU_OPS_RAW` | unset (off) | With `ORANGU_GPU_TIMESTAMPS=ops`, also prints every stamp in order with its interval — the per-layer structure the totals fold away, for the question "which dispatch of the seventy is the slow one". |
 | `ORANGU_DECODE_BATCH` | unset (off) | Set to have concurrent slots' decode steps run as one forward pass — the weights read once for all of them — instead of one after another. Each decoding slot joins a rendezvous; a step runs when every joined slot has offered one, and a slot that finishes leaves so no step waits for it. Correct (concurrent answers are the solo answers), and off because it is not yet faster: the batched step runs on the prefill chains, whose per-call resource building outweighs the saved weight reads at two to four rows (two streams 48 tok/s aggregate against 54 for one). |
 | `ORANGU_PREFILL_ATTN` | unset (off) | Set to run the **standalone** prefill attention dispatch where the fused path above declines, instead of the CPU attention loop. Unlike the fused path this pays a Q upload and an attention-output readback per layer, which the CPU loop does not, so it wins only at long prompts. A measurement aid rather than a recommended setting. |
-| `ORANGU_PREFILL_TILED_ATTN` | on where subgroups are supported (`0` turns it off) | The prefill's attention as a **tiled** kernel: one workgroup per (tile of queries, head), the tile's queries staged once in workgroup memory, the window walked in blocks of positions, every thread owning a few rows × a few columns × a slice of `head_dim` so each K or V element read feeds one multiply-add per row and the only cross-lane work per position is a three-step shuffle of the scores. The online softmax runs per thread over its own columns and the lanes sharing a row merge their partials once at the end. The per-query kernels it replaces (`ORANGU_NO_PREFILL_GQA`, `ORANGU_GQA_HEADS` below) walk the window one position at a time with a reduction and an `exp` per head per position, and every query re-reads K and V; measured on the E2B prefill at 2048 tokens the attention dispatch went from 91 to 74 ms per 512-token chunk (−18%). Output is the same up to summation order. `0` is the control arm, and the fallback for an adapter without subgroups. `ORANGU_FA_ROWS` (1–4, default 2 at `head_dim` 256, more for narrower heads), `ORANGU_FA_COLS` (2/4/8, default 8), `ORANGU_FA_LANES` (32/64 lanes per row group, default 32) and `ORANGU_FA_DLANES` (8/16 lanes across `head_dim`, default 8) pin the tile for measurement: on this card every four-row tile lost to the two-row one, whichever way the lanes were split, because the registers those rows hold cost more occupancy than the halved loads buy. |
+| `ORANGU_PREFILL_TILED_ATTN` | on where subgroups are supported (`0` turns it off) | The prefill's attention as a **tiled** kernel: one workgroup per (tile of queries, head), the tile's queries staged once in workgroup memory, the window walked in blocks of positions, every thread owning a few rows × a few columns × a slice of `head_dim` so each K or V element read feeds one multiply-add per row and the only cross-lane work per position is a three-step shuffle of the scores. The online softmax runs per thread over its own columns and the lanes sharing a row merge their partials once at the end. The per-query kernels it replaces (`ORANGU_NO_PREFILL_GQA`, `ORANGU_GQA_HEADS` below) walk the window one position at a time with a reduction and an `exp` per head per position, and every query re-reads K and V; measured on the E2B prefill at 2048 tokens the attention dispatch went from 91 to 74 ms per 512-token chunk (−18%). Output is the same up to summation order. `0` is the control arm, and the fallback for an adapter without subgroups or with subgroups narrower than 32 lanes (the shuffles fold 32 lanes unconditionally; the Mali-G720's subgroups are 16, and there the kernel is not built — `[vulkan] … subgroups are 16 lanes wide; the cooperative attention kernels need 32 and are not built` at startup — the same rule that keeps the cooperative decode kernels off such a device). `ORANGU_FA_ROWS` (1–4, default 2 at `head_dim` 256, more for narrower heads), `ORANGU_FA_COLS` (2/4/8, default 8), `ORANGU_FA_LANES` (32/64 lanes per row group, default 32) and `ORANGU_FA_DLANES` (8/16 lanes across `head_dim`, default 8) pin the tile for measurement: on this card every four-row tile lost to the two-row one, whichever way the lanes were split, because the registers those rows hold cost more occupancy than the halved loads buy. |
 | `ORANGU_NO_PREFILL_GQA` | unset (GQA sharing **on**) | Set to **disable** sharing each KV head's reads across the query heads that use it in the prefill attention kernel, falling back to one workgroup per `(head, query)`. Only affects models whose `n_head` exceeds `n_head_kv`. |
 | `ORANGU_GQA_HEADS` | unset (chosen by register budget) | Pins how many query heads of one KV group a prefill attention workgroup owns. Must divide the group size. Sharing a KV read across more heads and keeping enough waves resident to hide that read pull in opposite directions; the default picks from inside the measured band. A tuning knob for other GPUs. |
 | `ORANGU_GPU_TRACE` | unset (off) | Logs the number of GPU submissions per decode step to stdout — a diagnostic for round-trip counting, no effect on the computation. |
@@ -3176,8 +3443,9 @@ already has, not a crashed server.
 
 ### The startup banner's `Mode` row
 
-`Mode` names which of `--all`/`--code`/`--review`/`--explorer`/`--embedding`
-this process came up as — the other half of "what will this server do with my
+`Mode` names which of `--all`/`--code`/`--review`/`--explorer`/`--embedding`/
+`--image` this process came up as (`image` whenever the model is a
+`qwen_image` file, flag or no flag) — the other half of "what will this server do with my
 request", beside `Model`. It decides the sampling defaults, whether reasoning
 is suppressed, and whether the generation endpoints answer at all, and without
 it on the banner the only way to tell a `--review` server from an `--all` one
@@ -3322,6 +3590,7 @@ with a clear message if its variable is unset when the test is run
 | `ORANGU_TEST_PHI_MODEL` | phi3 real-model forward-pass test | A local Phi-3/Phi-4-mini `.gguf` file |
 | `ORANGU_TEST_QWEN4EXP_MODEL` | `qwen4exp` forward-pass test | A local Qwen3.8-Flash-Next `.gguf` (the first shard of a split model) |
 | `ORANGU_TEST_QWEN4EXP_MTP` | `qwen4exp` draft-head acceptance test | One of that repo's `MTP/mtp-*.gguf` heads; measures how often the head guesses what the model goes on to say |
+| `ORANGU_TEST_QWEN_IMAGE_MODEL` | `qwen_image` end-to-end picture test | A local Qwen-Image `.gguf`; its `qwen2vl` encoder and the VAE are found under `ORANGU_TEST_QWEN_IMAGE_MODELS_DIR` (default: the model's directory's ancestors) |
 
 ### HTTP layer and web UI
 
@@ -3331,7 +3600,19 @@ handle, config, workspace root, start time); `http::openai` and
 `http::files` holds the file-lifecycle API (see the next section);
 `/v1/shutdown` lives in `http::mod` itself since it's neither. Ctrl+C,
 `SIGINT`, and `POST /v1/shutdown` all converge on the same shutdown path via
-`tokio::select!`, mirroring `orangu-coordinator`'s own pattern.
+`tokio::select!`, mirroring `orangu-coordinator`'s own pattern. What that
+path does first is tell everything long-running to stop where it stands,
+because the runtime's drop joins the blocking threads: `engine::image::
+request_shutdown` sets a flag `transformer::forward` reads before every
+block and the VAE before every layer (`ForwardInput::cancel`,
+`decode_unless`/`encode_unless`, both also carrying a request's own
+cancel flag); `npu_tool::stop_preparation` sets its own flag, which
+`prepare` reads between stages and `block_error` between sampled blocks,
+kills the compile child, and sets `orangu::npu_ffn::request_stop`, which
+`NpuFfn::open` reads between cached graphs read off disk and the device
+thread between binds (releasing what it bound). A shutdown measured on
+the development board went from 107 s with a 1024-pixel picture in
+flight, and 26 s with NPU graphs binding, to under three seconds.
 
 `web::mod` serves a small server-rendered chat UI (vanilla HTML/CSS/JS, no
 build step) on its own `[web].port`, sharing the same in-process `Engine` as
@@ -3340,7 +3621,19 @@ markdown to HTML (including syntax-highlighted code blocks) with the same
 `markdown`/`syntect` crates `orangu`'s terminal UI uses. `web::mermaid`
 draws ```` ```mermaid ```` blocks (below). `web::sessions`
 persists each chat as `~/.orangu/server/sessions/<uuid>/chat.json`.
-`web::models` is the model manager (below).
+`web::models` is the model manager (below); `web::mcp` the MCP inventory
+(`GET`, and `PUT /api/mcps`, which `config::rewrite_mcp_section` writes
+one section at a time — a header through the line before the next — into
+the file `WebState::config_file` names, `McpConfiguration::validate`
+having refused what the loader would); `/api/props` the picture
+settings. The three are the panes of
+the console's one **Settings** dialog (`index.html`'s `#settings-overlay`,
+`app.js`'s `openSettings`/`showSettingsPane`): a brand-brown column of
+white buttons picks the pane, a brand-brown footer holds Save and Cancel
+(`saveSettings` posts the Image form when it differs from the server's
+defaults, then closes; Cancel just closes), the model manager's polling
+runs only while its pane is shown, and the Image pane is greyed when
+`/api/props` answers `image: null`.
 
 #### Downloading one code block
 
@@ -3847,7 +4140,12 @@ being watched.
 `argv` is rebuilt from what this process *resolved*, not from what it was
 given: the workspace as an absolute path (a `--daemon` process has since
 moved to `/`) and the role as an explicit flag (it may have been answered at
-an interactive prompt). `--config` is passed only if it was passed to this
+an interactive prompt). The flag is the *next* model's role, not this one's
+(`reexec::role_for_model`): a `qwen_image` file is always `--image`
+(`Role::required_by`, `Role::fixed_by_model`), which no language model can
+take — so a handover onto one says `--image` whatever this process is, and
+one off it back onto a language model says `--all`, nobody being at a
+prompt to choose. `--config` is passed only if it was passed to this
 process, so a server that found its config by the default search makes the
 new image repeat that search rather than pinning a path it never chose;
 `--host`/`--port`/`--web` follow the same rule (`reexec::Listen`). The address
@@ -3857,8 +4155,11 @@ descriptor that didn't survive, where the new image binds instead and must bind
 where this server has been answering.
 
 **A failed load falls back.** `FALLBACK_MODEL_VAR` carries the previous
-model spec; if the new image's `prepare` fails, `main` execs once more with
-it and *without* the variable, which is what bounds the retry to one. This
+model spec and `FALLBACK_ROLE_VAR` the role it was working in (the failed
+image's own flag was chosen for the model that failed, and may be exactly
+the one the fallback refuses); if the new image's `prepare` fails, `main`
+execs once more with them and *without* the variables, which is what
+bounds the retry to one. This
 matters because the pre-check cannot be exhaustive: `reexec::precheck` reads
 the header and applies the same judgement as the `SUPPORTED` column
 (architecture resolvable, every tensor type decodable), but a GPU backend
