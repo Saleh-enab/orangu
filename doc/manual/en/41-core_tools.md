@@ -968,6 +968,9 @@ The same Markdown is also kept for the rest of the session, so `/comment <number
 
 ### Key bindings
 
+`Alt` is the Option key on a Mac, and the terminal has to send it as Meta
+for these to work — see "Alt on macOS" in the Terminal section.
+
 | Key | Action |
 | --- | --- |
 | `Alt+j` | Select the next file (shows its diff in the left pane) |
@@ -1136,6 +1139,9 @@ On exit the report — every category with its findings (or `No issues found`), 
 The Markdown report is also kept for the rest of the session, so `/comment <number> with auto review` can post it on a GitHub/GitLab issue (see the `/comment` tool in the Git tools chapter).
 
 ### Key bindings
+
+`Alt` is the Option key on a Mac, and the terminal has to send it as Meta
+for these to work — see "Alt on macOS" in the Terminal section.
 
 | Key | Action |
 | --- | --- |

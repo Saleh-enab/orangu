@@ -242,6 +242,31 @@ Natural-language forms are recognized only for the built-in local command phrase
 
 ## Shortcuts and keys
 
+### Alt on macOS
+
+Every `Alt+…` binding below is pressed with the **Option (⌥)** key on a
+Mac — it is the same key. What differs is what the terminal sends for it:
+by default macOS treats Option as a character modifier, so `⌥S` types `ß`,
+`⌥J` types `∆`, `⌥X` types `≈`, and orangu never sees a key it can act on.
+Tell the terminal to send Option as Meta (an Escape-prefixed key, which
+orangu reads as `Alt`), once, in its settings:
+
+| terminal | setting |
+| :-- | :-- |
+| Terminal.app | Settings → Profiles → Keyboard → **Use Option as Meta key** |
+| iTerm2 | Settings → Profiles → Keys → General → Left Option key → **Esc+** |
+| Ghostty | `macos-option-as-alt = true` (or `left`) in its config |
+| Alacritty | `option_as_alt = "Both"` (or `"OnlyLeft"`) under `[window]` |
+| kitty | `macos_option_as_alt yes` (or `left`) in `kitty.conf` |
+| WezTerm | `send_composed_key_when_left_alt_is_pressed = false` |
+
+Setting it for the **left** Option key alone is the usual choice: the
+bindings work, and the right Option key still types accented characters.
+The bindings that need it are the ones on this page and in the interactive
+tools — the manual viewer's `Alt+S`/`Alt+J`/`Alt+K`/`Alt+X`, the review
+screens' `Alt+X`, the prompt's `Alt+Backspace`/`Alt+D`, and the scrolling
+and panning keys. `Ctrl+…` bindings are unaffected.
+
 ### Prompt editing
 
 - `Ctrl+A` or `Home` moves the cursor to the start of the input line

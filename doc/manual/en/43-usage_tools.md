@@ -8,7 +8,7 @@ The usage tools cover the session-level housekeeping commands: reading the built
 
 ## /manual
 
-Opens this manual in a full-screen, two-pane viewer: the text of the selected section in the left pane and the table of contents in the right pane. The manual text is embedded into the binary at compile time, so it is always available — no external files are read. Pressing `Alt+S` opens a search window that searches the entire manual (`Enter` jumps to the next match, `Esc` closes it).
+Opens this manual in a full-screen, two-pane viewer: the text of the selected section in the left pane and the table of contents in the right pane. The manual text is embedded into the binary at compile time, so it is always available — no external files are read. Pressing `Alt+S` opens a search window that searches the entire manual (`Enter` jumps to the next match, `Esc` closes it). On a Mac, `Alt` is the Option key, and the terminal has to be set to send it as Meta — see "Alt on macOS" under Shortcuts and keys in the Terminal section.
 
 The viewer, its layout, and its key bindings are described in the Built-in manual section of the Terminal interface chapter.
 

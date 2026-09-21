@@ -242,7 +242,7 @@ The review workflow is orangu's standout feature, so it is worth trying right aw
 review
 ```
 
-This opens the interactive reviewer: a two-pane view with your changed files on the right and the selected file's diff on the left. Use `Alt+j`/`Alt+k` to move between files, `Alt+a`/`Alt+r` to approve or reject one, and `Alt+c` to leave a categorized comment on a line. Type a question such as `is this thread-safe?` and press `Enter` to ask the model about the selected file. Press `Alt+x` to leave; the report is copied to your clipboard.
+This opens the interactive reviewer: a two-pane view with your changed files on the right and the selected file's diff on the left. Use `Alt+j`/`Alt+k` to move between files, `Alt+a`/`Alt+r` to approve or reject one, and `Alt+c` to leave a categorized comment on a line. Type a question such as `is this thread-safe?` and press `Enter` to ask the model about the selected file. Press `Alt+x` to leave; the report is copied to your clipboard. (On a Mac these are Option-key chords, and the terminal must send Option as Meta — see "Alt on macOS" in the Terminal section.)
 
 To have the model do the work, run:
 
