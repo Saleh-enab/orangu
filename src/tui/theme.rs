@@ -604,6 +604,15 @@ impl Theme {
         Ok(canonical_name)
     }
 
+    /// Emit the active theme's terminal palette again. Leaving the
+    /// alternate screen resets the terminal's own colours (see
+    /// `TerminalUiGuard`), so a screen shown before the main interface — the
+    /// `-r` session picker — has to put them back for the interface that
+    /// follows it.
+    pub fn reapply_terminal_palette() {
+        apply_terminal_palette(&Self::current());
+    }
+
     pub fn apply_cli_override(spec: &str) -> Result<String> {
         if is_path_like(spec) {
             let path = expand_tilde(spec);

@@ -122,7 +122,7 @@ _orangu() {
         '(-c --config)'{-c,--config}'[Path to the configuration file (orangu.conf)]:config file:_files' \
         '(-t --theme)'{-t,--theme}'[Override the TUI theme with a name or .theme file]:theme:_orangu_themes' \
         '(-w --workspace)'{-w,--workspace}'[Workspace root for local tools]:workspace:_orangu_workspaces' \
-        '(-r --resume)'{-r,--resume}'[Resume a session by UUID]:session uuid:_orangu_sessions' \
+        '(-r --resume)'{-r,--resume}'[Resume a session by UUID, or pick one from a list]::session uuid:_orangu_sessions' \
         '(-a --all)'{-a,--all}'[Reopen the workspace tabs from the previous run]' \
         '(--developer --committer)--developer[Open the prompt in developer mode (the default)]' \
         '(--developer --committer)--committer[Open the prompt in committer mode]' \
@@ -168,7 +168,7 @@ complete -c orangu -s c -l config           -r                          -d 'Path
 complete -c orangu -s t -l theme             -r -a 'classic modern_dark modern_light oranguday tokyonight rosepine-moon random' -d 'Override the TUI theme with a name or .theme file'
 complete -c orangu -s t -l theme             -r -a '(__fish_complete_path)' -d 'Theme file'
 complete -c orangu -s w -l workspace         -x -a '(__orangu_workspaces)' -d 'Workspace root for local tools'
-complete -c orangu -s r -l resume            -x -a '(__orangu_sessions)'   -d 'Resume a session by UUID'
+complete -c orangu -s r -l resume            -x -a '(__orangu_sessions)'   -d 'Resume a session by UUID, or pick one from a list'
 complete -c orangu -s a -l all                                            -d 'Reopen the workspace tabs from the previous run'
 complete -c orangu      -l developer                                      -d 'Open the prompt in developer mode (the default)'
 complete -c orangu      -l committer                                      -d 'Open the prompt in committer mode'
@@ -208,7 +208,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu' -ScriptBlock {
         @('-c', '--config', 'Path to the configuration file (orangu.conf)'),
         @('-t', '--theme', 'Override the TUI theme with a name or .theme file'),
         @('-w', '--workspace', 'Workspace root for local tools'),
-        @('-r', '--resume', 'Resume a session by UUID'),
+        @('-r', '--resume', 'Resume a session by UUID, or pick one from a list'),
         @('-a', '--all', 'Reopen the workspace tabs from the previous run'),
         @('--developer', 'Open the prompt in developer mode (the default)'),
         @('--committer', 'Open the prompt in committer mode'),

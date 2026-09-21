@@ -34,6 +34,7 @@ mod quotes;
 mod render;
 mod review;
 mod schedule;
+mod session_picker;
 mod session_store;
 mod shell;
 mod shell_command;
@@ -152,9 +153,10 @@ struct Args {
     /// directory.
     #[arg(short, long)]
     workspace: Option<PathBuf>,
-    /// Resume a stored session by UUID.
-    #[arg(short, long)]
-    resume: Option<String>,
+    /// Resume a stored session by UUID; with no UUID, pick one from a list
+    /// of every stored session, most recently updated first.
+    #[arg(short, long, value_name = "UUID")]
+    resume: Option<Option<String>>,
     /// Reopen the workspace tabs that were open at the end of the last run.
     #[arg(short = 'a', long = "all")]
     all: bool,
@@ -506,6 +508,29 @@ async fn run() -> Result<()> {
         );
     }
 
+    // `-r` without a UUID: pick the session from a list of every stored one.
+    // The pick follows the session to the workspace it was started in unless
+    // --workspace names one, as `/session <uuid>` does. The list's `New` row
+    // asks for a fresh session instead — no resume at all, not even the
+    // automatic one for the workspace and branch. A cancel is a quiet exit,
+    // since nothing was asked for that could be done.
+    let mut resume_target: Option<String> = None;
+    let mut fresh_session = false;
+    match args.resume.take() {
+        Some(Some(uuid)) => resume_target = Some(uuid),
+        Some(None) => match session_picker::run_session_picker(config.mouse)? {
+            Some(session_picker::PickerChoice::Resume { uuid, workspace }) => {
+                if args.workspace.is_none() {
+                    args.workspace = workspace;
+                }
+                resume_target = Some(uuid);
+            }
+            Some(session_picker::PickerChoice::New) => fresh_session = true,
+            None => return Ok(()),
+        },
+        None => {}
+    }
+
     let quote_module = quotes::QuoteModule::from_str(&config.quotes);
     // Remove any binary staged by a previous `/restart`; it is only needed
     // across the exec handoff and must not accumulate.
@@ -555,7 +580,7 @@ async fn run() -> Result<()> {
         vec![]
     };
     let (initial_workspace, initial_session) =
-        if args.all && args.workspace.is_none() && args.resume.is_none() {
+        if args.all && args.workspace.is_none() && resume_target.is_none() && !fresh_session {
             if let Some((ws, sess)) = saved_workspaces.first() {
                 (ws.clone(), sess.clone())
             } else {
@@ -566,8 +591,8 @@ async fn run() -> Result<()> {
         };
     let mut initial_tab = WorkspaceTab::open(
         initial_workspace,
-        initial_session.as_deref().or(args.resume.as_deref()),
-        initial_session.is_none() && args.resume.is_none(),
+        initial_session.as_deref().or(resume_target.as_deref()),
+        initial_session.is_none() && resume_target.is_none() && !fresh_session,
         &system_prompt,
         config.compression,
         config.auto_downsample_lines,
@@ -2940,6 +2965,28 @@ mod tests {
         ] {
             assert!(Args::try_parse_from(argv.clone()).is_err(), "{argv:?}");
         }
+    }
+
+    #[test]
+    fn resume_takes_a_uuid_or_opens_the_picker() {
+        // Absent, present without a UUID (the picker), present with one.
+        assert_eq!(args(&[]).resume, None);
+        assert_eq!(args(&["-r"]).resume, Some(None));
+        assert_eq!(args(&["--resume"]).resume, Some(None));
+        assert_eq!(
+            args(&["-r", "550e8400-e29b-41d4-a716-446655440000"]).resume,
+            Some(Some("550e8400-e29b-41d4-a716-446655440000".to_string()))
+        );
+        // A following flag is not mistaken for the UUID.
+        let picked_with_all = args(&["-r", "-a"]);
+        assert_eq!(picked_with_all.resume, Some(None));
+        assert!(picked_with_all.all);
+        let picked_with_workspace = args(&["--resume", "--workspace", "/tmp/ws"]);
+        assert_eq!(picked_with_workspace.resume, Some(None));
+        assert_eq!(
+            picked_with_workspace.workspace,
+            Some(std::path::PathBuf::from("/tmp/ws"))
+        );
     }
 
     /// Every flag clap parses is offered by all three hand-written

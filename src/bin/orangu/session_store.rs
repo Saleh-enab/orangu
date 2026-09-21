@@ -813,18 +813,19 @@ pub(crate) fn list_sessions_output(
     Ok(lines.join("\n"))
 }
 
-/// Render every stored session as a plain `SESSION  WORKSPACE  BRANCH  DATE`
-/// table, columns sized to the widest value, for `orangu -l|--list`. DATE is the
-/// session's last-updated timestamp. Sessions are listed newest-first by start
-/// time. Always ends with a trailing newline.
-pub(crate) fn list_all_sessions_output() -> Result<String> {
+/// Every session directory under `~/.orangu/sessions`, paired with its
+/// metadata — `None` when the `metadata` file is missing or unreadable, so a
+/// half-written session still shows up rather than hiding. Unsorted: `-l`
+/// and the `-r` picker each order the list their own way. An absent sessions
+/// directory is an empty list, not an error.
+pub(crate) fn stored_sessions() -> Result<Vec<(String, Option<SessionMetadata>)>> {
     let sessions_dir = {
         let home = home::home_dir().ok_or_else(|| anyhow!("failed to resolve home directory"))?;
         home.join(SESSIONS_DIRECTORY)
     };
 
     if !sessions_dir.exists() {
-        return Ok("No sessions found.\n".to_string());
+        return Ok(Vec::new());
     }
 
     let mut entries: Vec<(String, Option<SessionMetadata>)> = Vec::new();
@@ -848,6 +849,15 @@ pub(crate) fn list_all_sessions_output() -> Result<String> {
         let meta = load_session_metadata(&path.join("metadata")).ok().flatten();
         entries.push((uuid, meta));
     }
+    Ok(entries)
+}
+
+/// Render every stored session as a plain `SESSION  WORKSPACE  BRANCH  DATE`
+/// table, columns sized to the widest value, for `orangu -l|--list`. DATE is the
+/// session's last-updated timestamp. Sessions are listed newest-first by start
+/// time. Always ends with a trailing newline.
+pub(crate) fn list_all_sessions_output() -> Result<String> {
+    let mut entries = stored_sessions()?;
 
     if entries.is_empty() {
         return Ok("No sessions found.\n".to_string());

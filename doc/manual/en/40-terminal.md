@@ -18,7 +18,7 @@ The sync runs in the background so it never delays startup. Its progress and res
 | ----- | ------------- | ------------------------------------------------------------- |
 | `-c`  | `--config`    | Path to the configuration file. Without it, `./orangu.conf`, then `~/.orangu/orangu.conf`. |
 | `-w`  | `--workspace` | Workspace root the local tools operate on. Defaults to `.`.   |
-| `-r`  | `--resume`    | Resume a stored session by UUID (`-l` prints them).           |
+| `-r`  | `--resume`    | Resume a stored session by UUID, or pick one from a list.     |
 | `-a`  | `--all`       | Reopen the workspace tabs that were open at the end of the last run. |
 |       | `--developer` | Open the prompt in developer mode, the default — what `/developer` does. |
 |       | `--committer` | Open the prompt in committer mode, on the merge flow — what `/committer` does. The two are mutually exclusive. |
@@ -135,6 +135,28 @@ orangu --resume 550e8400-e29b-41d4-a716-446655440000
 ```
 
 This restores the previous conversation context and per-session readline history.
+
+### Picking a session
+
+Without a UUID, `--resume` (or `-r`) opens a full-screen list of every stored
+session, most recently updated first, with the same columns `--list` prints,
+closed by a `New` row:
+
+```text
+Resume a session  ↑/↓ Move  Enter Select  Esc Quit
+SESSION                               WORKSPACE           BRANCH         DATE
+550e8400-e29b-41d4-a716-446655440000  /home/user/project  main           2026-06-26 11:04
+6ba7b810-9dad-11d1-80b4-00c04fd430c8  /home/user/other    feature/login  2026-06-26 03:27
+New                                   Start a new session
+```
+
+`Up`/`Down` (or `k`/`j`), `PageUp`/`PageDown`, `Home`/`End` and the mouse
+wheel move the highlight; `Enter` takes the highlighted row and `Esc` (or
+`q`) exits without starting anything. A session opens in the workspace it
+was started in unless `--workspace` names another, as `/session <uuid>`
+does. `New` skips resuming altogether — the automatic workspace-and-branch
+resume included — and starts a fresh session in the current (or
+`--workspace`) directory. With no stored sessions, `New` is the only row.
 
 ### Listing sessions
 
