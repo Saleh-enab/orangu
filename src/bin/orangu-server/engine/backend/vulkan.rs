@@ -7568,6 +7568,20 @@ impl VulkanBackend {
         if ops.is_empty() {
             return Vec::new();
         }
+        // Named up front rather than left to the first thing that trips on
+        // it: an activation left on the device (an empty host `x`) used to
+        // reach the MMQ stage as a zero-byte arena slice and panic inside
+        // the bind-group builder, three frames from the caller at fault.
+        for op in ops {
+            assert_eq!(
+                op.x.len(),
+                op.n_tokens * op.w.in_dim,
+                "matmul_batch op x is [n_tokens = {}, in_dim = {}] — got {} values",
+                op.n_tokens,
+                op.w.in_dim,
+                op.x.len()
+            );
+        }
 
         // The op's grid (`build_op_resources`) is sized by
         // `decode_rows_per_workgroup`, which is four rows when the wide

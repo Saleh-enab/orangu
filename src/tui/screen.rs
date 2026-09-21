@@ -43,6 +43,11 @@ pub struct MainScreenLayout {
     pub vertical_tab_area: Option<ratatui::layout::Rect>,
     pub header_area: ratatui::layout::Rect,
     pub output_area: ratatui::layout::Rect,
+    /// The one-column track of the output window's scrollbar, to the right
+    /// of the text: the modern frame's right margin, or a column the classic
+    /// frame gives up from its edge-to-edge output. `None` on the landing
+    /// screen, which has no output.
+    pub scrollbar_area: Option<ratatui::layout::Rect>,
     pub prompt_area: ratatui::layout::Rect,
     pub padded_prompt_area: ratatui::layout::Rect,
 }
@@ -424,8 +429,16 @@ pub fn main_screen_layout(
         _ => (None, above_prompt_content_area),
     };
 
+    // The rightmost column of `area`, `height` rows tall: where the output
+    // window's scrollbar runs.
+    let last_column = |area: ratatui::layout::Rect| ratatui::layout::Rect {
+        x: area.x + area.width.saturating_sub(1),
+        y: area.y,
+        width: u16::from(area.width > 0),
+        height: area.height,
+    };
     let is_landing_mode = !classic && !has_output_content && input.is_empty();
-    let (header_area, output_area) = if classic {
+    let (header_area, output_area, scrollbar_area) = if classic {
         // The banner is always on screen, pinned to the top with a single blank
         // row separating it from a full-width output window.
         let banner_rows = (crate::tui::widgets::CLASSIC_BANNER_HEIGHT as u16)
@@ -438,7 +451,17 @@ pub fn main_screen_layout(
                 ratatui::layout::Constraint::Min(0),
             ])
             .split(central_area);
-        (chunks[0], chunks[2])
+        // The edge-to-edge output gives up its last two columns: a blank
+        // one, then the scrollbar's track on the screen edge.
+        let output_area = if chunks[2].width > 4 {
+            ratatui::layout::Rect {
+                width: chunks[2].width - 2,
+                ..chunks[2]
+            }
+        } else {
+            chunks[2]
+        };
+        (chunks[0], output_area, Some(last_column(chunks[2])))
     } else if is_landing_mode {
         let v_chunks = ratatui::layout::Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
@@ -458,18 +481,24 @@ pub fn main_screen_layout(
                 ratatui::layout::Constraint::Min(0),
             ])
             .split(v_chunks[1]);
-        (h_chunks[1], ratatui::layout::Rect::default())
+        (h_chunks[1], ratatui::layout::Rect::default(), None)
     } else {
         let margin = ratatui::layout::Margin {
             horizontal: 2,
             vertical: 0,
         };
+        // The scrollbar runs in the outer column of the right margin, one
+        // blank column off the text.
         let output_area = if central_area.width > 4 {
             central_area.inner(margin)
         } else {
             central_area
         };
-        (ratatui::layout::Rect::default(), output_area)
+        (
+            ratatui::layout::Rect::default(),
+            output_area,
+            Some(last_column(central_area)),
+        )
     };
 
     // The classic prompt frame runs edge to edge; the modern one is inset to
@@ -491,9 +520,50 @@ pub fn main_screen_layout(
         vertical_tab_area,
         header_area,
         output_area,
+        scrollbar_area,
         prompt_area,
         padded_prompt_area,
     }
+}
+
+/// How many rows the transcript occupies once rendered at `width` — the
+/// count `draw_screen` scrolls over, from the same cache it draws from, so a
+/// caller can land the view exactly at the top (`OutputState::scroll_to_top`).
+pub fn transcript_rendered_rows(
+    transcript: &[TranscriptLine],
+    transcript_epoch: usize,
+    width: usize,
+    word_wrap: bool,
+) -> usize {
+    let theme = crate::tui::theme::Theme::current();
+    with_transcript_render_cache(
+        transcript,
+        transcript_epoch,
+        width,
+        word_wrap,
+        &theme,
+        |cache| cache.lines.len(),
+    )
+}
+
+/// What the output window's scrollbar shows, in `ScrollbarState`'s units:
+/// how many positions the view can be scrolled to (one per possible first
+/// visible row, so `total - visible + 1`) and which of them it is at (the
+/// index of the first visible row). ratatui puts the thumb at the foot when
+/// `position == content_length - 1`, which is why the length counts
+/// positions rather than rows. `None` when everything fits, so the bar only
+/// appears once there is something to scroll to.
+pub fn output_scrollbar_position(
+    total_rows: usize,
+    visible_rows: usize,
+    scroll_offset: usize,
+) -> Option<(usize, usize)> {
+    if total_rows <= visible_rows || visible_rows == 0 {
+        return None;
+    }
+    let max_scroll_offset = total_rows - visible_rows;
+    let scroll_offset = scroll_offset.min(max_scroll_offset);
+    Some((max_scroll_offset + 1, max_scroll_offset - scroll_offset))
 }
 
 pub fn draw_screen(frame: &mut ratatui::Frame, args: ScreenRenderArgs<'_>) {
@@ -582,7 +652,7 @@ pub fn draw_screen(frame: &mut ratatui::Frame, args: ScreenRenderArgs<'_>) {
         })
         .collect::<Vec<_>>();
 
-    let (_scroll_offset, visible_lines) = with_transcript_render_cache(
+    let (scrollbar, visible_lines) = with_transcript_render_cache(
         args.transcript,
         args.transcript_epoch,
         inner_width,
@@ -592,6 +662,8 @@ pub fn draw_screen(frame: &mut ratatui::Frame, args: ScreenRenderArgs<'_>) {
             let total_lines = cache.lines.len() + pending_lines.len();
             let max_scroll_offset = total_lines.saturating_sub(available_output_rows);
             let scroll_offset = args.scroll_offset.min(max_scroll_offset);
+            let scrollbar =
+                output_scrollbar_position(total_lines, available_output_rows, scroll_offset);
 
             let text_rows = available_output_rows;
 
@@ -636,7 +708,7 @@ pub fn draw_screen(frame: &mut ratatui::Frame, args: ScreenRenderArgs<'_>) {
                 }
             }
 
-            (scroll_offset, visible_lines)
+            (scrollbar, visible_lines)
         },
     );
 
@@ -648,6 +720,26 @@ pub fn draw_screen(frame: &mut ratatui::Frame, args: ScreenRenderArgs<'_>) {
         ratatui::widgets::Paragraph::new(visible_lines),
         layout.output_area,
     );
+
+    // The scrollbar, to the right of the output, once the transcript is taller
+    // than the window: a muted track with the thumb showing where the visible
+    // rows sit in the whole.
+    if let (Some(track), Some((positions, first_row))) = (layout.scrollbar_area, scrollbar)
+        && track.width > 0
+    {
+        let mut state = ratatui::widgets::ScrollbarState::new(positions)
+            .position(first_row)
+            .viewport_content_length(available_output_rows);
+        let scrollbar =
+            ratatui::widgets::Scrollbar::new(ratatui::widgets::ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_symbol("█")
+                .track_style(theme.muted)
+                .thumb_style(ratatui::style::Style::default().fg(theme.text_primary));
+        frame.render_stateful_widget(scrollbar, track, &mut state);
+    }
 
     // Render Prompt Frame
     let current_model =
@@ -1664,5 +1756,57 @@ mod tests {
         assert_eq!(rows_for_theme("modern_dark"), 18);
 
         crate::tui::Theme::apply_named("classic").expect("restore classic");
+    }
+
+    #[test]
+    fn scrollbar_runs_in_the_column_right_of_the_output() {
+        let _guard = crate::tui::theme::theme_test_guard();
+
+        for theme in ["classic", "modern_dark"] {
+            crate::tui::Theme::apply_named(theme).expect("theme");
+            let layout = main_screen_layout(80, 24, "", None, &[], true);
+            let track = layout
+                .scrollbar_area
+                .expect("an output window has a scrollbar");
+            // One column wide, on the screen edge, spanning the output rows,
+            // with a blank column between it and the text.
+            assert_eq!(track.width, 1, "{theme}");
+            assert_eq!(track.x, 79, "{theme}");
+            assert_eq!(track.y, layout.output_area.y, "{theme}");
+            assert_eq!(track.height, layout.output_area.height, "{theme}");
+            assert_eq!(
+                layout.output_area.x + layout.output_area.width,
+                track.x - 1,
+                "{theme}"
+            );
+        }
+        // The landing screen has no output to scroll.
+        crate::tui::Theme::apply_named("modern_dark").expect("theme");
+        assert!(
+            main_screen_layout(80, 24, "", None, &[], false)
+                .scrollbar_area
+                .is_none()
+        );
+
+        crate::tui::Theme::apply_named("classic").expect("restore classic");
+    }
+
+    #[test]
+    fn scrollbar_position_tracks_the_first_visible_row() {
+        // Everything fits: no bar.
+        assert_eq!(output_scrollbar_position(10, 10, 0), None);
+        assert_eq!(output_scrollbar_position(3, 10, 0), None);
+        // 100 rows in a 10-row window: 91 possible first rows. At the bottom
+        // (offset 0) the first visible row is the last page's, row 90 — the
+        // last position, where ratatui parks the thumb at the foot.
+        assert_eq!(output_scrollbar_position(100, 10, 0), Some((91, 90)));
+        // Scrolled all the way up, the first visible row is row 0 — an
+        // overshooting offset lands there too.
+        assert_eq!(output_scrollbar_position(100, 10, 90), Some((91, 0)));
+        assert_eq!(
+            output_scrollbar_position(100, 10, usize::MAX),
+            Some((91, 0))
+        );
+        assert_eq!(output_scrollbar_position(100, 10, 45), Some((91, 45)));
     }
 }

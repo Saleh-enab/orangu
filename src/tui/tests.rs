@@ -503,3 +503,54 @@ fn review_cursor_line_is_highlighted_across_the_whole_row() {
     // The comment marker sits on the last column inside the pane.
     assert_eq!(buffer.cell((right - 1, row)).unwrap().symbol(), "\u{25cf}");
 }
+
+#[test]
+fn output_scrollbar_appears_only_once_the_transcript_overflows() {
+    let _guard = crate::tui::theme::theme_test_guard();
+    crate::tui::Theme::apply_named("modern_dark").expect("theme");
+    let (width, height) = (80u16, 24u16);
+    let short: Vec<TranscriptLine> = (0..3)
+        .map(|i| TranscriptLine::Plain(format!("line {i}")))
+        .collect();
+    let tall: Vec<TranscriptLine> = (0..60)
+        .map(|i| TranscriptLine::Plain(format!("line {i}")))
+        .collect();
+    let layout = main_screen_layout(80, 24, "", None, &[], true);
+    let track = layout
+        .scrollbar_area
+        .expect("output has a scrollbar column");
+    let column = |rows: &[String]| -> String {
+        rows.iter()
+            .skip(track.y as usize)
+            .take(track.height as usize)
+            .map(|row| row.chars().nth(track.x as usize).unwrap_or(' '))
+            .collect()
+    };
+
+    // Everything fits: the column stays blank.
+    let mut terminal = setup_test_terminal(width, height);
+    let mut args = default_render_args();
+    args.transcript = &short;
+    terminal.draw(|f| renderer::render(f, &args)).unwrap();
+    let rows = screen_rows(&terminal, width, height);
+    assert!(column(&rows).trim().is_empty(), "{:?}", column(&rows));
+
+    // Overflowing, at the bottom: a track with the thumb at its foot.
+    args.transcript = &tall;
+    terminal.draw(|f| renderer::render(f, &args)).unwrap();
+    let rows = screen_rows(&terminal, width, height);
+    let bar = column(&rows);
+    assert!(bar.contains('█') && bar.contains('│'), "{bar:?}");
+    assert!(bar.ends_with('█'), "{bar:?}");
+    assert!(bar.starts_with('│'), "{bar:?}");
+
+    // Scrolled to the top (Ctrl+Home): the thumb is at the head.
+    args.scroll_offset = usize::MAX;
+    terminal.draw(|f| renderer::render(f, &args)).unwrap();
+    let rows = screen_rows(&terminal, width, height);
+    let bar = column(&rows);
+    assert!(bar.starts_with('█'), "{bar:?}");
+    assert!(bar.ends_with('│'), "{bar:?}");
+
+    crate::tui::Theme::apply_named("classic").expect("restore classic");
+}

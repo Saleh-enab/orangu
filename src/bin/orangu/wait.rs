@@ -163,6 +163,10 @@ async fn drive_handle(
     let mut interval = tokio::time::interval(WAIT_LOOP_POLL_INTERVAL);
     let mut thinking_frame = 0usize;
     let thinking_started = std::time::Instant::now();
+    // Blink the terminal title for the whole wait — thinking included — and
+    // drop back to the idle `orangu ★` on every way out (response, failure,
+    // cancel, quit, or parking the stream behind a tab switch).
+    let mut working_title = WorkingTitle::new();
     let mut last_rendered_output = String::new();
     let mut last_rendered_metrics = StreamMetrics::default();
     let mut last_tool_was_running = false;
@@ -274,6 +278,7 @@ async fn drive_handle(
             }
             _ = interval.tick() => {
                 let elapsed = thinking_started.elapsed();
+                working_title.tick(elapsed);
                 let next_frame = (elapsed.as_millis() / THINKING_FRAME_INTERVAL.as_millis()) as usize;
                 let mut redraw = next_frame != thinking_frame;
                 thinking_frame = next_frame;
@@ -503,6 +508,7 @@ pub(crate) async fn wait_for_local_command<T: Send + 'static>(
     let started = std::time::Instant::now();
     let mut interval = tokio::time::interval(WAIT_LOOP_POLL_INTERVAL);
     let mut frame = 0usize;
+    let mut working_title = WorkingTitle::new();
     loop {
         tokio::select! {
             result = &mut handle => {
@@ -510,6 +516,7 @@ pub(crate) async fn wait_for_local_command<T: Send + 'static>(
             }
             _ = interval.tick() => {
                 let elapsed = started.elapsed();
+                working_title.tick(elapsed);
                 let next_frame = (elapsed.as_millis() / THINKING_FRAME_INTERVAL.as_millis()) as usize;
                 if next_frame != frame {
                     frame = next_frame;
@@ -604,6 +611,7 @@ pub(crate) async fn wait_for_streaming_command(
     let started = std::time::Instant::now();
     let mut interval = tokio::time::interval(WAIT_LOOP_POLL_INTERVAL);
     let mut frame = 0usize;
+    let mut working_title = WorkingTitle::new();
     // Double-`Esc` sets the cooperative cancel flag (when the command supplied
     // one); the task then stops itself at its next check and this loop returns
     // via the `handle` arm. `spawn_blocking` tasks can't be aborted, so this
@@ -620,6 +628,7 @@ pub(crate) async fn wait_for_streaming_command(
             }
             _ = interval.tick() => {
                 let elapsed = started.elapsed();
+                working_title.tick(elapsed);
                 let next_frame = (elapsed.as_millis() / THINKING_FRAME_INTERVAL.as_millis()) as usize;
                 if next_frame != frame {
                     frame = next_frame;

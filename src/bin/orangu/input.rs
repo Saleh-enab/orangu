@@ -622,6 +622,19 @@ impl OutputState {
         self.scroll_offset = self.scroll_offset.saturating_sub(rows.max(1));
     }
 
+    /// Ctrl+Home: show the very first rows of the transcript. The offset is
+    /// counted from the bottom, so the top is `total_rows - visible_rows` —
+    /// set exactly, not saturated past it, so the next PageDown/wheel step
+    /// moves the view at once instead of first eating an overshoot.
+    pub fn scroll_to_top(&mut self, total_rows: usize, visible_rows: usize) {
+        self.scroll_offset = total_rows.saturating_sub(visible_rows);
+    }
+
+    /// Ctrl+End: back to the latest output, where new rows appear.
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = 0;
+    }
+
     pub fn line_up(&mut self) {
         self.scroll_up(1);
     }
@@ -1252,6 +1265,30 @@ pub fn handle_input_event_with_status(
                 (KeyCode::Right, _) => {
                     interrupt_state.reset();
                     input_state.move_right();
+                    redraw = true;
+                }
+                (KeyCode::Home, KeyModifiers::CONTROL) => {
+                    interrupt_state.reset();
+                    let layout = orangu::tui::main_screen_layout(
+                        input_context.render.actual_width,
+                        input_context.render.actual_height,
+                        input_state.as_str(),
+                        input_context.render.tab_bar,
+                        input_context.render.tab_statuses,
+                        true,
+                    );
+                    let total_rows = orangu::tui::transcript_rendered_rows(
+                        output_state.lines(),
+                        output_state.render_epoch(),
+                        layout.output_area.width as usize,
+                        input_context.render.word_wrap,
+                    );
+                    output_state.scroll_to_top(total_rows, layout.output_area.height as usize);
+                    redraw = true;
+                }
+                (KeyCode::End, KeyModifiers::CONTROL) => {
+                    interrupt_state.reset();
+                    output_state.scroll_to_bottom();
                     redraw = true;
                 }
                 (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
@@ -1923,6 +1960,22 @@ mod tests {
             output_state.lines().last().map(TranscriptLine::as_str),
             Some("line 10004")
         );
+    }
+
+    #[test]
+    fn ctrl_home_lands_exactly_at_the_top_and_ctrl_end_at_the_bottom() {
+        let mut output_state = OutputState::default();
+        output_state.scroll_to_top(100, 10);
+        assert_eq!(output_state.scroll_offset(), 90);
+        // Exactly the top, not past it: one page down moves the view at once.
+        output_state.page_down(10);
+        assert!(output_state.scroll_offset() < 90);
+
+        output_state.scroll_to_bottom();
+        assert_eq!(output_state.scroll_offset(), 0);
+        // A transcript that fits has nothing above the window.
+        output_state.scroll_to_top(5, 10);
+        assert_eq!(output_state.scroll_offset(), 0);
     }
 
     #[test]

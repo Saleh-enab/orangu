@@ -361,6 +361,8 @@ Path-completion details:
 - `Shift+PageDown` scrolls forward through the output window by a full page
 - `Alt+Up` scrolls backward one line at a time
 - `Alt+Down` scrolls forward one line at a time
+- `Ctrl+Home` jumps to the start of the output; `Ctrl+End` jumps back to the end, where new output appears
+- A scrollbar runs down the right edge of the output window whenever there is more output than fits; its thumb shows where the visible rows sit in the whole
 - The output scrollback buffer keeps the most recent 10,000 lines
 - Scrolling is limited to the output window; it does not replace the header or prompt area
 

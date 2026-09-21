@@ -2627,14 +2627,14 @@ pub(crate) async fn run_auto_review_mode(
         }
     }
     // When feedback is on, announce a completed run with the standard terminal
-    // bell and drop the blinking-dot title back to a plain `orangu`. Only a run
-    // that actually finished rings — a cancel (Esc Esc) or exit (Alt+x) does
-    // not.
+    // bell and drop the blinking-dot title back to the idle `orangu ★`. Only a
+    // run that actually finished rings — a cancel (Esc Esc) or exit (Alt+x)
+    // does not, but both still restore the idle title.
     if feedback {
         if state.done {
             ring_terminal_bell();
         }
-        set_terminal_title(Some(TERMINAL_TITLE));
+        set_terminal_title(Some(TERMINAL_TITLE_IDLE));
         std::io::stdout().flush()?;
     }
     // Keep the report on screen for browsing until Alt+x/Esc Esc — except
@@ -2921,14 +2921,18 @@ pub(crate) enum AutoReviewRequestOutcome {
     SwitchTab(crate::workspace_tab::TabAction),
 }
 
-/// The dot character the terminal title blinks on, per whether the file
-/// currently under review is Deep. A title is set via a plain OSC escape —
-/// its text reaches the OS's native window-title widget, not the terminal's
-/// own text renderer, so it can't carry ANSI color the way the `/auto_review`
-/// pane's dots do. `◆` vs `●` distinguishes Deep by shape instead, so both
-/// render at the same size.
-pub(crate) fn auto_review_terminal_title_dot(reviewing_deep: bool) -> &'static str {
-    if reviewing_deep { "◆" } else { "●" }
+/// The terminal title while a run is in progress: `orangu ●` blinking with
+/// `orangu ○` (`◆`/`◇` while the file under review is Deep) once per second
+/// off the whole-run clock, so a backgrounded window still shows orangu is
+/// working. Replaces the idle `orangu ★` (`TERMINAL_TITLE_IDLE`) for the
+/// duration of the run.
+pub(crate) fn auto_review_working_terminal_title(state: &AutoReviewState) -> String {
+    let solid = working_title_solid(state.elapsed());
+    let reviewing_deep = state.reviewing.is_some_and(|index| state.is_deep(index));
+    format!(
+        "{TERMINAL_TITLE} {}",
+        working_title_dot(reviewing_deep, solid)
+    )
 }
 
 /// Drive one auto review request, rendering the screen with a live status
@@ -3093,21 +3097,10 @@ pub(crate) async fn run_auto_review_request(
                 // frame clock: four frames on, four frames off.
                 let blink_on = (frame / 4).is_multiple_of(2);
                 // With feedback on, mirror the progress in the terminal title so
-                // a backgrounded window still shows the run is alive: `orangu ●`
-                // (`orangu ◆` while the file under review is Deep) with the dot
-                // blinking once per second off the whole-run clock.
+                // a backgrounded window still shows the run is alive: the dot
+                // blinks solid/hollow once per second off the whole-run clock.
                 if feedback {
-                    let dot_on = state.elapsed().as_secs().is_multiple_of(2);
-                    let reviewing_deep = state.reviewing.is_some_and(|index| state.is_deep(index));
-                    let title = if dot_on {
-                        format!(
-                            "{TERMINAL_TITLE} {}",
-                            auto_review_terminal_title_dot(reviewing_deep)
-                        )
-                    } else {
-                        TERMINAL_TITLE.to_string()
-                    };
-                    set_terminal_title(Some(&title));
+                    set_terminal_title(Some(&auto_review_working_terminal_title(state)));
                 }
                 print_auto_review_screen(state, viewport, chrome, status, blink_on, "", 0, "", print_screen_fn);
                 std::io::stdout().flush()?;
@@ -4601,12 +4594,38 @@ mod tests {
 
     #[test]
     fn auto_review_terminal_title_dot_changes_shape_not_color_while_reviewing_deep() {
-        use crate::review::auto_review_terminal_title_dot;
+        use crate::terminal::working_title_dot;
 
-        // Both plain characters, same rendered size — a title can't carry
+        // All plain characters, same rendered size — a title can't carry
         // color, so Deep is distinguished by shape instead.
-        assert_eq!(auto_review_terminal_title_dot(false), "●");
-        assert_eq!(auto_review_terminal_title_dot(true), "◆");
+        assert_eq!(working_title_dot(false, true), "●");
+        assert_eq!(working_title_dot(true, true), "◆");
+    }
+
+    #[test]
+    fn working_terminal_title_dot_blinks_between_solid_and_hollow() {
+        use crate::terminal::{working_title_dot, working_title_solid};
+        use std::time::Duration;
+
+        // The off phase is the hollow twin of the same shape, not an absent
+        // dot, so the title keeps its width and the shape stays legible.
+        assert_eq!(working_title_dot(false, false), "○");
+        assert_eq!(working_title_dot(true, false), "◇");
+        // One second solid, one second hollow, from the start of the work.
+        assert!(working_title_solid(Duration::ZERO));
+        assert!(working_title_solid(Duration::from_millis(999)));
+        assert!(!working_title_solid(Duration::from_secs(1)));
+        assert!(working_title_solid(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn idle_terminal_title_is_a_star_not_a_dot() {
+        use crate::terminal::{TERMINAL_TITLE, TERMINAL_TITLE_IDLE};
+
+        // Idle is told apart from working by a different glyph entirely: the
+        // resting title carries a star, never one of the blinking dots.
+        assert_eq!(TERMINAL_TITLE_IDLE, "orangu ★");
+        assert!(TERMINAL_TITLE_IDLE.starts_with(TERMINAL_TITLE));
     }
 
     #[test]

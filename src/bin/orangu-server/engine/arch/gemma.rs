@@ -1643,13 +1643,15 @@ gemma 4 checkpoint."
                         causal: self.causal,
                         scale: self.attention_scale,
                         // A dense layer hands the GPU buffer straight to
-                        // `fused_post_attention_prefill`; only a MoE
-                        // layer, whose FFN is CPU-orchestrated, needs
-                        // attention's output on the host.
-                        // A MoE layer's output projection ran on the host
-                        // path from the host copy; with the head chain it
-                        // reads the device's.
-                        want_attn_out_host: layer.moe.is_some() && !moe_head_takes_device_attn,
+                        // `fused_post_attention_prefill`; a layer whose
+                        // post-attention half runs on the host instead — a
+                        // MoE layer (CPU-orchestrated FFN), a dense layer
+                        // whose FFN the NPU holds, or a capturing run —
+                        // needs attention's output on the host for its
+                        // `wo` projection. With the MoE head chain that
+                        // projection reads the device's copy.
+                        want_attn_out_host: (layer.moe.is_some() || ffn_on_npu || capturing)
+                            && !moe_head_takes_device_attn,
                     };
                     match (batch.as_deref_mut(), one.as_deref_mut()) {
                         // `slot_id + 1`, as `forward` passes its own
@@ -2016,6 +2018,17 @@ gemma 4 checkpoint."
                         Some((logits, pending))
                     }
                     None => {
+                        // The chains above declined after attention left
+                        // its result on the device only (`want_attn_out_host`
+                        // was false, or the MoE head chain fell through):
+                        // fetch it, rather than feed `wo` an empty slice.
+                        let attn_elems = n_tokens * layer.wo.in_dim;
+                        if attn_out.len() != attn_elems
+                            && let (Some(buf), Some(v)) =
+                                (&fused_attn_buf, self.backend.as_wgpu_on(layer.wo.device()))
+                        {
+                            attn_out = v.readback_rows(buf, attn_elems);
+                        }
                         self.backend
                             .matmul_into(&mut attn_proj, &attn_out, n_tokens, &layer.wo);
                         tensor::rmsnorm_inplace(

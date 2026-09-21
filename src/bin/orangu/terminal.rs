@@ -18,6 +18,11 @@ use strum::IntoEnumIterator;
 
 pub(crate) const CLEAR_TERMINAL_SEQUENCE: &str = "\x1b[2J\x1b[H";
 pub(crate) const TERMINAL_TITLE: &str = "orangu";
+/// The terminal title whenever orangu is idle: `orangu ★`. The star is the
+/// resting state — a run in progress replaces it with a blinking dot (see
+/// `auto_review_working_terminal_title`), so a glance at a backgrounded window
+/// tells "waiting for you" apart from "still working".
+pub(crate) const TERMINAL_TITLE_IDLE: &str = "orangu ★";
 
 pub(crate) struct TerminalTitleGuard;
 
@@ -38,6 +43,70 @@ pub(crate) fn set_terminal_title(title: Option<&str>) {
     match title {
         Some(title) => print!("\x1b]0;{title}\x07"),
         None => print!("\x1b]0;\x07"),
+    }
+}
+
+/// The dot the terminal title blinks with while orangu works, per whether
+/// the work is Deep (only `/auto_review` distinguishes this) and which half
+/// of the blink this is. A title is set via a plain OSC escape — its text
+/// reaches the OS's native window-title widget, not the terminal's own text
+/// renderer, so it can't carry ANSI color the way the tab bar's dots do. `◆`
+/// vs `●` distinguishes Deep by shape instead, so both render at the same
+/// size, and the blink alternates the solid glyph with its hollow twin
+/// (`○`/`◇`) rather than dropping the dot altogether, so the title keeps a
+/// fixed width and the shape stays readable in either phase.
+pub(crate) fn working_title_dot(deep: bool, solid: bool) -> &'static str {
+    match (deep, solid) {
+        (true, true) => "◆",
+        (true, false) => "◇",
+        (false, true) => "●",
+        (false, false) => "○",
+    }
+}
+
+/// Whether the working dot is in its solid phase at `elapsed` into the work:
+/// one second solid, one second hollow.
+pub(crate) fn working_title_solid(elapsed: std::time::Duration) -> bool {
+    elapsed.as_secs().is_multiple_of(2)
+}
+
+/// Blinks the terminal title between `orangu ●` and `orangu ○` for as long as
+/// it lives, so a backgrounded window shows orangu is working (thinking,
+/// streaming, or running a command). Created at the start of a wait loop and
+/// ticked with the loop's elapsed time; the title is only re-sent when the dot
+/// actually changes, and dropping the guard restores the idle `orangu ★`.
+pub(crate) struct WorkingTitle {
+    dot: Option<&'static str>,
+}
+
+impl WorkingTitle {
+    /// Start blinking: the title shows the solid dot at once.
+    pub(crate) fn new() -> Self {
+        let mut title = Self { dot: None };
+        title.set(working_title_dot(false, true));
+        title
+    }
+
+    /// Advance the blink to `elapsed` into the work.
+    pub(crate) fn tick(&mut self, elapsed: std::time::Duration) {
+        self.set(working_title_dot(false, working_title_solid(elapsed)));
+    }
+
+    /// Show `dot` in the title, re-sending the OSC escape only on a change.
+    pub(crate) fn set(&mut self, dot: &'static str) {
+        if self.dot == Some(dot) {
+            return;
+        }
+        self.dot = Some(dot);
+        set_terminal_title(Some(&format!("{TERMINAL_TITLE} {dot}")));
+        let _ = std::io::stdout().flush();
+    }
+}
+
+impl Drop for WorkingTitle {
+    fn drop(&mut self) {
+        set_terminal_title(Some(TERMINAL_TITLE_IDLE));
+        let _ = std::io::stdout().flush();
     }
 }
 

@@ -491,7 +491,7 @@ async fn run() -> Result<()> {
     // Only from here on is there an interface to name: the modes above print to
     // stdout and exit, and a terminal-title escape sequence in that output is
     // something a script or a pipe has to strip.
-    let _terminal_title_guard = TerminalTitleGuard::new(TERMINAL_TITLE);
+    let _terminal_title_guard = TerminalTitleGuard::new(TERMINAL_TITLE_IDLE);
     // `--committer` opens the prompt on the merge flow instead of the greeting;
     // `--developer` is the default and names it. Both switch the same atomic
     // `/committer` and `/developer` do, and only the interface reads it.
