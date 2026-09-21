@@ -110,14 +110,14 @@ _orangu_server() {
             COMPREPLY=( $(compgen -W "off auto all cpu" -- "$cur") )
             return 0
             ;;
-        -p|--port|--web|--device|--threads)
+        -p|--port|--web|--device|--context|--threads)
             return 0
             ;;
     esac
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            "-c --config -w --workspace --host -p --port --web --device --device-split --threads -i --init -s --shell-completions -d --daemon \
+            "-c --config -w --workspace --host -p --port --web --device --device-split --context --threads -i --init -s --shell-completions -d --daemon \
              --all --code --review --explorer --embedding --image -o --output --binary --deep --sort -y --yes -h --help -V --version" -- "$cur") )
         return 0
     fi
@@ -186,6 +186,7 @@ _orangu_server() {
         '--web[Port the web console listens on, 0 to disable it (overrides the config file)]:port:' \
         '--device[GPU device to use exclusively: an index, part of its name, or auto]:device:' \
         '--device-split[Spread the model'"'"'s layers across the selected devices: off, auto, all, cpu, or shares like 3,1]:mode:(off auto all cpu)' \
+        '--context[Context (tokens) one request must fit on the device; layers move to the host to make room]:tokens:' \
         '--threads[Worker threads for every CPU path (default: one per logical core)]:n:' \
         '(-i --init)'{-i,--init}'[Interactively create ~/.orangu/orangu-server.conf and exit]' \
         '(-s --shell-completions)'{-s,--shell-completions}'[Print shell completion script for the detected shell and exit]' \
@@ -278,6 +279,7 @@ complete -c orangu-server -s p -l port                -x -d 'Port the HTTP API l
 complete -c orangu-server      -l web                 -x -d 'Port the web console listens on, 0 to disable it (overrides the config file)'
 complete -c orangu-server      -l device              -x -d 'GPU device to use exclusively: an index, part of its name, or auto'
 complete -c orangu-server      -l device-split        -x -a 'off auto all cpu' -d 'Spread the model\'s layers across the selected devices: off, auto, all, cpu, or shares like 3,1'
+complete -c orangu-server      -l context             -x -d 'Context (tokens) one request must fit on the device; layers move to the host to make room'
 complete -c orangu-server      -l threads             -x -d 'Worker threads for every CPU path (default: one per logical core)'
 complete -c orangu-server -s i -l init                    -d 'Interactively create ~/.orangu/orangu-server.conf and exit'
 complete -c orangu-server -s s -l shell-completions       -d 'Print shell completion script for the detected shell and exit'
@@ -325,6 +327,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-server' -ScriptBlock {
         @('--web', 'Port the web console listens on, 0 to disable it (overrides the config file)'),
         @('--device', 'GPU device to use exclusively: an index, part of its name, or auto'),
         @('--device-split', 'Spread the model''s layers across the selected devices: off, auto, all, cpu, or shares like 3,1'),
+        @('--context', 'Context (tokens) one request must fit on the device; layers move to the host to make room'),
         @('--threads', 'Worker threads for every CPU path (default: one per logical core)'),
         @('-i', '--init', 'Interactively create ~/.orangu/orangu-server.conf and exit'),
         @('-s', '--shell-completions', 'Print shell completion script for the detected shell and exit'),
@@ -392,7 +395,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-server' -ScriptBlock {
         '--host' { return Offer @('all', '0.0.0.0', '127.0.0.1') }
         '--sort' { return Offer @('size', 'last-used') }
         '--device-split' { return Offer @('off', 'auto', 'all', 'cpu') }
-        { $_ -in '-p', '--port', '--web', '--device', '--threads' } { return }
+        { $_ -in '-p', '--port', '--web', '--device', '--context', '--threads' } { return }
     }
 
     if ($wordToComplete.StartsWith('-')) {

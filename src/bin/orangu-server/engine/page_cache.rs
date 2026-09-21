@@ -340,6 +340,9 @@ fn page_size() -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// A temporary file of `bytes`, mapped — for the tests of the Linux
+    /// paths, which are the only ones that read a mapping.
+    #[cfg(target_os = "linux")]
     fn mapped(bytes: &[u8]) -> (tempfile::NamedTempFile, Arc<Mmap>) {
         use std::io::Write as _;
         let mut file = tempfile::NamedTempFile::new().expect("temp file");

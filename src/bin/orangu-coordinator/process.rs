@@ -1143,16 +1143,14 @@ fn match_hint<'a>(
 /// [`Coordinator::shutdown`] to terminate a still-starting `orangu-server`
 /// process that has no live `tokio::process::Child` handle left to call
 /// `start_kill()` on (see `current_pid`'s doc comment). Best-effort: an
-/// already-gone PID is simply a no-op.
+/// already-gone PID is simply a no-op. Its two callers are gated the same
+/// way, so there is no other-platform arm to leave unused.
 #[cfg(unix)]
 fn kill_pid(pid: u32) {
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGINT);
     }
 }
-
-#[cfg(not(unix))]
-fn kill_pid(_pid: u32) {}
 
 /// Writes a `#!/bin/sh` script with `body` as its content to a fresh
 /// temp file, makes it executable, and leaks it (never auto-deleted) so
