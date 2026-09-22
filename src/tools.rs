@@ -13,7 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::graph::status::GraphBuildStatus;
+use crate::graph::status::{GraphBuildStatus, ScanActivity};
 use crate::graph::store::GraphStore;
 use crate::llm::{FunctionDefinition, ToolDefinition};
 use anyhow::{Result, anyhow};
@@ -50,6 +50,10 @@ pub struct ToolExecutor {
     /// see `GraphBuildStatus`. Surfaced as the Graph dot in `/auto_review`'s
     /// status bar.
     pub graph_status: Arc<Mutex<GraphBuildStatus>>,
+    /// Whether a workspace scan is running right now — see [`ScanActivity`].
+    /// `/graph` waits on this rather than reporting a graph that isn't built
+    /// yet, and scans the workspace itself when nothing else is scanning it.
+    pub graph_scans: ScanActivity,
     /// Optional workspace-scoped MCP services. Read-only executors never
     /// attach one, so external tools cannot bypass their safety boundary.
     mcp: Option<Arc<crate::mcp::McpManager>>,
@@ -152,6 +156,7 @@ impl ToolExecutor {
             tool_counts: Arc::new(Mutex::new(std::collections::HashMap::new())),
             graph_store: Arc::new(Mutex::new(None)),
             graph_status: Arc::new(Mutex::new(GraphBuildStatus::default())),
+            graph_scans: ScanActivity::default(),
             mcp: None,
             licence: Arc::new(Mutex::new(crate::license::Choice::default())),
         }
@@ -536,11 +541,57 @@ impl ToolExecutor {
         }
     }
 
+    /// Blocks until [`Self::graph_store`] holds a graph, so a caller can work
+    /// with the Knowledge Graph instead of being told it isn't ready.
+    ///
+    /// A scan that is already running (the startup scan `orangu` kicks off)
+    /// is waited out: it runs on its own thread and publishes the store
+    /// itself, so waiting here cannot stall it. Once nothing is scanning the
+    /// store is final — still empty means nobody ever scanned this workspace
+    /// (a `-p` one-shot starts no background scan), so this scans it here.
+    /// The store lock is held across that scan, which keeps two callers from
+    /// scanning the same workspace at once: the second blocks, then finds the
+    /// graph the first published.
+    pub fn ensure_graph(&self) -> Result<()> {
+        while self
+            .graph_store
+            .lock()
+            .map_err(|_| anyhow!("graph_store mutex poisoned"))?
+            .is_none()
+            && self.graph_scans.is_scanning()
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let mut guard = self
+            .graph_store
+            .lock()
+            .map_err(|_| anyhow!("graph_store mutex poisoned"))?;
+        if guard.is_some() {
+            return Ok(());
+        }
+        {
+            let _scan = self.graph_scans.begin();
+            let result = crate::agents::hooks::run_session_start_hook(&self.workspace);
+            *guard = Some(result.store);
+        }
+        drop(guard);
+        if let Ok(mut status) = self.graph_status.lock() {
+            *status = GraphBuildStatus::Ready;
+        }
+        Ok(())
+    }
+
     fn graph_lookup(&self, arguments: &Map<String, Value>) -> Result<String> {
         let symbol = arguments
             .get("symbol")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("missing 'symbol' argument"))?;
+
+        // A lookup waits for the workspace scan rather than answering "not
+        // built yet": a moment's wait beats an answer the model has to retry,
+        // and a retry it never makes reads as "this symbol does not exist".
+        self.ensure_graph()?;
 
         let guard = self
             .graph_store
@@ -549,8 +600,8 @@ impl ToolExecutor {
 
         match &*guard {
             None => Ok(format!(
-                "[graph_lookup] The Knowledge Graph is still being built. \
-                 Try again in a moment.\n(Searched for: \"{}\")",
+                "[graph_lookup] No Knowledge Graph could be built for this \
+                 workspace.\n(Searched for: \"{}\")",
                 symbol
             )),
             Some(store) => {
@@ -1744,6 +1795,125 @@ mod file_lifecycle_tool_tests {
         assert_eq!(
             fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
             "secret\n"
+        );
+    }
+}
+
+#[cfg(test)]
+mod graph_tool_tests {
+    use super::*;
+    use crate::graph::extract::ExtractedNode;
+    use crate::graph::store::GraphStore;
+    use serde_json::json;
+
+    fn lookup(tools: &ToolExecutor, symbol: &str) -> String {
+        let arguments: Map<String, Value> = [("symbol".to_string(), json!(symbol))]
+            .into_iter()
+            .collect();
+        tools.graph_lookup(&arguments).expect("graph_lookup")
+    }
+
+    /// Removes the graph cache a scan of `workspace` leaves under
+    /// `~/.orangu/workspace/`, which outlives the temporary directory it was
+    /// keyed by.
+    fn forget_scan(workspace: &Path) {
+        let cache = crate::workspace_cache::workspace_cache_dir(workspace, "graph");
+        let _ = fs::remove_dir_all(&cache);
+        // And the per-workspace directory holding it, if it now holds nothing.
+        if let Some(parent) = cache.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+
+    fn workspace_with_a_symbol() -> tempfile::TempDir {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::create_dir_all(workspace.path().join("src")).expect("src dir");
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            "pub fn scanned_symbol() {}\n",
+        )
+        .expect("src file");
+        workspace
+    }
+
+    /// A lookup that lands while the startup scan is still running waits for
+    /// that scan and answers from its graph, rather than reporting a graph
+    /// that isn't built — an answer the model reads as "no such symbol".
+    #[test]
+    fn graph_lookup_waits_for_a_scan_that_is_still_running() {
+        let workspace = workspace_with_a_symbol();
+        let tools = ToolExecutor::new(workspace.path());
+
+        // A scan that takes its time, and publishes a symbol that scanning
+        // the workspace would not turn up.
+        let scan = tools.graph_scans.begin();
+        let scan_store = tools.graph_store.clone();
+        let scanner = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let mut store = GraphStore::new();
+            store.add_node(ExtractedNode {
+                id: "published_symbol".to_string(),
+                label: "published_symbol".to_string(),
+                source_file: "src/lib.rs".to_string(),
+                source_location: "1".to_string(),
+                kind: "function".to_string(),
+            });
+            *scan_store.lock().expect("store") = Some(store);
+            // Published before the guard drops, so a waiter that sees no scan
+            // running can take the store as final.
+            drop(scan);
+        });
+
+        let started = std::time::Instant::now();
+        let answer = lookup(&tools, "published_symbol");
+        let waited = started.elapsed();
+        scanner.join().expect("scanner");
+
+        assert!(
+            waited >= std::time::Duration::from_millis(200),
+            "expected the lookup to wait for the scan, answered after {waited:?}"
+        );
+        assert!(
+            answer.contains("published_symbol") && !answer.contains("No Knowledge Graph"),
+            "expected the scan's own graph, got {answer:?}"
+        );
+    }
+
+    /// Nothing is scanning this workspace — a `-p` one-shot starts no
+    /// background scan — so the lookup scans it itself and answers from the
+    /// graph it just built.
+    #[test]
+    fn graph_lookup_scans_the_workspace_when_nothing_else_is_building_it() {
+        let workspace = workspace_with_a_symbol();
+        let tools = ToolExecutor::new(workspace.path());
+        assert!(tools.graph_store.lock().expect("store").is_none());
+
+        let answer = lookup(&tools, "scanned_symbol");
+        forget_scan(workspace.path());
+
+        assert!(
+            answer.contains("scanned_symbol"),
+            "expected the symbol it scanned, got {answer:?}"
+        );
+        // The graph it built stays live for the next lookup, and it no longer
+        // counts as a scan in flight.
+        assert!(tools.graph_store.lock().expect("store").is_some());
+        assert!(!tools.graph_scans.is_scanning());
+    }
+
+    /// A symbol the graph does not hold is still reported as missing — the
+    /// wait is not a licence to answer "not built yet" in disguise.
+    #[test]
+    fn a_missing_symbol_is_reported_as_missing() {
+        let workspace = workspace_with_a_symbol();
+        let tools = ToolExecutor::new(workspace.path());
+
+        let answer = lookup(&tools, "no_such_symbol_anywhere");
+        forget_scan(workspace.path());
+
+        assert!(
+            answer.contains("No symbol matching"),
+            "expected a not-found answer, got {answer:?}"
         );
     }
 }

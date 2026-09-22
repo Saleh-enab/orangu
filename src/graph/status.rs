@@ -37,3 +37,77 @@ pub enum GraphBuildStatus {
     /// will stay empty for the rest of the session.
     Failed,
 }
+
+/// How many workspace scans are running right now, shared by everyone who
+/// starts one (the startup scan in `orangu`'s event loop) and read by anyone
+/// who would rather wait for a graph than go without it.
+///
+/// It answers the one question [`GraphBuildStatus`] cannot: `Building` is the
+/// default, so it reads the same whether a scan is under way or none was ever
+/// started (a `-p "/graph"` one-shot starts none). A waiter needs to tell
+/// those apart — the first is worth waiting for, the second means the waiter
+/// has to scan the workspace itself.
+///
+/// A scan raises the count with [`ScanActivity::begin`] and lowers it when the
+/// returned guard drops, so a scan that panics or is cancelled still releases
+/// its waiters. A scan must publish its store *before* its guard drops: a
+/// waiter that sees nothing scanning takes the store as final.
+#[derive(Clone, Debug, Default)]
+pub struct ScanActivity(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl ScanActivity {
+    /// Registers a scan as running until the returned guard is dropped.
+    pub fn begin(&self) -> ScanGuard {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ScanGuard(self.0.clone())
+    }
+
+    /// Whether at least one scan is running.
+    pub fn is_scanning(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+}
+
+/// Keeps a [`ScanActivity`] count raised for as long as it lives.
+pub struct ScanGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ScanGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_activity_tracks_running_scans() {
+        let activity = ScanActivity::default();
+        assert!(!activity.is_scanning());
+
+        let outer = activity.begin();
+        assert!(activity.is_scanning());
+        {
+            let _inner = activity.begin();
+            assert!(activity.is_scanning());
+        }
+        // The inner scan ended; the outer one is still running.
+        assert!(activity.is_scanning());
+        drop(outer);
+        assert!(!activity.is_scanning());
+    }
+
+    /// A scan that panics still has to release whoever is waiting on it.
+    #[test]
+    fn a_panicking_scan_releases_its_waiters() {
+        let activity = ScanActivity::default();
+        let scanner = activity.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _scan = scanner.begin();
+            panic!("scan blew up");
+        });
+        assert!(result.is_err());
+        assert!(!activity.is_scanning());
+    }
+}

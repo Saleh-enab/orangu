@@ -2387,14 +2387,16 @@ pub(crate) fn handle_command(
         )),
         LocalCommand::PendingDelete(Some(index)) => Ok(CommandOutcome::PendingDelete(index)),
         LocalCommand::Graph => {
+            // `/graph` produces a file, so it waits for the graph instead of
+            // handing back a "try again" — see `ToolExecutor::ensure_graph`.
+            tools.ensure_graph()?;
             let guard = tools
                 .graph_store
                 .lock()
                 .map_err(|_| anyhow::anyhow!("graph store mutex poisoned"))?;
             match &*guard {
                 None => Ok(CommandOutcome::OutputError(
-                    "Knowledge Graph is still being built — please wait a moment and try again."
-                        .to_string(),
+                    "Could not build the Knowledge Graph for this workspace.".to_string(),
                 )),
                 Some(store) => {
                     let repo_name = crate::export::repository_display(workspace);
@@ -3258,6 +3260,168 @@ mod tests {
             );
             assert_eq!(crate::mode::current(), mode, "{input:?} did not switch");
         }
+    }
+
+    /// Runs `/graph` against `tools`, returning the outcome.
+    fn run_graph_command(tools: &ToolExecutor, workspace: &std::path::Path) -> CommandOutcome {
+        let llms = HashMap::from([(
+            "llama".to_string(),
+            test_profile("http://localhost:8100/v1", "gemma"),
+        )]);
+        let mut active_model = "llama".to_string();
+        let mut active_model_id = "gemma".to_string();
+        let mut current_endpoint = Some(normalized_openai_endpoint("http://localhost:8100/v1"));
+        let mut session = ChatSession::new("system");
+
+        handle_command(
+            "/graph",
+            CommandState {
+                active_model: &mut active_model,
+                active_model_id: &mut active_model_id,
+                current_endpoint: &mut current_endpoint,
+                session: &mut session,
+                detect_model: &mut false,
+            },
+            CommandContext {
+                skills: &orangu::skills::SkillRegistry::discover(std::path::Path::new("/")),
+                startup_model: "llama",
+                startup_endpoint: "http://localhost:8100/v1",
+                llms: &llms,
+                tools,
+                workspace,
+                session_dir: workspace,
+                embeddings_server: "",
+                is_coordinator: false,
+                usage_stats: &super::UsageStats::new(),
+                available_models: &[],
+                virtual_width: 512,
+                auto_rebase: false,
+                auto_squash: false,
+                compile_workers: 1,
+                compression: false,
+                terminal: "",
+                forge: crate::git::Forge::GitHub,
+                semantic_budget_tokens: 16384,
+                config_path: workspace,
+                review_reports: crate::git::ReviewReports::default(),
+            },
+        )
+        .expect("handle command")
+    }
+
+    /// Removes the graph cache a scan of `workspace` leaves under
+    /// `~/.orangu/workspace/`, which outlives the temporary directory it was
+    /// keyed by.
+    fn forget_scan(workspace: &std::path::Path) {
+        let cache = orangu::workspace_cache::workspace_cache_dir(workspace, "graph");
+        let _ = fs::remove_dir_all(&cache);
+        // And the per-workspace directory holding it, if it now holds nothing.
+        if let Some(parent) = cache.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+
+    /// The HTML files `/graph` could have written in `workspace`.
+    fn graph_files(workspace: &std::path::Path) -> Vec<std::path::PathBuf> {
+        fs::read_dir(workspace)
+            .expect("workspace")
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.to_string_lossy().ends_with("-graph.html"))
+            .collect()
+    }
+
+    /// Nothing is scanning this workspace — a `-p "/graph"` one-shot starts no
+    /// background scan — so the command scans it itself rather than reporting a
+    /// graph that isn't built. Either way it comes back with a written file.
+    #[test]
+    fn graph_scans_the_workspace_when_nothing_else_is_building_it() {
+        let workspace = tempdir().expect("workspace");
+        fs::create_dir_all(workspace.path().join("src")).expect("src dir");
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            "pub fn graphed_symbol() {}\n",
+        )
+        .expect("src file");
+        let tools = ToolExecutor::new(workspace.path());
+        assert!(tools.graph_store.lock().expect("store").is_none());
+
+        let outcome = run_graph_command(&tools, workspace.path());
+        forget_scan(workspace.path());
+
+        let CommandOutcome::MarkdownOutput(message) = outcome else {
+            panic!("expected the written-to message from /graph");
+        };
+        let written = graph_files(workspace.path());
+        assert_eq!(written.len(), 1, "expected one graph file, got {written:?}");
+        let name = written[0]
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            message.contains(&format!("[{name}]")),
+            "{message:?} should name the file it wrote"
+        );
+        // The scan it ran is left behind for `graph_lookup` and the next
+        // `/graph`, and is no longer registered as running.
+        assert!(tools.graph_store.lock().expect("store").is_some());
+        assert!(!tools.graph_scans.is_scanning());
+    }
+
+    /// A `/graph` that arrives while the startup scan is still running waits
+    /// for that scan instead of telling the caller to try again — and uses its
+    /// graph rather than scanning the workspace a second time.
+    #[test]
+    fn graph_waits_for_a_scan_that_is_still_running() {
+        use orangu::graph::extract::ExtractedNode;
+        use orangu::graph::store::GraphStore;
+
+        let workspace = tempdir().expect("workspace");
+        fs::create_dir_all(workspace.path().join("src")).expect("src dir");
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            "pub fn one() {}\npub fn two() {}\npub fn three() {}\n",
+        )
+        .expect("src file");
+        let tools = ToolExecutor::new(workspace.path());
+
+        // A scan that takes its time and publishes a store nothing else would
+        // produce: a single node, where scanning the files would find three.
+        let scan = tools.graph_scans.begin();
+        let scan_store = tools.graph_store.clone();
+        let scanner = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let mut store = GraphStore::new();
+            store.add_node(ExtractedNode {
+                id: "only::node".to_string(),
+                label: "only".to_string(),
+                source_file: "src/lib.rs".to_string(),
+                source_location: "1".to_string(),
+                kind: "function".to_string(),
+            });
+            *scan_store.lock().expect("store") = Some(store);
+            // Published before the guard drops, so a waiter that sees no scan
+            // running can take the store as final.
+            drop(scan);
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = run_graph_command(&tools, workspace.path());
+        let waited = started.elapsed();
+        scanner.join().expect("scanner");
+
+        let CommandOutcome::MarkdownOutput(message) = outcome else {
+            panic!("expected the written-to message from /graph");
+        };
+        assert!(
+            waited >= std::time::Duration::from_millis(200),
+            "expected the command to wait for the scan, returned after {waited:?}"
+        );
+        assert!(
+            message.contains("(1 nodes / 0 edges)"),
+            "{message:?} should report the scan's own graph"
+        );
+        assert_eq!(graph_files(workspace.path()).len(), 1);
     }
 
     #[test]

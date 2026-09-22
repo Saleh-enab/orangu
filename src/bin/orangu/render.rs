@@ -597,9 +597,13 @@ fn describe_image_url(url: &str) -> String {
 /// The label keeps the link colour and underline so it still reads as a link
 /// where OSC 8 is unsupported (there the control sequence is ignored and the
 /// styled label remains). An empty label falls back to showing the URL itself.
+///
+/// The sequence is terminated by BEL rather than `ESC \`: the transcript is
+/// drawn through `ansi_to_tui`, whose OSC parser only ends on BEL, so an
+/// `ESC \`-terminated link would swallow the label and the rest of the line.
 pub fn render_link(label: &str, url: &str) -> String {
     let shown = if label.is_empty() { url } else { label };
-    format!("\x1b]8;;{url}\x1b\\{ANSI_FG_LINK}{shown}{ANSI_FG_RESET}\x1b]8;;\x1b\\")
+    format!("\x1b]8;;{url}\x07{ANSI_FG_LINK}{shown}{ANSI_FG_RESET}\x1b]8;;\x07")
 }
 
 pub fn render_list(list: &List) -> String {
@@ -943,6 +947,32 @@ mod tests {
         assert!(!rendered.contains("## Heading"));
         assert!(!rendered.contains("`code`"));
         assert!(!rendered.contains("> note"));
+    }
+
+    /// The transcript is drawn through `ansi_to_tui`, which ends an OSC
+    /// sequence only on BEL: a link must keep its label and whatever follows
+    /// it on the line, as `/graph`'s "written to: [file](url) (N nodes)" does.
+    #[test]
+    fn rendered_link_keeps_its_label_through_ansi_to_tui() {
+        use ansi_to_tui::IntoText;
+
+        let line = format!(
+            "Knowledge Graph written to: {} (3 nodes / 2 edges)",
+            render_link(
+                "orangu-main-graph.html",
+                "file:///tmp/orangu-main-graph.html"
+            )
+        );
+        let text = line.into_text().expect("parses");
+        let shown: String = text.lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(
+            shown,
+            "Knowledge Graph written to: orangu-main-graph.html (3 nodes / 2 edges)"
+        );
     }
 
     #[test]

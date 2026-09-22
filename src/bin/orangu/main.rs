@@ -788,15 +788,41 @@ async fn run() -> Result<()> {
     // collected in the event loop below, exactly like `sync_handle` / `pr_handle`.
     //
     // `kg_store` is shared between `tools` (reads it for `graph_lookup`) and
-    // the event loop below (writes into it once the scan finishes). `kg_status`
-    // is the same pairing for the build-status signal `/auto_review`'s status
-    // bar reads (`GraphBuildStatus`): `Building` until this block sets it.
+    // this task, which writes into it the moment the scan finishes rather than
+    // when the event loop below collects the handle: `/graph` waits on the
+    // store, so it must go live as soon as it exists. `kg_status` is the same
+    // pairing for the build-status signal `/auto_review`'s status bar reads
+    // (`GraphBuildStatus`): `Building` until the scan sets it.
+    //
+    // `scan_activity` marks the scan as running for as long as the task
+    // lives. The store is published *before* that guard drops, so a waiter
+    // that sees nothing scanning can take the store as final — and a task
+    // that panics still drops the guard and releases its waiters.
     let kg_store = tools.graph_store.clone(); // Arc pointer shared with ToolExecutor
     let kg_status = tools.graph_status.clone();
+    let scan_store = kg_store.clone();
+    let scan_status = kg_status.clone();
+    let scan_activity = tools.graph_scans.clone();
     let scan_workspace = tools.workspace().to_path_buf();
     let mut kg_scan_handle: Option<tokio::task::JoinHandle<_>> =
         Some(tokio::task::spawn_blocking(move || {
-            run_session_start_hook(&scan_workspace)
+            let _scan = scan_activity.begin();
+            let result = run_session_start_hook(&scan_workspace);
+            // The per-file hash table the incremental rescan starts from,
+            // seeded here because the store itself moves into the shared Arc.
+            let file_hashes: std::collections::HashMap<String, String> = result
+                .store
+                .all_nodes()
+                .iter()
+                .map(|n| (n.source_file.clone(), String::new()))
+                .collect();
+            if let Ok(mut guard) = scan_store.lock() {
+                *guard = Some(result.store);
+            }
+            if let Ok(mut status) = scan_status.lock() {
+                *status = orangu::graph::status::GraphBuildStatus::Ready;
+            }
+            file_hashes
         }));
 
     // Per-file sha256 hashes used by the incremental KG rescan.
@@ -1388,31 +1414,17 @@ async fn run() -> Result<()> {
             completion::set_issue_metadata(metadata);
         }
 
-        // Collect the Knowledge Graph scan result once it finishes and push a
-        // short summary to the output pane (mirrors the sync-notice pattern).
+        // Collect the Knowledge Graph scan once it finishes. The store and the
+        // build status are already live (the task publishes them itself); what
+        // is collected here is the per-file hash table the incremental rescan
+        // starts from, and a scan that died without publishing anything.
         if kg_scan_handle
             .as_ref()
             .is_some_and(|handle| handle.is_finished())
             && let Some(handle) = kg_scan_handle.take()
         {
             match handle.await {
-                Ok(result) => {
-                    // Seed the per-file hash table from the initial full scan.
-                    kg_file_hashes = result
-                        .store
-                        .all_nodes()
-                        .iter()
-                        .map(|n| (n.source_file.clone(), String::new()))
-                        .collect();
-                    // Write the finished store into the shared Arc so the
-                    // `graph_lookup` tool becomes live for the agent.
-                    if let Ok(mut guard) = kg_store.lock() {
-                        *guard = Some(result.store);
-                    }
-                    if let Ok(mut status) = kg_status.lock() {
-                        *status = orangu::graph::status::GraphBuildStatus::Ready;
-                    }
-                }
+                Ok(file_hashes) => kg_file_hashes = file_hashes,
                 Err(err) => {
                     output_state.push_text(&format!("Knowledge graph scan failed: {err:#}"));
                     if let Ok(mut status) = kg_status.lock() {

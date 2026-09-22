@@ -106,6 +106,12 @@ impl GraphCache {
     /// Saves the current `store` and `file_hashes` to `path`, creating any
     /// missing parent directories. Silently ignores write errors to avoid
     /// crashing the session over a non-critical cache failure.
+    ///
+    /// The file is written through a per-process temporary and renamed into
+    /// place, so a reader never sees half a cache and two scanners of the same
+    /// workspace — two sessions, or a `graph_lookup` in a subagent that keeps
+    /// its own graph — cannot interleave into one corrupt file. The loser of
+    /// that race simply overwrites the winner with an equivalent cache.
     pub fn save(path: &Path, store: &GraphStore, file_hashes: &HashMap<String, String>) {
         let edges: Vec<CachedEdge> = store
             .all_edge_data()
@@ -131,7 +137,10 @@ impl GraphCache {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(path, json);
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        if std::fs::write(&temporary, json).is_ok() && std::fs::rename(&temporary, path).is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
     }
 
     /// Returns `true` if the file at `path` (relative string key) has a
@@ -142,5 +151,42 @@ impl GraphCache {
             Some(cached) => cached != current_hash,
             None => true, // not in cache → new file, must scan
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::extract::ExtractedNode;
+
+    /// A saved cache loads back, and the rename leaves no temporary behind for
+    /// the next scan (or a `du` of `~/.orangu`) to trip over.
+    #[test]
+    fn a_saved_cache_loads_back_and_leaves_no_temporary() {
+        let dir = tempfile::tempdir().expect("cache dir");
+        let path = dir.path().join("graph").join("cache.json");
+        let mut store = GraphStore::new();
+        store.add_node(ExtractedNode {
+            id: "cached::symbol".to_string(),
+            label: "symbol".to_string(),
+            source_file: "src/lib.rs".to_string(),
+            source_location: "1".to_string(),
+            kind: "function".to_string(),
+        });
+        let hashes = HashMap::from([("src/lib.rs".to_string(), "abc".to_string())]);
+
+        GraphCache::save(&path, &store, &hashes);
+
+        let (cache, loaded) = GraphCache::load(&path).expect("cache loads back");
+        assert_eq!(loaded.stats().node_count, 1);
+        assert!(!cache.is_stale("src/lib.rs", "abc"));
+        assert!(cache.is_stale("src/lib.rs", "def"));
+
+        let left_behind: Vec<String> = std::fs::read_dir(path.parent().expect("parent"))
+            .expect("cache dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(left_behind, vec!["cache.json".to_string()]);
     }
 }
