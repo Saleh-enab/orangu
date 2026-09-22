@@ -934,6 +934,27 @@ pub struct PullRequestDetail {
     pub checks: Vec<PullRequestCheck>,
 }
 
+/// A full snapshot of one open issue for the `/export issue` report — as
+/// much detail as [`fetch_issue_details`] can get from the forge CLI in a
+/// single list call.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IssueDetail {
+    pub number: u64,
+    pub title: String,
+    pub author: String,
+    pub created_at: String,
+    pub updated_at: String,
+    /// The milestone's title, or empty when the issue has none.
+    pub milestone: String,
+    pub comment_count: usize,
+    pub assignees: Vec<String>,
+    pub labels: Vec<String>,
+    /// The issue's description, as Markdown (empty when it has none).
+    pub body: String,
+    pub last_comment: Option<PullRequestComment>,
+    pub url: String,
+}
+
 /// Fetch every open pull/merge request in the repository containing
 /// `workspace`, with as much detail as the forge CLI can return in one call:
 /// conflicts, comments, reviewers (and their review state), assignees, and
@@ -1034,6 +1055,187 @@ pub fn parse_pull_request_details(stdout: &[u8], forge: Forge) -> Result<Vec<Pul
         .collect())
 }
 
+/// Fetch every open issue in the repository containing `workspace`, with as
+/// much detail as the forge CLI can return in one call: comments, assignees,
+/// labels, milestone, and the description. Used by `/export issue`.
+///
+/// GitHub: `gh issue list --json ...` — a single call that already excludes
+/// pull requests and carries the conversation comments. GitLab: `glab api
+/// projects/:id/issues?state=opened` (the REST list endpoint), paginated so
+/// a repository with more than one page of issues is reported in full;
+/// GitLab's list response carries only a comment count, not the comments
+/// themselves, so GitLab issues have no last comment.
+///
+/// Like [`fetch_pull_request_details`], CLI/network failures surface as
+/// `Err`, since `/export issue` is an explicit user action that should
+/// report why the report could not be built rather than silently producing
+/// an empty one.
+pub fn fetch_issue_details(workspace: &Path, forge: Forge) -> Result<Vec<IssueDetail>> {
+    let repo_root = discover_git_root(workspace)
+        .ok_or_else(|| anyhow!("export issue is only available inside a Git repository"))?;
+    let cli = forge.cli();
+    let args: Vec<&str> = match forge {
+        Forge::GitHub => vec![
+            "issue",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            "1000",
+            "--json",
+            "number,title,author,createdAt,updatedAt,milestone,comments,assignees,labels,body,url",
+        ],
+        Forge::GitLab => vec![
+            "api",
+            "projects/:id/issues?state=opened&per_page=100",
+            "--paginate",
+        ],
+    };
+    let output = match std::process::Command::new(cli)
+        .args(&args)
+        .current_dir(&repo_root)
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow!(
+                "export issue requires the {cli} CLI to be installed"
+            ));
+        }
+        Err(err) => return Err(err).context(format!("failed to run {cli}")),
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!(
+            "{cli} issue list failed{}",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        ));
+    }
+    parse_issue_details(&output.stdout, forge)
+}
+
+/// Parse the JSON printed by `gh issue list --json ...` / `glab api
+/// .../issues --paginate` into [`IssueDetail`]s. The output is one JSON array
+/// — or, with `--paginate`, several back to back, one per page — so it is
+/// read as a stream of values and every array's entries are collected.
+/// Entries missing their number are skipped; every other field falls back to
+/// its empty/default value rather than failing the whole parse, since forges
+/// vary in which optional fields they populate.
+pub fn parse_issue_details(stdout: &[u8], forge: Forge) -> Result<Vec<IssueDetail>> {
+    let text = String::from_utf8_lossy(stdout);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut issues = Vec::new();
+    for value in serde_json::Deserializer::from_str(trimmed).into_iter::<serde_json::Value>() {
+        let value = value.context("failed to parse forge issue details as JSON")?;
+        let Some(entries) = value.as_array() else {
+            continue;
+        };
+        issues.extend(entries.iter().filter_map(|entry| match forge {
+            Forge::GitHub => parse_github_issue_detail(entry),
+            Forge::GitLab => parse_gitlab_issue_detail(entry),
+        }));
+    }
+    Ok(issues)
+}
+
+fn parse_github_issue_detail(entry: &serde_json::Value) -> Option<IssueDetail> {
+    let number = entry.get("number")?.as_u64()?;
+    let comments = entry.get("comments").and_then(serde_json::Value::as_array);
+    Some(IssueDetail {
+        number,
+        title: json_str(entry, "title"),
+        author: json_login(entry.get("author"), "login"),
+        created_at: format_comment_date(&json_str(entry, "createdAt")),
+        updated_at: format_comment_date(&json_str(entry, "updatedAt")),
+        milestone: entry
+            .get("milestone")
+            .map(|milestone| json_str(milestone, "title"))
+            .unwrap_or_default(),
+        comment_count: comments.map(Vec::len).unwrap_or(0),
+        assignees: json_string_array(entry, "assignees", "login"),
+        labels: json_string_array(entry, "labels", "name"),
+        body: json_str(entry, "body").trim().to_string(),
+        last_comment: comments.and_then(|comments| latest_comment(comments, "login")),
+        url: json_str(entry, "url"),
+    })
+}
+
+fn parse_gitlab_issue_detail(entry: &serde_json::Value) -> Option<IssueDetail> {
+    let number = entry.get("iid")?.as_u64()?;
+    Some(IssueDetail {
+        number,
+        title: json_str(entry, "title"),
+        author: json_login(entry.get("author"), "username"),
+        created_at: format_comment_date(&json_str(entry, "created_at")),
+        updated_at: format_comment_date(&json_str(entry, "updated_at")),
+        milestone: entry
+            .get("milestone")
+            .map(|milestone| json_str(milestone, "title"))
+            .unwrap_or_default(),
+        comment_count: entry
+            .get("user_notes_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize,
+        assignees: json_string_array(entry, "assignees", "username"),
+        labels: entry
+            .get("labels")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        body: json_str(entry, "description").trim().to_string(),
+        // Only a count (`user_notes_count`) is available from the issue list
+        // endpoint, not the notes themselves.
+        last_comment: None,
+        url: json_str(entry, "web_url"),
+    })
+}
+
+/// The `field` (`login` on GitHub, `username` on GitLab) of a user object,
+/// or `"unknown"` when the object or field is missing.
+fn json_login(user: Option<&serde_json::Value>, field: &str) -> String {
+    user.and_then(|user| user.get(field))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+/// The most recently created comment of a `[{author, body, createdAt}, ...]`
+/// array, by `createdAt` (ISO 8601 strings sort lexicographically). GitHub's
+/// field already carries the author and body, so this needs no extra
+/// request. `None` when the array is empty.
+fn latest_comment(comments: &[serde_json::Value], login_field: &str) -> Option<PullRequestComment> {
+    comments
+        .iter()
+        .max_by_key(|comment| {
+            comment
+                .get("createdAt")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+        })
+        .map(|comment| PullRequestComment {
+            author: json_login(comment.get("author"), login_field),
+            body: comment
+                .get("body")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+        })
+}
+
 fn json_str(entry: &serde_json::Value, key: &str) -> String {
     entry
         .get(key)
@@ -1103,32 +1305,7 @@ fn parse_github_pr_detail(entry: &serde_json::Value) -> Option<PullRequestDetail
     };
     let comments = entry.get("comments").and_then(serde_json::Value::as_array);
     let comment_count = comments.map(Vec::len).unwrap_or(0);
-    // The most recently created comment, by `createdAt` (ISO 8601 strings
-    // sort lexicographically); GitHub's field already carries the author and
-    // body, so this needs no extra request.
-    let last_comment = comments
-        .and_then(|comments| {
-            comments.iter().max_by_key(|comment| {
-                comment
-                    .get("createdAt")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("")
-            })
-        })
-        .map(|comment| PullRequestComment {
-            author: comment
-                .get("author")
-                .and_then(|author| author.get("login"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown")
-                .to_string(),
-            body: comment
-                .get("body")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_string(),
-        });
+    let last_comment = comments.and_then(|comments| latest_comment(comments, "login"));
 
     // The latest review state per author, then any reviewer still awaiting a
     // review (present in `reviewRequests` but not yet in `reviews`).
@@ -1968,6 +2145,138 @@ mod tests {
         // bodies.
         assert!(pr.files.is_empty());
         assert_eq!(pr.last_comment, None);
+    }
+
+    #[test]
+    fn parses_github_issue_details() {
+        let json = br#"[{
+            "number": 17,
+            "title": "Crash on startup",
+            "author": {"login": "alice"},
+            "createdAt": "2026-06-01T12:30:45Z",
+            "updatedAt": "2026-06-02T08:00:00Z",
+            "milestone": {"title": "1.0"},
+            "comments": [
+                {"author": {"login": "dave"}, "body": "Reproduced.", "createdAt": "2026-06-02T09:15:00Z"},
+                {"author": {"login": "alice"}, "body": "hi", "createdAt": "2026-06-01T13:00:00Z"}
+            ],
+            "assignees": [{"login": "bob"}],
+            "labels": [{"name": "bug"}, {"name": "urgent"}],
+            "body": "It crashes.\n\n## Steps\n\n1. Start it\n",
+            "url": "https://github.com/o/r/issues/17"
+        }, {
+            "number": 18,
+            "title": "No milestone, no body",
+            "author": {"login": "erin"},
+            "createdAt": "2026-06-03T00:00:00Z",
+            "updatedAt": "2026-06-03T00:00:00Z",
+            "milestone": null,
+            "comments": [],
+            "assignees": [],
+            "labels": [],
+            "body": "",
+            "url": "https://github.com/o/r/issues/18"
+        }]"#;
+        let issues = parse_issue_details(json, Forge::GitHub).expect("parse");
+        assert_eq!(issues.len(), 2);
+        let issue = &issues[0];
+        assert_eq!(issue.number, 17);
+        assert_eq!(issue.title, "Crash on startup");
+        assert_eq!(issue.author, "alice");
+        assert_eq!(issue.created_at, "2026-06-01 12:30:45");
+        assert_eq!(issue.updated_at, "2026-06-02 08:00:00");
+        assert_eq!(issue.milestone, "1.0");
+        assert_eq!(issue.comment_count, 2);
+        // The later comment (by createdAt) wins, not the last one in the array.
+        assert_eq!(
+            issue.last_comment,
+            Some(PullRequestComment {
+                author: "dave".to_string(),
+                body: "Reproduced.".to_string(),
+            })
+        );
+        assert_eq!(issue.assignees, vec!["bob".to_string()]);
+        assert_eq!(issue.labels, vec!["bug".to_string(), "urgent".to_string()]);
+        assert_eq!(issue.body, "It crashes.\n\n## Steps\n\n1. Start it");
+        assert_eq!(issue.url, "https://github.com/o/r/issues/17");
+
+        let bare = &issues[1];
+        assert_eq!(bare.number, 18);
+        assert_eq!(bare.milestone, "");
+        assert_eq!(bare.comment_count, 0);
+        assert_eq!(bare.last_comment, None);
+        assert!(bare.assignees.is_empty());
+        assert!(bare.labels.is_empty());
+        assert_eq!(bare.body, "");
+    }
+
+    #[test]
+    fn parses_gitlab_issue_details_across_pages() {
+        // `glab api --paginate` prints one JSON array per page, back to
+        // back; both pages' issues must be collected.
+        let json = br#"[{
+            "iid": 7,
+            "title": "Tidy docs",
+            "author": {"username": "erin"},
+            "created_at": "2026-06-01T12:30:45.000Z",
+            "updated_at": "2026-06-02T08:00:00.000Z",
+            "milestone": {"title": "Sprint 3"},
+            "user_notes_count": 3,
+            "assignees": [{"username": "frank"}],
+            "labels": ["docs"],
+            "description": "Fix the typos.",
+            "web_url": "https://gitlab.com/o/r/-/issues/7"
+        }]
+[{
+            "iid": 8,
+            "title": "Second page",
+            "author": {"username": "gina"},
+            "created_at": "2026-06-04T00:00:00.000Z",
+            "updated_at": "2026-06-04T00:00:00.000Z",
+            "milestone": null,
+            "user_notes_count": 0,
+            "assignees": [],
+            "labels": [],
+            "description": null,
+            "web_url": "https://gitlab.com/o/r/-/issues/8"
+        }]"#;
+        let issues = parse_issue_details(json, Forge::GitLab).expect("parse");
+        assert_eq!(issues.len(), 2);
+        let issue = &issues[0];
+        assert_eq!(issue.number, 7);
+        assert_eq!(issue.author, "erin");
+        assert_eq!(issue.milestone, "Sprint 3");
+        assert_eq!(issue.comment_count, 3);
+        assert_eq!(issue.assignees, vec!["frank".to_string()]);
+        assert_eq!(issue.labels, vec!["docs".to_string()]);
+        assert_eq!(issue.body, "Fix the typos.");
+        // GitLab's issue list endpoint carries no note bodies.
+        assert_eq!(issue.last_comment, None);
+        assert_eq!(issue.url, "https://gitlab.com/o/r/-/issues/7");
+        assert_eq!(issues[1].number, 8);
+        assert_eq!(issues[1].milestone, "");
+        assert_eq!(issues[1].body, "");
+    }
+
+    #[test]
+    fn empty_issue_details_is_empty() {
+        assert!(
+            parse_issue_details(b"", Forge::GitHub)
+                .expect("parse")
+                .is_empty()
+        );
+        assert!(
+            parse_issue_details(b"[]\n", Forge::GitLab)
+                .expect("parse")
+                .is_empty()
+        );
+        // An entry without a number is skipped rather than failing the parse.
+        assert!(
+            parse_issue_details(br#"[{"title": "no number"}]"#, Forge::GitHub)
+                .expect("parse")
+                .is_empty()
+        );
+        assert!(parse_issue_details(b"not json", Forge::GitHub).is_err());
     }
 
     #[test]

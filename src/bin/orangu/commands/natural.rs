@@ -511,6 +511,9 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     if matches_ci(input, &["export pr", "export pull requests"]) {
         return Some(LocalCommand::Export(ExportTarget::Pr));
     }
+    if matches_ci(input, &["export issue", "export issues"]) {
+        return Some(LocalCommand::Export(ExportTarget::Issue));
+    }
     if matches_ci(input, &["export statistics total"]) {
         return Some(LocalCommand::Export(ExportTarget::Statistics(true)));
     }

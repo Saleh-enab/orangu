@@ -43,7 +43,7 @@ use crate::commands::{
 };
 use crate::dispatch::{handle_command, run_after_turn, run_duplicates_scan};
 use crate::export;
-use crate::git::{Forge, ReviewReports, fetch_pull_request_details};
+use crate::git::{Forge, ReviewReports, fetch_issue_details, fetch_pull_request_details};
 use crate::models::{
     coordinator_role_profile, detect_embeddings_server, is_active_connection_a_coordinator,
 };
@@ -647,6 +647,10 @@ fn export_path(
             let prs = fetch_pull_request_details(workspace, forge)?;
             export::export_pr(workspace, &prs, model_id)
         }
+        ExportTarget::Issue => {
+            let issues = fetch_issue_details(workspace, forge)?;
+            export::export_issue(workspace, &issues, model_id)
+        }
         ExportTarget::Statistics(total) => export::export_statistics(workspace, model_id, total),
         ExportTarget::Duplicates => {
             let report = run_duplicates_scan(workspace, orangu::duplicates::DEFAULT_THRESHOLD)?;
@@ -739,6 +743,7 @@ mod tests {
             "/server",
             "/status",
             "/export pr",
+            "/export issue",
             "/help",
             "/diff",
             "/usage",

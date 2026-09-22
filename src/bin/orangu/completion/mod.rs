@@ -762,7 +762,7 @@ mod tests {
 
     #[test]
     fn export_completes_console_review_auto_review_and_duplicates() {
-        // The bare argument offers all six targets, in order.
+        // The bare argument offers all seven targets, in order.
         let (start, all) = export_completion_candidates("/export ").expect("export argument");
         assert_eq!(start, "/export ".len());
         assert_eq!(
@@ -773,6 +773,7 @@ mod tests {
                 "auto review",
                 "duplicates",
                 "pr",
+                "issue",
                 "statistics"
             ]
         );
@@ -795,6 +796,12 @@ mod tests {
                 .expect("argument")
                 .1,
             vec!["pr".to_string()]
+        );
+        assert_eq!(
+            export_completion_candidates("/export i")
+                .expect("argument")
+                .1,
+            vec!["issue".to_string()]
         );
         assert_eq!(
             export_completion_candidates("/export auto")
@@ -829,6 +836,7 @@ mod tests {
                 "auto review",
                 "duplicates",
                 "pr",
+                "issue",
                 "statistics"
             ]
         );

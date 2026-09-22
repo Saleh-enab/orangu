@@ -1353,11 +1353,12 @@ It takes one optional argument selecting what to export:
 - `/export auto review` — the **auto-review buffer** specifically: the Markdown of the last `/auto_review` report. If no auto review has been run yet, the command reports that there is nothing to export.
 - `/export duplicates` — a **duplicate-code report**: the report from the most recent `/duplicates` run in this tab, rendered to a PDF. The report is cached when `/duplicates` runs, so the export reuses it directly — including that run's threshold (run `/duplicates 0.8` and `/export duplicates` writes an 80% report) — without scanning the workspace a second time. If `/duplicates` has not been run this session, the export scans once at the default 80% threshold and caches the result, so it still works with no prior command.
 - `/export pr` — a **pull request report**: every open pull/merge request in the repository, fetched from the forge (`gh`/`glab`) at export time, one page per pull request with as much detail as the forge returns.
+- `/export issue` (or `/export issues`) — an **issue report**: every open issue in the repository, fetched from the forge (`gh`/`glab`) at export time, one page per issue with its description and as much detail as the forge returns.
 - `/export statistics` (or `/export statistics total`) — the **persistent activity history**: the same Total-then-year report `/statistics` (or `/statistics total`) prints in the console — totals, streaks, heatmap, and by-author commit breakdown, then a yearly/monthly breakdown per year — plus a token-usage bar chart, rendered to a PDF.
 
-The argument **Tab-completes** (and shows the inline ghost hint): pressing Tab after `/export` offers `console`, `review`, `auto review`, `duplicates`, `pr`, and `statistics`, and the multi-word `auto review` completes from as little as `a` (so `export a` → `export auto review`). The natural-language `export <target>` form (without the leading slash) completes the same way.
+The argument **Tab-completes** (and shows the inline ghost hint): pressing Tab after `/export` offers `console`, `review`, `auto review`, `duplicates`, `pr`, `issue`, and `statistics`, and the multi-word `auto review` completes from as little as `a` (so `export a` → `export auto review`). The natural-language `export <target>` form (without the leading slash) completes the same way.
 
-The file is saved in the workspace root as `{repository}-{branch}-console.pdf`, `{repository}-{branch}-review.pdf`, or `{repository}-{branch}-duplicates.pdf`, where `{repository}` is the Git repository (or workspace) directory name and `{branch}` is the current branch (`nobranch` when not on one); both are sanitized for use in a filename, so a branch such as `feature/x` becomes `feature-x`. The `pr` and `statistics` exports are saved as `{repository}-pr.pdf` and `{repository}-statistics.pdf` instead — no branch, since those reports cover the whole repository, not one branch. An existing file with the same name is overwritten. On success the saved path is printed to the output window.
+The file is saved in the workspace root as `{repository}-{branch}-console.pdf`, `{repository}-{branch}-review.pdf`, or `{repository}-{branch}-duplicates.pdf`, where `{repository}` is the Git repository (or workspace) directory name and `{branch}` is the current branch (`nobranch` when not on one); both are sanitized for use in a filename, so a branch such as `feature/x` becomes `feature-x`. The `pr`, `issue`, and `statistics` exports are saved as `{repository}-pr.pdf`, `{repository}-issue.pdf`, and `{repository}-statistics.pdf` instead — no branch, since those reports cover the whole repository, not one branch. An existing file with the same name is overwritten. On success the saved path is printed to the output window.
 
 Every page carries a **header band** centered on `{repository}-{branch}` (`{repository}-statistics` for the statistics export, which covers the whole repository rather than one branch) and a **footer band** centered on `orangu {version} ({model})` (the active model), both in white on the orangu brand colour to match the terminal banner; in the footer the word `orangu` links to the project site.
 
@@ -1384,7 +1385,15 @@ The **pr** export is organized like the review and duplicates exports:
 - **Page 2 — table of contents.** One entry per open pull request, `#N Title`, **clickable links** that jump to their page. Each entry ends with a status icon: a **green checkmark** when the pull request is neither a draft nor conflicting, otherwise a **red "X"**.
 - **Page 3 onward — one page per pull request** (more when it changes many files or has a long last comment). The title **links to the pull/merge request's home page on the forge**, followed by a table (spanning the full page width) of author, a **Link** row with the pull request's full URL (also clickable), created/updated dates, the branch, draft status, merge-conflict status, comment count, assignees, reviewers, and labels — whatever the forge returned. The **Draft** and **Conflicts** values are shown in **bold** when they are `Yes`, so an unfinished or blocked pull request catches the eye. Each **reviewer** is shown as their name followed by a status icon rather than the review state spelled out: a **green checkmark** for an approval, a **red "X"** for a change request (or, on GitLab, a still-outstanding review request — its merge-request list does not carry per-reviewer approval state at all), and a **"?"** for anything else that isn't a clear verdict (a comment, a still-pending GitHub review request, or a dismissed review). Below the table, the **changed files**: one line per file, its **full path** followed by its added-line count in **green** and removed-line count in **red** (GitLab's merge-request list carries no diff, so this section is empty there). Finally a **Last comment** table (also full width): a header spanning both columns, then one row with the comment's **author** (left) and its **text** (right, word-wrapped and truncated if very long); a pull request with no comments — or, on GitLab, whose comment bodies the list endpoint does not carry — shows `N/A` in both columns. (A repository with no open pull requests is the status page followed by a short note instead.)
 
-The **statistics** export has the most pages of the six, since most of the work is in the PDF rather than the console:
+The **issue** export is organized like the pr export:
+
+- **Page 1 — issue status.** A single table: the repository name, generation date/time, the open issues broken down by status — **Open** (the total), **Assigned** (with at least one assignee), and **Unassigned** — then **Oldest** and **Newest**, each a clickable link to that issue followed by its creation date. With no open issues both read `N/A`; with exactly one, **Oldest** is left empty rather than repeating the same entry as **Newest**.
+- **Page 2 — table of contents.** One entry per open issue, `#N Title`, **clickable links** that jump to their page.
+- **Page 3 onward — one page per issue** (more when its description is long). The title **links to the issue's home page on the forge**, followed by a table (spanning the full page width) of author, a **Link** row with the issue's full URL (also clickable), created/updated dates, milestone, comment count, assignees, and labels — whatever the forge returned. The **Assignees** value is shown in **bold** when it is `none`, so an issue nobody has picked up catches the eye. Below the table, the **Description**: the issue's body rendered from its Markdown the same way the review export renders a report — brand-coloured headings, **bold** and *italic* emphasis, lists, fenced code blocks, block quotes, and tables — flowing across further pages when it is long (`No description.` when the issue has none). Finally a **Last comment** table (also full width): a header spanning both columns, then one row with the comment's **author** (left) and its **text** (right, word-wrapped and truncated if very long); an issue with no comments — or, on GitLab, whose note bodies the list endpoint does not carry — shows `N/A` in both columns. (A repository with no open issues is the status page followed by a short note instead.)
+
+On GitHub the report is built from `gh issue list` (up to 1000 open issues, pull requests excluded); on GitLab from `glab api projects/:id/issues`, paginated so every open issue is included.
+
+The **statistics** export has the most pages of the seven, since most of the work is in the PDF rather than the console:
 
 - **Page 1 — Total.** A **Repository Activity** table (total commits, days active, current streak, longest streak) and a **Token Usage** table (total sessions, turns, tokens, LLM and tool time) — the same figures `/statistics` prints in the console.
 - **Table of contents.** Two layers: one top-level entry per section — Activity, Authors, each calendar year, and Author Details — with each year's months nested beneath it, so a specific month ("June, 2026") is one click away. Every entry is a **clickable link** that jumps to its page, in the same style as `/export pr` and `/export review`'s tables of contents; the contents flow across as many pages as the history needs.
@@ -1424,6 +1433,12 @@ Export a pull request report:
 /export pr
 ```
 
+Export an issue report:
+
+```text
+/export issue
+```
+
 Export the persistent activity history:
 
 ```text
@@ -1440,6 +1455,7 @@ export review
 export auto review
 export duplicates
 export pr
+export issue
 export statistics
 export statistics total
 ```

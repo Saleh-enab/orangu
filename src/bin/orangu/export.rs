@@ -18,7 +18,9 @@
 //! Renders either the console output window (`export console`) or the last
 //! review report (`export review`) to a PDF saved in the root of the
 //! workspace as `{repository}-{branch}-console.pdf` or
-//! `{repository}-{branch}-review.pdf`.
+//! `{repository}-{branch}-review.pdf` — and, likewise, a duplicate-code
+//! report, the open pull requests (`export pr`), the open issues (`export
+//! issue`), and the activity statistics.
 //!
 //! Every page carries a header band with `{repository}-{branch}` and a footer
 //! band with `orangu {version} ({model})` — both in white on the orangu brand
@@ -67,8 +69,9 @@ use orangu::tui::TranscriptLine;
 
 use crate::VERSION;
 use crate::git::{
-    ForgeWeb, PullRequestCheck, PullRequestDetail, PullRequestReviewer, discover_git_root,
-    forge_web_from_origin, git_repository_name, workspace_branch_name,
+    ForgeWeb, IssueDetail, PullRequestCheck, PullRequestComment, PullRequestDetail,
+    PullRequestReviewer, discover_git_root, forge_web_from_origin, git_repository_name,
+    workspace_branch_name,
 };
 use crate::render::{SyntaxHighlightAssets, syntax_highlight_assets};
 
@@ -549,7 +552,8 @@ pub fn export_pr(workspace: &Path, prs: &[PullRequestDetail], model: &str) -> Re
         let start_cursor = (CONTENT_TOP_MM - header_height).max(CONTENT_BOTTOM_MM);
         let (mut pages_for_pr, cursor_after_files) =
             paginate_from(&build_changed_file_blocks(pr), &pdf.fonts, start_cursor);
-        let comment_table_height = last_comment_table_height_mm(pr, &pdf.fonts);
+        let comment_table_height =
+            last_comment_table_height_mm(pr.last_comment.as_ref(), &pdf.fonts);
         // The comment table breaks atomically onto a fresh page rather than
         // wrapping (mirroring `draw_pr_detail_page`), so its post-table
         // cursor is exactly `height` mm below wherever it started.
@@ -605,10 +609,22 @@ pub fn export_pr(workspace: &Path, prs: &[PullRequestDetail], model: &str) -> Re
 /// The linked title heading (`#N Title`, linking to the forge) for a pull
 /// request's detail page.
 fn pr_title_block(pr: &PullRequestDetail) -> Block {
+    detail_title_block(pr.number, &pr.title, &pr.url)
+}
+
+/// The linked title heading (`#N Title`, linking to the forge) for an
+/// issue's detail page.
+fn issue_title_block(issue: &IssueDetail) -> Block {
+    detail_title_block(issue.number, &issue.title, &issue.url)
+}
+
+/// A detail page's title heading — `#N Title` in bold, clickable when the
+/// entry has a `url` — shared by the pull request and issue reports.
+fn detail_title_block(number: u64, title: &str, url: &str) -> Block {
     let title_size = BODY_SIZE + 3.5;
     Block {
         spans: vec![Span {
-            text: format!("#{} {}", pr.number, pr.title),
+            text: format!("#{number} {title}"),
             bold: true,
             italic: false,
             color: None,
@@ -619,7 +635,7 @@ fn pr_title_block(pr: &PullRequestDetail) -> Block {
         hanging_mm: 0.0,
         word_wrap: true,
         space_after_mm: title_size * 0.6 * PT_TO_MM,
-        link: (!pr.url.is_empty()).then(|| pr.url.clone()),
+        link: (!url.is_empty()).then(|| url.to_string()),
     }
 }
 
@@ -707,48 +723,73 @@ fn pr_stats_rows(repository: &str, prs: &[PullRequestDetail]) -> Vec<(String, Ro
         ),
     ];
     let (oldest, newest) = oldest_and_newest(prs);
-    // With exactly one open pull request, "Oldest" and "Newest" would be the
-    // same entry — showing it twice is redundant, so "Oldest" is left empty
-    // rather than repeating "Newest". With none at all, both fall back to
-    // "N/A" via `pr_link_or_na`.
-    let oldest_value = if prs.len() == 1 {
-        RowValue::Text(String::new())
-    } else {
-        pr_link_or_na(oldest)
-    };
-    rows.push(("Oldest".to_string(), oldest_value, false));
-    rows.push(("Newest".to_string(), pr_link_or_na(newest), false));
+    rows.extend(oldest_and_newest_rows(
+        prs.len(),
+        oldest.map(|pr| (pr.url.as_str(), pr.created_at.as_str())),
+        newest.map(|pr| (pr.url.as_str(), pr.created_at.as_str())),
+    ));
     rows
 }
 
-/// A pull request as an "Oldest"/"Newest" row value: its link and creation
-/// date, or `"N/A"` when there is none (no open pull requests, or none with
-/// a known creation date).
-fn pr_link_or_na(pr: Option<&PullRequestDetail>) -> RowValue {
-    match pr {
-        Some(pr) => RowValue::LinkWithText(pr.url.clone(), pr.created_at.clone()),
+/// The "Oldest" and "Newest" rows of a status page, each the entry's link
+/// followed by its creation date. With exactly one open entry, "Oldest" and
+/// "Newest" would be the same — showing it twice is redundant, so "Oldest"
+/// is left empty rather than repeating "Newest". With none at all, both fall
+/// back to "N/A" via [`link_or_na`].
+fn oldest_and_newest_rows(
+    count: usize,
+    oldest: Option<(&str, &str)>,
+    newest: Option<(&str, &str)>,
+) -> [(String, RowValue, bool); 2] {
+    let oldest_value = if count == 1 {
+        RowValue::Text(String::new())
+    } else {
+        link_or_na(oldest)
+    };
+    [
+        ("Oldest".to_string(), oldest_value, false),
+        ("Newest".to_string(), link_or_na(newest), false),
+    ]
+}
+
+/// A pull request or issue as an "Oldest"/"Newest" row value: its `(url,
+/// created_at)` as a link and creation date, or `"N/A"` when there is none
+/// (nothing open, or nothing with a known creation date).
+fn link_or_na(entry: Option<(&str, &str)>) -> RowValue {
+    match entry {
+        Some((url, created_at)) => RowValue::LinkWithText(url.to_string(), created_at.to_string()),
         None => RowValue::Text("N/A".to_string()),
     }
 }
 
-/// The oldest and newest pull request by `created_at` (an ISO-ish
-/// `YYYY-MM-DD HH:MM:SS` string, which sorts lexicographically) — `None` for
-/// either when no pull request has a known creation date. The same pull
-/// request is returned for both when there is only one.
+/// The oldest and newest pull request by `created_at` — see
+/// [`oldest_and_newest_by`].
 fn oldest_and_newest(
     prs: &[PullRequestDetail],
 ) -> (Option<&PullRequestDetail>, Option<&PullRequestDetail>) {
-    let mut oldest: Option<&PullRequestDetail> = None;
-    let mut newest: Option<&PullRequestDetail> = None;
-    for pr in prs {
-        if pr.created_at.is_empty() {
+    oldest_and_newest_by(prs, |pr| &pr.created_at)
+}
+
+/// The oldest and newest entry by the `created_at` string each yields (an
+/// ISO-ish `YYYY-MM-DD HH:MM:SS`, which sorts lexicographically) — `None`
+/// for either when no entry has a known (non-empty) creation date. The same
+/// entry is returned for both when there is only one.
+fn oldest_and_newest_by<T>(
+    entries: &[T],
+    created_at: impl Fn(&T) -> &str,
+) -> (Option<&T>, Option<&T>) {
+    let mut oldest: Option<&T> = None;
+    let mut newest: Option<&T> = None;
+    for entry in entries {
+        let created = created_at(entry);
+        if created.is_empty() {
             continue;
         }
-        if oldest.is_none_or(|current| pr.created_at < current.created_at) {
-            oldest = Some(pr);
+        if oldest.is_none_or(|current| created < created_at(current)) {
+            oldest = Some(entry);
         }
-        if newest.is_none_or(|current| pr.created_at > current.created_at) {
-            newest = Some(pr);
+        if newest.is_none_or(|current| created > created_at(current)) {
+            newest = Some(entry);
         }
     }
     (oldest, newest)
@@ -827,13 +868,30 @@ fn pr_header_rows(pr: &PullRequestDetail) -> Vec<(String, RowValue, bool)> {
 /// starts. Mirrors [`Pdf::draw_pr_detail_page`]'s layout exactly, so the
 /// table of contents can compute accurate page numbers without drawing.
 fn pr_header_height_mm(pr: &PullRequestDetail, fonts: &DocFonts) -> f32 {
-    let title = pr_title_block(pr);
+    detail_header_height_mm(&pr_title_block(pr), pr_header_rows(pr).len(), fonts)
+}
+
+/// The vertical space (mm) an issue page's fixed header — the title heading
+/// plus the field table — occupies, before the description starts. Mirrors
+/// [`Pdf::draw_issue_detail_page`]'s layout exactly, so the table of
+/// contents can compute accurate page numbers without drawing.
+fn issue_header_height_mm(issue: &IssueDetail, fonts: &DocFonts) -> f32 {
+    detail_header_height_mm(
+        &issue_title_block(issue),
+        issue_header_rows(issue).len(),
+        fonts,
+    )
+}
+
+/// The height (mm) of a detail page's `title` heading (however many lines it
+/// wraps to) followed by a [`Pdf::draw_kv_table`] of `row_count` rows.
+fn detail_header_height_mm(title: &Block, row_count: usize, fonts: &DocFonts) -> f32 {
     let title_line_height = title.size * 1.35 * PT_TO_MM;
-    let title_lines = wrap_block(&title, fonts).len() as f32;
+    let title_lines = wrap_block(title, fonts).len() as f32;
     let title_height = title_lines * title_line_height + title.space_after_mm;
 
     let row_height = BODY_SIZE * 1.9 * PT_TO_MM;
-    let table_height = pr_header_rows(pr).len() as f32 * row_height + 8.0;
+    let table_height = row_count as f32 * row_height + 8.0;
 
     title_height + table_height
 }
@@ -907,9 +965,15 @@ fn check_status_style(bucket: &str) -> (&'static str, (f32, f32, f32)) {
 /// section, whether it renders as the checks table or (when the forge
 /// reported none) the "No checks reported." fallback line.
 fn checks_heading_block() -> Block {
+    section_heading_block("Checks")
+}
+
+/// A bold body-sized label introducing a detail page section (the pull
+/// request report's "Checks", the issue report's "Description").
+fn section_heading_block(text: &str) -> Block {
     Block {
         spans: vec![Span {
-            text: "Checks".to_string(),
+            text: text.to_string(),
             bold: true,
             italic: false,
             color: None,
@@ -1031,16 +1095,221 @@ fn last_comment_table_layout(
     (divider, row_height, lines)
 }
 
-/// The vertical space (mm) the "Last comment" table occupies, for a pull
-/// request with (or without) a comment — `"N/A"`/`"N/A"` when there is none,
-/// matching what [`Pdf::draw_pr_detail_page`] actually draws.
-fn last_comment_table_height_mm(pr: &PullRequestDetail, fonts: &DocFonts) -> f32 {
-    let (author, body) = match &pr.last_comment {
+/// The author and body the "Last comment" table shows for `comment` —
+/// `"N/A"`/`"N/A"` when there is none.
+fn last_comment_cells(comment: Option<&PullRequestComment>) -> (&str, &str) {
+    match comment {
         Some(comment) => (comment.author.as_str(), comment.body.as_str()),
         None => ("N/A", "N/A"),
-    };
+    }
+}
+
+/// The vertical space (mm) the "Last comment" table occupies, for a pull
+/// request or issue with (or without) a comment — `"N/A"`/`"N/A"` when there
+/// is none, matching what [`Pdf::draw_pr_detail_page`] and
+/// [`Pdf::draw_issue_detail_page`] actually draw.
+fn last_comment_table_height_mm(comment: Option<&PullRequestComment>, fonts: &DocFonts) -> f32 {
+    let (author, body) = last_comment_cells(comment);
     let (_, row_height, lines) = last_comment_table_layout(author, body, fonts);
     row_height + lines.len().max(1) as f32 * row_height + 8.0
+}
+
+/// Export a report of every open issue to a PDF in the workspace root as
+/// `{repository}-issue.pdf`. `issues` is fetched from the forge by the
+/// caller.
+///
+/// - **Page 1 — issue status.** The repository name, generation time, and
+///   the open issues broken down by status: open, assigned, and unassigned,
+///   then the oldest and newest.
+/// - **Page 2 — table of contents.** One entry per open issue, `#N Title`,
+///   linking to its page.
+/// - **Page 3 onward — one page per issue** (more when its description is
+///   long): its title linking to the forge, a table of author, link, dates,
+///   milestone, comment count, assignees, and labels, then the description
+///   rendered from its Markdown, and finally the last comment.
+///
+/// A repository with no open issues still gets its status page, followed by
+/// a short note instead of a table of contents and issue pages.
+pub fn export_issue(workspace: &Path, issues: &[IssueDetail], model: &str) -> Result<PathBuf> {
+    let repository = repository_display(workspace);
+    let mut pdf = Pdf::new(&header_label(workspace), model)?;
+
+    pdf.draw_issue_stats_page(&repository, issues);
+
+    let path = export_issue_file_path(workspace);
+    if issues.is_empty() {
+        pdf.new_page();
+        pdf.draw_blocks(&[Block::paragraph(vec![Span::plain("No open issues.")])]);
+        pdf.save(&path)?;
+        return Ok(path);
+    }
+
+    // One page (more when an issue has a long description) per issue;
+    // compute where each lands so the table of contents (page 2) can point
+    // at it. The header (title + field table) is a fixed height drawn ahead
+    // of the description, so the description is paginated from however much
+    // room is left on that first page; the "Last comment" table follows,
+    // adding one more page only if it doesn't fit where the description
+    // left off (it breaks atomically — see `draw_last_comment_section`).
+    let titles: Vec<String> = issues
+        .iter()
+        .map(|issue| format!("#{} {}", issue.number, issue.title))
+        .collect();
+    let mut starts = Vec::with_capacity(issues.len());
+    let mut page = 3;
+    for issue in issues {
+        starts.push(page);
+        let header_height = issue_header_height_mm(issue, &pdf.fonts);
+        let start_cursor = (CONTENT_TOP_MM - header_height).max(CONTENT_BOTTOM_MM);
+        let (mut pages_for_issue, cursor_after_description) = paginate_from(
+            &build_issue_description_blocks(issue),
+            &pdf.fonts,
+            start_cursor,
+        );
+        let comment_table_height =
+            last_comment_table_height_mm(issue.last_comment.as_ref(), &pdf.fonts);
+        if cursor_after_description - comment_table_height < CONTENT_BOTTOM_MM {
+            pages_for_issue += 1;
+        }
+        page += pages_for_issue;
+    }
+
+    let toc_rows: Vec<(&str, usize, Option<bool>)> = titles
+        .iter()
+        .map(String::as_str)
+        .zip(starts.iter().copied())
+        .map(|(title, start)| (title, start, None))
+        .collect();
+    pdf.new_page();
+    pdf.draw_toc(&toc_rows);
+
+    for issue in issues {
+        pdf.new_page();
+        pdf.draw_issue_detail_page(issue);
+    }
+
+    pdf.save(&path)?;
+    Ok(path)
+}
+
+/// The rows of the issue export's page 1 status table: the repository,
+/// generation time, the open/assigned/unassigned counts, and — when there is
+/// at least one open issue with a known creation date — the oldest and
+/// newest, each a clickable link to the issue followed by its creation date.
+fn issue_stats_rows(repository: &str, issues: &[IssueDetail]) -> Vec<(String, RowValue, bool)> {
+    let assigned = issues
+        .iter()
+        .filter(|issue| !issue.assignees.is_empty())
+        .count();
+    let mut rows = vec![
+        (
+            "Repository".to_string(),
+            RowValue::Text(repository.to_string()),
+            false,
+        ),
+        (
+            "Generated".to_string(),
+            RowValue::Text(format_timestamp()),
+            false,
+        ),
+        (
+            "Open".to_string(),
+            RowValue::Text(issues.len().to_string()),
+            false,
+        ),
+        (
+            "Assigned".to_string(),
+            RowValue::Text(assigned.to_string()),
+            false,
+        ),
+        (
+            "Unassigned".to_string(),
+            RowValue::Text((issues.len() - assigned).to_string()),
+            false,
+        ),
+    ];
+    let (oldest, newest) = oldest_and_newest_by(issues, |issue| &issue.created_at);
+    rows.extend(oldest_and_newest_rows(
+        issues.len(),
+        oldest.map(|issue| (issue.url.as_str(), issue.created_at.as_str())),
+        newest.map(|issue| (issue.url.as_str(), issue.created_at.as_str())),
+    ));
+    rows
+}
+
+/// The rows of an issue's header table: author, link, dates, milestone,
+/// comment count, assignees, and labels — whatever the forge returned. The
+/// `Assignees` value is bold when the issue has none, so an unassigned issue
+/// catches the eye.
+fn issue_header_rows(issue: &IssueDetail) -> Vec<(String, RowValue, bool)> {
+    vec![
+        (
+            "Author".to_string(),
+            RowValue::Text(non_empty(issue.author.clone(), "unknown")),
+            false,
+        ),
+        ("Link".to_string(), RowValue::Link(issue.url.clone()), false),
+        (
+            "Created".to_string(),
+            RowValue::Text(non_empty(issue.created_at.clone(), "unknown")),
+            false,
+        ),
+        (
+            "Updated".to_string(),
+            RowValue::Text(non_empty(issue.updated_at.clone(), "unknown")),
+            false,
+        ),
+        (
+            "Milestone".to_string(),
+            RowValue::Text(non_empty(issue.milestone.clone(), "none")),
+            false,
+        ),
+        (
+            "Comments".to_string(),
+            RowValue::Text(issue.comment_count.to_string()),
+            false,
+        ),
+        (
+            "Assignees".to_string(),
+            RowValue::Text(list_or_none(&issue.assignees)),
+            issue.assignees.is_empty(),
+        ),
+        (
+            "Labels".to_string(),
+            RowValue::Text(list_or_none(&issue.labels)),
+            false,
+        ),
+    ]
+}
+
+/// The issue page's "Description" section: the bold heading, then the
+/// issue's body rendered from its Markdown (headings, emphasis, lists, code
+/// blocks, quotes, and tables, like the review export) — or a "No
+/// description." line when it has none. The last block carries the extra
+/// gap ahead of the "Last comment" table, as the changed-files list does.
+fn build_issue_description_blocks(issue: &IssueDetail) -> Vec<Block> {
+    let mut blocks = vec![section_heading_block("Description")];
+    if issue.body.trim().is_empty() {
+        blocks.push(Block::paragraph(vec![Span::plain("No description.")]));
+    } else {
+        let mut tree = parse_markdown(&issue.body);
+        resolve_reference_links(&mut tree);
+        if let Node::Root(root) = &tree {
+            render_block_nodes(&root.children, 0, &mut blocks);
+        }
+    }
+    if let Some(last) = blocks.last_mut() {
+        last.space_after_mm += LAST_COMMENT_GAP_MM;
+    }
+    blocks
+}
+
+/// `{repository}-issue.pdf` in the workspace root — no branch, like the pr
+/// export, since the report covers every open issue in the repository, not
+/// one branch.
+fn export_issue_file_path(workspace: &Path) -> PathBuf {
+    let repository = non_empty(sanitize(&repository_display(workspace)), "workspace");
+    workspace.join(format!("{repository}-issue.pdf"))
 }
 
 /// `{repository}-pr.pdf` in the workspace root — no branch, since the report
@@ -2581,17 +2850,42 @@ impl Pdf {
         if !pr.files.is_empty() {
             self.draw_blocks(&build_changed_file_blocks(pr));
         }
-        // A single atomic page break if the table (small and bounded — see
-        // `last_comment_table_height_mm`) does not fit in what's left.
-        if self.cursor_y - last_comment_table_height_mm(pr, &self.fonts) < CONTENT_BOTTOM_MM {
+        self.draw_last_comment_section(pr.last_comment.as_ref());
+        self.draw_check_section(pr);
+    }
+
+    /// Page 1 of the issue export: the repository name, generation time,
+    /// the open issues broken down by status — how many are open in total,
+    /// how many have an assignee, and how many have none — and the oldest/
+    /// newest open issue.
+    fn draw_issue_stats_page(&mut self, repository: &str, issues: &[IssueDetail]) {
+        self.draw_block(&heading("Issues", BODY_SIZE + 5.0));
+        self.draw_kv_table(&issue_stats_rows(repository, issues));
+    }
+
+    /// One issue's detail page: the linked title heading, a field table
+    /// (author, link, dates, milestone, comment count, assignees, labels),
+    /// then the "Description" section rendered from the issue's Markdown,
+    /// and finally the "Last comment" table. The page is assumed freshly
+    /// started (`new_page` just called); a long description spills onto
+    /// further pages on its own via `draw_blocks`' normal overflow handling.
+    fn draw_issue_detail_page(&mut self, issue: &IssueDetail) {
+        self.draw_block(&issue_title_block(issue));
+        self.draw_kv_table(&issue_header_rows(issue));
+        self.draw_blocks(&build_issue_description_blocks(issue));
+        self.draw_last_comment_section(issue.last_comment.as_ref());
+    }
+
+    /// The "Last comment" table for a pull request's or issue's `comment`
+    /// (`"N/A"`/`"N/A"` when there is none), after a single atomic page break
+    /// if the table (small and bounded — see [`last_comment_table_height_mm`])
+    /// does not fit in what's left of the page.
+    fn draw_last_comment_section(&mut self, comment: Option<&PullRequestComment>) {
+        if self.cursor_y - last_comment_table_height_mm(comment, &self.fonts) < CONTENT_BOTTOM_MM {
             self.new_page();
         }
-        let (author, body) = match &pr.last_comment {
-            Some(comment) => (comment.author.as_str(), comment.body.as_str()),
-            None => ("N/A", "N/A"),
-        };
+        let (author, body) = last_comment_cells(comment);
         self.draw_last_comment_table(author, body);
-        self.draw_check_section(pr);
     }
 
     /// The pull request report's final section: the bold "Checks" heading,
@@ -4546,9 +4840,9 @@ mod tests {
     fn last_comment_table_height_matches_no_comment_and_with_comment() {
         let fonts = Pdf::new("t", "m").expect("pdf").fonts;
         let mut pr = sample_pull_request();
-        let with_comment = last_comment_table_height_mm(&pr, &fonts);
+        let with_comment = last_comment_table_height_mm(pr.last_comment.as_ref(), &fonts);
         pr.last_comment = None;
-        let without_comment = last_comment_table_height_mm(&pr, &fonts);
+        let without_comment = last_comment_table_height_mm(pr.last_comment.as_ref(), &fonts);
         // Both a real comment and the "N/A" placeholder are one line, so the
         // heights should match (both render one header row + one data row).
         assert!((with_comment - without_comment).abs() < 0.01);
@@ -4562,6 +4856,219 @@ mod tests {
         let path = export_pr(workspace.path(), std::slice::from_ref(&pr), "gemma").expect("export");
         let bytes = std::fs::read(&path).expect("read pdf");
         assert!(bytes.starts_with(b"%PDF"));
+    }
+
+    fn sample_issue() -> IssueDetail {
+        IssueDetail {
+            number: 17,
+            title: "Crash on startup".to_string(),
+            author: "alice".to_string(),
+            created_at: "2026-06-01 12:30:45".to_string(),
+            updated_at: "2026-06-02 08:00:00".to_string(),
+            milestone: "1.0".to_string(),
+            comment_count: 2,
+            assignees: vec!["bob".to_string()],
+            labels: vec!["bug".to_string(), "urgent".to_string()],
+            body: "It **crashes** right away.\n\n## Steps\n\n1. Start it\n2. Wait\n\n```sh\norangu\n```\n"
+                .to_string(),
+            last_comment: Some(crate::git::PullRequestComment {
+                author: "dave".to_string(),
+                body: "Reproduced.".to_string(),
+            }),
+            url: "https://github.com/o/r/issues/17".to_string(),
+        }
+    }
+
+    #[test]
+    fn export_issue_renders_stats_toc_and_pages() {
+        let workspace = tempdir().expect("workspace");
+        let issues = vec![sample_issue()];
+        let path = export_issue(workspace.path(), &issues, "gemma").expect("export");
+        assert!(path.exists());
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.ends_with("-issue.pdf"), "{name}");
+        // Like the pr export, the branch is not part of the filename.
+        assert!(!name.contains("nobranch"), "{name}");
+        let bytes = std::fs::read(&path).expect("read pdf");
+        assert!(bytes.starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn export_issue_with_no_issues_still_writes_a_pdf() {
+        let workspace = tempdir().expect("workspace");
+        let path = export_issue(workspace.path(), &[], "gemma").expect("export");
+        let bytes = std::fs::read(&path).expect("read pdf");
+        assert!(bytes.starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn export_issue_paginates_a_long_description_and_keeps_toc_in_step() {
+        // A description long enough to spill across several pages, followed
+        // by a second issue: the second issue's table-of-contents page
+        // number must match where it is actually drawn.
+        let mut long = sample_issue();
+        long.body = (1..=400)
+            .map(|n| format!("Line {n} of a very long description."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut second = sample_issue();
+        second.number = 18;
+        second.last_comment = None;
+        let issues = vec![long, second];
+
+        let workspace = tempdir().expect("workspace");
+        let path = export_issue(workspace.path(), &issues, "gemma").expect("export");
+        let bytes = std::fs::read(&path).expect("read pdf");
+        assert!(bytes.starts_with(b"%PDF"));
+
+        // Redo the page arithmetic `export_issue` does and check it against
+        // a real draw of the first issue.
+        let mut pdf = Pdf::new("t", "m").expect("pdf");
+        let header_height = issue_header_height_mm(&issues[0], &pdf.fonts);
+        let start_cursor = (CONTENT_TOP_MM - header_height).max(CONTENT_BOTTOM_MM);
+        let (mut pages, cursor_after) = paginate_from(
+            &build_issue_description_blocks(&issues[0]),
+            &pdf.fonts,
+            start_cursor,
+        );
+        let comment_height =
+            last_comment_table_height_mm(issues[0].last_comment.as_ref(), &pdf.fonts);
+        if cursor_after - comment_height < CONTENT_BOTTOM_MM {
+            pages += 1;
+        }
+        assert!(pages > 1, "the long description should spill over");
+        let before = pdf.current_page();
+        pdf.draw_issue_detail_page(&issues[0]);
+        assert_eq!(pdf.current_page() - before + 1, pages);
+    }
+
+    #[test]
+    fn issue_stats_rows_count_assigned_and_unassigned() {
+        let assigned = sample_issue();
+        let mut unassigned = sample_issue();
+        unassigned.number = 18;
+        unassigned.assignees.clear();
+        unassigned.created_at = "2026-07-01 00:00:00".to_string();
+        unassigned.url = "https://github.com/o/r/issues/18".to_string();
+        let issues = vec![assigned, unassigned];
+        let rows = issue_stats_rows("o/r", &issues);
+        assert_eq!(find_row_text(&rows, "Repository"), Some(("o/r", false)));
+        assert_eq!(find_row_text(&rows, "Open"), Some(("2", false)));
+        assert_eq!(find_row_text(&rows, "Assigned"), Some(("1", false)));
+        assert_eq!(find_row_text(&rows, "Unassigned"), Some(("1", false)));
+        let value = |label: &str| {
+            rows.iter()
+                .find(|(key, _, _)| key == label)
+                .map(|(_, value, _)| value.clone())
+        };
+        assert_eq!(
+            value("Oldest"),
+            Some(RowValue::LinkWithText(
+                "https://github.com/o/r/issues/17".to_string(),
+                "2026-06-01 12:30:45".to_string(),
+            ))
+        );
+        assert_eq!(
+            value("Newest"),
+            Some(RowValue::LinkWithText(
+                "https://github.com/o/r/issues/18".to_string(),
+                "2026-07-01 00:00:00".to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    fn issue_stats_rows_use_na_when_empty_and_blank_oldest_for_a_single_issue() {
+        let rows = issue_stats_rows("o/r", &[]);
+        assert_eq!(find_row_text(&rows, "Open"), Some(("0", false)));
+        assert_eq!(find_row_text(&rows, "Oldest"), Some(("N/A", false)));
+        assert_eq!(find_row_text(&rows, "Newest"), Some(("N/A", false)));
+
+        let rows = issue_stats_rows("o/r", &[sample_issue()]);
+        assert_eq!(find_row_text(&rows, "Oldest"), Some(("", false)));
+        assert!(matches!(
+            rows.iter().find(|(key, _, _)| key == "Newest"),
+            Some((_, RowValue::LinkWithText(_, _), false))
+        ));
+    }
+
+    #[test]
+    fn issue_header_rows_report_every_field_and_bold_missing_assignees() {
+        let issue = sample_issue();
+        let rows = issue_header_rows(&issue);
+        assert_eq!(find_row_text(&rows, "Author"), Some(("alice", false)));
+        assert_eq!(
+            find_row_text(&rows, "Link"),
+            Some(("https://github.com/o/r/issues/17", false))
+        );
+        assert_eq!(
+            find_row_text(&rows, "Created"),
+            Some(("2026-06-01 12:30:45", false))
+        );
+        assert_eq!(find_row_text(&rows, "Milestone"), Some(("1.0", false)));
+        assert_eq!(find_row_text(&rows, "Comments"), Some(("2", false)));
+        assert_eq!(find_row_text(&rows, "Assignees"), Some(("bob", false)));
+        assert_eq!(find_row_text(&rows, "Labels"), Some(("bug, urgent", false)));
+
+        let mut bare = sample_issue();
+        bare.milestone.clear();
+        bare.assignees.clear();
+        bare.labels.clear();
+        let rows = issue_header_rows(&bare);
+        assert_eq!(find_row_text(&rows, "Milestone"), Some(("none", false)));
+        // An unassigned issue's "none" is bold so it catches the eye.
+        assert_eq!(find_row_text(&rows, "Assignees"), Some(("none", true)));
+        assert_eq!(find_row_text(&rows, "Labels"), Some(("none", false)));
+    }
+
+    #[test]
+    fn issue_title_block_links_to_the_forge() {
+        let block = issue_title_block(&sample_issue());
+        assert_eq!(block.spans[0].text, "#17 Crash on startup");
+        assert!(block.spans[0].bold);
+        assert_eq!(
+            block.link.as_deref(),
+            Some("https://github.com/o/r/issues/17")
+        );
+    }
+
+    #[test]
+    fn issue_description_blocks_render_markdown_or_a_fallback() {
+        let blocks = build_issue_description_blocks(&sample_issue());
+        assert_eq!(blocks[0].spans[0].text, "Description");
+        assert!(blocks[0].spans[0].bold);
+        // The body's Markdown is rendered: bold emphasis, a heading, list
+        // items, and the code block each end up in their own blocks.
+        let texts: Vec<String> = blocks
+            .iter()
+            .map(|block| {
+                block
+                    .spans
+                    .iter()
+                    .map(|span| span.text.clone())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(texts.iter().any(|text| text.contains("Steps")), "{texts:?}");
+        assert!(
+            texts.iter().any(|text| text.contains("orangu")),
+            "{texts:?}"
+        );
+        assert!(
+            blocks.iter().any(|block| block
+                .spans
+                .iter()
+                .any(|span| span.bold && span.text == "crashes")),
+            "{texts:?}"
+        );
+        // The last block carries the extra gap ahead of the comment table.
+        assert!(blocks.last().unwrap().space_after_mm >= LAST_COMMENT_GAP_MM);
+
+        let mut bare = sample_issue();
+        bare.body = "   ".to_string();
+        let blocks = build_issue_description_blocks(&bare);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1].spans[0].text, "No description.");
     }
 
     #[test]

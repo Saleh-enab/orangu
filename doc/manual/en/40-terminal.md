@@ -51,7 +51,7 @@ Two groups of commands are refused rather than run, with a message saying which 
 
 `/create_patch` is not in either group: a one-shot has no stored review report, but it still resolves the conflicts of an in-progress merge, rebase, or cherry-pick, which is what makes `orangu -p "/create_patch"` usable from a script that hits one.
 
-`/export` covers the targets that are computed at export time: `pr`, `statistics`, and `duplicates`. `console`, `review`, and `auto review` export what an interactive session accumulated, and report that there is nothing to export.
+`/export` covers the targets that are computed at export time: `pr`, `issue`, `statistics`, and `duplicates`. `console`, `review`, and `auto review` export what an interactive session accumulated, and report that there is nothing to export.
 
 ### Quiet mode
 

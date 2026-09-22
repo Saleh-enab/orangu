@@ -395,6 +395,9 @@ pub enum ExportTarget {
     /// A report of every open pull/merge request (`export pr`), fetched from
     /// the forge at export time.
     Pr,
+    /// A report of every open issue (`export issue`), fetched from the forge
+    /// at export time.
+    Issue,
     /// The persistent activity history (`export statistics`, or `export
     /// statistics total` for every workspace): totals, streaks, and a daily
     /// heatmap, read from the same log `/statistics` reports on.
@@ -403,12 +406,13 @@ pub enum ExportTarget {
 
 /// The `/export` target words, in offer order, used for Tab completion and the
 /// inline ghost. Kept in step with [`parse_export_target`].
-pub const EXPORT_TARGETS: [&str; 6] = [
+pub const EXPORT_TARGETS: [&str; 7] = [
     "console",
     "review",
     "auto review",
     "duplicates",
     "pr",
+    "issue",
     "statistics",
 ];
 

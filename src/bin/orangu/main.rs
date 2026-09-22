@@ -108,9 +108,9 @@ use git::{
     bisect_status_output, branch_create_output, branch_delete_output, branch_list_all_output,
     branch_list_output, branch_rename_output, cherry_pick_output, close_output,
     collect_review_diff, comment_output, commit_output, create_pull_request_output,
-    discover_git_root, fetch_active_pull_requests, fetch_issue_metadata, fetch_output,
-    fetch_pull_request_details, get_comments_output, git_checkout, git_diff_against_branch,
-    git_workspace_diff, grep_output, init_repo_output, issue_field_output,
+    discover_git_root, fetch_active_pull_requests, fetch_issue_details, fetch_issue_metadata,
+    fetch_output, fetch_pull_request_details, get_comments_output, git_checkout,
+    git_diff_against_branch, git_workspace_diff, grep_output, init_repo_output, issue_field_output,
     list_workspace_files_tree, log_output, merge_output, open_in_editor, pull_request_output,
     push_output, rebase_output, restore_output, show_output, squash_output, stash_drop_output,
     stash_list_output, stash_output, stash_pop_output, status_output, sync_default_branch,
@@ -2488,6 +2488,11 @@ async fn run() -> Result<()> {
                     },
                     ExportTarget::Pr => fetch_pull_request_details(&workspace, forge)
                         .and_then(|prs| export::export_pr(&workspace, &prs, &active_model_id)),
+                    ExportTarget::Issue => {
+                        fetch_issue_details(&workspace, forge).and_then(|issues| {
+                            export::export_issue(&workspace, &issues, &active_model_id)
+                        })
+                    }
                     ExportTarget::Statistics(total) => {
                         export::export_statistics(&workspace, &active_model_id, total)
                     }

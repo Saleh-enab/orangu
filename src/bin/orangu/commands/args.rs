@@ -26,6 +26,7 @@ pub fn parse_export_target(arg: &str) -> Option<ExportTarget> {
         "auto review" | "auto_review" | "auto-review" => Some(ExportTarget::AutoReview),
         "duplicates" => Some(ExportTarget::Duplicates),
         "pr" | "pull requests" | "pull_requests" | "pull-requests" => Some(ExportTarget::Pr),
+        "issue" | "issues" => Some(ExportTarget::Issue),
         "statistics" => Some(ExportTarget::Statistics(false)),
         "statistics total" => Some(ExportTarget::Statistics(true)),
         _ => None,
