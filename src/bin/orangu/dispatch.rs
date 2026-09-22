@@ -472,6 +472,126 @@ pub(crate) fn auto_review_all_outcome(
     })
 }
 
+/// Launch an `/auto_review <pattern>` of every file matching a glob pattern
+/// such as `src/main/java/**` or `*.rs`. The pattern generalizes the
+/// single-file argument, so what gets reviewed follows
+/// `auto_review_file_outcome`: on main/master every Git-tracked file the
+/// pattern matches is reviewed whole (a full read of its current content); on
+/// any other branch only the changed files it matches are reviewed, as their
+/// diff against the default branch, under the same rebased-branch guard. A
+/// pattern that matches nothing is refused rather than launching an empty
+/// review. See `AutoReviewPatternMatcher` for the matching rules.
+pub(crate) fn auto_review_pattern_outcome(
+    workspace: &Path,
+    pattern: &str,
+    immediate: bool,
+    deep: bool,
+) -> CommandOutcome {
+    let Some(repo_root) = git::discover_git_root(workspace) else {
+        return CommandOutcome::OutputError(
+            "auto review is only available inside a Git repository".to_string(),
+        );
+    };
+    let matcher = match AutoReviewPatternMatcher::new(pattern) {
+        Ok(matcher) => matcher,
+        Err(err) => {
+            return CommandOutcome::OutputError(format!("Invalid pattern '{pattern}': {err}"));
+        }
+    };
+    let on_protected = match git::git_current_branch(&repo_root) {
+        Ok(branch) => git::is_protected_branch(&branch),
+        Err(err) => return local_command_error(err),
+    };
+
+    let files: Vec<ReviewEntry> = if on_protected {
+        let mut paths = git::git_tracked_files(workspace);
+        paths.sort();
+        // As for `all`, a file that cannot be read as text is left out rather
+        // than sinking the whole batch.
+        paths
+            .into_iter()
+            .filter(|path| matcher.is_match(path))
+            .filter_map(|path| full_file_review_entry(workspace, &repo_root, &path).ok())
+            .collect()
+    } else {
+        if let Some(refusal) = behind_default_branch_guard(workspace) {
+            return refusal;
+        }
+        match collect_review_diff(workspace) {
+            Ok(review) => {
+                let files: Vec<ReviewEntry> = review
+                    .files
+                    .into_iter()
+                    .filter(|f| matcher.is_match(&f.path))
+                    .map(|f| ReviewEntry {
+                        path: f.path,
+                        status: ReviewStatus::Unreviewed,
+                        diff_lines: f.lines,
+                        patch: f.patch,
+                    })
+                    .collect();
+                if files.is_empty() {
+                    return CommandOutcome::OutputError(format!(
+                        "No changed file matches '{pattern}' against {}.",
+                        review.base_label
+                    ));
+                }
+                files
+            }
+            Err(err) => return local_command_error(err),
+        }
+    };
+    if files.is_empty() {
+        return CommandOutcome::OutputError(format!(
+            "No tracked file matches '{pattern}' to review."
+        ));
+    }
+
+    CommandOutcome::AutoReview(ReviewLaunch {
+        files,
+        immediate,
+        deep,
+    })
+}
+
+/// The glob matcher behind `/auto_review <pattern>`, with `.gitignore`-style
+/// rules: `*` and `?` never cross a `/`, `**` does (so `src/main/java/**` is
+/// everything under that directory, at any depth, and `src/*.rs` only its
+/// direct children), and a pattern without a `/` — `*.rs`, `Foo?.java` —
+/// matches on the file's name at any depth, mirroring how a bare
+/// `/auto_review tui.rs` resolves by basename. Paths are matched as `git`
+/// reports them: repo-relative, `/`-separated, no leading `./`.
+pub(crate) struct AutoReviewPatternMatcher {
+    glob: globset::GlobMatcher,
+    by_name: bool,
+}
+
+impl AutoReviewPatternMatcher {
+    pub(crate) fn new(pattern: &str) -> Result<Self, globset::Error> {
+        let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
+        let glob = globset::GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .build()?
+            .compile_matcher();
+        Ok(Self {
+            glob,
+            by_name: !pattern.contains('/'),
+        })
+    }
+
+    pub(crate) fn is_match(&self, path: &str) -> bool {
+        let path = path.strip_prefix("./").unwrap_or(path);
+        if self.glob.is_match(path) {
+            return true;
+        }
+        self.by_name
+            && Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| self.glob.is_match(name))
+    }
+}
+
 /// Whether a changed file's repo-relative `path` matches the user's `arg`: the
 /// exact path (what Tab completion fills in), or a trailing path / basename
 /// match so a hand-typed bare name like `tui.rs` still resolves.
@@ -1610,6 +1730,9 @@ pub(crate) fn handle_command(
         }
         LocalCommand::AutoReview(AutoReviewTarget::File(file), immediate, deep) => Ok(
             auto_review_file_outcome(workspace, file.trim(), immediate, deep),
+        ),
+        LocalCommand::AutoReview(AutoReviewTarget::Pattern(pattern), immediate, deep) => Ok(
+            auto_review_pattern_outcome(workspace, pattern.trim(), immediate, deep),
         ),
         LocalCommand::AutoReview(AutoReviewTarget::All, immediate, deep) => {
             Ok(auto_review_all_outcome(workspace, immediate, deep))
@@ -2870,6 +2993,164 @@ mod tests {
         assert!(matches!(
             auto_review_file_outcome(workspace.path(), "other.txt", false, false),
             CommandOutcome::OutputError(_)
+        ));
+    }
+
+    #[test]
+    fn auto_review_pattern_matcher_follows_gitignore_rules() {
+        let m = AutoReviewPatternMatcher::new("src/main/java/**").expect("glob");
+        assert!(m.is_match("src/main/java/Foo.java"));
+        assert!(m.is_match("src/main/java/com/example/Bar.java"));
+        assert!(m.is_match("./src/main/java/Foo.java"));
+        assert!(!m.is_match("src/test/java/FooTest.java"));
+        assert!(!m.is_match("src/main/java"));
+
+        // `*` stays within one path segment; `**` crosses them.
+        let m = AutoReviewPatternMatcher::new("src/*.rs").expect("glob");
+        assert!(m.is_match("src/tui.rs"));
+        assert!(!m.is_match("src/bin/main.rs"));
+        let m = AutoReviewPatternMatcher::new("src/**/*.rs").expect("glob");
+        assert!(m.is_match("src/tui.rs"));
+        assert!(m.is_match("src/bin/orangu/main.rs"));
+        assert!(!m.is_match("tests/it.rs"));
+
+        // A pattern without a `/` matches on the file name at any depth.
+        let m = AutoReviewPatternMatcher::new("*.rs").expect("glob");
+        assert!(m.is_match("build.rs"));
+        assert!(m.is_match("src/bin/orangu/main.rs"));
+        assert!(!m.is_match("src/bin/orangu/main.rs.orig"));
+        let m = AutoReviewPatternMatcher::new("{tui,cli}.rs").expect("glob");
+        assert!(m.is_match("src/tui.rs"));
+        assert!(m.is_match("src/cli.rs"));
+        assert!(!m.is_match("src/main.rs"));
+        let m = AutoReviewPatternMatcher::new("./*.md").expect("glob");
+        assert!(m.is_match("README.md"));
+
+        // A malformed pattern is an error, not a silent no-match.
+        assert!(AutoReviewPatternMatcher::new("src/[a").is_err());
+    }
+
+    #[test]
+    fn auto_review_pattern_on_main_reviews_every_matching_tracked_file() {
+        let _env_lock = crate::process_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let workspace = tempdir().expect("workspace");
+        let home = tempdir().expect("home");
+        let _home = crate::git::EnvVarGuard::set_path("HOME", home.path());
+        crate::git::init_git_for_test(workspace.path());
+        crate::git::git_run(workspace.path(), &["checkout", "-B", "main"]);
+        fs::create_dir_all(workspace.path().join("src/main/java/com")).expect("dirs");
+        fs::create_dir_all(workspace.path().join("src/test/java")).expect("dirs");
+        fs::write(
+            workspace.path().join("src/main/java/Foo.java"),
+            "class Foo {}\n",
+        )
+        .expect("file");
+        fs::write(
+            workspace.path().join("src/main/java/com/Bar.java"),
+            "class Bar {}\n",
+        )
+        .expect("file");
+        fs::write(
+            workspace.path().join("src/test/java/FooTest.java"),
+            "class FooTest {}\n",
+        )
+        .expect("file");
+        fs::write(workspace.path().join("README.md"), "one\n").expect("file");
+        crate::git::git_run(workspace.path(), &["add", "."]);
+        crate::git::git_run(workspace.path(), &["commit", "-m", "base"]);
+        // Untracked files never match, exactly as for `all`.
+        fs::write(
+            workspace.path().join("src/main/java/Untracked.java"),
+            "class U {}\n",
+        )
+        .expect("untracked");
+
+        match auto_review_pattern_outcome(workspace.path(), "src/main/java/**", true, true) {
+            CommandOutcome::AutoReview(launch) => {
+                let paths: Vec<&str> = launch.files.iter().map(|f| f.path.as_str()).collect();
+                assert_eq!(
+                    paths,
+                    vec!["src/main/java/Foo.java", "src/main/java/com/Bar.java"]
+                );
+                // Each match is reviewed whole, as an all-added diff.
+                assert!(launch.files[0].patch.contains("+class Foo {}"));
+                assert!(launch.immediate);
+                assert!(launch.deep);
+            }
+            _ => panic!("expected an AutoReview outcome for a pattern on main"),
+        }
+
+        // A slash-less pattern matches by file name at any depth.
+        match auto_review_pattern_outcome(workspace.path(), "*.java", false, false) {
+            CommandOutcome::AutoReview(launch) => {
+                assert_eq!(launch.files.len(), 3);
+                assert!(!launch.immediate);
+                assert!(!launch.deep);
+            }
+            _ => panic!("expected an AutoReview outcome for *.java on main"),
+        }
+
+        // A pattern matching nothing, and a malformed one, are refused.
+        assert!(matches!(
+            auto_review_pattern_outcome(workspace.path(), "docs/**", false, false),
+            CommandOutcome::OutputError(msg) if msg.contains("No tracked file matches 'docs/**'")
+        ));
+        assert!(matches!(
+            auto_review_pattern_outcome(workspace.path(), "src/[a", false, false),
+            CommandOutcome::OutputError(msg) if msg.starts_with("Invalid pattern 'src/[a'")
+        ));
+    }
+
+    #[test]
+    fn auto_review_pattern_on_branch_reviews_only_matching_changes() {
+        let _env_lock = crate::process_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let workspace = tempdir().expect("workspace");
+        let home = tempdir().expect("home");
+        let _home = crate::git::EnvVarGuard::set_path("HOME", home.path());
+        crate::git::init_git_for_test(workspace.path());
+        crate::git::git_run(workspace.path(), &["checkout", "-B", "main"]);
+        fs::create_dir_all(workspace.path().join("src/main/java")).expect("dirs");
+        fs::create_dir_all(workspace.path().join("src/test/java")).expect("dirs");
+        fs::write(workspace.path().join("src/main/java/Foo.java"), "one\n").expect("file");
+        fs::write(workspace.path().join("src/main/java/Same.java"), "same\n").expect("file");
+        fs::write(workspace.path().join("src/test/java/FooTest.java"), "one\n").expect("file");
+        crate::git::git_run(workspace.path(), &["add", "."]);
+        crate::git::git_run(workspace.path(), &["commit", "-m", "base"]);
+
+        crate::git::git_run(workspace.path(), &["checkout", "-b", "feature/x"]);
+        fs::write(
+            workspace.path().join("src/main/java/Foo.java"),
+            "one\ntwo\n",
+        )
+        .expect("edit");
+        fs::write(
+            workspace.path().join("src/test/java/FooTest.java"),
+            "one\ntwo\n",
+        )
+        .expect("edit");
+        crate::git::git_run(workspace.path(), &["commit", "-am", "edit"]);
+
+        // Only the changed file under the pattern is reviewed, as its diff —
+        // the unchanged `Same.java` under the same directory is left out.
+        match auto_review_pattern_outcome(workspace.path(), "src/main/java/**", false, false) {
+            CommandOutcome::AutoReview(launch) => {
+                let paths: Vec<&str> = launch.files.iter().map(|f| f.path.as_str()).collect();
+                assert_eq!(paths, vec!["src/main/java/Foo.java"]);
+                let patch = &launch.files[0].patch;
+                assert!(patch.contains("+two"), "{patch:?}");
+                assert!(!patch.contains("+one"), "{patch:?}");
+            }
+            _ => panic!("expected an AutoReview outcome for a pattern on a branch"),
+        }
+
+        // A pattern with no changed file under it is refused.
+        assert!(matches!(
+            auto_review_pattern_outcome(workspace.path(), "docs/**", false, false),
+            CommandOutcome::OutputError(msg) if msg.contains("No changed file matches 'docs/**'")
         ));
     }
 

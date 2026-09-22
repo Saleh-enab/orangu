@@ -44,6 +44,7 @@ crossterm = "0.29.0"
 home = "0.5.12"
 html2text = "0.17.1"
 ignore = "0.4.33"
+globset = "0.4.20"
 markdown = "1.0.0"
 merman = { version = "0.7.0", features = ["render"] }
 printpdf = { version = "0.12.8", default-features = false, features = ["text_layout", "png"] }

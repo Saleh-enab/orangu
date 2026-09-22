@@ -280,13 +280,23 @@ pub const AUTO_REVIEW_ALL: &str = "all";
 pub const AUTO_REVIEW_DEEP: &str = "deep";
 
 /// What `/auto_review` reviews: the branch diff (the default), a single file
-/// (`/auto_review <file>`), or every file in the project (`/auto_review
-/// all`). The `all` keyword takes priority over a file argument if both are
-/// given.
+/// (`/auto_review <file>`), every file matching a glob pattern
+/// (`/auto_review src/main/java/**`), or every file in the project
+/// (`/auto_review all`). The `all` keyword takes priority over a file or
+/// pattern argument if both are given.
 pub enum AutoReviewTarget<'a> {
     Branch,
     File(Cow<'a, str>),
+    Pattern(Cow<'a, str>),
     All,
+}
+
+/// Whether an `/auto_review` file argument is a glob pattern rather than a
+/// plain path: it contains a `*`, `?`, `[`, or `{` metacharacter. A plain path
+/// is looked up as a single file; a pattern selects every file it matches
+/// (see `AutoReviewTarget::Pattern`).
+pub fn is_auto_review_pattern(arg: &str) -> bool {
+    arg.contains(['*', '?', '[', '{'])
 }
 
 /// The `/comment` keyword that submits the last `/review` summary as the

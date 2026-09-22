@@ -21,9 +21,12 @@ use std::borrow::Cow;
 /// start, the `all` keyword (case-insensitive) requests a review of every
 /// project file, the `deep` keyword (case-insensitive) requests every file
 /// start in Deep mode, and otherwise the first remaining token, if any, is
-/// the single-file target. So `immediate`, `all`, `deep`, `src/main.rs`,
-/// `src/main.rs immediate`, and `deep all immediate` are all accepted, in any
-/// order; `all` wins over a file argument if both are somehow given.
+/// the target — a single file, or a glob pattern (one containing `*`, `?`,
+/// `[`, or `{`, see `is_auto_review_pattern`) selecting every file it
+/// matches. So `immediate`, `all`, `deep`, `src/main.rs`, `src/main/java/**`,
+/// `src/main.rs immediate`, `src/**/*.java immediate`, and `deep all
+/// immediate` are all accepted, in any order; `all` wins over a file or
+/// pattern argument if both are somehow given.
 pub(crate) fn parse_auto_review_args(args: &str) -> (AutoReviewTarget<'_>, bool, bool) {
     let mut file = None;
     let mut immediate = false;
@@ -43,7 +46,11 @@ pub(crate) fn parse_auto_review_args(args: &str) -> (AutoReviewTarget<'_>, bool,
     let target = if all {
         AutoReviewTarget::All
     } else if let Some(file) = file {
-        AutoReviewTarget::File(Cow::Borrowed(file))
+        if is_auto_review_pattern(file) {
+            AutoReviewTarget::Pattern(Cow::Borrowed(file))
+        } else {
+            AutoReviewTarget::File(Cow::Borrowed(file))
+        }
     } else {
         AutoReviewTarget::Branch
     };

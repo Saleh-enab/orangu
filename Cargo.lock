@@ -3555,6 +3555,7 @@ dependencies = [
  "daemonize",
  "fern",
  "flate2",
+ "globset",
  "half",
  "home",
  "html2text",

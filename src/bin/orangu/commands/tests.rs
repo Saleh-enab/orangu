@@ -1042,6 +1042,62 @@ fn parses_auto_review_commands() {
         Some(LocalCommand::AutoReview(AutoReviewTarget::File(file), true, false)) if file == "src/tui.rs"
     ));
 
+    // A file argument with a glob metacharacter is a pattern, not a path —
+    // in the slash and natural-language forms, and combined with the
+    // keywords in any order.
+    for input in [
+        "/auto_review src/main/java/**",
+        "auto review src/main/java/**",
+    ] {
+        assert!(
+            matches!(
+                parse_local_command(input),
+                Some(LocalCommand::AutoReview(AutoReviewTarget::Pattern(pattern), false, false))
+                    if pattern == "src/main/java/**"
+            ),
+            "expected {input:?} to carry the pattern"
+        );
+    }
+    for pattern in ["*.rs", "src/?ui.rs", "src/[a-z]*.rs", "src/{tui,cli}.rs"] {
+        assert!(
+            matches!(
+                parse_local_command(&format!("/auto_review {pattern}")),
+                Some(LocalCommand::AutoReview(AutoReviewTarget::Pattern(p), false, false))
+                    if p == pattern
+            ),
+            "expected {pattern:?} to parse as a pattern"
+        );
+    }
+    assert!(matches!(
+        parse_local_command("/auto_review src/main/java/** immediate"),
+        Some(LocalCommand::AutoReview(AutoReviewTarget::Pattern(p), true, false))
+            if p == "src/main/java/**"
+    ));
+    assert!(matches!(
+        parse_local_command("/auto_review immediate src/main/java/**"),
+        Some(LocalCommand::AutoReview(AutoReviewTarget::Pattern(p), true, false))
+            if p == "src/main/java/**"
+    ));
+    assert!(matches!(
+        parse_local_command("/auto_review deep src/main/java/** immediate"),
+        Some(LocalCommand::AutoReview(AutoReviewTarget::Pattern(p), true, true))
+            if p == "src/main/java/**"
+    ));
+    assert!(matches!(
+        parse_local_command("/auto_review src/**/*.java deep immediate"),
+        Some(LocalCommand::AutoReview(AutoReviewTarget::Pattern(p), true, true))
+            if p == "src/**/*.java"
+    ));
+    // `all` wins over a pattern too.
+    assert!(matches!(
+        parse_local_command("/auto_review src/main/java/** all"),
+        Some(LocalCommand::AutoReview(
+            AutoReviewTarget::All,
+            false,
+            false
+        ))
+    ));
+
     // The `all` keyword requests every project file — alone, with `immediate`
     // in either order, and its natural-language form.
     for input in ["/auto_review all", "auto review all", "/auto_review ALL"] {

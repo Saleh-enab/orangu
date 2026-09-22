@@ -8,7 +8,7 @@ copy the report to the clipboard on exit.
 | --- | --- |
 | `/review` | Interactive: your changed files on the right, the selected file's diff on the left. |
 | `/auto_review` | The model reviews the branch and each file, and marks every file green or red. |
-| `/auto_review src/tui.rs` `all` | One file, or every Git-tracked file in the project. |
+| `/auto_review src/tui.rs` `src/**/*.rs` `all` | One file, every file matching a glob, or every Git-tracked file in the project. |
 | `is this thread-safe?` | Type a question in either view and press Enter to ask about the selected file. |
 | `/create_patch` | Hands the finished report to the model, which verifies each finding and fixes it in the working tree. Never commits. |
 
