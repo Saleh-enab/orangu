@@ -1174,14 +1174,16 @@ impl LlamaModel {
         // host, not in `bufs` — every layer was finished there. Hand it to
         // the tail as a CPU input; `record_output_norm` takes either.
         if npu.is_some() || moe_seam {
-            // `Tail::None` wants this run's *pre-norm* hidden state, and on
-            // this path it is on the host rather than in any buffer — there
-            // is nothing to hand back. Declining sends the caller to the
-            // unfused path, which is slower and right; the alternative,
-            // handing back `output_norm(x)` and letting the next device run
-            // layers on it, is what this used to do.
+            // `Tail::None` wants this run's *pre-norm* hidden state, which on
+            // this path is on the host, so it goes back in a buffer of its
+            // own. Declining is not an option here: every layer has already
+            // committed this position to its cache, and a caller that reran
+            // the layers would commit it a second time.
             if tail == Tail::None {
-                return None;
+                let buf = vulkan.prefill_rows_buffer(n_embd);
+                vulkan.upload_rows(&buf, &host_x);
+                ts.finish(vulkan, &mut encoder, n_layer);
+                return Some((encoder, buf, 0));
             }
             let normed = vulkan.record_output_norm(
                 &mut encoder,
