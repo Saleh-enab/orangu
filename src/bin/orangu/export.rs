@@ -69,9 +69,8 @@ use orangu::tui::TranscriptLine;
 
 use crate::VERSION;
 use crate::git::{
-    ForgeWeb, IssueDetail, PullRequestCheck, PullRequestComment, PullRequestDetail,
-    PullRequestReviewer, discover_git_root, forge_web_from_origin, git_repository_name,
-    workspace_branch_name,
+    ForgeWeb, IssueComment, IssueDetail, PullRequestCheck, PullRequestDetail, PullRequestReviewer,
+    discover_git_root, forge_web_from_origin, git_repository_name, workspace_branch_name,
 };
 use crate::render::{SyntaxHighlightAssets, syntax_highlight_assets};
 
@@ -512,7 +511,8 @@ pub fn export_duplicates(
 ///   of author, dates, branches, draft/conflict/CI status, comment count,
 ///   assignees, reviewers (with their review state), and labels, then the
 ///   changed files — full path, one per line, with additions in green and
-///   deletions in red — the last comment, and finally the CI checks, name
+///   deletions in red — every comment, oldest first, each body rendered
+///   from its Markdown, and finally the CI checks, name
 ///   and coloured status aligned in a borderless two-column table.
 ///
 /// A repository with no open pull requests still gets its status page,
@@ -533,13 +533,12 @@ pub fn export_pr(workspace: &Path, prs: &[PullRequestDetail], model: &str) -> Re
         return Ok(path);
     }
 
-    // One page (more when a pull request touches many files) per pull
-    // request; compute where each lands so the table of contents (page 2)
-    // can point at it. The header (title + field table) is a fixed height
-    // drawn ahead of the changed-files list, so the files are paginated from
-    // however much room is left on that first page; the "Last comment" table
-    // follows, adding one more page only if it doesn't fit where the files
-    // list left off.
+    // One page (more when a pull request touches many files or has many
+    // comments) per pull request; compute where each lands so the table of
+    // contents (page 2) can point at it. The header (title + field table) is
+    // a fixed height drawn ahead of the changed-files list, so the files are
+    // paginated from however much room is left on that first page; the
+    // comments follow from wherever the files left off.
     let titles: Vec<String> = prs
         .iter()
         .map(|pr| format!("#{} {}", pr.number, pr.title))
@@ -552,18 +551,11 @@ pub fn export_pr(workspace: &Path, prs: &[PullRequestDetail], model: &str) -> Re
         let start_cursor = (CONTENT_TOP_MM - header_height).max(CONTENT_BOTTOM_MM);
         let (mut pages_for_pr, cursor_after_files) =
             paginate_from(&build_changed_file_blocks(pr), &pdf.fonts, start_cursor);
-        let comment_table_height =
-            last_comment_table_height_mm(pr.last_comment.as_ref(), &pdf.fonts);
-        // The comment table breaks atomically onto a fresh page rather than
-        // wrapping (mirroring `draw_pr_detail_page`), so its post-table
-        // cursor is exactly `height` mm below wherever it started.
-        let cursor_after_comment = if cursor_after_files - comment_table_height < CONTENT_BOTTOM_MM
-        {
-            pages_for_pr += 1;
-            CONTENT_TOP_MM - comment_table_height
-        } else {
-            cursor_after_files - comment_table_height
-        };
+        let (comment_pages, cursor_after_comment) = paginate_from(
+            &build_comment_blocks(&pr.comments),
+            &pdf.fonts,
+            cursor_after_files,
+        );
         // The "Checks" heading, then either the checks table or the "No
         // checks reported." fallback line — mirroring `draw_check_section`.
         let (heading_pages, cursor_after_heading) = paginate_from(
@@ -583,7 +575,7 @@ pub fn export_pr(workspace: &Path, prs: &[PullRequestDetail], model: &str) -> Re
         // Each `paginate_*` counts the page it started on, already counted
         // by the previous section's last page — only pages beyond that are
         // new.
-        pages_for_pr += (heading_pages - 1) + (rows_pages - 1);
+        pages_for_pr += (comment_pages - 1) + (heading_pages - 1) + (rows_pages - 1);
         page += pages_for_pr;
     }
 
@@ -896,17 +888,17 @@ fn detail_header_height_mm(title: &Block, row_count: usize, fonts: &DocFonts) ->
     title_height + table_height
 }
 
+/// Extra breathing room (mm), on top of a block's normal trailing gap, left
+/// after the last block of a detail page section — so the section that
+/// follows doesn't crowd it. Added to the last block's `space_after_mm` so
+/// both the real draw (`draw_blocks`) and the table of contents' page-count
+/// simulation (`paginate_from`, which also sums `space_after_mm`) account for
+/// it identically.
+const SECTION_GAP_MM: f32 = 6.0;
+
 /// One line per changed file: its full path, then its added-line count in
 /// green and removed-line count in red. Empty when the forge did not return a
 /// diff (GitLab's merge-request list endpoint never does).
-/// Extra breathing room (mm), on top of a changed-file line's normal
-/// trailing gap, left after the last one — so the "Last comment" table that
-/// follows doesn't crowd the changed files. Added to the last block's
-/// `space_after_mm` so both the real draw (`draw_blocks`) and the table of
-/// contents' page-count simulation (`paginate_from`, which also sums
-/// `space_after_mm`) account for it identically.
-const LAST_COMMENT_GAP_MM: f32 = 6.0;
-
 fn build_changed_file_blocks(pr: &PullRequestDetail) -> Vec<Block> {
     let mut blocks: Vec<Block> = pr
         .files
@@ -939,7 +931,7 @@ fn build_changed_file_blocks(pr: &PullRequestDetail) -> Vec<Block> {
         })
         .collect();
     if let Some(last) = blocks.last_mut() {
-        last.space_after_mm += LAST_COMMENT_GAP_MM;
+        last.space_after_mm += SECTION_GAP_MM;
     }
     blocks
 }
@@ -969,7 +961,8 @@ fn checks_heading_block() -> Block {
 }
 
 /// A bold body-sized label introducing a detail page section (the pull
-/// request report's "Checks", the issue report's "Description").
+/// request report's "Checks", the issue report's "Description", both
+/// reports' "Comments").
 fn section_heading_block(text: &str) -> Block {
     Block {
         spans: vec![Span {
@@ -989,8 +982,8 @@ fn section_heading_block(text: &str) -> Block {
 }
 
 /// The "No checks reported." line standing in for the checks table when the
-/// forge returned none — matching the "Last comment" table's own N/A
-/// fallback.
+/// forge returned none — matching the "No comments." line of the comments
+/// section.
 fn no_checks_block() -> Block {
     Block::paragraph(vec![Span::plain("No checks reported.")])
 }
@@ -1047,71 +1040,60 @@ fn list_or_none(items: &[String]) -> String {
     }
 }
 
-/// The comment body length above which [`truncate_comment`] cuts it off —
-/// bounds the "Last comment" table's height so it stays small and its size
-/// predictable ahead of drawing (see [`last_comment_table_height_mm`]).
-const LAST_COMMENT_MAX_CHARS: usize = 500;
-
-/// Cut `body` to [`LAST_COMMENT_MAX_CHARS`] characters, appending an ellipsis
-/// when it was longer. Left whole otherwise.
-fn truncate_comment(body: &str) -> String {
-    if body.chars().count() <= LAST_COMMENT_MAX_CHARS {
-        return body.to_string();
+/// The "Comments" section of a pull request's or issue's detail page: the
+/// bold heading, then every comment, oldest first — a header line with the
+/// author in bold and the date, then the body rendered from its Markdown like
+/// an issue's description — or a "No comments." line when there are none.
+/// The section flows across pages like any other blocks; its last block
+/// carries the extra gap ahead of whatever follows.
+fn build_comment_blocks(comments: &[IssueComment]) -> Vec<Block> {
+    let mut blocks = vec![section_heading_block("Comments")];
+    if comments.is_empty() {
+        blocks.push(Block::paragraph(vec![Span::plain("No comments.")]));
     }
-    let mut truncated: String = body.chars().take(LAST_COMMENT_MAX_CHARS).collect();
-    truncated.push('…');
-    truncated
-}
-
-/// The "Last comment" table's geometry (the author/comment column divider,
-/// the row height) and the comment's wrapped, truncated lines — shared by
-/// [`Pdf::draw_last_comment_table`] and [`last_comment_table_height_mm`] so
-/// they can never drift apart.
-fn last_comment_table_layout(
-    author: &str,
-    body: &str,
-    fonts: &DocFonts,
-) -> (f32, f32, Vec<String>) {
-    let x0 = MARGIN_MM;
-    let x1 = PAGE_WIDTH_MM - MARGIN_MM;
-    let row_height = BODY_SIZE * 1.9 * PT_TO_MM;
-    let author_width = fonts.text_width_mm(author, false, false, BODY_SIZE);
-    let divider = (x0 + 6.0 + author_width.max(20.0) + 6.0).min(x1 - 40.0);
-    let comment_width = (x1 - divider - 6.0).max(20.0);
-    let chars: Vec<StyledChar> = truncate_comment(body)
-        .chars()
-        .map(|ch| StyledChar {
-            ch,
-            bold: false,
-            italic: false,
-            color: None,
+    for (index, comment) in comments.iter().enumerate() {
+        if index > 0
+            && let Some(last) = blocks.last_mut()
+        {
+            last.space_after_mm += SECTION_GAP_MM;
+        }
+        blocks.push(Block {
+            spans: vec![
+                Span {
+                    text: comment.author.clone(),
+                    bold: true,
+                    italic: false,
+                    color: None,
+                    link: None,
+                },
+                Span {
+                    text: format!("  {}", comment.date),
+                    bold: false,
+                    italic: false,
+                    color: Some(GRID_COLOR),
+                    link: None,
+                },
+            ],
+            size: BODY_SIZE,
+            indent_mm: 0.0,
+            hanging_mm: 0.0,
+            word_wrap: true,
+            space_after_mm: BODY_SIZE * 0.25 * PT_TO_MM,
             link: None,
-        })
-        .collect();
-    let lines = wrap(&chars, comment_width, comment_width, true, fonts, BODY_SIZE)
-        .into_iter()
-        .map(|line| line.into_iter().map(|styled| styled.ch).collect())
-        .collect();
-    (divider, row_height, lines)
-}
-
-/// The author and body the "Last comment" table shows for `comment` —
-/// `"N/A"`/`"N/A"` when there is none.
-fn last_comment_cells(comment: Option<&PullRequestComment>) -> (&str, &str) {
-    match comment {
-        Some(comment) => (comment.author.as_str(), comment.body.as_str()),
-        None => ("N/A", "N/A"),
+        });
+        if comment.body.trim().is_empty() {
+            continue;
+        }
+        let mut tree = parse_markdown(&comment.body);
+        resolve_reference_links(&mut tree);
+        if let Node::Root(root) = &tree {
+            render_block_nodes(&root.children, 0, &mut blocks);
+        }
     }
-}
-
-/// The vertical space (mm) the "Last comment" table occupies, for a pull
-/// request or issue with (or without) a comment — `"N/A"`/`"N/A"` when there
-/// is none, matching what [`Pdf::draw_pr_detail_page`] and
-/// [`Pdf::draw_issue_detail_page`] actually draw.
-fn last_comment_table_height_mm(comment: Option<&PullRequestComment>, fonts: &DocFonts) -> f32 {
-    let (author, body) = last_comment_cells(comment);
-    let (_, row_height, lines) = last_comment_table_layout(author, body, fonts);
-    row_height + lines.len().max(1) as f32 * row_height + 8.0
+    if let Some(last) = blocks.last_mut() {
+        last.space_after_mm += SECTION_GAP_MM;
+    }
+    blocks
 }
 
 /// Export a report of every open issue to a PDF in the workspace root as
@@ -1126,7 +1108,8 @@ fn last_comment_table_height_mm(comment: Option<&PullRequestComment>, fonts: &Do
 /// - **Page 3 onward — one page per issue** (more when its description is
 ///   long): its title linking to the forge, a table of author, link, dates,
 ///   milestone, comment count, assignees, and labels, then the description
-///   rendered from its Markdown, and finally the last comment.
+///   rendered from its Markdown, and finally every comment, oldest first,
+///   each body rendered from its Markdown too.
 ///
 /// A repository with no open issues still gets its status page, followed by
 /// a short note instead of a table of contents and issue pages.
@@ -1144,13 +1127,12 @@ pub fn export_issue(workspace: &Path, issues: &[IssueDetail], model: &str) -> Re
         return Ok(path);
     }
 
-    // One page (more when an issue has a long description) per issue;
-    // compute where each lands so the table of contents (page 2) can point
-    // at it. The header (title + field table) is a fixed height drawn ahead
-    // of the description, so the description is paginated from however much
-    // room is left on that first page; the "Last comment" table follows,
-    // adding one more page only if it doesn't fit where the description
-    // left off (it breaks atomically — see `draw_last_comment_section`).
+    // One page (more when an issue has a long description or many comments)
+    // per issue; compute where each lands so the table of contents (page 2)
+    // can point at it. The header (title + field table) is a fixed height
+    // drawn ahead of the description, so the description is paginated from
+    // however much room is left on that first page; the comments follow from
+    // wherever the description left off.
     let titles: Vec<String> = issues
         .iter()
         .map(|issue| format!("#{} {}", issue.number, issue.title))
@@ -1161,17 +1143,17 @@ pub fn export_issue(workspace: &Path, issues: &[IssueDetail], model: &str) -> Re
         starts.push(page);
         let header_height = issue_header_height_mm(issue, &pdf.fonts);
         let start_cursor = (CONTENT_TOP_MM - header_height).max(CONTENT_BOTTOM_MM);
-        let (mut pages_for_issue, cursor_after_description) = paginate_from(
+        let (description_pages, cursor_after_description) = paginate_from(
             &build_issue_description_blocks(issue),
             &pdf.fonts,
             start_cursor,
         );
-        let comment_table_height =
-            last_comment_table_height_mm(issue.last_comment.as_ref(), &pdf.fonts);
-        if cursor_after_description - comment_table_height < CONTENT_BOTTOM_MM {
-            pages_for_issue += 1;
-        }
-        page += pages_for_issue;
+        let (comment_pages, _) = paginate_from(
+            &build_comment_blocks(&issue.comments),
+            &pdf.fonts,
+            cursor_after_description,
+        );
+        page += description_pages + comment_pages - 1;
     }
 
     let toc_rows: Vec<(&str, usize, Option<bool>)> = titles
@@ -1286,7 +1268,7 @@ fn issue_header_rows(issue: &IssueDetail) -> Vec<(String, RowValue, bool)> {
 /// issue's body rendered from its Markdown (headings, emphasis, lists, code
 /// blocks, quotes, and tables, like the review export) — or a "No
 /// description." line when it has none. The last block carries the extra
-/// gap ahead of the "Last comment" table, as the changed-files list does.
+/// gap ahead of the comments, as the changed-files list does.
 fn build_issue_description_blocks(issue: &IssueDetail) -> Vec<Block> {
     let mut blocks = vec![section_heading_block("Description")];
     if issue.body.trim().is_empty() {
@@ -1299,7 +1281,7 @@ fn build_issue_description_blocks(issue: &IssueDetail) -> Vec<Block> {
         }
     }
     if let Some(last) = blocks.last_mut() {
-        last.space_after_mm += LAST_COMMENT_GAP_MM;
+        last.space_after_mm += SECTION_GAP_MM;
     }
     blocks
 }
@@ -2838,19 +2820,19 @@ impl Pdf {
     /// One pull request's detail page: the linked title heading, a field
     /// table (author, dates, branch, draft/conflict status, comment count,
     /// assignees, reviewers, labels), then the changed files — one line per
-    /// file, full path, additions in green and deletions in red — the "Last
-    /// comment" table, and finally the "Checks" section (see
-    /// `build_check_blocks`). The page is assumed freshly started (`new_page`
-    /// just called); the changed-files list and the checks section each spill
-    /// onto further pages on their own via `draw_blocks`' normal overflow
-    /// handling when there's a lot of either.
+    /// file, full path, additions in green and deletions in red — the
+    /// "Comments" section (see `build_comment_blocks`), and finally the
+    /// "Checks" section (see `build_check_blocks`). The page is assumed
+    /// freshly started (`new_page` just called); each section spills onto
+    /// further pages on its own via `draw_blocks`' normal overflow handling
+    /// when it is long.
     fn draw_pr_detail_page(&mut self, pr: &PullRequestDetail) {
         self.draw_block(&pr_title_block(pr));
         self.draw_kv_table(&pr_header_rows(pr));
         if !pr.files.is_empty() {
             self.draw_blocks(&build_changed_file_blocks(pr));
         }
-        self.draw_last_comment_section(pr.last_comment.as_ref());
+        self.draw_blocks(&build_comment_blocks(&pr.comments));
         self.draw_check_section(pr);
     }
 
@@ -2866,26 +2848,15 @@ impl Pdf {
     /// One issue's detail page: the linked title heading, a field table
     /// (author, link, dates, milestone, comment count, assignees, labels),
     /// then the "Description" section rendered from the issue's Markdown,
-    /// and finally the "Last comment" table. The page is assumed freshly
-    /// started (`new_page` just called); a long description spills onto
-    /// further pages on its own via `draw_blocks`' normal overflow handling.
+    /// and finally the "Comments" section (see `build_comment_blocks`). The
+    /// page is assumed freshly started (`new_page` just called); a long
+    /// description or many comments spill onto further pages on their own
+    /// via `draw_blocks`' normal overflow handling.
     fn draw_issue_detail_page(&mut self, issue: &IssueDetail) {
         self.draw_block(&issue_title_block(issue));
         self.draw_kv_table(&issue_header_rows(issue));
         self.draw_blocks(&build_issue_description_blocks(issue));
-        self.draw_last_comment_section(issue.last_comment.as_ref());
-    }
-
-    /// The "Last comment" table for a pull request's or issue's `comment`
-    /// (`"N/A"`/`"N/A"` when there is none), after a single atomic page break
-    /// if the table (small and bounded — see [`last_comment_table_height_mm`])
-    /// does not fit in what's left of the page.
-    fn draw_last_comment_section(&mut self, comment: Option<&PullRequestComment>) {
-        if self.cursor_y - last_comment_table_height_mm(comment, &self.fonts) < CONTENT_BOTTOM_MM {
-            self.new_page();
-        }
-        let (author, body) = last_comment_cells(comment);
-        self.draw_last_comment_table(author, body);
+        self.draw_blocks(&build_comment_blocks(&issue.comments));
     }
 
     /// The pull request report's final section: the bold "Checks" heading,
@@ -2928,51 +2899,6 @@ impl Pdf {
         self.cursor_y -= 8.0;
     }
 
-    /// The "Last comment" table following a pull request's changed files: a
-    /// header row spanning both columns, then one data row with the
-    /// comment's author (left) and its text (right, word-wrapped to fit).
-    /// `"N/A"`/`"N/A"` when the pull request has no comment.
-    fn draw_last_comment_table(&mut self, author: &str, body: &str) {
-        let (divider, row_height, lines) = last_comment_table_layout(author, body, &self.fonts);
-        let x0 = MARGIN_MM;
-        let x1 = PAGE_WIDTH_MM - MARGIN_MM;
-        let top = self.cursor_y;
-        let header_bottom = top - row_height;
-        let bottom = header_bottom - lines.len().max(1) as f32 * row_height;
-
-        self.text(
-            "Last comment",
-            true,
-            x0 + 3.0,
-            top - row_height * 0.68,
-            BODY_SIZE,
-            TEXT_COLOR,
-        );
-        self.text(
-            author,
-            false,
-            x0 + 3.0,
-            header_bottom - row_height * 0.68,
-            BODY_SIZE,
-            TEXT_COLOR,
-        );
-        for (index, line) in lines.iter().enumerate() {
-            let baseline = header_bottom - (index as f32 + 0.68) * row_height;
-            self.text(line, false, divider + 3.0, baseline, BODY_SIZE, TEXT_COLOR);
-        }
-
-        // Outer box, the rule under the header, and the column divider
-        // (alongside the data row only — the header spans both columns).
-        self.rule(x0, top, x1, top, GRID_COLOR, 0.4);
-        self.rule(x0, header_bottom, x1, header_bottom, GRID_COLOR, 0.4);
-        self.rule(x0, bottom, x1, bottom, GRID_COLOR, 0.4);
-        self.rule(x0, top, x0, bottom, GRID_COLOR, 0.4);
-        self.rule(x1, top, x1, bottom, GRID_COLOR, 0.4);
-        self.rule(divider, header_bottom, divider, bottom, GRID_COLOR, 0.4);
-
-        self.cursor_y = bottom - 8.0;
-    }
-
     /// A two-column table: bold labels on the left, values on the right. Each
     /// row is `(label, value, bold)`; `bold` renders that row's value in bold
     /// too (used to draw attention to e.g. a pull request's `Draft`/
@@ -2985,7 +2911,7 @@ impl Pdf {
             .fold(0.0_f32, f32::max);
         let divider = x0 + 6.0 + label_width + 6.0;
         // Span the full content width (page width minus margins) rather than
-        // a fixed value-column width, matching `draw_last_comment_table`.
+        // a fixed value-column width.
         let x1 = PAGE_WIDTH_MM - MARGIN_MM;
         let row_height = BODY_SIZE * 1.9 * PT_TO_MM;
         let top = self.cursor_y;
@@ -3867,8 +3793,7 @@ fn paginate(blocks: &[Block], fonts: &DocFonts) -> usize {
 /// vertical room already used — by a fixed-height header drawn ahead of these
 /// blocks — instead of a fresh page's full height. Returns the page count and
 /// the cursor position after the last block, so a fixed-height element that
-/// follows (like the "Last comment" table) can be accounted for too, without
-/// redrawing.
+/// follows can be accounted for too, without redrawing.
 fn paginate_from(blocks: &[Block], fonts: &DocFonts, start_cursor_y: f32) -> (usize, f32) {
     let mut pages = 1;
     let mut cursor_y = start_cursor_y;
@@ -4393,10 +4318,11 @@ mod tests {
                     deletions: 2,
                 },
             ],
-            last_comment: Some(crate::git::PullRequestComment {
+            comments: vec![IssueComment {
                 author: "dave".to_string(),
+                date: "2026-06-02 09:00:00".to_string(),
                 body: "Looks good, thanks!".to_string(),
-            }),
+            }],
             url: "https://github.com/o/r/pull/42".to_string(),
             checks: vec![
                 crate::git::PullRequestCheck {
@@ -4816,46 +4742,79 @@ mod tests {
     }
 
     #[test]
-    fn last_comment_table_layout_wraps_the_body_and_places_the_divider() {
-        let fonts = Pdf::new("t", "m").expect("pdf").fonts;
-        let (divider, row_height, lines) =
-            last_comment_table_layout("dave", "Looks good, thanks!", &fonts);
-        assert!(divider > MARGIN_MM);
-        assert!(row_height > 0.0);
-        assert_eq!(lines.join(" "), "Looks good, thanks!");
+    fn comment_blocks_list_every_comment_in_order() {
+        let issue = sample_issue();
+        let blocks = build_comment_blocks(&issue.comments);
+        let texts: Vec<String> = blocks
+            .iter()
+            .map(|block| block.spans.iter().map(|span| span.text.as_str()).collect())
+            .collect();
+        let dave = texts
+            .iter()
+            .position(|text| text.starts_with("dave"))
+            .expect("dave");
+        let erin = texts
+            .iter()
+            .position(|text| text.starts_with("erin"))
+            .expect("erin");
+        assert!(dave < erin, "{texts:?}");
+        assert!(texts.iter().any(|text| text == "Reproduced."), "{texts:?}");
+        // The body is rendered from its Markdown.
+        assert!(
+            blocks.iter().any(|block| block
+                .spans
+                .iter()
+                .any(|span| span.bold && span.text == "#18")),
+            "{texts:?}"
+        );
+        assert!(blocks.last().unwrap().space_after_mm >= SECTION_GAP_MM);
     }
 
     #[test]
-    fn last_comment_table_truncates_very_long_bodies() {
-        let fonts = Pdf::new("t", "m").expect("pdf").fonts;
-        let long_body = "x".repeat(LAST_COMMENT_MAX_CHARS + 200);
-        let (_, _, lines) = last_comment_table_layout("dave", &long_body, &fonts);
-        let joined: String = lines.join("");
-        // Truncated to the cap plus the ellipsis marker, not the full length.
-        assert!(joined.chars().count() <= LAST_COMMENT_MAX_CHARS + 1);
-        assert!(joined.ends_with('…'));
+    fn comment_blocks_say_so_when_there_are_none() {
+        let blocks = build_comment_blocks(&[]);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1].spans[0].text, "No comments.");
     }
 
     #[test]
-    fn last_comment_table_height_matches_no_comment_and_with_comment() {
-        let fonts = Pdf::new("t", "m").expect("pdf").fonts;
+    fn export_pr_paginates_many_comments_and_keeps_toc_in_step() {
         let mut pr = sample_pull_request();
-        let with_comment = last_comment_table_height_mm(pr.last_comment.as_ref(), &fonts);
-        pr.last_comment = None;
-        let without_comment = last_comment_table_height_mm(pr.last_comment.as_ref(), &fonts);
-        // Both a real comment and the "N/A" placeholder are one line, so the
-        // heights should match (both render one header row + one data row).
-        assert!((with_comment - without_comment).abs() < 0.01);
-    }
-
-    #[test]
-    fn export_pr_draws_last_comment_table_with_na_fallback() {
+        pr.comments = (1..=200)
+            .map(|n| IssueComment {
+                author: "dave".to_string(),
+                date: format!("2026-06-02 09:{:02}:00", n % 60),
+                body: format!("Comment {n}."),
+            })
+            .collect();
         let workspace = tempdir().expect("workspace");
-        let mut pr = sample_pull_request();
-        pr.last_comment = None;
-        let path = export_pr(workspace.path(), std::slice::from_ref(&pr), "gemma").expect("export");
+        let mut second = sample_pull_request();
+        second.number = 43;
+        second.comments.clear();
+        let path = export_pr(workspace.path(), &[pr.clone(), second], "gemma").expect("export");
         let bytes = std::fs::read(&path).expect("read pdf");
         assert!(bytes.starts_with(b"%PDF"));
+
+        // Redo the page arithmetic `export_pr` does and check it against a
+        // real draw of the first pull request.
+        let mut pdf = Pdf::new("t", "m").expect("pdf");
+        let header_height = pr_header_height_mm(&pr, &pdf.fonts);
+        let start_cursor = (CONTENT_TOP_MM - header_height).max(CONTENT_BOTTOM_MM);
+        let (file_pages, cursor) =
+            paginate_from(&build_changed_file_blocks(&pr), &pdf.fonts, start_cursor);
+        let (comment_pages, cursor) =
+            paginate_from(&build_comment_blocks(&pr.comments), &pdf.fonts, cursor);
+        let (heading_pages, cursor) = paginate_from(
+            std::slice::from_ref(&checks_heading_block()),
+            &pdf.fonts,
+            cursor,
+        );
+        let (rows_pages, _) = paginate_checks_rows(&pr.checks, cursor);
+        let pages = file_pages + (comment_pages - 1) + (heading_pages - 1) + (rows_pages - 1);
+        assert!(pages > 1, "the comments should spill over");
+        let before = pdf.current_page();
+        pdf.draw_pr_detail_page(&pr);
+        assert_eq!(pdf.current_page() - before + 1, pages);
     }
 
     fn sample_issue() -> IssueDetail {
@@ -4871,10 +4830,18 @@ mod tests {
             labels: vec!["bug".to_string(), "urgent".to_string()],
             body: "It **crashes** right away.\n\n## Steps\n\n1. Start it\n2. Wait\n\n```sh\norangu\n```\n"
                 .to_string(),
-            last_comment: Some(crate::git::PullRequestComment {
-                author: "dave".to_string(),
-                body: "Reproduced.".to_string(),
-            }),
+            comments: vec![
+                IssueComment {
+                    author: "dave".to_string(),
+                    date: "2026-06-02 09:00:00".to_string(),
+                    body: "Reproduced.".to_string(),
+                },
+                IssueComment {
+                    author: "erin".to_string(),
+                    date: "2026-06-02 10:00:00".to_string(),
+                    body: "Fixed by **#18**.".to_string(),
+                },
+            ],
             url: "https://github.com/o/r/issues/17".to_string(),
         }
     }
@@ -4913,7 +4880,7 @@ mod tests {
             .join("\n\n");
         let mut second = sample_issue();
         second.number = 18;
-        second.last_comment = None;
+        second.comments.clear();
         let issues = vec![long, second];
 
         let workspace = tempdir().expect("workspace");
@@ -4926,16 +4893,17 @@ mod tests {
         let mut pdf = Pdf::new("t", "m").expect("pdf");
         let header_height = issue_header_height_mm(&issues[0], &pdf.fonts);
         let start_cursor = (CONTENT_TOP_MM - header_height).max(CONTENT_BOTTOM_MM);
-        let (mut pages, cursor_after) = paginate_from(
+        let (description_pages, cursor_after) = paginate_from(
             &build_issue_description_blocks(&issues[0]),
             &pdf.fonts,
             start_cursor,
         );
-        let comment_height =
-            last_comment_table_height_mm(issues[0].last_comment.as_ref(), &pdf.fonts);
-        if cursor_after - comment_height < CONTENT_BOTTOM_MM {
-            pages += 1;
-        }
+        let (comment_pages, _) = paginate_from(
+            &build_comment_blocks(&issues[0].comments),
+            &pdf.fonts,
+            cursor_after,
+        );
+        let pages = description_pages + comment_pages - 1;
         assert!(pages > 1, "the long description should spill over");
         let before = pdf.current_page();
         pdf.draw_issue_detail_page(&issues[0]);
@@ -5061,8 +5029,8 @@ mod tests {
                 .any(|span| span.bold && span.text == "crashes")),
             "{texts:?}"
         );
-        // The last block carries the extra gap ahead of the comment table.
-        assert!(blocks.last().unwrap().space_after_mm >= LAST_COMMENT_GAP_MM);
+        // The last block carries the extra gap ahead of the comments.
+        assert!(blocks.last().unwrap().space_after_mm >= SECTION_GAP_MM);
 
         let mut bare = sample_issue();
         bare.body = "   ".to_string();

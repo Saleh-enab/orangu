@@ -52,11 +52,22 @@ fn list_open_pull_requests(repo_root: &Path, forge: Forge) -> Result<Option<Vec<
         Forge::GitHub => "pr",
         Forge::GitLab => "mr",
     };
-    // GitHub: `gh pr list --state open --json number,title`.
-    // GitLab: `glab mr list --output json` (open merge requests by default).
+    // GitHub: `gh pr list --state open --limit 1000 --json number,title`
+    // (`gh` stops at 30 without `--limit`).
+    // GitLab: `glab mr list --per-page 100 --output json` (open merge requests
+    // by default).
     let args: Vec<&str> = match forge {
-        Forge::GitHub => vec![request, "list", "--state", "open", "--json", "number,title"],
-        Forge::GitLab => vec![request, "list", "--output", "json"],
+        Forge::GitHub => vec![
+            request,
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            "1000",
+            "--json",
+            "number,title",
+        ],
+        Forge::GitLab => vec![request, "list", "--per-page", "100", "--output", "json"],
     };
     let output = match crate::askpass::apply(&mut std::process::Command::new(cli))
         .args(&args)
@@ -744,8 +755,8 @@ fn parse_member_usernames(text: &str, field: &str) -> Vec<String> {
 }
 
 /// One comment on an issue or pull/merge request, as fetched by
-/// [`get_comments_output`].
-#[derive(Debug, PartialEq, Eq)]
+/// [`fetch_comments`].
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IssueComment {
     pub author: String,
     pub date: String,
@@ -759,6 +770,28 @@ pub fn get_comments_output(
 ) -> Result<String> {
     let repo_root = discover_git_root(workspace)
         .ok_or_else(|| anyhow!("get_comments is only available inside a Git repository"))?;
+    let number = match target {
+        GetCommentsTarget::Issue(n) | GetCommentsTarget::PullRequest(n) => *n,
+    };
+    let comments = fetch_comments(&repo_root, target, forge)?;
+    let label = match target {
+        GetCommentsTarget::Issue(_) => "issue",
+        GetCommentsTarget::PullRequest(_) => "pull request",
+    };
+    if comments.is_empty() {
+        return Ok(format!("No comments on {label} #{number}"));
+    }
+    Ok(format_comment_blocks(&comments))
+}
+
+/// Every comment on an issue or pull/merge request, oldest first, fetched
+/// page by page so none is left out. Shared by the `get_comments` tool and
+/// the `/export pr` / `/export issue` reports.
+pub(crate) fn fetch_comments(
+    repo_root: &Path,
+    target: &GetCommentsTarget,
+    forge: Forge,
+) -> Result<Vec<IssueComment>> {
     let cli = forge.cli();
     let number = match target {
         GetCommentsTarget::Issue(n) | GetCommentsTarget::PullRequest(n) => n.to_string(),
@@ -787,14 +820,14 @@ pub fn get_comments_output(
     let mut comments = Vec::new();
     for endpoint in &endpoints {
         let output = match std::process::Command::new(cli)
-            .args(["api", endpoint])
-            .current_dir(&repo_root)
+            .args(["api", "--paginate", endpoint])
+            .current_dir(repo_root)
             .output()
         {
             Ok(output) => output,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 return Err(anyhow!(
-                    "get_comments requires the {cli} CLI to be installed"
+                    "fetching comments requires the {cli} CLI to be installed"
                 ));
             }
             Err(err) => return Err(err).context(format!("failed to run {cli}")),
@@ -802,7 +835,7 @@ pub fn get_comments_output(
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(anyhow!(
-                "{cli} get_comments failed{}",
+                "{cli} comment list failed{}",
                 if stderr.is_empty() {
                     String::new()
                 } else {
@@ -815,66 +848,50 @@ pub fn get_comments_output(
     // Conversation and review comments come from separate endpoints; interleave
     // them chronologically. The formatted dates sort lexicographically.
     comments.sort_by(|a, b| a.date.cmp(&b.date));
-    let label = match target {
-        GetCommentsTarget::Issue(_) => "issue",
-        GetCommentsTarget::PullRequest(_) => "pull request",
-    };
-    if comments.is_empty() {
-        return Ok(format!("No comments on {label} #{number}"));
-    }
-    Ok(format_comment_blocks(&comments))
+    Ok(comments)
 }
 
-/// Parse a JSON comment array printed by `gh api` (issue conversation comments
-/// or pull request review comments; the author is under `user`) or by
-/// `glab api .../notes` (the author is under `author`) into [`IssueComment`]s.
-/// GitLab system notes (label changes, assignments, ...) are skipped; only
-/// comments written by a person remain.
+/// Parse the JSON comment arrays printed by `gh api --paginate` (issue
+/// conversation comments or pull request review comments; the author is under
+/// `user`) or by `glab api --paginate .../notes` (the author is under
+/// `author`) into [`IssueComment`]s. A paginated call prints one array per
+/// page, back to back, so the output is read as a stream of values and every
+/// array's entries are collected. GitLab system notes (label changes,
+/// assignments, ...) are skipped; only comments written by a person remain.
 pub fn parse_comment_list(stdout: &[u8], forge: Forge) -> Result<Vec<IssueComment>> {
     let text = String::from_utf8_lossy(stdout);
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-    let value: serde_json::Value =
-        serde_json::from_str(trimmed).context("failed to parse forge comment list as JSON")?;
     let (author_key, name_key) = match forge {
         Forge::GitHub => ("user", "login"),
         Forge::GitLab => ("author", "username"),
     };
-    let Some(entries) = value.as_array() else {
-        return Ok(Vec::new());
-    };
-    Ok(entries
-        .iter()
-        .filter(|entry| {
-            forge == Forge::GitHub
-                || !entry
-                    .get("system")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-        })
-        .map(|entry| IssueComment {
-            author: entry
-                .get(author_key)
-                .and_then(|author| author.get(name_key))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown")
-                .to_string(),
-            date: format_comment_date(
-                entry
-                    .get("created_at")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(""),
-            ),
-            body: entry
-                .get("body")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_string(),
-        })
-        .collect())
+    let mut comments = Vec::new();
+    for value in serde_json::Deserializer::from_str(trimmed).into_iter::<serde_json::Value>() {
+        let value = value.context("failed to parse forge comment list as JSON")?;
+        let Some(entries) = value.as_array() else {
+            continue;
+        };
+        comments.extend(
+            entries
+                .iter()
+                .filter(|entry| {
+                    forge == Forge::GitHub
+                        || !entry
+                            .get("system")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                })
+                .map(|entry| IssueComment {
+                    author: json_login(entry.get(author_key), name_key),
+                    date: format_comment_date(&json_str(entry, "created_at")),
+                    body: json_str(entry, "body").trim().to_string(),
+                }),
+        );
+    }
+    Ok(comments)
 }
 
 /// Render comments as blocks separated by blank lines: a subtle
@@ -1000,14 +1017,6 @@ pub struct ChangedFile {
     pub deletions: u64,
 }
 
-/// The author and body of a pull/merge request's most recent conversation
-/// comment, for the `/export pr` report's "Last comment" table.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PullRequestComment {
-    pub author: String,
-    pub body: String,
-}
-
 /// One CI check on a pull/merge request — its name and outcome bucket.
 /// `bucket` mirrors `gh pr checks --json bucket`'s categories (`pass`,
 /// `fail`, `pending`, `skipping`, `cancel`); GitLab job statuses are folded
@@ -1039,7 +1048,8 @@ pub struct PullRequestDetail {
     pub assignees: Vec<String>,
     pub labels: Vec<String>,
     pub files: Vec<ChangedFile>,
-    pub last_comment: Option<PullRequestComment>,
+    /// Every conversation and inline review comment, oldest first.
+    pub comments: Vec<IssueComment>,
     pub url: String,
     pub checks: Vec<PullRequestCheck>,
 }
@@ -1061,7 +1071,8 @@ pub struct IssueDetail {
     pub labels: Vec<String>,
     /// The issue's description, as Markdown (empty when it has none).
     pub body: String,
-    pub last_comment: Option<PullRequestComment>,
+    /// Every comment, oldest first.
+    pub comments: Vec<IssueComment>,
     pub url: String,
 }
 
@@ -1070,9 +1081,10 @@ pub struct IssueDetail {
 /// conflicts, comments, reviewers (and their review state), assignees, and
 /// labels. Used by `/export pr`.
 ///
-/// GitHub: `gh pr list --json ...` — a single call that also carries
-/// `mergeable` and `reviews`. GitLab: `glab api
-/// projects/:id/merge_requests?state=opened` (the REST list endpoint);
+/// GitHub: `gh pr list --limit 1000 --json ...` — a single call that also
+/// carries `mergeable` and `reviews` (`gh` stops at 30 without `--limit`).
+/// GitLab: `glab api projects/:id/merge_requests?state=opened` (the REST list
+/// endpoint), paginated so every open merge request is reported;
 /// GitLab's list response does not carry per-reviewer approval state, so
 /// GitLab reviewers are reported with the state `"Requested"` rather than
 /// approved/changes-requested/commented, and diff size (`additions`/
@@ -1083,12 +1095,14 @@ pub struct IssueDetail {
 /// explicit user action that should report why the report could not be
 /// built rather than silently producing an empty one.
 ///
-/// Each pull/merge request's CI checks are then fetched with one further CLI
-/// call per pull request (see [`fetch_pull_request_checks`]) — neither forge's
-/// list endpoint carries per-check detail, so this can't be folded into the
-/// call above. Unlike the list call, a checks failure is never fatal to the
-/// report: a pull request with no CI configured or an unauthenticated CLI
-/// just reports no checks.
+/// Each pull/merge request's CI checks and comments are then fetched with
+/// further CLI calls per pull request (see [`fetch_pull_request_checks`] and
+/// [`fetch_comments`]) — neither forge's list endpoint carries per-check
+/// detail or every comment (GitHub's stops at 100 and leaves out inline
+/// review comments; GitLab's carries only a count). A checks failure is never
+/// fatal to the report: a pull request with no CI configured or an
+/// unauthenticated CLI just reports no checks. A comments failure is, since
+/// the report would otherwise silently leave comments out.
 pub fn fetch_pull_request_details(
     workspace: &Path,
     forge: Forge,
@@ -1102,6 +1116,8 @@ pub fn fetch_pull_request_details(
             "list",
             "--state",
             "open",
+            "--limit",
+            "1000",
             "--json",
             "number,title,author,createdAt,updatedAt,baseRefName,headRefName,isDraft,mergeable,\
              comments,reviews,reviewRequests,assignees,labels,files,url",
@@ -1109,6 +1125,7 @@ pub fn fetch_pull_request_details(
         Forge::GitLab => vec![
             "api",
             "projects/:id/merge_requests?state=opened&per_page=100",
+            "--paginate",
         ],
     };
     let output = match std::process::Command::new(cli)
@@ -1134,14 +1151,43 @@ pub fn fetch_pull_request_details(
         ));
     }
     let mut details = parse_pull_request_details(&output.stdout, forge)?;
-    for pr in &mut details {
+    for_each_concurrently(&mut details, |pr| {
         pr.checks = fetch_pull_request_checks(&repo_root, pr.number, forge);
-    }
+        pr.comments = fetch_comments(
+            &repo_root,
+            &GetCommentsTarget::PullRequest(pr.number),
+            forge,
+        )
+        .with_context(|| format!("failed to fetch the comments of #{}", pr.number))?;
+        pr.comment_count = pr.comments.len();
+        Ok(())
+    })?;
     Ok(details)
 }
 
-/// Parse the JSON array printed by `gh pr list --json ...` / `glab api
-/// .../merge_requests` into [`PullRequestDetail`]s. Entries missing their
+/// How many forge CLI calls the `/export pr` and `/export issue` reports run
+/// at once while fetching each entry's comments and checks.
+const FORGE_FETCH_THREADS: usize = 8;
+
+/// Run `fetch` on every item, [`FORGE_FETCH_THREADS`] at a time — a report
+/// over dozens of pull requests or issues would otherwise wait on each CLI
+/// call in turn. Stops at the first error.
+fn for_each_concurrently<T: Send>(
+    items: &mut [T],
+    fetch: impl Fn(&mut T) -> Result<()> + Sync,
+) -> Result<()> {
+    use rayon::prelude::*;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(FORGE_FETCH_THREADS)
+        .build()
+        .context("failed to start the forge fetch threads")?;
+    pool.install(|| items.par_iter_mut().try_for_each(&fetch))
+}
+
+/// Parse the JSON printed by `gh pr list --json ...` / `glab api
+/// .../merge_requests --paginate` into [`PullRequestDetail`]s. The output is
+/// one JSON array — or, with `--paginate`, several back to back, one per
+/// page — and every array's entries are collected. Entries missing their
 /// number are skipped; every other field falls back to its empty/default
 /// value rather than failing the whole parse, since forges vary in which
 /// optional fields they populate.
@@ -1151,18 +1197,18 @@ pub fn parse_pull_request_details(stdout: &[u8], forge: Forge) -> Result<Vec<Pul
     if trimmed.is_empty() {
         return Ok(Vec::new());
     }
-    let value: serde_json::Value = serde_json::from_str(trimmed)
-        .context("failed to parse forge pull request details as JSON")?;
-    let Some(entries) = value.as_array() else {
-        return Ok(Vec::new());
-    };
-    Ok(entries
-        .iter()
-        .filter_map(|entry| match forge {
+    let mut details = Vec::new();
+    for value in serde_json::Deserializer::from_str(trimmed).into_iter::<serde_json::Value>() {
+        let value = value.context("failed to parse forge pull request details as JSON")?;
+        let Some(entries) = value.as_array() else {
+            continue;
+        };
+        details.extend(entries.iter().filter_map(|entry| match forge {
             Forge::GitHub => parse_github_pr_detail(entry),
             Forge::GitLab => parse_gitlab_pr_detail(entry),
-        })
-        .collect())
+        }));
+    }
+    Ok(details)
 }
 
 /// Fetch every open issue in the repository containing `workspace`, with as
@@ -1170,11 +1216,11 @@ pub fn parse_pull_request_details(stdout: &[u8], forge: Forge) -> Result<Vec<Pul
 /// labels, milestone, and the description. Used by `/export issue`.
 ///
 /// GitHub: `gh issue list --json ...` — a single call that already excludes
-/// pull requests and carries the conversation comments. GitLab: `glab api
-/// projects/:id/issues?state=opened` (the REST list endpoint), paginated so
-/// a repository with more than one page of issues is reported in full;
-/// GitLab's list response carries only a comment count, not the comments
-/// themselves, so GitLab issues have no last comment.
+/// pull requests. GitLab: `glab api projects/:id/issues?state=opened` (the
+/// REST list endpoint), paginated so a repository with more than one page of
+/// issues is reported in full. Each issue's comments are then fetched with
+/// one further CLI call per issue (see [`fetch_comments`]): GitHub's list
+/// stops at 100 comments and GitLab's carries only a count.
 ///
 /// Like [`fetch_pull_request_details`], CLI/network failures surface as
 /// `Err`, since `/export issue` is an explicit user action that should
@@ -1225,7 +1271,14 @@ pub fn fetch_issue_details(workspace: &Path, forge: Forge) -> Result<Vec<IssueDe
             }
         ));
     }
-    parse_issue_details(&output.stdout, forge)
+    let mut issues = parse_issue_details(&output.stdout, forge)?;
+    for_each_concurrently(&mut issues, |issue| {
+        issue.comments = fetch_comments(&repo_root, &GetCommentsTarget::Issue(issue.number), forge)
+            .with_context(|| format!("failed to fetch the comments of #{}", issue.number))?;
+        issue.comment_count = issue.comments.len();
+        Ok(())
+    })?;
+    Ok(issues)
 }
 
 /// Parse the JSON printed by `gh issue list --json ...` / `glab api
@@ -1272,7 +1325,8 @@ fn parse_github_issue_detail(entry: &serde_json::Value) -> Option<IssueDetail> {
         assignees: json_string_array(entry, "assignees", "login"),
         labels: json_string_array(entry, "labels", "name"),
         body: json_str(entry, "body").trim().to_string(),
-        last_comment: comments.and_then(|comments| latest_comment(comments, "login")),
+        // Filled by `fetch_issue_details` in a follow-up call per issue.
+        comments: Vec::new(),
         url: json_str(entry, "url"),
     })
 }
@@ -1306,9 +1360,8 @@ fn parse_gitlab_issue_detail(entry: &serde_json::Value) -> Option<IssueDetail> {
             })
             .unwrap_or_default(),
         body: json_str(entry, "description").trim().to_string(),
-        // Only a count (`user_notes_count`) is available from the issue list
-        // endpoint, not the notes themselves.
-        last_comment: None,
+        // Filled by `fetch_issue_details` in a follow-up call per issue.
+        comments: Vec::new(),
         url: json_str(entry, "web_url"),
     })
 }
@@ -1320,30 +1373,6 @@ fn json_login(user: Option<&serde_json::Value>, field: &str) -> String {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown")
         .to_string()
-}
-
-/// The most recently created comment of a `[{author, body, createdAt}, ...]`
-/// array, by `createdAt` (ISO 8601 strings sort lexicographically). GitHub's
-/// field already carries the author and body, so this needs no extra
-/// request. `None` when the array is empty.
-fn latest_comment(comments: &[serde_json::Value], login_field: &str) -> Option<PullRequestComment> {
-    comments
-        .iter()
-        .max_by_key(|comment| {
-            comment
-                .get("createdAt")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-        })
-        .map(|comment| PullRequestComment {
-            author: json_login(comment.get("author"), login_field),
-            body: comment
-                .get("body")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_string(),
-        })
 }
 
 fn json_str(entry: &serde_json::Value, key: &str) -> String {
@@ -1415,7 +1444,6 @@ fn parse_github_pr_detail(entry: &serde_json::Value) -> Option<PullRequestDetail
     };
     let comments = entry.get("comments").and_then(serde_json::Value::as_array);
     let comment_count = comments.map(Vec::len).unwrap_or(0);
-    let last_comment = comments.and_then(|comments| latest_comment(comments, "login"));
 
     // The latest review state per author, then any reviewer still awaiting a
     // review (present in `reviewRequests` but not yet in `reviews`).
@@ -1477,7 +1505,9 @@ fn parse_github_pr_detail(entry: &serde_json::Value) -> Option<PullRequestDetail
         assignees: json_string_array(entry, "assignees", "login"),
         labels: json_string_array(entry, "labels", "name"),
         files: json_changed_files(entry, "files"),
-        last_comment,
+        // Filled by `fetch_pull_request_details` in a follow-up call per
+        // pull request.
+        comments: Vec::new(),
         url: json_str(entry, "url"),
         // Filled by `fetch_pull_request_details` in a follow-up call per
         // pull request — neither forge's list endpoint carries checks.
@@ -1572,9 +1602,9 @@ fn parse_gitlab_pr_detail(entry: &serde_json::Value) -> Option<PullRequestDetail
         // would be needed to fill this in, which `/export pr` skips to avoid
         // one extra round trip per open merge request.
         files: Vec::new(),
-        // Only a count (`user_notes_count`) is available from the
-        // merge-request list endpoint, not the comments themselves.
-        last_comment: None,
+        // Filled by `fetch_pull_request_details` in a follow-up call per
+        // merge request.
+        comments: Vec::new(),
         url: json_str(entry, "web_url"),
         // Filled by `fetch_pull_request_details` in a follow-up call per
         // merge request — see `fetch_gitlab_checks`.
@@ -1876,6 +1906,17 @@ mod tests {
                 .expect("parse")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn parses_paginated_comment_lists() {
+        // `gh api --paginate` / `glab api --paginate` print one JSON array per
+        // page, back to back; every page's comments must be collected.
+        let json = br#"[{"user":{"login":"alice"},"created_at":"2026-06-01T12:30:45Z","body":"First page"}]
+[{"user":{"login":"bob"},"created_at":"2026-06-02T08:00:00Z","body":"Second page"}]"#;
+        let comments = parse_comment_list(json, Forge::GitHub).expect("parse");
+        let bodies: Vec<&str> = comments.iter().map(|c| c.body.as_str()).collect();
+        assert_eq!(bodies, vec!["First page", "Second page"]);
     }
 
     #[test]
@@ -2192,14 +2233,8 @@ mod tests {
         assert_eq!(pr.author, "alice");
         assert_eq!(pr.conflicting, Some(true));
         assert_eq!(pr.comment_count, 2);
-        // The later comment (by createdAt) wins, not the last one in the array.
-        assert_eq!(
-            pr.last_comment,
-            Some(PullRequestComment {
-                author: "dave".to_string(),
-                body: "Looks good, thanks!".to_string(),
-            })
-        );
+        // Comments are fetched in a follow-up call, not from the list.
+        assert!(pr.comments.is_empty());
         assert_eq!(
             pr.files,
             vec![
@@ -2275,7 +2310,7 @@ mod tests {
         // GitLab's merge-request list endpoint carries no diff or comment
         // bodies.
         assert!(pr.files.is_empty());
-        assert_eq!(pr.last_comment, None);
+        assert!(pr.comments.is_empty());
     }
 
     #[test]
@@ -2318,14 +2353,8 @@ mod tests {
         assert_eq!(issue.updated_at, "2026-06-02 08:00:00");
         assert_eq!(issue.milestone, "1.0");
         assert_eq!(issue.comment_count, 2);
-        // The later comment (by createdAt) wins, not the last one in the array.
-        assert_eq!(
-            issue.last_comment,
-            Some(PullRequestComment {
-                author: "dave".to_string(),
-                body: "Reproduced.".to_string(),
-            })
-        );
+        // Comments are fetched in a follow-up call, not from the list.
+        assert!(issue.comments.is_empty());
         assert_eq!(issue.assignees, vec!["bob".to_string()]);
         assert_eq!(issue.labels, vec!["bug".to_string(), "urgent".to_string()]);
         assert_eq!(issue.body, "It crashes.\n\n## Steps\n\n1. Start it");
@@ -2335,10 +2364,21 @@ mod tests {
         assert_eq!(bare.number, 18);
         assert_eq!(bare.milestone, "");
         assert_eq!(bare.comment_count, 0);
-        assert_eq!(bare.last_comment, None);
+        assert!(bare.comments.is_empty());
         assert!(bare.assignees.is_empty());
         assert!(bare.labels.is_empty());
         assert_eq!(bare.body, "");
+    }
+
+    #[test]
+    fn parses_gitlab_pull_request_details_across_pages() {
+        // `glab api --paginate` prints one JSON array per page, back to
+        // back; both pages' merge requests must be collected.
+        let json = br#"[{"iid": 7, "title": "First page"}]
+[{"iid": 8, "title": "Second page"}]"#;
+        let details = parse_pull_request_details(json, Forge::GitLab).expect("parse");
+        let numbers: Vec<u64> = details.iter().map(|pr| pr.number).collect();
+        assert_eq!(numbers, vec![7, 8]);
     }
 
     #[test]
@@ -2382,7 +2422,7 @@ mod tests {
         assert_eq!(issue.labels, vec!["docs".to_string()]);
         assert_eq!(issue.body, "Fix the typos.");
         // GitLab's issue list endpoint carries no note bodies.
-        assert_eq!(issue.last_comment, None);
+        assert!(issue.comments.is_empty());
         assert_eq!(issue.url, "https://gitlab.com/o/r/-/issues/7");
         assert_eq!(issues[1].number, 8);
         assert_eq!(issues[1].milestone, "");
